@@ -410,12 +410,20 @@ async def save_page_pdf(url: str | None = None, path: str | None = None) -> dict
     return _present(await (await _b()).save_pdf(_confine_path(path, ".pdf"), url))
 
 
+# What a site picks for each of its cookies (partitionKey: the top-level site of a partitioned cookie). The rest are the
+# browser's own: numbers, true/false, and sameSite's Strict, Lax or None.
+_COOKIE_TEXT = ("name", "value", "domain", "path", "partitionKey")
+
+
 @mcp.tool(annotations=_READ)
 @_safe
 async def get_cookies(url: str | None = None) -> dict:
-    """Get cookies for the current context (optionally filtered to `url`)."""
+    """Get cookies for the current context (optionally filtered to `url`). Each cookie's name, value, domain and
+    path are the site's, each between untrusted-content tags on one line."""
     await _check_url(url)
-    return _present(await (await _b()).cookies(url))
+    found = await (await _b()).cookies(url)
+    found["cookies"] = [_present(c, inline=_COOKIE_TEXT) for c in found["cookies"]]  # each swept and fenced once
+    return found
 
 
 @mcp.tool(annotations=_LOCAL)

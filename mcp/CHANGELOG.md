@@ -1,6 +1,23 @@
 # clearcote-mcp changelog
 
-## 0.3.0 (unreleased)
+## Unreleased
+
+### Output changes
+
+- `get_cookies` fences what a site picks for its cookies: each cookie's `name`, `value`, `domain` and `path` (and
+  `partitionKey`, when there is one) is `<untrusted_page_content>…</untrusted_page_content>` on one line, as a title
+  is; to get the value back, drop the two tags. The list and each cookie's keys are unchanged, and `expires`,
+  `httpOnly`, `secure` and `sameSite` stay as they were. Before, these were only swept for fence-like markers, so a
+  cookie value could carry instructions that read as the client's own text.
+
+### Tests
+
+- The stop-signal tests start the server with its stop signals at their defaults, as a client does. Run under
+  `nohup` (SIGHUP ignored) or as a background job of a non-interactive shell (SIGINT ignored), the server inherited
+  the ignored signal, rightly left it alone, and the test failed. A new test checks that a signal the server starts
+  out ignoring is left alone.
+
+## 0.3.0
 
 ### Output changes
 

@@ -126,9 +126,9 @@ holds it, so `get_cdp_endpoint` has no endpoint to hand out; start your own host
 - File writes are **confined** to a sandbox dir (no path traversal).
 - Oversized text is **capped** so a response never floods the agent's context, with an explicit
   `<field>_truncated` flag.
-- Everything a page controls (text, Markdown, HTML, element lists, script results and errors, titles, and the
-  browser's error messages, which can quote the page) is **fenced** as untrusted data (`<untrusted_page_content>`),
-  and nothing in it can pass for a fence tag.
+- Everything a page controls (text, Markdown, HTML, element lists, script results and errors, titles, cookies, and
+  the browser's error messages, which can quote the page) is **fenced** as untrusted data
+  (`<untrusted_page_content>`), and nothing in it can pass for a fence tag.
 - The shared browser is **rebuilt** automatically if it dies, and **closed** whenever the server stops (its input
   closed, Ctrl+C, Ctrl+Break, SIGTERM or SIGHUP), with its profile and temporary files. Not after a forced kill of
   the server; not a browser whose launch is still under way 20 s after the stop (the server waits no longer); and on

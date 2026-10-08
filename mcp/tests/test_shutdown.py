@@ -70,9 +70,24 @@ def test_a_stopped_server_finishes_closing_the_browser(shared):
     assert b.closes == 1 and S._browser is None
 
 
-# The real server over stdio, as a client starts it, with a stand-in browser that leaves a mark when it is closed.
-STAND_IN = r"""
+# A child server starts with the stop signals as a client leaves them: at their defaults. A test run can hand some down
+# ignored (SIGHUP under nohup, SIGINT in a background job of a non-interactive shell), and the server leaves alone a
+# signal it starts out ignoring, so the stop-signal tests would fail there for a reason of the run's, not the server's.
+# Signals named after the first argument are ignored on purpose instead, as nohup does.
+AS_A_CLIENT_STARTS_IT = r"""
+import signal
 import sys
+
+for name in ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"):
+    if hasattr(signal, name):
+        if name in sys.argv[2:]:
+            signal.signal(getattr(signal, name), signal.SIG_IGN)
+        elif signal.getsignal(getattr(signal, name)) is signal.SIG_IGN:
+            signal.signal(getattr(signal, name), signal.default_int_handler if name == "SIGINT" else signal.SIG_DFL)
+"""
+
+# The real server over stdio, as a client starts it, with a stand-in browser that leaves a mark when it is closed.
+STAND_IN = AS_A_CLIENT_STARTS_IT + r"""
 from pathlib import Path
 from clearcote_mcp import server
 
@@ -86,12 +101,12 @@ server.main()
 
 
 class Server:
-    def __init__(self, tmp_path, **popen):
+    def __init__(self, tmp_path, ignored=(), **popen):
         self.mark = tmp_path / "closed.txt"
         env = {k: v for k, v in os.environ.items() if k != "CLEARCOTE_API_KEY"}
         env["CLEARCOTE_MCP_PREWARM"] = "0"
         self.log = open(tmp_path / "stderr.txt", "wb")
-        self.proc = subprocess.Popen([sys.executable, "-c", STAND_IN, str(self.mark)], cwd=tmp_path, env=env,
+        self.proc = subprocess.Popen([sys.executable, "-c", STAND_IN, str(self.mark), *ignored], cwd=tmp_path, env=env,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, **popen)
         self.lines = queue.Queue()
         threading.Thread(target=lambda: [self.lines.put(line) for line in self.proc.stdout], daemon=True).start()
@@ -153,12 +168,28 @@ def test_a_stop_signal_closes_the_browser_and_ends_the_server(tmp_path, name, se
         server.close()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="nohup and background jobs of a shell: POSIX")
+@pytest.mark.parametrize("name", ["SIGHUP", "SIGINT"])
+def test_a_signal_the_server_starts_out_ignoring_is_left_alone(tmp_path, name):
+    """Under nohup (SIGHUP) or in a background job of a non-interactive shell (SIGINT) the signal is meant to pass the
+    server by: it goes on serving, and stops when its input closes."""
+    server = Server(tmp_path, ignored=(name,)).start()
+    try:
+        os.kill(server.proc.pid, getattr(signal, name))
+        server.send({"id": 2, "method": "ping"})
+        assert json.loads(server.lines.get(timeout=30))["id"] == 2, f"{name}: the server stopped serving"
+        server.proc.stdin.close()
+        assert server.stopped(30) == 0, f"{name}: the server acted on a signal it was started ignoring"
+        assert server.mark.read_text() == "closed"
+    finally:
+        server.close()
+
+
 # A stop signal while the browser is still being launched (the pre-warm at startup): serve() runs in a thread that
 # the cancel cannot stop, and the browser it starts must still be closed before the server leaves.
-STARTING = r"""
+STARTING = AS_A_CLIENT_STARTS_IT + r"""
 import atexit
 import subprocess
-import sys
 import time
 from pathlib import Path
 
