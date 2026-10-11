@@ -317,8 +317,9 @@ def apply_headless_geometry(pw_kwargs, seed=None, args=None, exe=None):
     if engine_places_persona_window(exe, args):
         if not any(k in pw_kwargs for k in _CALLER_GEOMETRY_KEYS):
             pw_kwargs["no_viewport"] = True
-        return {"mode": "persona-native", "args": [], "fit": False,
-                "reconcile": pw_kwargs.get("viewport") is not None and not pw_kwargs.get("no_viewport")}
+        reconcile = pw_kwargs.get("viewport") is not None and not pw_kwargs.get("no_viewport")
+        return {"mode": "persona-native", "args": [], "fit": False, "reconcile": reconcile,
+                "viewport": pw_kwargs.get("viewport") if reconcile else None}
     if any(k in pw_kwargs for k in _CALLER_GEOMETRY_KEYS):
         return None
     pw_kwargs["no_viewport"] = True
@@ -564,40 +565,78 @@ def _reconcile_plan(bounds, avail):
     return None if new == (left, top) else new
 
 
-def reconcile_window_position(page):
-    """A persona window (r39+) with an explicit ``viewport``: Playwright sizes the real window
-    around the caller's viewport, which can leave it hanging over the right or bottom edge of the
-    persona's work area. Move it back on (a move fires no resize event); a viewport larger than the
-    work area is the caller's choice and is only logged. Headless, where the display is the
-    persona's and window coordinates are work-area coordinates. Returns the new ``(left, top)`` or
-    None. Never raises."""
+# The frame (outer - inner) the engine draws around a HEADLESS window in the normal state, by the
+# host OS the engine runs on (measured on r37 and the r39 test build: a no_viewport restored window).
+# Windows 16 x 129, Linux 0 x 121 -- the Linux frame is Linux's own, never Windows' borders.
+HEADLESS_NORMAL_FRAME = (16, 129) if sys.platform.startswith("win") else (0, 121)
+
+
+def _viewport_size(viewport):
+    if isinstance(viewport, dict):
+        return int(viewport.get("width") or 0), int(viewport.get("height") or 0)
+    return None
+
+
+def _reconcile_steps(win, avail, viewport):
+    """The ``Browser.setWindowBounds`` payloads (in order) that make a persona window agree with an
+    explicit viewport, plus the bounds they leave.
+
+    Playwright asks for the viewport's size with zero insets in headless. On a MAXIMIZED persona
+    window Chromium only restores the window and drops the size (BrowserHandler::SetWindowBounds), so
+    the window ends up at its restore rectangle, unrelated to the emulated viewport (measured on the
+    r39 test build: outer 1493x830 around inner 1280x720; another seed outer height == inner height).
+    Asking for the viewport size again gives a window with no frame at all (outer == inner). So: the
+    normal state, then the viewport plus the engine's own normal-window frame, at the window's
+    position, then moved back onto the work area if it hangs over an edge (a move only)."""
+    b = dict((win or {}).get("bounds") or {})
+    steps = []
+    vp = _viewport_size(viewport)
+    if vp and vp[0] > 0 and vp[1] > 0:
+        if b.get("windowState", "normal") != "normal":
+            steps.append({"windowState": "normal"})
+            b["windowState"] = "normal"
+        want = (vp[0] + HEADLESS_NORMAL_FRAME[0], vp[1] + HEADLESS_NORMAL_FRAME[1])
+        if (b.get("width"), b.get("height")) != want:
+            steps.append({"width": want[0], "height": want[1]})
+            b["width"], b["height"] = want
+    plan = _reconcile_plan(b, avail) if {"left", "top", "width", "height"} <= set(b) else None
+    if plan:
+        steps.append({"left": plan[0], "top": plan[1]})
+        b["left"], b["top"] = plan
+    return steps, b
+
+
+def reconcile_window_position(page, viewport=None):
+    """A persona window (r39+) under an explicit ``viewport``: make the real window agree with it
+    (``_reconcile_steps``): the viewport plus the engine's normal frame, kept on the persona's work
+    area. A viewport larger than the work area is the caller's choice and is only logged. Headless,
+    where the display is the persona's and window coordinates are work-area coordinates. Runs on the
+    first page while it is still on about:blank. Returns the final bounds, or None. Never raises."""
     try:
         avail = page.evaluate(_WORKAREA_JS)
         cdp = page.context.new_cdp_session(page)
         win = cdp.send("Browser.getWindowForTarget")
-        plan = _reconcile_plan(win.get("bounds"), avail)
-        if plan:
-            cdp.send("Browser.setWindowBounds",
-                     {"windowId": win["windowId"], "bounds": {"left": plan[0], "top": plan[1]}})
-        return plan
+        steps, final = _reconcile_steps(win, avail, viewport)
+        for bounds in steps:
+            cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"], "bounds": bounds})
+        return final
     except Exception as exc:  # noqa: BLE001
-        logger.debug("window position reconcile skipped: %s", exc)
+        logger.debug("window reconcile skipped: %s", exc)
         return None
 
 
-async def reconcile_window_position_async(page):
+async def reconcile_window_position_async(page, viewport=None):
     """Async mirror of ``reconcile_window_position``."""
     try:
         avail = await page.evaluate(_WORKAREA_JS)
         cdp = await page.context.new_cdp_session(page)
         win = await cdp.send("Browser.getWindowForTarget")
-        plan = _reconcile_plan(win.get("bounds"), avail)
-        if plan:
-            await cdp.send("Browser.setWindowBounds",
-                           {"windowId": win["windowId"], "bounds": {"left": plan[0], "top": plan[1]}})
-        return plan
+        steps, final = _reconcile_steps(win, avail, viewport)
+        for bounds in steps:
+            await cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"], "bounds": bounds})
+        return final
     except Exception as exc:  # noqa: BLE001
-        logger.debug("window position reconcile skipped: %s", exc)
+        logger.debug("window reconcile skipped: %s", exc)
         return None
 
 
@@ -608,7 +647,7 @@ def place_window(page, args, geom):
     if not geom:
         return None
     if geom.get("mode") == "persona-native":
-        return reconcile_window_position(page) if geom.get("reconcile") else None
+        return reconcile_window_position(page, geom.get("viewport")) if geom.get("reconcile") else None
     return fit_window_to_work_area(page, args)
 
 
@@ -617,7 +656,7 @@ async def place_window_async(page, args, geom):
     if not geom:
         return None
     if geom.get("mode") == "persona-native":
-        return (await reconcile_window_position_async(page)) if geom.get("reconcile") else None
+        return (await reconcile_window_position_async(page, geom.get("viewport"))) if geom.get("reconcile") else None
     return await fit_window_to_work_area_async(page, args)
 
 

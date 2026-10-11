@@ -657,7 +657,8 @@ def _call_geometry(geom, kw):
     """The plan for one new_page/new_context call: an r39+ persona window reconciles only when this
     call asks for its own viewport; every other plan is the launch's."""
     if geom and geom.get("mode") == "persona-native":
-        return dict(geom, reconcile=kw.get("viewport") is not None and not kw.get("no_viewport"))
+        reconcile = kw.get("viewport") is not None and not kw.get("no_viewport")
+        return dict(geom, reconcile=reconcile, viewport=kw.get("viewport") if reconcile else None)
     return geom or _FIT
 
 

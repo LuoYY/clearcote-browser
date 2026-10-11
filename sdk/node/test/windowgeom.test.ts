@@ -12,7 +12,9 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  HEADLESS_NORMAL_FRAME,
   applyHeadlessGeometry,
+  reconcileSteps,
   enginePlacesPersonaWindow,
   fitWindowOverCdp,
   headedLinuxFit,
@@ -113,7 +115,7 @@ describe("r39 persona window plan", () => {
   it("sends no display switch and plans no fit on r39", () => {
     const opts: Record<string, unknown> = {};
     const g = applyHeadlessGeometry(opts, "7", ["--fingerprint=7"], {}, r39);
-    expect(g).toEqual({ mode: "persona-native", args: [], fit: false, reconcile: false });
+    expect(g).toEqual({ mode: "persona-native", args: [], fit: false, reconcile: false, viewport: null });
     expect(opts.viewport).toBeNull();
   });
 
@@ -124,7 +126,7 @@ describe("r39 persona window plan", () => {
   ])("keeps explicit choice %j (reconcile %s)", (explicit, reconcile) => {
     const opts: Record<string, unknown> = { ...explicit };
     const g = applyHeadlessGeometry(opts, "7", ["--fingerprint=7"], {}, r39);
-    expect(g).toEqual({ mode: "persona-native", args: [], fit: false, reconcile });
+    expect(g).toMatchObject({ mode: "persona-native", args: [], fit: false, reconcile });
     expect(opts).toEqual(explicit);
   });
 
@@ -148,7 +150,25 @@ describe("r39 persona window plan", () => {
     expect(reconcilePlan(b, avail)).toEqual(want);
   });
 
-  it("does nothing for a native persona page without a viewport, and only moves it with one", async () => {
+  const [FW, FH] = HEADLESS_NORMAL_FRAME;
+
+  it("frames an explicit viewport on a restored or maximized persona window (r39 test build finding)", () => {
+    // Playwright's viewport-sized request only RESTORES a maximized window (Chromium drops the size):
+    // outer 1493x830 around inner 1280x720 on the r39 test build.
+    const r = reconcileSteps({ left: 0, top: 22, width: 1493, height: 830, windowState: "normal" }, [1920, 1032],
+      { width: 1280, height: 720 });
+    expect(r.steps).toEqual([{ width: 1280 + FW, height: 720 + FH }]);
+    const m = reconcileSteps({ left: 0, top: 0, width: 1920, height: 1032, windowState: "maximized" }, [1920, 1032],
+      { width: 1280, height: 720 });
+    expect(m.steps.slice(0, 2)).toEqual([{ windowState: "normal" }, { width: 1280 + FW, height: 720 + FH }]);
+    expect(reconcileSteps({ left: 100, top: 20, width: 1280 + FW, height: 720 + FH, windowState: "normal" },
+      [1920, 1032], { width: 1280, height: 720 }).steps).toEqual([]);
+    expect(reconcileSteps({ left: 900, top: 300, width: 1296, height: 854, windowState: "normal" }, [1920, 1032], null).steps)
+      .toEqual([{ left: 624, top: 178 }]);
+    expect(HEADLESS_NORMAL_FRAME).toEqual(process.platform === "win32" ? [16, 129] : [0, 121]);
+  });
+
+  it("does nothing for a native persona page without a viewport, and frames + moves it with one", async () => {
     const calls: [string, unknown][] = [];
     const page = {
       evaluate: async () => [1920, 1032],
@@ -165,9 +185,14 @@ describe("r39 persona window plan", () => {
     };
     await placeWindow(page as never, [], { mode: "persona-native", args: [], fit: false, reconcile: false });
     expect(calls).toEqual([]);
-    await placeWindow(page as never, [], { mode: "persona-native", args: [], fit: false, reconcile: true });
-    expect(calls.filter(([m]) => m === "Browser.setWindowBounds"))
-      .toEqual([["Browser.setWindowBounds", { windowId: 3, bounds: { left: 624, top: 178 } }]]);
+    await placeWindow(page as never, [], {
+      mode: "persona-native", args: [], fit: false, reconcile: true, viewport: { width: 1280, height: 720 },
+    });
+    const w = 1280 + FW, h = 720 + FH;
+    expect(calls.filter(([m]) => m === "Browser.setWindowBounds")).toEqual([
+      ["Browser.setWindowBounds", { windowId: 3, bounds: { width: w, height: h } }],
+      ["Browser.setWindowBounds", { windowId: 3, bounds: { left: Math.min(900, 1920 - w), top: Math.min(300, 1032 - h) } }],
+    ]);
   });
 
   it("serves a native persona with nothing but an explicit window size", async () => {

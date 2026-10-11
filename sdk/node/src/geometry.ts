@@ -261,7 +261,7 @@ export interface DisplayFingerprint {
 export type AppliedGeometry =
   /** r39+ engine, persona: no display switch, no fit. `reconcile`: an explicit viewport, whose window is
    *  only moved back onto the work area if it hangs over an edge ({@link reconcileWindowPosition}). */
-  | { mode: "persona-native"; args: string[]; fit: false; reconcile: boolean }
+  | { mode: "persona-native"; args: string[]; fit: false; reconcile: boolean; viewport?: Size | null }
   /** args carries the seed's fallback headless display (`--screen-info`) on every platform (the
    *  engine's own persona display wins over it); empty when the caller set the display. */
   | { mode: "persona"; args: string[] }
@@ -297,7 +297,7 @@ export function applyHeadlessGeometry(
     // real window (viewport: null) otherwise. An explicit viewport only gets the position reconcile.
     const reconcile = "viewport" in opts && opts.viewport !== null && opts.viewport !== undefined;
     if (!("viewport" in opts) && !("screen" in opts)) opts.viewport = null;
-    return { mode: "persona-native", args: [], fit: false, reconcile };
+    return { mode: "persona-native", args: [], fit: false, reconcile, viewport: reconcile ? (opts.viewport as Size) : null };
   }
   if ("viewport" in opts || "screen" in opts) return null;
   opts.viewport = null;
@@ -462,21 +462,69 @@ export function reconcilePlan(
 }
 
 /**
- * A persona window (r39+) with an explicit `viewport`: Playwright sizes the real window around the
- * caller's viewport, which can leave it hanging over the right or bottom edge of the persona's work
- * area. Move it back on (a move fires no resize event); a viewport larger than the work area is the
- * caller's choice. Headless, where the display is the persona's. Never throws.
+ * The frame (outer - inner) the engine draws around a HEADLESS window in the normal state, by the host
+ * OS the engine runs on (measured on r37 and the r39 test build: a no-viewport restored window). Windows
+ * 16 x 129, Linux 0 x 121 -- the Linux frame is Linux's own, never Windows' borders.
  */
-export async function reconcileWindowPosition(page: Page): Promise<[number, number] | null> {
+export const HEADLESS_NORMAL_FRAME: readonly [number, number] = process.platform === "win32" ? [16, 129] : [0, 121];
+
+type WindowBounds = { left?: number; top?: number; width?: number; height?: number; windowState?: string };
+
+/**
+ * The `Browser.setWindowBounds` payloads (in order) that make a persona window agree with an explicit
+ * viewport, plus the bounds they leave. Playwright asks for the viewport's size with zero insets in
+ * headless; on a MAXIMIZED persona window Chromium only restores the window and drops the size
+ * (BrowserHandler::SetWindowBounds), so it ends up at its restore rectangle, unrelated to the emulated
+ * viewport (measured on the r39 test build: outer 1493x830 around inner 1280x720). Asking for the bare
+ * viewport size again gives a window with no frame at all. So: the normal state, then the viewport plus
+ * the engine's own normal-window frame, then a move back onto the work area if it hangs over an edge.
+ */
+export function reconcileSteps(
+  bounds: WindowBounds | null | undefined,
+  avail: readonly number[],
+  viewport?: Size | null,
+): { steps: WindowBounds[]; final: WindowBounds } {
+  const b: WindowBounds = { ...(bounds ?? {}) };
+  const steps: WindowBounds[] = [];
+  if (viewport && viewport.width > 0 && viewport.height > 0) {
+    if ((b.windowState ?? "normal") !== "normal") {
+      steps.push({ windowState: "normal" });
+      b.windowState = "normal";
+    }
+    const w = viewport.width + HEADLESS_NORMAL_FRAME[0];
+    const h = viewport.height + HEADLESS_NORMAL_FRAME[1];
+    if (b.width !== w || b.height !== h) {
+      steps.push({ width: w, height: h });
+      b.width = w;
+      b.height = h;
+    }
+  }
+  const complete = b.left !== undefined && b.top !== undefined && b.width !== undefined && b.height !== undefined;
+  const plan = complete ? reconcilePlan(b as Required<Omit<WindowBounds, "windowState">> & WindowBounds, avail) : null;
+  if (plan) {
+    steps.push({ left: plan[0], top: plan[1] });
+    b.left = plan[0];
+    b.top = plan[1];
+  }
+  return { steps, final: b };
+}
+
+/**
+ * A persona window (r39+) under an explicit `viewport`: make the real window agree with it
+ * ({@link reconcileSteps}): the viewport plus the engine's normal frame, kept on the persona's work area.
+ * Headless, where the display is the persona's; runs on the first page while it is on about:blank.
+ * Never throws.
+ */
+export async function reconcileWindowPosition(page: Page, viewport?: Size | null): Promise<WindowBounds | null> {
   try {
     const avail = (await page.evaluate(WORKAREA_JS)) as number[];
     const cdp = await page.context().newCDPSession(page);
-    const win = (await cdp.send("Browser.getWindowForTarget")) as {
-      windowId: number; bounds?: { left: number; top: number; width: number; height: number; windowState?: string };
-    };
-    const plan = reconcilePlan(win.bounds, avail);
-    if (plan) await cdp.send("Browser.setWindowBounds", { windowId: win.windowId, bounds: { left: plan[0], top: plan[1] } });
-    return plan;
+    const win = (await cdp.send("Browser.getWindowForTarget")) as { windowId: number; bounds?: WindowBounds };
+    const { steps, final } = reconcileSteps(win.bounds, avail, viewport);
+    for (const bounds of steps) {
+      await cdp.send("Browser.setWindowBounds", { windowId: win.windowId, bounds: bounds as Record<string, unknown> });
+    }
+    return final;
   } catch {
     return null;   // deliberately silent: never fail a launch over geometry
   }
@@ -494,7 +542,7 @@ export type WindowPlan = AppliedGeometry | typeof FIT_PLAN;
 export async function placeWindow(page: Page, args: readonly string[] | null | undefined, plan: WindowPlan | null): Promise<void> {
   if (!plan) return;
   if (plan.mode === "persona-native") {
-    if (plan.reconcile) await reconcileWindowPosition(page);
+    if (plan.reconcile) await reconcileWindowPosition(page, plan.viewport);
     return;
   }
   await fitWindowToWorkArea(page, args);

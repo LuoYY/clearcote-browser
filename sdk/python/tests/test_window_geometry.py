@@ -33,7 +33,9 @@ import importlib
 
 _download = importlib.import_module("clearcote.download")  # the module; clearcote.download is a function
 from clearcote._geometry import (
+    HEADLESS_NORMAL_FRAME,
     _reconcile_plan,
+    _reconcile_steps,
     apply_headless_geometry,
     engine_places_persona_window,
     fit_window_over_cdp,
@@ -161,7 +163,7 @@ def test_native_persona_plan_sends_no_display_and_no_fit(tmp_path):
     exe = _engine(tmp_path)
     kw = {}
     geom = apply_headless_geometry(kw, "7", ["--fingerprint=7"], exe=exe)
-    assert geom == {"mode": "persona-native", "args": [], "fit": False, "reconcile": False}
+    assert geom == {"mode": "persona-native", "args": [], "fit": False, "reconcile": False, "viewport": None}
     assert kw["no_viewport"] is True
 
 
@@ -201,6 +203,37 @@ def test_reconcile_only_moves_a_window_back_onto_the_work_area(bounds, avail, wa
     assert _reconcile_plan(bounds, avail) == want
 
 
+FW, FH = HEADLESS_NORMAL_FRAME
+
+
+def test_reconcile_restores_a_maximized_window_and_frames_the_viewport():
+    """Measured on the r39 test build: Playwright's viewport-sized request only RESTORES a maximized
+    persona window (Chromium drops the size), leaving outer 1493x830 around inner 1280x720. The
+    reconcile asks for the normal state, then viewport + the engine's normal frame, then a move."""
+    win = {"windowId": 3, "bounds": {"left": 0, "top": 22, "width": 1493, "height": 830, "windowState": "normal"}}
+    steps, final = _reconcile_steps(win, (1920, 1032), {"width": 1280, "height": 720})
+    assert steps == [{"width": 1280 + FW, "height": 720 + FH}]
+    assert (final["width"], final["height"], final["left"], final["top"]) == (1280 + FW, 720 + FH, 0, 22)
+    maxed = {"windowId": 3, "bounds": {"left": 0, "top": 0, "width": 1920, "height": 1032, "windowState": "maximized"}}
+    steps, _ = _reconcile_steps(maxed, (1920, 1032), {"width": 1280, "height": 720})
+    assert steps[:2] == [{"windowState": "normal"}, {"width": 1280 + FW, "height": 720 + FH}]
+
+
+def test_reconcile_leaves_a_window_that_already_agrees_alone():
+    win = {"windowId": 3, "bounds": {"left": 100, "top": 20, "width": 1280 + FW, "height": 720 + FH,
+                                     "windowState": "normal"}}
+    assert _reconcile_steps(win, (1920, 1032), {"width": 1280, "height": 720})[0] == []
+
+
+def test_reconcile_never_resizes_without_a_viewport():
+    win = {"windowId": 3, "bounds": {"left": 900, "top": 300, "width": 1296, "height": 854, "windowState": "normal"}}
+    assert _reconcile_steps(win, (1920, 1032), None)[0] == [{"left": 624, "top": 178}]
+
+
+def test_headless_normal_frame_is_the_host_engines():
+    assert HEADLESS_NORMAL_FRAME == ((16, 129) if sys.platform.startswith("win") else (0, 121))
+
+
 class _Cdp:
     def __init__(self, bounds):
         self.calls = []
@@ -221,8 +254,7 @@ class _Cdp:
             return {"windowId": 3, "bounds": dict(self.bounds)}
         if method == "Browser.setWindowBounds":
             b = params["bounds"]
-            if "width" in b:
-                self.bounds.update(width=b["width"], height=b["height"], left=b["left"], top=b["top"])
+            self.bounds.update({k: b[k] for k in ("left", "top", "width", "height") if k in b})
             self.bounds["windowState"] = b.get("windowState", "normal")
         return {}
 
@@ -332,13 +364,17 @@ def test_persistent_context_on_r39_with_no_viewport_is_the_engines_alone(monkeyp
     assert rec.cdp.calls == []
 
 
-def test_persistent_context_on_r39_with_a_viewport_moves_an_overhanging_window(monkeypatch, tmp_path):
+def test_persistent_context_on_r39_with_a_viewport_frames_it_and_keeps_it_on_the_work_area(monkeypatch, tmp_path):
     rec = _Recorder({"left": 900, "top": 300, "width": 1296, "height": 854, "windowState": "normal"})
     rec.install(monkeypatch)
     clearcote.launch_persistent_context(str(tmp_path / "p"), executable_path=_engine(tmp_path),
                                         fingerprint="7", viewport={"width": 1280, "height": 720}, quiet=True)
     assert rec.context_kwargs["viewport"] == {"width": 1280, "height": 720}
-    assert rec.window_calls() == [("Browser.setWindowBounds", {"windowId": 3, "bounds": {"left": 624, "top": 178}})]
+    w, h = 1280 + FW, 720 + FH
+    assert rec.window_calls() == [
+        ("Browser.setWindowBounds", {"windowId": 3, "bounds": {"width": w, "height": h}}),
+        ("Browser.setWindowBounds", {"windowId": 3, "bounds": {"left": min(900, 1920 - w), "top": min(300, 1032 - h)}}),
+    ]
 
 
 def test_launch_on_r39_new_pages_get_no_fit(monkeypatch, tmp_path):
@@ -479,9 +515,13 @@ def test_live_start_maximized_wins(tmp_path):
 
 
 @live_r39
-def test_live_explicit_viewport_is_kept_and_the_window_stays_on_the_work_area(tmp_path):
-    m = _live(tmp_path / "vp", "9", viewport={"width": 1280, "height": 720})
+@pytest.mark.parametrize("seed", ["1", "2", "3", "9"])
+def test_live_explicit_viewport_is_kept_framed_and_on_the_work_area(tmp_path, seed):
+    """Seeds 1 and 2 have maximized persona windows: before the reconcile change they reported outer
+    1493x830 / an outer height equal to the inner one around a 1280x720 viewport (r39 test build)."""
+    m = _live(tmp_path / ("vp" + seed), seed, viewport={"width": 1280, "height": 720})
     assert m["inner"] == [1280, 720], m
+    assert m["outer"] == [1280 + FW, 720 + FH], f"outer and inner must differ by the engine's frame: {m}"
     assert m["pos"][0] + m["outer"][0] <= m["avail"][0] and m["pos"][1] + m["outer"][1] <= m["avail"][1], m
     assert m["resizes"] == 0, m
 

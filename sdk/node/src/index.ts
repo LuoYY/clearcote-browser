@@ -463,7 +463,11 @@ function installHeadlessGeometry(browser: Browser, args?: readonly string[] | nu
     "viewport" in o || "screen" in o ? o : { ...o, viewport: null };
   const perCall = (o: Record<string, unknown>): WindowPlan | null =>
     plan && plan.mode === "persona-native"
-      ? { ...plan, reconcile: o.viewport !== null && o.viewport !== undefined }
+      ? {
+          ...plan,
+          reconcile: o.viewport !== null && o.viewport !== undefined,
+          viewport: o.viewport !== null && o.viewport !== undefined ? (o.viewport as { width: number; height: number }) : null,
+        }
       : plan;
   const origNewPage = browser.newPage.bind(browser);
   const origNewContext = browser.newContext.bind(browser);
