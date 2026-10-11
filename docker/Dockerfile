@@ -1,7 +1,7 @@
 # clearcote — open-source stealth Chromium, as a CDP-endpoint container.
 #
 #   docker build -t clearcote .
-#   docker run -d -p 9222:9222 --security-opt seccomp=seccomp.json clearcote   # CDP on http://localhost:9222
+#   docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=seccomp.json clearcote   # CDP on http://localhost:9222
 #   # then:  playwright.chromium.connect_over_cdp("http://localhost:9222")
 #
 # seccomp.json (in this directory, and in the image at /etc/clearcote/seccomp.json) is Docker's default
@@ -9,10 +9,10 @@
 # replaces the daemon's own default. Without it the container still runs, with Chrome's sandbox off
 # (--no-sandbox) and a log line saying so; see README.md.
 #
-# Published image: teamflatearth/clearcote  (docker run -d -p 9222:9222 teamflatearth/clearcote)
-# Builds against the LATEST clearcote SDK (override with --build-arg CLEARCOTE_SPEC='==0.26.0').
+# Published image: teamflatearth/clearcote  (docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 teamflatearth/clearcote)
+# Builds against the LATEST clearcote SDK (override with --build-arg CLEARCOTE_SPEC='==0.46.0').
 # Free by default. Pass a licence key to run the PRO engine, and mount the cache so it downloads once:
-#   docker run -d -p 9222:9222 -v clearcote-cache:/opt/xdg-cache \
+#   docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 -v clearcote-cache:/opt/xdg-cache \
 #     -e CLEARCOTE_LICENSE_KEY=cc_lic_... teamflatearth/clearcote
 FROM python:3.12-slim-bookworm
 

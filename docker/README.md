@@ -10,12 +10,21 @@ the browser.
 # the seccomp profile that lets Chrome run with its sandbox (it ships in the image; --tmpfs keeps
 # docker from first copying the ~0.5 GB engine into a volume just to read this one file)
 docker run --rm --tmpfs /opt/xdg-cache --entrypoint cat teamflatearth/clearcote /etc/clearcote/seccomp.json > clearcote-seccomp.json
-docker run -d --rm -p 9222:9222 --security-opt seccomp=clearcote-seccomp.json teamflatearth/clearcote
+docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json teamflatearth/clearcote
 # CDP on http://localhost:9222
 ```
 
 Without `--security-opt` the container still runs, with Chrome's sandbox off; see
 [Chrome's sandbox](#chromes-sandbox).
+
+In Windows PowerShell, `>` writes the file as UTF-16, which Docker cannot read as JSON. Copy the profile
+out of the image instead (this works in any shell):
+
+```bash
+docker create --name cc-seccomp --tmpfs /opt/xdg-cache teamflatearth/clearcote
+docker cp cc-seccomp:/etc/clearcote/seccomp.json clearcote-seccomp.json
+docker rm cc-seccomp
+```
 
 ```python
 from playwright.sync_api import sync_playwright
@@ -33,7 +42,7 @@ headless-mode tells some detectors probe. Set `CC_HEADLESS=1` for the old pure-h
 
 | env | example | meaning |
 |---|---|---|
-| `CC_PLATFORM` | `windows` \| `linux` \| `macos` \| `android` | spoofed OS |
+| `CC_PLATFORM` | `windows` \| `linux` \| `macos` \| `android` | spoofed OS (default `linux`) |
 | `CC_FINGERPRINT` | `user-7423` | seed → stable, unlinkable identity. Unset: a random seed per container, kept in the profile directory (printed at start); set but empty: no seed |
 | `CC_BRAND` | `Edge` | brand (UA + UA-CH) |
 | `CC_BRAND_VERSION` | `150.0.4078.65` | brand/version (drives TLS via `match-persona`) |
@@ -43,20 +52,23 @@ headless-mode tells some detectors probe. Set `CC_HEADLESS=1` for the old pure-h
 | `CC_GPU_VENDOR` / `CC_GPU_RENDERER` | `Google Inc. (NVIDIA)` / `ANGLE (NVIDIA …)` | WebGL strings |
 | `CC_TLS_PROFILE` | `match-persona` | TLS ClientHello follows the claimed Chrome major |
 | `CC_HEADLESS` | `1` | force pure-headless (default is **headful on Xvfb**) |
-| `CC_SCREEN` | `1920x1080x24` | Xvfb virtual screen geometry (headful mode) |
+| `CC_SCREEN` | `1920x1080x24` | screen size: sizes Xvfb and is also the screen, work area and window the persona claims, headed or headless |
+| `CC_PIN_SCREEN` | `0` | let the seed choose the claimed screen instead of `CC_SCREEN` (default: pinned to `CC_SCREEN`) |
 | `CC_PORT` | `9222` | exposed CDP port |
 | `CC_WIDEVINE` | `1` \| `0` | seed the Widevine CDM — **auto-on for `CC_PLATFORM=windows`** |
 | `CC_SHADER_DIALECT` | `hlsl` \| `0` | report ANGLE's translated shader as HLSL — **auto-on for `CC_PLATFORM=windows`** |
 | `CLEARCOTE_LICENSE_KEY` | `cc_lic_...` | use the licensed engine instead of the bundled open one — see below |
-| `CC_VERSION` | `152` \| `152.0.7977.82` \| `r24` | with a **Pro** key: pin a major, an exact build or a revision (default: the newest your key allows). Free keys always get the latest build and are refused a pin |
+| `CC_VERSION` | `<major>` \| `<exact build>` \| `r<N>` | with a **Pro** key: pin a major, an exact build or a revision (default: the newest your key allows). Free keys always get the latest build and are refused a pin |
 | `CC_PROXY` | `http://user:pass@host:8080` \| `socks5://…` | send the browser's traffic through this proxy (http, https, socks4, socks5; the container refuses to start rather than go direct if it cannot apply it). A password is answered by the engine when it can (the licensed builds), otherwise by a relay on the container's own loopback. Pass it through `CC_SECRETS_FILE` to keep the password out of `docker inspect` |
-| `CC_IDLE_EXIT_SECONDS` | `30` | stop once no CDP client has been connected for this long, counted from when the CDP endpoint first answers (default: never). Pair it with `--rm` so an abandoned container also disappears |
-| `CC_SECRETS_FILE` | `/tmp/clearcote-secrets.json` | a JSON file holding `CLEARCOTE_LICENSE_KEY` and/or `CC_PROXY`, read once at start and deleted — see [Secrets](#secrets-and-docker-inspect) |
+| `CC_IDLE_EXIT_SECONDS` | `30` | images from `sdk-0.40.0`: stop once no CDP client has been connected for this long, counted from when the CDP endpoint first answers (default: never). Pair it with `--rm` so an abandoned container also disappears |
+| `CC_SECRETS_FILE` | `/tmp/clearcote-secrets.json` | images from `sdk-0.40.0`: a JSON file holding `CLEARCOTE_LICENSE_KEY` and/or `CC_PROXY`, read once at start and deleted — see [Secrets](#secrets-and-docker-inspect) |
 | `CLEARCOTE_FONT_DIRS` | `/fonts` | your own fonts, mounted into the container (e.g. a copy of a Windows machine's Fonts folder) — see [Fonts](#fonts) |
 | `CLEARCOTE_FALLBACK_FONT_DIRS` | `/usr/local/share/clearcote/fonts` (set by the image) | fonts used only for characters nothing else covers — see [Fonts](#fonts) |
+| `CC_EXTRA_ARGS` | `--lang=de` | extra Chrome switches, separated by spaces |
+| `CC_PLATFORM_VERSION`, `CC_LOCATION`, `CC_WEBRTC_IP`, `CC_WEBRTC_MDNS`, `CC_FINGERPRINT_PROFILE`, `CC_DEVICE_MEMORY`, `CC_COLOR_DEPTH`, `CC_MAX_TOUCH_POINTS`, `CC_STORAGE_QUOTA`, `CC_DEVICE_PIXEL_RATIO`, `CC_LIGHT_STEALTH`, `CC_DISABLE_GPU_FINGERPRINT`, `CC_FINGERPRINT_NOISE`, `CC_CANVAS_NOISE`, `CC_GPU_STRING_SPOOF` | `CC_DEVICE_MEMORY=8` | the SDK `launch()` option of the same name in lower case (`CC_DEVICE_MEMORY=8` is `device_memory=8`); on/off options take `1` or `0`. See [Fingerprint options](../sdk/python/README.md#fingerprint-options) |
 
 ```bash
-docker run -d -p 9222:9222 \
+docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json \
   -e CC_PLATFORM=windows -e CC_FINGERPRINT=user-7423 -e CC_BRAND=Edge \
   teamflatearth/clearcote
 ```
@@ -97,7 +109,8 @@ never change the widths a Windows persona reports.
   licensed to use.
 
 ```bash
-docker run -d -p 9222:9222 -v /srv/windows-fonts:/fonts:ro -e CLEARCOTE_FONT_DIRS=/fonts \
+docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json \
+  -v /srv/windows-fonts:/fonts:ro -e CLEARCOTE_FONT_DIRS=/fonts \
   -e CC_PLATFORM=windows teamflatearth/clearcote
 docker exec <container> clearcote info --quick   # which scripts render, which families are genuine
 ```
@@ -105,10 +118,10 @@ docker exec <container> clearcote info --quick   # which scripts render, which f
 ## Licensed engine (Free with GitHub or Pro)
 
 The image bakes in the **open** engine. Set `CLEARCOTE_LICENSE_KEY` and the container resolves the
-**licensed** engine instead (Chromium 152 today), downloading it once into the cache volume:
+**licensed** engine instead (the newest build your key allows), downloading it once into the cache volume:
 
 ```bash
-docker run -d -p 127.0.0.1:9222:9222 \
+docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json \
   -e CLEARCOTE_LICENSE_KEY=cc_lic_... \
   -v clearcote-cache:/opt/xdg-cache \
   teamflatearth/clearcote
@@ -122,7 +135,8 @@ docker run -d -p 127.0.0.1:9222:9222 \
 - **Free keys** (sign in with GitHub at [clearcotelabs.com](https://clearcotelabs.com/pricing#free))
   run **one browser at a time** across all your containers: a second container exits with
   `The free tier runs one browser at a time` until the first is stopped. They need an image built
-  from **SDK 0.30.0 or newer** — `docker pull teamflatearth/clearcote` to refresh. An older image is
+  from **SDK 0.30.0 or newer** (`sdk-0.40.0` for `CC_SECRETS_FILE` and `CC_IDLE_EXIT_SECONDS`, `sdk-0.41.0`
+  for Chrome's sandbox) — `docker pull teamflatearth/clearcote` to refresh. An older image is
   refused outright on a free key, because the licensed browser expects the container to keep its
   licence current while it runs; that is also what stops a running free container within a couple of
   minutes if the key is revoked, checked in elsewhere, or over its limit.
@@ -180,7 +194,7 @@ runs in the container (`docker exec` included) does not. On balance it is still 
 without the sandbox, a compromised renderer has everything the container's user has.
 
 ```bash
-docker run -d -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json teamflatearth/clearcote
+docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json teamflatearth/clearcote
 ```
 
 ```yaml
@@ -189,10 +203,11 @@ services:
   clearcote:
     image: teamflatearth/clearcote
     ports: ["127.0.0.1:9222:9222"]
+    shm_size: "1gb"
     security_opt: ["seccomp=./clearcote-seccomp.json"]
 ```
 
-The SDKs' macOS `launch()` passes the profile itself to an image that uses it (serve protocol 3), on a
+The SDKs' Docker launch (`launch()` on macOS, or `docker=True` / `CLEARCOTE_DOCKER=1` on any OS) passes the profile itself to an image that uses it (serve protocol 3), on a
 Docker that runs on an x86_64 CPU. On another CPU (Docker Desktop on Apple silicon) the image runs
 emulated, and the sandbox has not been tried under that emulation yet, so it stays off there. When
 `docker info` does not say which CPU Docker runs on, it stays off too, with one warning.
@@ -226,15 +241,16 @@ configuration, put them in a JSON file inside the container instead and point `C
 the entrypoint reads the file once and deletes it:
 
 ```bash
-id=$(docker create -p 127.0.0.1:9222:9222 -e CC_SECRETS_FILE=/tmp/clearcote-secrets.json \
+id=$(docker create --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json \
+  -e CC_SECRETS_FILE=/tmp/clearcote-secrets.json \
   -v clearcote-cache:/opt/xdg-cache teamflatearth/clearcote)
 # a file owned by the image's user (uid 10001), e.g. built with: tar --owner=10001 --group=10001 --mode=600
 docker cp - "$id:/tmp" < clearcote-secrets.tar
 docker start "$id"
 ```
 
-The SDKs' macOS `launch()` (which runs this image because there is no native macOS build) does exactly
-that. Anyone with access to the Docker daemon can still read a running container's memory and files, so
+The SDKs' Docker launch (`launch()` on macOS, where there is no native build, or `docker=True` anywhere)
+does exactly that. Anyone with access to the Docker daemon can still read a running container's memory and files, so
 treat daemon access as access to the key.
 
 A secrets file keeps a proxy's password out of the configuration, not out of the process list: the licensed
@@ -245,20 +261,21 @@ engine keeps the password in the entrypoint's relay instead, off the command lin
 
 ## Notes
 
-- Each image tag is built from one SDK release: `sdk-<version>` (e.g. `sdk-0.30.0`), `<browser>` (the
+- Each image tag is built from one SDK release: `sdk-<version>` (e.g. `sdk-0.46.0`), `<browser>` (the
   open binary it bakes in, e.g. `0.1.0-pre.23`) and `latest`. Rebuild + verify this image yourself:
   `docker build -t clearcote .` — every layer is auditable.
-- `--disable-dev-shm-usage` is set; add `--shm-size=1g` on very heavy pages if needed.
+- `--disable-dev-shm-usage` is set; the SDKs still pass `--shm-size=1g`, and the examples here do the same.
 - The image carries the label `com.clearcotelabs.serve-protocol` (2: it takes `CC_SECRETS_FILE` and
   `CC_IDLE_EXIT_SECONDS`; 3: it also runs Chrome's sandbox when the container allows it), and its
   entrypoint logs one `[clearcote] serve-state {...}` line saying what it applied: the engine that
   resolved (`licensed` or `open`), the proxy, how a proxy's password is answered (`engine` or `relay`),
-  the idle exit, the sandbox. The SDKs' macOS `launch()` reads the label before it starts a
+  the idle exit, the sandbox. The SDKs' Docker launch reads the label before it starts a
   container (an image without it gets plain variables, with a warning, and is refused a proxy password it
   cannot answer) and refuses a container whose log does not show the licensed engine when a key was
   given, or the proxy (and its login) when one was given.
-- The SDKs' macOS `launch()` starts this image with `--rm`, `CC_IDLE_EXIT_SECONDS=30`, the seccomp profile
-  (serve protocol 3) and owner labels
+- The SDKs' Docker launch starts this image with `--rm`, `--platform linux/amd64`, `--shm-size 1g`,
+  `-p 127.0.0.1::9222`, `CC_IDLE_EXIT_SECONDS=30`, the seccomp profile (serve protocol 3, on an x86_64
+  Docker only), the `clearcote-cache` volume (with a licence key only) and owner labels
   (`com.clearcotelabs.sdk-launch`, `com.clearcotelabs.owner-host`, `com.clearcotelabs.owner-token`), so a
   container whose program was killed stops on its own and is removed; the next launch from the same user
   and machine removes any whose owner process is certainly gone at once (never one from another machine or

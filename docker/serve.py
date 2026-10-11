@@ -8,7 +8,7 @@ force the old pure-headless mode — with a DevTools/CDP endpoint reachable on 0
 attaches over CDP and keeps its own automation code. The persona is configured entirely from
 CC_* env vars.
 
-  docker run -d -p 9222:9222 teamflatearth/clearcote
+  docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 teamflatearth/clearcote
   # then, from the host:  playwright.chromium.connect_over_cdp("http://localhost:9222")
 
 Modern Chrome binds the DevTools endpoint to 127.0.0.1 only (a security restriction;

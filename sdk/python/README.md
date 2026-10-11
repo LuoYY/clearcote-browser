@@ -10,8 +10,9 @@ no zips or paths to manage. Or run the same code on a hosted Clearcote browser w
 
 > **Platform:** Clearcote ships **Windows x64** and **Linux x64** binaries; `launch()` runs on both
 > and the SDK auto-downloads the right one for your OS. On Linux the persona is Linux-native (Linux
-> GPU/voices/audio-device values) and DRM uses the Linux CDM. macOS is on the
-> [roadmap](../../ROADMAP.md). On a minimal Linux host, install the browser's runtime libs (e.g.
+> GPU/voices/audio-device values) and DRM uses the Linux CDM. There is no native macOS build yet
+> ([roadmap](../../ROADMAP.md)): on macOS, `launch()` runs the [Docker image](../../docker/README.md) through
+> Docker Desktop instead (SDK 0.40.0+; `docker=True` or `CLEARCOTE_DOCKER=1` does the same on any OS). On a minimal Linux host, install the browser's runtime libs (e.g.
 > `apt-get install -y libnss3 libnspr4 libgbm1 libasound2 libatk1.0-0 libatk-bridge2.0-0 libcups2
 > libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libxfixes3 libxext6 libpango-1.0-0
 > libcairo2 libx11-6 libxcb1 libexpat1 libdbus-1-3`) and pass `args=["--no-sandbox"]` (or

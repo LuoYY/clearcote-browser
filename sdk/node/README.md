@@ -10,8 +10,9 @@ you don't manage zips or paths. Or run the same code on a hosted Clearcote brows
 
 > **Platform:** Clearcote ships **Windows x64** and **Linux x64** binaries; `launch()` runs on both
 > and the SDK auto-downloads the right one for your OS. On Linux the persona is Linux-native (Linux
-> GPU/voices/audio-device values) and DRM uses the Linux CDM. macOS is on the
-> [roadmap](../../ROADMAP.md). On a minimal Linux host, install `xz-utils` (the Node SDK unpacks the
+> GPU/voices/audio-device values) and DRM uses the Linux CDM. There is no native macOS build yet
+> ([roadmap](../../ROADMAP.md)): on macOS, `launch()` runs the [Docker image](../../docker/README.md) through
+> Docker Desktop instead (SDK 0.40.0+; `docker: true` or `CLEARCOTE_DOCKER=1` does the same on any OS). On a minimal Linux host, install `xz-utils` (the Node SDK unpacks the
 > `.tar.xz` with the system `tar`) plus the browser's runtime libs (e.g.
 > `apt-get install -y xz-utils libnss3 libnspr4 libgbm1 libasound2 libatk1.0-0 libatk-bridge2.0-0 libcups2
 > libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libxfixes3 libxext6 libpango-1.0-0
@@ -95,7 +96,7 @@ await srv.close();
 ```
 
 The returned `Server` exposes `.cdpUrl`, `.wsUrl()`, and `.close()`. (For a no-code CDP endpoint, the
-official Docker image also works: `docker run -d --rm -p 9222:9222 teamflatearth/clearcote`.)
+official Docker image also works: `docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 teamflatearth/clearcote`.)
 
 Headless, `serve()` gives the browser a real-size display (the persona's, or one drawn from real
 desktops) and maximizes its window onto the work area before any client attaches, so every page,

@@ -273,8 +273,13 @@ See [many identities on one endpoint](sdk/python/README.md#many-identities-on-on
 The official image is a Clearcote browser exposed as a CDP endpoint on port 9222.
 
 ```bash
-docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 teamflatearth/clearcote
+# the seccomp profile that lets Chrome keep its sandbox (it ships in the image)
+docker run --rm --tmpfs /opt/xdg-cache --entrypoint cat teamflatearth/clearcote /etc/clearcote/seccomp.json > clearcote-seccomp.json
+docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json teamflatearth/clearcote
 ```
+
+Without `--security-opt` it still runs, with Chrome's sandbox off. In Windows PowerShell, copy the profile out
+with `docker cp` instead of `>`: see [Pull & run](docker/README.md#pull--run) and [Chrome's sandbox](docker/README.md#chromes-sandbox).
 
 ```python
 from playwright.sync_api import sync_playwright
@@ -291,7 +296,7 @@ Set the persona with environment variables: `CC_PLATFORM` (`windows`, `linux`, `
 `CC_ACCEPT_LANGUAGE`, `CC_TLS_PROFILE`.
 
 ```bash
-docker run -d --shm-size=1g -p 127.0.0.1:9222:9222 \
+docker run -d --rm --shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=clearcote-seccomp.json \
   -e CC_PLATFORM=windows -e CC_FINGERPRINT=user-7423 teamflatearth/clearcote
 ```
 
@@ -488,7 +493,8 @@ Puppeteer and any CDP client: yes, through the binary or a CDP endpoint. Seleniu
 
 **Which operating systems are supported?**
 Windows x64 and Linux x64, plus the Docker image. The browser can present itself as Windows, Linux, macOS or Android on either.
-macOS and ARM64 builds are on the [roadmap](ROADMAP.md).
+Native macOS and ARM64 builds are on the [roadmap](ROADMAP.md); until then `launch()` on macOS runs the Docker image
+through Docker Desktop (SDK 0.40.0+).
 
 **Should I add a stealth plugin on top?**
 No. Plugins such as `puppeteer-extra-plugin-stealth` change values from JavaScript, which conflicts with the engine-level persona.

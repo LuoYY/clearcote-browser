@@ -8,8 +8,8 @@ Site: https://clearcotelabs.com · Full docs for agents: https://clearcotelabs.c
 Pre-release, building in the open.
 - Open build: Chromium 150 (150.0.7871.114, v0.1.0-pre.23) on GitHub Releases, Windows x64 + Linux x64. New Chromium majors reach it roughly 2 months after release.
 - Licensed build (Free with GitHub and Pro): Chromium 152 (152.0.7977.82 r22); 151 and 150 stay selectable.
-- SDK: `clearcote` 0.29.0 on PyPI, npm and NuGet (Python, Node, .NET).
-- Docker: `teamflatearth/clearcote` (SDK 0.29.0) — a stealth CDP endpoint on :9222.
+- SDK: `clearcote` 0.46.0 on PyPI, npm and NuGet (Python, Node, .NET).
+- Docker: `teamflatearth/clearcote` (tags `latest`, `0.1.0-pre.23`, `sdk-0.46.0`) — a CDP endpoint on :9222. Run it with `--shm-size=1g -p 127.0.0.1:9222:9222 --security-opt seccomp=<the profile from the image>`; see /docker/README.md.
 - MCP server: `clearcote-mcp` (PyPI / npm). Profile Manager desktop app 0.12.2 (Windows + Linux): https://github.com/clearcotelabs/clearcote-profile-manager
 
 ## Quick start
@@ -20,7 +20,7 @@ Pre-release, building in the open.
                      proxy={"server": "http://host:8080", "username": "u", "password": "p"})
     page = browser.new_page(); page.goto("https://example.com")
 
-Command line (SDK 0.29.0, Python and Node): `clearcote install`, `clearcote info` (checks the install, engine features, a launch test, licence seats), `clearcote login [key]`, `clearcote clear-cache`, `clearcote serve` (one CDP endpoint, many identities chosen per connection).
+Command line (SDK 0.46.0, Python and Node): `clearcote install`, `clearcote info` (checks the install, engine features, a launch test, licence seats), `clearcote login [key]`, `clearcote clear-cache`, `clearcote serve` (one CDP endpoint, many identities chosen per connection).
 
 ## Tiers
 - Open source: no account, reproducible from public source, full engine-level fingerprint control.
