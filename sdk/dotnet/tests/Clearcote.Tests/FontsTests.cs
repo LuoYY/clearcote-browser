@@ -368,7 +368,7 @@ public class FontsTests : IDisposable
             if (!OperatingSystem.IsWindows())
                 Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(dir));
             Assert.Contains(fonts, File.ReadAllText(path));
-            File.Delete(path);
+            Directory.Delete(dir, recursive: true);  // the process-exit hook is not something a test should rely on
         });
     }
 

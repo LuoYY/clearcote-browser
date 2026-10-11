@@ -227,7 +227,8 @@ describe("the generated fontconfig file", () => {
         expect(basename(dirname(path))).toMatch(/^cc-fontconfig-/);
         expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
         expect(readFileSync(path, "utf8")).toContain(fonts);
-        rmSync(path, { force: true });
+        // Its exit hook never runs in a vitest worker: remove the directory here (CI checks temp is left empty).
+        rmSync(dirname(path), { recursive: true, force: true });
       });
     });
 
