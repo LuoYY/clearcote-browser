@@ -61,8 +61,9 @@ namespace Clearcote;
 /// page exists (<see cref="WindowGeom"/> mirrors the derivation). On such an engine
 /// (<see cref="EnginePlacesPersonaWindow"/>) a persona launch gets <see cref="Mode.PersonaNative"/>: no
 /// <c>--screen-info</c>, no work-area fit (and none of the old per-page screen overrides), only NoViewport
-/// when the caller chose no viewport or screen; an explicit viewport keeps its size and its window is
-/// only moved back onto the work area if it hangs over an edge (<see cref="ReconcileWindowPositionAsync"/>).
+/// when the caller chose no viewport or screen; an explicit viewport is kept as asked and its window is
+/// made to agree with it — normal state, the viewport plus the engine's normal-window frame — and kept on
+/// the work area (<see cref="ReconcileWindowPositionAsync"/>).
 /// Older engines, seedless launches and schema 1-3 pins keep everything below unchanged.
 /// </para>
 /// <para>
@@ -382,24 +383,27 @@ public static class Geometry
         /// <summary>
         /// A persona on an engine that opens the persona's window itself (r39+,
         /// <see cref="EnginePlacesPersonaWindow"/>): no display switch, no fit. The context takes
-        /// NoViewport only when the caller chose no viewport or screen; an explicit viewport gets only a
-        /// position reconcile (<see cref="HeadlessPlan.Reconcile"/>).
+        /// NoViewport only when the caller chose no viewport or screen; an explicit viewport gets only the
+        /// window reconciled with it (<see cref="HeadlessPlan.Reconcile"/>).
         /// </summary>
         PersonaNative,
     }
 
-    /// <summary>What a headless launch should do; see <see cref="ResolveHeadless(bool?, string?, IEnumerable{string}?, bool, string?, bool)"/>.</summary>
+    /// <summary>What a headless launch should do; see <see cref="ResolveHeadless(bool?, string?, IEnumerable{string}?, bool, string?, ViewportSize?)"/>.</summary>
     /// <param name="Mode">The regime, or <see cref="Mode.None"/> to leave geometry alone.</param>
     /// <param name="Display">Regime 2's display, or null (other regimes, or the caller passed their own <c>--screen-info</c>).</param>
     /// <param name="Args">Switches to APPEND to the command line. Keep passing the caller's own args to the fit.</param>
     public sealed record HeadlessPlan(Mode Mode, Display? Display, string[] Args)
     {
         /// <summary>
-        /// <see cref="Mode.PersonaNative"/> under an explicit caller viewport: the window keeps the
-        /// caller's viewport and is only moved back onto the work area if it hangs over an edge
-        /// (<see cref="ReconcileWindowPositionAsync"/>). False for every other plan.
+        /// <see cref="Mode.PersonaNative"/> under an explicit caller viewport: the real window is made to
+        /// agree with that viewport (normal state, the viewport plus the engine's normal-window frame) and
+        /// kept on the work area (<see cref="ReconcileWindowPositionAsync"/>). False for every other plan.
         /// </summary>
         public bool Reconcile { get; init; }
+
+        /// <summary>The caller's explicit viewport when <see cref="Reconcile"/> is true; null otherwise.</summary>
+        public ViewportSize? Viewport { get; init; }
     }
 
     /// <summary>Resolve the geometry a headless launch should use.</summary>
@@ -430,19 +434,27 @@ public static class Geometry
     /// <param name="args">The caller's command line.</param>
     /// <param name="callerSetGeometry">The caller set ViewportSize (NoViewport included) or ScreenSize.</param>
     /// <param name="exe">The engine binary that will run; null keeps the plan for an older engine.</param>
-    /// <param name="callerViewport">The caller set an explicit ViewportSize other than NoViewport
-    /// (<see cref="IsExplicitViewport"/>): a persona-native window then gets only the position reconcile.</param>
+    /// <param name="callerViewport">The caller's own ViewportSize, if any. An explicit one (anything but
+    /// NoViewport, <see cref="IsExplicitViewport"/>) makes a persona-native plan reconcile the window with
+    /// it (<see cref="HeadlessPlan.Reconcile"/>, <see cref="HeadlessPlan.Viewport"/>).</param>
     public static HeadlessPlan ResolveHeadless(
         bool? headless,
         string? seed,
         IEnumerable<string>? args,
         bool callerSetGeometry,
         string? exe,
-        bool callerViewport = false)
+        ViewportSize? callerViewport = null)
     {
         if (headless == false) return new(Mode.None, null, Array.Empty<string>());
         if (EnginePlacesPersonaWindow(exe, args))
-            return new(Mode.PersonaNative, null, Array.Empty<string>()) { Reconcile = callerViewport };
+        {
+            var reconcile = IsExplicitViewport(callerViewport);
+            return new(Mode.PersonaNative, null, Array.Empty<string>())
+            {
+                Reconcile = reconcile,
+                Viewport = reconcile ? callerViewport : null,
+            };
+        }
         if (callerSetGeometry) return new(Mode.None, null, Array.Empty<string>());
         if (PersonaActive(args))
         {
@@ -675,38 +687,108 @@ public static class Geometry
         return moved == (left, top) ? null : moved;
     }
 
-    /// <summary><see cref="ReconcilePlan(int, int, int, int, string?, int[])"/> for CDP <c>Browser.Bounds</c>; a missing size throws.</summary>
-    private static (int Left, int Top)? ReconcilePlan(JsonElement bounds, int[] avail)
+    /// <summary>
+    /// The frame (outer - inner) the engine draws around a HEADLESS window in the normal state, by the
+    /// host OS the engine runs on: Windows 16 x 129, elsewhere (Linux) 0 x 121 — the Linux frame is
+    /// Linux's own, never Windows' borders. Measured on r37 and the r39 test build (a NoViewport restored
+    /// window). Same as the Python SDK's <c>HEADLESS_NORMAL_FRAME</c>.
+    /// </summary>
+    public static readonly (int Width, int Height) HeadlessNormalFrame =
+        OperatingSystem.IsWindows() ? (16, 129) : (0, 121);
+
+    /// <summary>A window's CDP <c>Browser.Bounds</c>; a field the engine did not report is null.</summary>
+    internal sealed record WindowBounds(int? Left, int? Top, int? Width, int? Height, string? WindowState)
     {
-        var state = bounds.TryGetProperty("windowState", out var s) ? s.GetString() : null;
-        if ((state ?? "normal") != "normal") return null;
-        return ReconcilePlan(bounds.GetProperty("left").GetInt32(), bounds.GetProperty("top").GetInt32(),
-            bounds.GetProperty("width").GetInt32(), bounds.GetProperty("height").GetInt32(), state, avail);
+        public static WindowBounds From(JsonElement b)
+        {
+            static int? Int(JsonElement e, string key) =>
+                e.ValueKind == JsonValueKind.Object && e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number
+                    ? (int)Math.Round(v.GetDouble())
+                    : null;
+            var state = b.ValueKind == JsonValueKind.Object && b.TryGetProperty("windowState", out var s)
+                        && s.ValueKind == JsonValueKind.String
+                ? s.GetString()
+                : null;
+            return new(Int(b, "left"), Int(b, "top"), Int(b, "width"), Int(b, "height"), state);
+        }
     }
 
     /// <summary>
-    /// A persona window (r39+, <see cref="Mode.PersonaNative"/>) with an explicit viewport: Playwright
-    /// sizes the real window around the caller's viewport, which can leave it hanging over the right or
-    /// bottom edge of the persona's work area. Move it back on with left/top only (a move fires no resize
-    /// event, and the caller's viewport is kept); a viewport larger than the work area is the caller's
-    /// choice. Headless, where the display is the persona's and window coordinates are work-area
-    /// coordinates. Returns the new <c>(left, top)</c>, or null when nothing moved. Never throws.
+    /// The <c>Browser.setWindowBounds</c> bounds (in order) that make a persona window agree with an
+    /// explicit viewport, and the bounds they leave.
     /// </summary>
-    public static async Task<(int Left, int Top)?> ReconcileWindowPositionAsync(IPage page)
+    /// <remarks>
+    /// Playwright asks for the viewport's size with zero insets in headless. On a MAXIMIZED persona window
+    /// Chromium only restores the window and drops the size (BrowserHandler::SetWindowBounds), so the
+    /// window ends up at its restore rectangle, unrelated to the emulated viewport (measured on the r39
+    /// test build: outer 1493x830 around inner 1280x720; another seed an outer height equal to the inner
+    /// one). Asking for the bare viewport size again gives a window with no frame at all (outer == inner).
+    /// So: (1) the normal state if the window is not in it; (2) the viewport plus the engine's own
+    /// normal-window frame (<see cref="HeadlessNormalFrame"/>) unless the window already has that size;
+    /// (3) then, on the updated bounds, a left/top-only move back onto the work area if it hangs over an
+    /// edge (<see cref="ReconcilePlan(int, int, int, int, string?, int[])"/>). Without an explicit
+    /// viewport nothing is resized: only the move.
+    /// </remarks>
+    /// <param name="bounds">The window's bounds as the engine reported them.</param>
+    /// <param name="avail">The work area, <c>[availWidth, availHeight]</c>.</param>
+    /// <param name="viewport">The caller's explicit viewport, or null.</param>
+    /// <param name="frame">The normal-window frame; null takes <see cref="HeadlessNormalFrame"/> (tests pass one).</param>
+    internal static (List<Dictionary<string, object>> Steps, WindowBounds Final) ReconcileSteps(
+        WindowBounds bounds, int[] avail, ViewportSize? viewport, (int Width, int Height)? frame = null)
+    {
+        var b = bounds;
+        var steps = new List<Dictionary<string, object>>();
+        if (viewport is { Width: > 0, Height: > 0 } vp)
+        {
+            if ((b.WindowState ?? "normal") != "normal")
+            {
+                steps.Add(new Dictionary<string, object> { ["windowState"] = "normal" });
+                b = b with { WindowState = "normal" };
+            }
+            var (fw, fh) = frame ?? HeadlessNormalFrame;
+            var (w, h) = (vp.Width + fw, vp.Height + fh);
+            if (b.Width != w || b.Height != h)
+            {
+                steps.Add(new Dictionary<string, object> { ["width"] = w, ["height"] = h });
+                b = b with { Width = w, Height = h };
+            }
+        }
+        if (b is { Left: { } left, Top: { } top, Width: { } width, Height: { } height }
+            && ReconcilePlan(left, top, width, height, b.WindowState, avail) is { } move)
+        {
+            steps.Add(new Dictionary<string, object> { ["left"] = move.Left, ["top"] = move.Top });
+            b = b with { Left = move.Left, Top = move.Top };
+        }
+        return (steps, b);
+    }
+
+    /// <summary>
+    /// A persona window (r39+, <see cref="Mode.PersonaNative"/>) under an explicit
+    /// <paramref name="viewport"/>: make the real window agree with it — the normal state, the viewport
+    /// plus the engine's normal-window frame — kept on the persona's work area (see
+    /// <see cref="ReconcileSteps"/>). Without a viewport it only moves a window that hangs over an edge
+    /// back on (left/top only). A viewport larger than the work area is the caller's choice. Headless,
+    /// where the display is the persona's and window coordinates are work-area coordinates; runs on the
+    /// first page while it is still on about:blank.
+    /// </summary>
+    /// <returns>The window's final bounds, or null when they could not be read. Never throws.</returns>
+    public static async Task<(int Left, int Top, int Width, int Height)?> ReconcileWindowPositionAsync(
+        IPage page, ViewportSize? viewport = null)
     {
         try
         {
             var avail = await page.EvaluateAsync<int[]>(WorkareaJs).ConfigureAwait(false);
             var cdp = await page.Context.NewCDPSessionAsync(page).ConfigureAwait(false);
             var win = (await cdp.SendAsync("Browser.getWindowForTarget").ConfigureAwait(false))!.Value;
-            var plan = ReconcilePlan(win.GetProperty("bounds"), avail);
-            if (plan is { } p)
+            var windowId = win.GetProperty("windowId").GetInt32();
+            var (steps, final) = ReconcileSteps(
+                WindowBounds.From(win.TryGetProperty("bounds", out var b) ? b : default), avail, viewport);
+            foreach (var step in steps)
                 await cdp.SendAsync("Browser.setWindowBounds", new Dictionary<string, object>
                 {
-                    ["windowId"] = win.GetProperty("windowId").GetInt32(),
-                    ["bounds"] = new Dictionary<string, object> { ["left"] = p.Left, ["top"] = p.Top },
+                    ["windowId"] = windowId, ["bounds"] = step,
                 }).ConfigureAwait(false);
-            return plan;
+            return final is { Left: { } l, Top: { } t, Width: { } w, Height: { } h } ? (l, t, w, h) : null;
         }
         catch (Exception)
         {
@@ -774,12 +856,13 @@ public static class Geometry
     /// persistent context always has one) or its first new page: the work-area fit
     /// (<see cref="InstallWindowFixupAsync(IBrowserContext, IEnumerable{string}?, bool)"/>) for every plan
     /// but <see cref="Mode.PersonaNative"/>; for that one (an r39+ persona window, which the engine
-    /// opened at the persona's bounds) only the position reconcile when the plan asks for it
-    /// (<see cref="HeadlessPlan.Reconcile"/>), and otherwise nothing at all.
+    /// opened at the persona's bounds) only the reconcile with the caller's viewport when the plan asks
+    /// for it (<see cref="HeadlessPlan.Reconcile"/>, <see cref="ReconcileWindowPositionAsync"/>), and
+    /// otherwise nothing at all.
     /// </summary>
     /// <param name="context">The context whose window to place.</param>
     /// <param name="args">The caller's command line.</param>
-    /// <param name="plan">The launch's plan (<see cref="ResolveHeadless(bool?, string?, IEnumerable{string}?, bool, string?, bool)"/>).</param>
+    /// <param name="plan">The launch's plan (<see cref="ResolveHeadless(bool?, string?, IEnumerable{string}?, bool, string?, ViewportSize?)"/>).</param>
     public static async Task InstallWindowFixupAsync(IBrowserContext context, IEnumerable<string>? args, HeadlessPlan plan)
     {
         if (plan.Mode != Mode.PersonaNative)
@@ -791,7 +874,7 @@ public static class Geometry
         var page = context.Pages.Count > 0
             ? context.Pages[0]
             : await context.NewPageAsync().ConfigureAwait(false);
-        await ReconcileWindowPositionAsync(page).ConfigureAwait(false);
+        await ReconcileWindowPositionAsync(page, plan.Viewport).ConfigureAwait(false);
     }
 
     /// <summary>

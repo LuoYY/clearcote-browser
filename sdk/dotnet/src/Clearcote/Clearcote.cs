@@ -259,11 +259,11 @@ public static class Clearcote
             lease is not null ? License.WithRunToken(lease.Token, callerEnv, launchToken?.File) : callerEnv, args);
 
         // An r39+ engine with a persona opens the persona's display and window itself (Mode.PersonaNative):
-        // no display switch and no fit, only a position reconcile under an explicit viewport.
+        // no display switch and no fit; under an explicit viewport the window is reconciled with it.
         var geometry = Geometry.ResolveHeadless(
             options.Headless, options.Fingerprint, args,
             callerSetGeometry: options.ViewportSize is not null || options.ScreenSize is not null,
-            exe: exe, callerViewport: Geometry.IsExplicitViewport(options.ViewportSize));
+            exe: exe, callerViewport: options.ViewportSize);
         // Headed Linux with no window manager (Xvfb: every Docker/VPS headful run) leaves Chrome's
         // 945x1060 default window at (10,10); the same first-page fit as headless maximizes it. A
         // caller's own viewport or window switch keeps theirs; other headed platforms keep NoViewport alone,
@@ -302,8 +302,8 @@ public static class Clearcote
         if (lease is not null) context.Close += (_, _) => { _ = lease.StopAsync(); launchToken?.Release(); };
         // Both headless regimes, and headed Linux: maximize into the display's work area. It never
         // throws, so a launch cannot fail on it, and it runs while the context is still on about:blank,
-        // so the caller's page never observes a resize. An r39+ persona window gets no fit: at most a
-        // move back onto the work area under an explicit viewport.
+        // so the caller's page never observes a resize. An r39+ persona window gets no fit: under an
+        // explicit viewport only the reconcile (normal state, viewport + frame, kept on the work area).
         if (geometry.Mode != Geometry.Mode.None || headedFit)
             await Geometry.InstallWindowFixupAsync(context, args, geometry).ConfigureAwait(false);
         return context;

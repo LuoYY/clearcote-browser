@@ -260,8 +260,8 @@ Precedence, first match wins:
 
 1. **Your explicit configuration**: `ViewportSize` (including `NoViewport`) / `ScreenSize`, `WindowSize` for
    `ServeAsync`, and `--window-size`, `--window-position`, `--start-maximized` in `Args`. An explicit
-   `ViewportSize` is honoured as given; the SDK only moves the window back onto the work area if it hangs
-   over an edge.
+   `ViewportSize` is honoured as given; the SDK sizes the real window around it (a restored window with
+   the browser's normal frame) and keeps that window on the work area.
 2. **The placement this identity saved in its profile**: a `UserDataDir` reused with the same seed restores
    the window it closed with; a profile last used with another seed (or an older engine) gets the new
    seed's window.

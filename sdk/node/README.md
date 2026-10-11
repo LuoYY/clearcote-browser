@@ -549,8 +549,9 @@ Where several things decide the window, the first one that applies wins:
 
 1. **Your explicit configuration.** `viewport` (including `viewport: null`) / `screen`, `serve({ windowSize })`,
    and the switches `--window-size`, `--window-position`, `--start-maximized`. An explicit `viewport` is
-   honoured as given; the SDK only moves the window back onto the work area if the viewport makes it hang
-   over an edge.
+   honoured as given: the SDK makes the real window the viewport plus the browser's own frame, at the
+   persona's position, moved back onto the work area if it would hang over an edge, so outer and inner sizes
+   still agree.
 2. **The placement this identity saved in its profile.** A `userDataDir` reused with the same seed restores
    the window it closed with, as Chrome does. A profile last used with another seed (or by an older engine)
    gets the new seed's window instead.

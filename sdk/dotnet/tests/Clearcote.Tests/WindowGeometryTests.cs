@@ -226,21 +226,22 @@ public class WindowGeometryTests : IDisposable
         var args = new[] { "--fingerprint=7" };
         // NoViewport (the SC 203 configuration): the engine does it all, nothing to reconcile
         var none = ViewportSize.NoViewport;
-        var p1 = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: exe,
-            callerViewport: Geometry.IsExplicitViewport(none));
+        var p1 = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: exe, callerViewport: none);
         Assert.Equal((Geometry.Mode.PersonaNative, false), (p1.Mode, p1.Reconcile));
+        Assert.Null(p1.Viewport);
         Assert.Same(none, Geometry.ContextViewport(p1, true, none, null));
-        // an explicit viewport is kept as asked and only gets the position reconcile
+        // an explicit viewport is kept as asked, and the plan carries it for the window reconcile
         var vp = new ViewportSize { Width = 1280, Height = 720 };
-        var p2 = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: exe,
-            callerViewport: Geometry.IsExplicitViewport(vp));
+        var p2 = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: exe, callerViewport: vp);
         Assert.Equal((Geometry.Mode.PersonaNative, true), (p2.Mode, p2.Reconcile));
+        Assert.Same(vp, p2.Viewport);
         Assert.Empty(p2.Args);
         Assert.Same(vp, Geometry.ContextViewport(p2, true, vp, null));
         // a ScreenSize alone: no NoViewport default is forced on the caller, nothing to reconcile
         var screen = new ScreenSize { Width = 1280, Height = 720 };
-        var p3 = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: exe, callerViewport: false);
+        var p3 = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: exe);
         Assert.Equal((Geometry.Mode.PersonaNative, false), (p3.Mode, p3.Reconcile));
+        Assert.Null(p3.Viewport);
         Assert.Null(Geometry.ContextViewport(p3, true, null, screen));
     }
 
@@ -265,9 +266,12 @@ public class WindowGeometryTests : IDisposable
         Assert.StartsWith("--screen-info=", Assert.Single(plan.Args));
         AssertNoViewport(Geometry.ContextViewport(plan, true, null, null));
         // and a caller's own geometry still opts out entirely
-        var own = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: r38, callerViewport: true);
+        var own = Geometry.ResolveHeadless(true, "7", args, callerSetGeometry: true, exe: r38,
+            callerViewport: new ViewportSize { Width = 1280, Height = 720 });
         Assert.Equal(Geometry.Mode.None, own.Mode);
         Assert.Empty(own.Args);
+        Assert.False(own.Reconcile);
+        Assert.Null(own.Viewport);
         Assert.Null(Geometry.ContextViewport(own, true, null, new ScreenSize { Width = 1280, Height = 720 }));
     }
 
@@ -315,6 +319,92 @@ public class WindowGeometryTests : IDisposable
         var plan = Geometry.ReconcilePlan(left, top, w, h, state, new[] { 1920, 1032 });
         (int Left, int Top)? want = wantLeft is null ? null : (wantLeft.Value, wantTop!.Value);
         Assert.Equal(want, plan);
+    }
+
+    // ─────────────────────────────────────────────────────── the reconcile steps
+    private static readonly ViewportSize Vp1280 = new() { Width = 1280, Height = 720 };
+    private static readonly int[] Avail1920 = { 1920, 1032 };
+
+    private static string[] Json(IEnumerable<Dictionary<string, object>> steps) =>
+        steps.Select(s => JsonSerializer.Serialize(s)).ToArray();
+
+    [Fact]
+    public void TheHeadlessNormalFrameIsTheHostEngines()
+    {
+        Assert.Equal(OperatingSystem.IsWindows() ? (16, 129) : (0, 121), Geometry.HeadlessNormalFrame);
+    }
+
+    [Theory]
+    [InlineData(16, 129)]   // a Windows host engine
+    [InlineData(0, 121)]    // a Linux host engine
+    public void TheReconcileRestoresAMaximizedWindowAndFramesTheViewport(int fw, int fh)
+    {
+        // Measured on the r39 test build: Playwright's viewport-sized request only RESTORES a maximized
+        // persona window (Chromium drops the size), leaving outer 1493x830 around inner 1280x720. The
+        // reconcile asks for the normal state, then viewport + the engine's normal frame, then a move.
+        var restored = new Geometry.WindowBounds(0, 22, 1493, 830, "normal");
+        var (steps, final) = Geometry.ReconcileSteps(restored, Avail1920, Vp1280, (fw, fh));
+        Assert.Equal(new[] { $"{{\"width\":{1280 + fw},\"height\":{720 + fh}}}" }, Json(steps));
+        Assert.Equal(new Geometry.WindowBounds(0, 22, 1280 + fw, 720 + fh, "normal"), final);
+
+        var maxed = new Geometry.WindowBounds(0, 0, 1920, 1032, "maximized");
+        (steps, final) = Geometry.ReconcileSteps(maxed, Avail1920, Vp1280, (fw, fh));
+        // at (0,0) the framed window is on the work area: no move
+        Assert.Equal(new[] { "{\"windowState\":\"normal\"}", $"{{\"width\":{1280 + fw},\"height\":{720 + fh}}}" },
+            Json(steps));
+        Assert.Equal(new Geometry.WindowBounds(0, 0, 1280 + fw, 720 + fh, "normal"), final);
+    }
+
+    [Fact]
+    public void TheReconcileSizesFirstThenMovesTheSizedWindowBackOn()
+    {
+        // The clamp is computed on the updated bounds: the framed window, not the one the engine reported.
+        var (fw, fh) = (16, 129);
+        var win = new Geometry.WindowBounds(900, 300, 1400, 900, "maximized");
+        var (steps, final) = Geometry.ReconcileSteps(win, Avail1920, Vp1280, (fw, fh));
+        Assert.Equal(new[]
+        {
+            "{\"windowState\":\"normal\"}",
+            "{\"width\":1296,\"height\":849}",
+            $"{{\"left\":{1920 - 1296},\"top\":{1032 - 849}}}",
+        }, Json(steps));
+        Assert.Equal(new Geometry.WindowBounds(624, 183, 1296, 849, "normal"), final);
+    }
+
+    [Fact]
+    public void TheReconcileLeavesAWindowThatAlreadyAgreesAlone()
+    {
+        var (fw, fh) = Geometry.HeadlessNormalFrame;
+        var win = new Geometry.WindowBounds(100, 20, 1280 + fw, 720 + fh, "normal");
+        var (steps, final) = Geometry.ReconcileSteps(win, Avail1920, Vp1280);
+        Assert.Empty(steps);
+        Assert.Equal(win, final);
+    }
+
+    [Fact]
+    public void TheReconcileNeverResizesWithoutAViewport()
+    {
+        var win = new Geometry.WindowBounds(900, 300, 1296, 854, "normal");
+        Assert.Equal(new[] { "{\"left\":624,\"top\":178}" }, Json(Geometry.ReconcileSteps(win, Avail1920, null).Steps));
+        // NoViewport is no viewport: move only
+        Assert.Equal(new[] { "{\"left\":624,\"top\":178}" },
+            Json(Geometry.ReconcileSteps(win, Avail1920, ViewportSize.NoViewport).Steps));
+        // and a maximized window without a viewport is left exactly as it is
+        Assert.Empty(Geometry.ReconcileSteps(new Geometry.WindowBounds(0, 0, 1920, 1032, "maximized"), Avail1920, null).Steps);
+    }
+
+    [Fact]
+    public void TheReconcileReadsTheEnginesBoundsAndSkipsTheMoveWhenAPositionIsMissing()
+    {
+        var parsed = Geometry.WindowBounds.From(JsonDocument.Parse(
+            "{\"left\":900,\"top\":300,\"width\":1296,\"height\":854,\"windowState\":\"normal\"}").RootElement);
+        Assert.Equal(new Geometry.WindowBounds(900, 300, 1296, 854, "normal"), parsed);
+        var partial = Geometry.WindowBounds.From(JsonDocument.Parse("{\"width\":1296,\"height\":854}").RootElement);
+        Assert.Equal(new Geometry.WindowBounds(null, null, 1296, 854, null), partial);
+        Assert.Empty(Geometry.ReconcileSteps(partial, Avail1920, null).Steps);
+        // the size still follows the viewport; only the move needs a position
+        Assert.Equal(new[] { "{\"width\":1280,\"height\":841}" }, Json(Geometry.ReconcileSteps(partial, Avail1920, Vp1280, (0, 121)).Steps));
+        Assert.Equal(new Geometry.WindowBounds(null, null, null, null, null), Geometry.WindowBounds.From(default));
     }
 
     // ─────────────────────────────────────────────────────── the first-page window step, on a fake page
@@ -374,14 +464,15 @@ public class WindowGeometryTests : IDisposable
         };
     }
 
-    private static (IBrowserContext Context, FakePage Page) FakeWindow(int left, int top, int width, int height)
+    private static (IBrowserContext Context, FakePage Page) FakeWindow(int left, int top, int width, int height,
+        string state = "normal")
     {
         var page = DispatchProxy.Create<IPage, FakePage>();
         var ctx = DispatchProxy.Create<IBrowserContext, FakeContext>();
         var cdp = DispatchProxy.Create<ICDPSession, FakeCdp>();
         var fake = (FakePage)(object)page;
         fake.Context = ctx;
-        fake.WindowBounds = new() { ["left"] = left, ["top"] = top, ["width"] = width, ["height"] = height, ["windowState"] = "normal" };
+        fake.WindowBounds = new() { ["left"] = left, ["top"] = top, ["width"] = width, ["height"] = height, ["windowState"] = state };
         ((FakeContext)(object)ctx).Cdp = cdp;
         ((FakeContext)(object)ctx).Page = page;
         ((FakeCdp)(object)cdp).Page = fake;
@@ -398,18 +489,42 @@ public class WindowGeometryTests : IDisposable
     }
 
     [Fact]
-    public async Task ANativePersonaWindowUnderAnExplicitViewportIsOnlyMovedBackOn()
+    public async Task ANativePersonaWindowUnderAnExplicitViewportIsFramedAndKeptOnTheWorkArea()
     {
-        var (ctx, fake) = FakeWindow(900, 300, 1296, 854);
+        // The launch wiring: the plan carries the caller's viewport to the first page's window step.
+        var (fw, fh) = Geometry.HeadlessNormalFrame;
+        var (w, h) = (1280 + fw, 720 + fh);
         var plan = Geometry.ResolveHeadless(true, "7", new[] { "--fingerprint=7" }, callerSetGeometry: true, exe: Engine(),
-            callerViewport: true);
+            callerViewport: new ViewportSize { Width = 1280, Height = 720 });
+        var (ctx, fake) = FakeWindow(900, 300, 1296, 854);
         await Geometry.InstallWindowFixupAsync(ctx, new[] { "--fingerprint=7" }, plan);
-        var set = Assert.Single(fake.Calls, c => c.Method == "Browser.setWindowBounds");
-        Assert.Equal("{\"windowId\":3,\"bounds\":{\"left\":624,\"top\":178}}", set.Params);   // left/top only, never a size
-        // already on the work area: nothing to move
-        var (ctx2, fake2) = FakeWindow(0, 0, 1296, 854);
+        Assert.Equal(new[]
+        {
+            $"{{\"windowId\":3,\"bounds\":{{\"width\":{w},\"height\":{h}}}}}",
+            $"{{\"windowId\":3,\"bounds\":{{\"left\":{Math.Min(900, 1920 - w)},\"top\":{Math.Min(300, 1032 - h)}}}}}",
+        }, fake.Calls.Where(c => c.Method == "Browser.setWindowBounds").Select(c => c.Params));
+        // a maximized persona window: restored first, then framed (at (0,0) it needs no move)
+        var (ctxMax, fakeMax) = FakeWindow(0, 0, 1920, 1032, "maximized");
+        await Geometry.InstallWindowFixupAsync(ctxMax, new[] { "--fingerprint=7" }, plan);
+        Assert.Equal(new[]
+        {
+            "{\"windowId\":3,\"bounds\":{\"windowState\":\"normal\"}}",
+            $"{{\"windowId\":3,\"bounds\":{{\"width\":{w},\"height\":{h}}}}}",
+        }, fakeMax.Calls.Where(c => c.Method == "Browser.setWindowBounds").Select(c => c.Params));
+        // a window that already agrees with the viewport and sits on the work area: nothing to do
+        var (ctx2, fake2) = FakeWindow(0, 0, w, h);
         await Geometry.InstallWindowFixupAsync(ctx2, new[] { "--fingerprint=7" }, plan);
         Assert.DoesNotContain(fake2.Calls, c => c.Method == "Browser.setWindowBounds");
+    }
+
+    [Fact]
+    public async Task TheReconcileWithoutAViewportOnlyMovesTheWindow()
+    {
+        var (ctx, fake) = FakeWindow(900, 300, 1296, 854);
+        var page = ((FakeContext)(object)ctx).Page!;
+        Assert.Equal((624, 178, 1296, 854), await Geometry.ReconcileWindowPositionAsync(page));
+        var set = Assert.Single(fake.Calls, c => c.Method == "Browser.setWindowBounds");
+        Assert.Equal("{\"windowId\":3,\"bounds\":{\"left\":624,\"top\":178}}", set.Params);   // left/top only, never a size
     }
 
     [Fact]
