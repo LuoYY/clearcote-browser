@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { IsolatedWorld, worldFor, ISO_IS_FOCUSED, ISO_VIEWPORT } from "../src/isolated.js";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  IsolatedWorld, worldFor, nodeAtParams, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_DESCRIBE, ISO_FORM_CONTROL, ISO_PLATFORM,
+  ISO_SCROLL, ISO_VIEWPORT, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_CSS_BOX, ISO_SCROLL_BY,
+} from "../src/isolated.js";
+
+// A read that takes an argument (the CSS-only ISO_IS_FOCUSED this used went with the hit-test port).
+const ISO_IS_FOCUSED = "(s) => { const e = document.querySelector(s); return !!e && e === document.activeElement; }";
 
 // Humanize's DOM reads run in an isolated world, never the page's (mirrors
 // sdk/python/tests/test_isolated.py).
@@ -68,5 +76,148 @@ describe("IsolatedWorld", () => {
     await worldFor(page).evaluate(ISO_VIEWPORT);
     await worldFor(page).evaluate(ISO_VIEWPORT);
     expect(page.sessions()).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------- hit test + node calls (forms)
+// Mirrors the node_at / call_on_node tests in sdk/python/tests/test_isolated.py.
+class HitCdp extends FakeCdp {
+  constructor(public hit: any = null, public callValue: unknown = null, values: unknown[] = []) { super(values); }
+  async send(method: string, params?: any): Promise<any> {
+    if (method === "DOM.getNodeForLocation") { this.calls.push([method, params]); return this.hit; }
+    if (method === "DOM.resolveNode") { this.calls.push([method, params]); return { object: { objectId: "obj-1" } }; }
+    if (method === "Runtime.callFunctionOn") { this.calls.push([method, params]); return { result: { value: this.callValue } }; }
+    if (method === "Runtime.releaseObject") { this.calls.push([method, params]); return {}; }
+    return super.send(method, params);
+  }
+}
+
+describe("IsolatedWorld hit test and node calls", () => {
+  it("nodeAt uses the renderer hit test and rounds to pixels", async () => {
+    const cdp = new HitCdp({ backendNodeId: 42, frameId: "MAIN" });
+    const w = new IsolatedWorld(fakePage(cdp));
+    expect(await w.nodeAt(10.6, 20.4)).toBe(42);
+    const hit = cdp.calls.find(([m]) => m === "DOM.getNodeForLocation")![1];
+    expect(hit).toEqual({ x: 11, y: 20, includeUserAgentShadowDOM: false, ignorePointerEventsNone: true });
+  });
+
+  it("nodeAt hit-tests in DOCUMENT coordinates: the viewport point plus the scroll offset", async () => {
+    // read here when the caller has no scroll yet ...
+    const cdp = new HitCdp({ backendNodeId: 7, frameId: "MAIN" }, null, [[0, 547]]);
+    const w = new IsolatedWorld(fakePage(cdp));
+    expect(await w.nodeAt(100, 50)).toBe(7);
+    expect(cdp.calls.find(([m]) => m === "Runtime.evaluate")![1].expression).toBe(`(${ISO_SCROLL})(null)`);
+    expect(cdp.calls.find(([m]) => m === "DOM.getNodeForLocation")![1]).toMatchObject({ x: 100, y: 597 });
+    // ... and taken as given when it does (no second read)
+    const cdp2 = new HitCdp({ backendNodeId: 8, frameId: "MAIN" });
+    expect(await new IsolatedWorld(fakePage(cdp2)).nodeAt(10, 10, [30, 200])).toBe(8);
+    expect(cdp2.calls.filter(([m]) => m === "Runtime.evaluate")).toEqual([]);
+    expect(cdp2.calls.find(([m]) => m === "DOM.getNodeForLocation")![1]).toMatchObject({ x: 40, y: 210 });
+    expect(nodeAtParams(1.5, 2.5, [0.4, 0.4])).toMatchObject({ x: 2, y: 3 });
+    // Python's round(): half to even, so all SDKs hit-test the same pixel
+    expect(nodeAtParams(60.5, 61.5)).toMatchObject({ x: 60, y: 62 });
+  });
+
+  it("nodeAt refuses a node inside another frame, and is undefined when nothing is there", async () => {
+    expect(await new IsolatedWorld(fakePage(new HitCdp({ backendNodeId: 42, frameId: "IFRAME-7" }))).nodeAt(1, 1)).toBeUndefined();
+    expect(await new IsolatedWorld(fakePage(new HitCdp({}))).nodeAt(1, 1)).toBeUndefined();
+    expect(await new IsolatedWorld(fakePage(new HitCdp(null))).nodeAt(1, 1)).toBeUndefined();
+  });
+
+  it("scroll() reads [scrollX, scrollY] in the isolated world, [0, 0] when it cannot", async () => {
+    expect(await new IsolatedWorld(fakePage(new FakeCdp([[12, 345]]))).scroll()).toEqual([12, 345]);
+    expect(await new IsolatedWorld(fakePage(new FakeCdp([null]))).scroll()).toEqual([0, 0]);
+  });
+
+  it("callOnNode resolves into the isolated world and releases the handle", async () => {
+    const cdp = new HitCdp(null, { tag: "select" });
+    const w = new IsolatedWorld(fakePage(cdp));
+    expect(await w.callOnNode(42, ISO_DESCRIBE, { want: "select" })).toEqual({ tag: "select" });
+    const methods = cdp.calls.map(([m]) => m);
+    const res = cdp.calls.find(([m]) => m === "DOM.resolveNode")![1];
+    expect(res).toEqual({ backendNodeId: 42, executionContextId: 8 }); // the isolated world
+    const call = cdp.calls.find(([m]) => m === "Runtime.callFunctionOn")![1];
+    expect(call.objectId).toBe("obj-1");
+    expect(call.functionDeclaration).toBe(ISO_DESCRIBE);
+    expect(call.arguments).toEqual([{ value: { want: "select" } }]);
+    expect(call.returnByValue).toBe(true);
+    expect(methods.indexOf("Runtime.releaseObject")).toBeGreaterThan(methods.indexOf("Runtime.callFunctionOn"));
+    expect(methods).not.toContain("Runtime.enable");
+    expect(methods).not.toContain("DOM.enable");
+  });
+
+  it("concurrent calls share ONE CDP session and ONE isolated world", async () => {
+    const cdp = new HitCdp({ backendNodeId: 3, frameId: "MAIN" }, { tag: "input" }, [[0, 0], [0, 0], [0, 0]]);
+    const page = fakePage(cdp);
+    const w = new IsolatedWorld(page);
+    const got = await Promise.all([w.evaluate(ISO_VIEWPORT), w.nodeAt(1, 1), w.callOnNode(3, ISO_DESCRIBE), w.scroll()]);
+    expect(got[1]).toBe(3);
+    expect(got[2]).toEqual({ tag: "input" });
+    expect(page.sessions()).toBe(1);
+    expect(cdp.calls.filter(([m]) => m === "Page.createIsolatedWorld").length).toBe(1);
+  });
+
+  it("a stale world is re-created once; a node that is gone leaves the world alone", async () => {
+    class Flaky extends HitCdp {
+      resolveErrors: string[] = [];
+      async send(method: string, params?: any): Promise<any> {
+        if (method === "DOM.resolveNode" && this.resolveErrors.length) {
+          this.calls.push([method, params]);
+          throw new Error(this.resolveErrors.shift());
+        }
+        return super.send(method, params);
+      }
+    }
+    const stale = new Flaky(null, { tag: "a" });
+    stale.resolveErrors = ["Cannot find context with specified id"];
+    const w1 = new IsolatedWorld(fakePage(stale));
+    expect(await w1.callOnNode(5, ISO_DESCRIBE)).toEqual({ tag: "a" });
+    expect(stale.calls.filter(([m]) => m === "Page.createIsolatedWorld").length).toBe(2);
+    const gone = new Flaky(null, { tag: "b" });
+    gone.resolveErrors = ["No node with given id found"];
+    const w2 = new IsolatedWorld(fakePage(gone));
+    expect(await w2.callOnNode(5, ISO_DESCRIBE)).toBeUndefined();
+    expect(await w2.callOnNode(5, ISO_DESCRIBE)).toEqual({ tag: "b" });
+    expect(gone.calls.filter(([m]) => m === "Page.createIsolatedWorld").length).toBe(1);
+  });
+
+  it("callOnNode and send resolve undefined instead of touching the page world", async () => {
+    const noCdp = { context: () => ({ newCDPSession: async () => { throw new Error("no cdp"); } }),
+      evaluate: () => { throw new Error("must not fall back to page.evaluate"); } };
+    expect(await new IsolatedWorld(noCdp).callOnNode(1, ISO_DESCRIBE)).toBeUndefined();
+    expect(await new IsolatedWorld(noCdp).send("DOM.describeNode", {})).toBeUndefined();
+    expect(await new IsolatedWorld(noCdp).nodeAt(1, 1)).toBeUndefined();
+  });
+
+  it("the form reads are functions of their argument, not page globals", () => {
+    for (const src of [ISO_DESCRIBE, ISO_ACTIVE_VALUE, ISO_ACTIVE_FIELD, ISO_SCROLL]) {
+      expect(src).not.toContain("__");
+      expect(src).not.toContain("window.");
+    }
+    expect(ISO_DESCRIBE.trimStart().startsWith("function (a)")).toBe(true);
+  });
+
+  // The reads are copied VERBATIM from sdk/python/clearcote/_isolated.py: one page-side contract.
+  const PY = fileURLToPath(new URL("../../python/clearcote/_isolated.py", import.meta.url));
+  it.runIf(existsSync(PY))("the read sources are the Python reference's, verbatim", () => {
+    const src = readFileSync(PY, "utf8").replace(/\r\n/g, "\n");
+    const py = (name: string): string => {
+      const triple = new RegExp(`^${name} = """([\\s\\S]*?)"""`, "m").exec(src);
+      if (triple) return triple[1];
+      const plain = new RegExp(`^${name} = "(.*)"$`, "m").exec(src);
+      if (!plain) throw new Error(`${name} not found in _isolated.py`);
+      return plain[1];
+    };
+    expect(ISO_DESCRIBE).toBe(py("DESCRIBE"));
+    expect(ISO_ACTIVE_VALUE).toBe(py("ACTIVE_VALUE"));
+    expect(ISO_ACTIVE_FIELD).toBe(py("ACTIVE_FIELD"));
+    expect(ISO_SCROLL).toBe(py("SCROLL"));
+    expect(ISO_FORM_CONTROL).toBe(py("FORM_CONTROL"));
+    expect(ISO_VIEWPORT).toBe(py("VIEWPORT"));
+    expect(ISO_PLATFORM).toBe(py("PLATFORM"));
+    expect(ISO_HIT_IN_BOX).toBe(py("HIT_IN_BOX"));
+    expect(ISO_LISTBOX_ROW).toBe(py("LISTBOX_ROW"));
+    expect(ISO_CSS_BOX).toBe(py("CSS_BOX"));
+    expect(ISO_SCROLL_BY).toBe(py("SCROLL_BY"));
   });
 });

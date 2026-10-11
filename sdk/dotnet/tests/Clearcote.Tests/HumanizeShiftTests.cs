@@ -66,6 +66,8 @@ public class HumanizeShiftTests
         var pageRec = (Recorder)(object)page;
         pageRec.Keyboard = keyboard;
         pageRec.Mouse = mouse;
+        // These tests assert exact key sequences: no fat-finger slips (FormsTests and the live suite cover those).
+        Humanize.TypoRateOverride.AddOrUpdate(page, new System.Runtime.CompilerServices.StrongBox<double>(0));
         return (page, (Recorder)(object)keyboard);
     }
 

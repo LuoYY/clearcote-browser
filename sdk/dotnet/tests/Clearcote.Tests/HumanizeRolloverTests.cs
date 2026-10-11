@@ -33,6 +33,8 @@ public class HumanizeRolloverTests
         pageRec.Keyboard = keyboard;
         pageRec.Mouse = mouse;
         Humanize.RolloverOverride.AddOrUpdate(page, new StrongBox<double>(rate));
+        // exact key sequences: no fat-finger slips here (FormsTests and the live suite cover those)
+        Humanize.TypoRateOverride.AddOrUpdate(page, new StrongBox<double>(0));
         return (page, (HumanizeShiftTests.Recorder)(object)keyboard);
     }
 

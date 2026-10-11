@@ -181,6 +181,9 @@ internal static class DockerLaunch
         foreach (var p in RefusedOptions)
         {
             var value = p.GetValue(o);
+            // Widevine = false: the opt-out of the licensed LOCAL default; the container has no default to turn
+            // off, so it is accepted and dropped (Widevine = true is still refused).
+            if (p.Name == nameof(LaunchOptions.Widevine) && value is false) continue;
             if (value is not null && !Equals(value, p.GetValue(defaults)))
                 throw new ArgumentException(
                     $"{p.Name} is not available when LaunchAsync runs Clearcote in Docker (there is no native macOS build). {OffHint}");

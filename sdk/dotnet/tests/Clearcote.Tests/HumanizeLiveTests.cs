@@ -47,6 +47,8 @@ window.__keys = [];
             try
             {
                 var page = context.Pages.Count > 0 ? context.Pages[0] : await context.NewPageAsync();
+                // the key sequence below is asserted exactly: no fat-finger slips on this page
+                Humanize.TypoRateOverride.AddOrUpdate(page, new System.Runtime.CompilerServices.StrongBox<double>(0));
                 await page.SetContentAsync(HookPage);
                 await page.Locator("#t").HumanClickAsync();
                 await page.HumanTypeAsync("Ab!");

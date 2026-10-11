@@ -899,7 +899,8 @@ const pause = (ms: number): void => {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 };
 
-function renameDir(src: string, dst: string): void {
+/** Rename a directory, retrying on Windows while a scanner holds a file in the fresh tree (also the Widevine install's). */
+export function renameDir(src: string, dst: string): void {
   for (let attempt = 0; ; attempt++) {
     try {
       installTestHooks.beforeRename?.(src, dst);

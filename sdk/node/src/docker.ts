@@ -179,7 +179,11 @@ function proxyUrl(proxy: unknown): string {
 /** The CC_* (and licence) variables the image is started with. Throws naming the first option the
  * image cannot take. */
 export function containerEnv(options: Record<string, unknown>): Record<string, string> {
-  const unknown = Object.keys(options).filter((k) => !DOCKER_ACCEPTED.includes(k) && options[k] !== undefined && options[k] !== null).sort();
+  // widevine: false: the opt-out of the licensed LOCAL default; the container has no default to turn off, so it is
+  // accepted and dropped (widevine: true is still refused).
+  const unknown = Object.keys(options)
+    .filter((k) => !DOCKER_ACCEPTED.includes(k) && options[k] !== undefined && options[k] !== null && !(k === "widevine" && options[k] === false))
+    .sort();
   if (unknown.length) {
     const takes = DOCKER_ACCEPTED.filter((k) => !SDK_SIDE.includes(k)).sort().join(", ");
     throw new TypeError(`${unknown[0]} is not available when launch() runs Clearcote in Docker (there is no native macOS build). The container takes: ${takes}. ${OFF_HINT}`);

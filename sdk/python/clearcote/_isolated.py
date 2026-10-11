@@ -15,6 +15,7 @@ navigation mid-call). Callers fall back to their safe default -- never to the pa
 Mirrors sdk/node/src/isolated.ts and sdk/dotnet/src/Clearcote/IsolatedWorld.cs.
 """
 
+import asyncio
 import json
 
 
@@ -28,6 +29,24 @@ def _value(result):
     return (result.get("result") or {}).get("value")
 
 
+def _node_at_params(x, y, scroll):
+    # DOM.getNodeForLocation hit-tests in DOCUMENT coordinates (the viewport point plus the scroll
+    # offset); Playwright's boxes, CDP's box model and the mouse are all VIEWPORT coordinates.
+    # Measured on r37: a field scrolled 547 px down answered "No node found" at its viewport centre
+    # and the input itself at centre + scroll.
+    sx, sy = scroll or (0, 0)
+    return {"x": int(round(x + sx)), "y": int(round(y + sy)), "includeUserAgentShadowDOM": False,
+            "ignorePointerEventsNone": True}
+
+
+SCROLL = "() => [scrollX, scrollY]"
+
+
+def _call_params(object_id, fn_source, arg):
+    return {"objectId": object_id, "functionDeclaration": fn_source, "arguments": [{"value": arg}],
+            "returnByValue": True}
+
+
 class IsolatedWorld:
     """Sync: an isolated world in ``page``'s main frame."""
 
@@ -35,17 +54,21 @@ class IsolatedWorld:
         self._page = page
         self._cdp = None
         self._ctx = None
+        self._frame = None
+
+    def _ensure(self):
+        if self._cdp is None:
+            self._cdp = self._page.context.new_cdp_session(self._page)
+        if self._ctx is None:
+            self._frame = self._cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+            self._ctx = self._cdp.send(
+                "Page.createIsolatedWorld", {"frameId": self._frame})["executionContextId"]
 
     def evaluate(self, fn_source, arg=None):
         """Run ``(fn_source)(arg)`` (``arg`` JSON-serialisable) and return its JSON value, or None."""
         for _ in range(2):  # a stale context (navigation) is re-created once
             try:
-                if self._cdp is None:
-                    self._cdp = self._page.context.new_cdp_session(self._page)
-                if self._ctx is None:
-                    frame_id = self._cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
-                    self._ctx = self._cdp.send(
-                        "Page.createIsolatedWorld", {"frameId": frame_id})["executionContextId"]
+                self._ensure()
                 return _value(self._cdp.send("Runtime.evaluate", {
                     "expression": _expression(fn_source, arg), "contextId": self._ctx,
                     "returnByValue": True}))
@@ -53,28 +76,147 @@ class IsolatedWorld:
                 self._ctx = None
         return None
 
+    def send(self, method, params=None):
+        """A raw CDP call on this page's session (DOM reads that run no script), or None."""
+        try:
+            if self._cdp is None:
+                self._cdp = self._page.context.new_cdp_session(self._page)
+            return self._cdp.send(method, params or {})
+        except Exception:  # noqa: BLE001
+            return None
+
+    def scroll(self):
+        """The main frame's (scrollX, scrollY), read in the isolated world; (0, 0) if unknown."""
+        s = self.evaluate(SCROLL)
+        return (float(s[0]), float(s[1])) if isinstance(s, list) and len(s) == 2 else (0.0, 0.0)
+
+    def node_at(self, x, y, scroll=None):
+        """backendNodeId of the MAIN-FRAME element at viewport point (x, y), or None. ``scroll``:
+        the page's (scrollX, scrollY) if the caller already has it (read here otherwise).
+
+        CDP's hit test (DOM.getNodeForLocation) runs in the renderer with no script at all, so this
+        is how humanize finds the element a Playwright locator means -- get_by_role, get_by_label,
+        `>> nth=`, .filter() -- without document.querySelector, which cannot parse those selectors
+        (the old helpers threw on them and silently dropped to stock Playwright input)."""
+        try:
+            self._ensure()
+        except Exception:  # noqa: BLE001
+            self._ctx = None
+            return None
+        hit = self.send("DOM.getNodeForLocation",
+                        _node_at_params(x, y, scroll if scroll is not None else self.scroll()))
+        if not hit or "backendNodeId" not in hit:
+            return None
+        if hit.get("frameId") and self._frame and hit["frameId"] != self._frame:
+            return None   # inside an iframe: not this world's document
+        return hit["backendNodeId"]
+
+    def call_on_node(self, backend_node_id, fn_source, arg=None):
+        """Run ``fn_source`` -- a ``function (arg) { ... }`` whose ``this`` is the node -- in the
+        isolated world and return its JSON value, or None."""
+        for _ in range(2):
+            try:
+                self._ensure()
+                obj = self._cdp.send("DOM.resolveNode", {
+                    "backendNodeId": backend_node_id, "executionContextId": self._ctx})["object"]
+                try:
+                    return _value(self._cdp.send("Runtime.callFunctionOn",
+                                                 _call_params(obj["objectId"], fn_source, arg)))
+                finally:
+                    try:
+                        self._cdp.send("Runtime.releaseObject", {"objectId": obj["objectId"]})
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                self._ctx = None
+        return None
+
 
 class AsyncIsolatedWorld:
-    """Async: an isolated world in ``page``'s main frame."""
+    """Async: an isolated world in ``page``'s main frame.
+
+    The CDP session and the world are each created ONCE, under a lock: two coroutines reading at the
+    same time (a mouse.wheel's viewport read during a fill's hit test) both saw "no session yet" and
+    each opened one, and each created its own isolated world."""
 
     def __init__(self, page):
         self._page = page
         self._cdp = None
         self._ctx = None
+        self._frame = None
+        self._lock = None   # made on first use, inside the running event loop
+
+    def _guard(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def _session(self):
+        if self._cdp is None:
+            async with self._guard():
+                if self._cdp is None:   # another coroutine may have opened it while this one waited
+                    self._cdp = await self._page.context.new_cdp_session(self._page)
+        return self._cdp
+
+    async def _ensure(self):
+        await self._session()
+        if self._ctx is None:
+            async with self._guard():
+                if self._ctx is None:
+                    tree = await self._cdp.send("Page.getFrameTree")
+                    self._frame = tree["frameTree"]["frame"]["id"]
+                    created = await self._cdp.send("Page.createIsolatedWorld", {"frameId": self._frame})
+                    self._ctx = created["executionContextId"]
 
     async def evaluate(self, fn_source, arg=None):
         for _ in range(2):
             try:
-                if self._cdp is None:
-                    self._cdp = await self._page.context.new_cdp_session(self._page)
-                if self._ctx is None:
-                    tree = await self._cdp.send("Page.getFrameTree")
-                    created = await self._cdp.send(
-                        "Page.createIsolatedWorld", {"frameId": tree["frameTree"]["frame"]["id"]})
-                    self._ctx = created["executionContextId"]
+                await self._ensure()
                 return _value(await self._cdp.send("Runtime.evaluate", {
                     "expression": _expression(fn_source, arg), "contextId": self._ctx,
                     "returnByValue": True}))
+            except Exception:  # noqa: BLE001
+                self._ctx = None
+        return None
+
+    async def send(self, method, params=None):
+        try:
+            return await (await self._session()).send(method, params or {})
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def scroll(self):
+        s = await self.evaluate(SCROLL)
+        return (float(s[0]), float(s[1])) if isinstance(s, list) and len(s) == 2 else (0.0, 0.0)
+
+    async def node_at(self, x, y, scroll=None):
+        try:
+            await self._ensure()
+        except Exception:  # noqa: BLE001
+            self._ctx = None
+            return None
+        hit = await self.send("DOM.getNodeForLocation",
+                              _node_at_params(x, y, scroll if scroll is not None else await self.scroll()))
+        if not hit or "backendNodeId" not in hit:
+            return None
+        if hit.get("frameId") and self._frame and hit["frameId"] != self._frame:
+            return None
+        return hit["backendNodeId"]
+
+    async def call_on_node(self, backend_node_id, fn_source, arg=None):
+        for _ in range(2):
+            try:
+                await self._ensure()
+                obj = (await self._cdp.send("DOM.resolveNode", {
+                    "backendNodeId": backend_node_id, "executionContextId": self._ctx}))["object"]
+                try:
+                    return _value(await self._cdp.send("Runtime.callFunctionOn",
+                                                       _call_params(obj["objectId"], fn_source, arg)))
+                finally:
+                    try:
+                        await self._cdp.send("Runtime.releaseObject", {"objectId": obj["objectId"]})
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception:  # noqa: BLE001
                 self._ctx = None
         return None
@@ -104,22 +246,105 @@ def async_world_for(page):
     return world
 
 
-# How long a trial action may look for a covered click point before the native path takes over.
+# How long a covered click point is re-checked (an overlay fading out) before the native path takes over.
 COVER_CHECK_MS = 400
+# The one longer look when Playwright's trial -- now only the fallback for a point inside a child
+# frame -- timed out only because the element was not "stable" yet (no "intercepts pointer events"
+# in its call log): slow first frames, not an overlay. Also the timeout of the utility-world value
+# reads that prove a fill landed.
+COVER_RETRY_MS = 2000
 
 # The reads humanize makes, as functions of one JSON argument (run by IsolatedWorld.evaluate).
 VIEWPORT = "() => [innerWidth, innerHeight]"
 # The platform the page believes (the persona's), for the wheel notch size.
 PLATFORM = "() => { const d = navigator.userAgentData; return (d && d.platform) || navigator.platform || ''; }"
-IS_FOCUSED = ("(s) => { const e = document.querySelector(s);"
-              " return !!e && e === document.activeElement; }")
-SELECT_PLAN = """(a) => { const s = document.querySelector(a.sel);
-     if (!s || s.multiple || s.disabled) return null;
-     const os = [...s.options];
-     let i = -1;
-     if (a.by === 'index') i = (a.want >= 0 && a.want < os.length) ? a.want : -1;
-     else if (a.by === 'label') i = os.findIndex(o => (o.label || o.textContent || '').trim() === String(a.want).trim());
-     else i = os.findIndex(o => o.value === a.want);
-     if (i < 0 || os[i].disabled) return null;
-     return { to: i, from: s.selectedIndex, ret: os[i].value }; }"""
-SELECTED_INDEX = "(s) => { const e = document.querySelector(s); return e ? e.selectedIndex : -1; }"
+
+# The value of whatever has focus (input/textarea value, or a contenteditable's text): how the typing
+# path checks that a fat-finger key actually landed before it deletes anything.
+ACTIVE_VALUE = """() => { let e = document.activeElement;
+  while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (!e || e.tagName === 'IFRAME' || e.tagName === 'FRAME') return null;
+  if (typeof e.value === 'string' && e.tagName !== 'BUTTON') return e.value;
+  return e.isContentEditable ? e.textContent : null; }"""
+# What the typo gate needs about the focused field (type / inputmode / autocomplete), or null.
+# Focus inside an open shadow root is followed to the real field; focus inside a frame cannot be read
+# from here, so it reports {frame: true} and the gate fails CLOSED (no slips in a card or login form
+# that lives in an iframe).
+ACTIVE_FIELD = """() => { let e = document.activeElement; if (!e || e === document.body) return null;
+  while (e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') return { frame: true };
+  return { type: e.tagName === 'INPUT' ? e.type : '', inputmode: e.getAttribute('inputmode'),
+           autocomplete: e.getAttribute('autocomplete') }; }"""
+# Everything the form routes need about ONE element, read from the node the hit test found (a
+# CDP callFunctionOn target: `this` is that node). `want` walks up to the control the locator means
+# (a click on a <select>'s padding hits the select; one on a label's text does not, and then the
+# caller tries another point). Returns null when no such ancestor exists.
+DESCRIBE = """function (a) {
+  let e = this.nodeType === 1 ? this : this.parentElement;
+  if (!e) return null;
+  if (a && a.want) { const c = e.closest(a.want); if (!c) return null; e = c; }
+  const r = e.getBoundingClientRect(), cs = getComputedStyle(e), tag = e.tagName.toLowerCase();
+  const o = { tag, type: tag === 'input' ? e.type : '', ce: !!e.isContentEditable,
+    rect: [r.x, r.y, r.width, r.height], focused: e === document.activeElement,
+    value: typeof e.value === 'string' ? e.value : (e.isContentEditable ? e.textContent : null),
+    min: e.getAttribute('min'), max: e.getAttribute('max'), step: e.getAttribute('step'),
+    maxlength: typeof e.maxLength === 'number' ? e.maxLength : -1,
+    inputmode: e.getAttribute('inputmode'), autocomplete: e.getAttribute('autocomplete'),
+    readonly: !!e.readOnly, disabled: !!e.disabled, dir: cs.direction, wm: cs.writingMode,
+    bl: e.clientLeft || 0, bt: e.clientTop || 0 };
+  if (tag === 'select') {
+    o.multiple = e.multiple; o.size = e.size; o.selectedIndex = e.selectedIndex;
+    o.options = Array.from(e.options, x => ({ value: x.value, label: x.label,
+      disabled: x.disabled || !!(x.parentElement && x.parentElement.tagName === 'OPTGROUP' && x.parentElement.disabled),
+      selected: x.selected }));
+    if (e.multiple || e.size > 1)
+      o.optRects = Array.from(e.options, x => { const q = x.getBoundingClientRect(); return [q.x, q.y, q.width, q.height]; });
+  }
+  return o; }"""
+# The controls a locator can mean for the form routes.
+FORM_CONTROL = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']"
+# Does the element the browser's hit test found at a click point belong to the element whose box the
+# caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
+# that box? `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
+# press). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
+# element and back and performs a press whose events Playwright blocks, so a page saw a mousemove
+# inside the target, a jump back and a pointerdown/click before every humanized click (verifier B).
+HIT_IN_BOX = """function (b) {
+  let e = this.nodeType === 1 ? this : this.parentElement;
+  for (let n = 0; e && n < 128; n++) {
+    const r = e.getBoundingClientRect();
+    if (Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
+        Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5) return true;
+    const p = e.parentNode;
+    e = e.parentElement || (p && p.nodeType === 11 && p.host) || null;
+  }
+  return false; }"""
+# A list box's scroll state and one row's box, from any node inside the <select> (`this`): where its
+# visible rows are (top / bottom of the client area), how far it is scrolled (st, of max), the row's
+# rect, and which rows are selected.
+LISTBOX_ROW = """function (a) {
+  const n = this.nodeType === 1 ? this : this.parentElement;
+  const e = n && n.closest('select');
+  if (!e || !e.options[a.i]) return null;
+  const r = e.getBoundingClientRect(), q = e.options[a.i].getBoundingClientRect();
+  return { box: [r.x, r.y, r.width, r.height], row: [q.x, q.y, q.width, q.height],
+    top: r.y + e.clientTop, bottom: r.y + e.clientTop + e.clientHeight,
+    st: e.scrollTop, max: e.scrollHeight - e.clientHeight,
+    sel: Array.from(e.options, x => x.selected) }; }"""
+# The first match of a plain-CSS selector, by the browser's own querySelectorAll in this world (the
+# page's hooks on its prototypes never see it): how many match, and the first one's box -- scrolled
+# into view first when `scroll` is set (centred, only if needed: what Playwright's
+# scroll_into_view_if_needed does). null when the selector is not CSS the browser accepts.
+CSS_BOX = """(a) => { let l;
+  try { l = document.querySelectorAll(a.sel); } catch (e) { return null; }
+  if (!l.length) return { n: 0 };
+  const e = l[0];
+  if (a.scroll) { if (e.scrollIntoViewIfNeeded) e.scrollIntoViewIfNeeded(true);
+                  else e.scrollIntoView({ block: 'center', inline: 'center' }); }
+  const r = e.getBoundingClientRect();
+  return { n: l.length, rect: [r.x, r.y, r.width, r.height] }; }"""
+# Scroll the window by [dx, dy] at once (no smooth-scroll animation to wait out) and return how far
+# it actually moved: the box humanize already holds moves by exactly that much.
+SCROLL_BY = """(d) => { const x = scrollX, y = scrollY;
+  scrollBy({ left: d[0], top: d[1], behavior: 'instant' });
+  return [scrollX - x, scrollY - y]; }"""

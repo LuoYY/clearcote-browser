@@ -1,29 +1,51 @@
-"""Opt-in Widevine CDM fetch + profile seeding (Windows).
+"""Widevine CDM fetch + profile seeding (Windows + Linux).
 
 clearcote is a 100%-open-source build, so it ships with the EME/Widevine *plumbing* compiled in
 (`enable_widevine=true`) but WITHOUT the proprietary Widevine CDM binary (Google's blob can't live
-in a FOSS package). This module lets a user *opt in* to fetching that CDM from Google's component
-server at runtime — exactly like a real Chrome receives it via the component updater — so
+in a FOSS package). This module fetches that CDM from Google's component server at runtime —
+exactly like a real Chrome receives it via the component updater — so
 `navigator.requestMediaKeySystemAccess('com.widevine.alpha')` resolves (DRM streaming works, and the
-EME surface matches a real Chrome on Windows instead of being a "no-Widevine" coherence tell).
+EME surface matches a real Chrome instead of being a "no-Widevine" coherence tell).
 
     from clearcote import fetch_widevine
     cdm_dir = fetch_widevine()          # downloads + verifies into ~/.clearcote/WidevineCdm
-    # then launch a PERSISTENT context with widevine=True (auto-seeds the hint file):
     ctx = clearcote.launch_persistent_context("profile", widevine=True)
 
-The CDM is fetched once and cached; `seed_widevine()` writes the component hint file into a
-user-data-dir so the engine loads it. By using YOUR opt-in fetch, the clearcote package itself never
-distributes Google's CDM.
+WHEN IT IS ON (since 0.48.0). A licensed launch (a licence key resolved: the launch that selects the
+PRO build, which claims the Google Chrome brand) on an engine with ``--widevine-cdm-path`` (r32+)
+loads the CDM by default. A free launch keeps it opt-in. ``widevine=False`` or CLEARCOTE_WIDEVINE=0
+turns it off, ``widevine=True`` or CLEARCOTE_WIDEVINE=1 turns it on for any launch; an explicit
+option wins over the environment. See :func:`widevine_mode`.
+
+The default is FAIL-SOFT and never waits on the network when a CDM is cached: a cached CDM is used at
+once (a stale one is refreshed in the background). Only the very first launch, with nothing cached,
+waits for the download, at most CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS (default 15, clamped to 1-600); when
+it fails (offline, a firewall, Google refusing the request) the launch goes on without Widevine and says
+so once per process, on stderr. The default path prints nothing else. A launch that ASKED for Widevine
+keeps the behaviour it always had: a failure prints a note (unless quiet) and the launch goes on without DRM.
+
+The CDM is fetched once and cached (CLEARCOTE_WIDEVINE_DIR, else ~/.clearcote/WidevineCdm); Google is
+asked for a newer one at most once a day, and a failed check counts as one (the cached CDM keeps working).
+Installs take the SDK's install lock in the cache directory and land with a rename (retried on Windows
+while a scanner holds the fresh tree), so concurrent first launches never see a half-extracted CDM. The
+version Google names must look like one (``4.10.2830.0``) before it is used as a directory name.
+`seed_widevine()` writes the component hint file into a user-data-dir so an older engine loads it.
+The clearcote package itself never distributes Google's CDM: it is downloaded from Google, on the
+user's machine.
 """
 
 import hashlib
 import io
 import json
 import os
+import re
+import shutil
 import struct
 import sys
+import threading
+import time
 import urllib.request
+import uuid
 import zipfile
 
 # The Widevine CDM component (Chrome's component-updater app id) + Google's Omaha JSON endpoint.
@@ -38,6 +60,20 @@ else:
     _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 HINT_FILE = "latest-component-updated-widevine-cdm"
+
+# Default-on Widevine (0.48.0). Same names, values and rules in the Node and .NET SDKs.
+WIDEVINE_ENV = "CLEARCOTE_WIDEVINE"  # 1/true/yes/on forces it on, 0/false/no/off off; an explicit option wins
+TIMEOUT_ENV = "CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS"  # how long a DEFAULT launch waits for a first download
+DEFAULT_TIMEOUT_SECONDS = 15.0
+MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS = 1.0, 600.0  # the variable is clamped to this range
+CHECK_INTERVAL_SECONDS = 24 * 3600  # ask Google for a newer CDM at most once a day
+RETRY_AFTER_SECONDS = 600.0  # a failed first download is not retried for 10 minutes in this process
+STAMP_FILE = ".last-check"  # in the cache root: mtime = the last update check (a failed one counts)
+VERSION_RE = re.compile(r"[0-9]+(\.[0-9]+){1,3}")  # a CDM version (ASCII digits); anything else never becomes a path
+LOCK_WAIT_SECONDS = 300.0  # how long an install waits for another process installing the CDM
+WARN_CODE = "widevine-default"
+_TRUTHY = ("1", "true", "yes", "on")
+_FALSY = ("0", "false", "no", "off")
 
 
 def _cdm_platform():
@@ -120,41 +156,295 @@ def _crx3_to_zip(data):
     return data[12 + header_len:]
 
 
-def fetch_widevine(dest=None, quiet=False):
-    """Download + verify the Windows x64 Widevine CDM into ``dest`` (default ~/.clearcote/WidevineCdm/
-    <version>). Returns the versioned CDM directory (contains manifest.json +
-    _platform_specific/win_x64/widevinecdm.dll). Re-fetch is skipped if already present."""
-    resp = _post_json(OMAHA_URL, _omaha_request_body())
-    url, sha256, version = _parse_update(resp)
-    root = dest or _cache_root()
-    ver_dir = os.path.join(root, version or "current")
+def _cdm_binary(ver_dir):
     _at, _p, _v, sub, fn = _cdm_platform()
-    dll = os.path.join(ver_dir, "_platform_specific", sub, fn)
-    if os.path.isfile(dll) and os.path.isfile(os.path.join(ver_dir, "manifest.json")):
+    return os.path.join(ver_dir, "_platform_specific", sub, fn)
+
+
+def _valid_cdm(ver_dir):
+    """A complete CDM directory: its manifest and this OS's CDM binary are both there."""
+    return bool(ver_dir) and os.path.isfile(_cdm_binary(ver_dir)) and \
+        os.path.isfile(os.path.join(ver_dir, "manifest.json"))
+
+
+def _version_key(name):
+    try:
+        return (1, tuple(int(p) for p in name.split(".")))
+    except ValueError:
+        return (0, ())  # "current" (no version in the update response) sorts below any real version
+
+
+def cached_cdm(root=None):
+    """The newest complete CDM in the cache (``root``, default the cache root), or None. No network."""
+    root = root or _cache_root()
+    try:
+        names = [n for n in os.listdir(root) if not n.startswith(".")]
+    except OSError:
+        return None
+    for name in sorted(names, key=_version_key, reverse=True):
+        ver_dir = os.path.join(root, name)
+        if _valid_cdm(ver_dir):
+            return ver_dir
+    return None
+
+
+def _stamp_fresh(root):
+    """Whether Google was asked for a newer CDM less than CHECK_INTERVAL_SECONDS ago."""
+    try:
+        age = time.time() - os.path.getmtime(os.path.join(root, STAMP_FILE))
+    except OSError:
+        return False
+    return -3600 < age < CHECK_INTERVAL_SECONDS  # a stamp from the future (clock moved back) is not fresh
+
+
+def _touch_stamp(root):
+    try:
+        with open(os.path.join(root, STAMP_FILE), "w", encoding="utf-8") as handle:
+            handle.write(str(int(time.time())))
+    except OSError:
+        pass
+
+
+def _sweep_leftovers(root):
+    """Remove what an interrupted install left in the cache root. Only called under the install lock,
+    so no installer is using them."""
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith((".tmp-", ".trash-")):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
+def _version_dir(root, version):
+    """``root``/<version>, once ``version`` looks like a CDM version (``4.10.2830.0``). The version comes from
+    Google's update response: anything else (``../victim``, an absolute path) is refused before it can name, or
+    delete, a directory. No version at all means ``current``."""
+    if not version:
+        return os.path.join(root, "current")
+    if not VERSION_RE.fullmatch(str(version)):
+        raise RuntimeError("Widevine update response named an unexpected version %r — refusing to use it"
+                           % (str(version)[:80],))
+    return os.path.join(root, version)
+
+
+def _install(root, url, sha256, version, quiet):
+    """Download, verify and install one CDM version into ``root``/<version>. Holds the SDK's install
+    lock (``root``/.install-lock, the protocol in download.py) so concurrent first launches take turns,
+    extracts into ``root``/.tmp-<id> and renames the finished tree into place: a reader never sees a
+    half-extracted CDM. The renames are download.py's, which retry while a Windows scanner holds a file in
+    the fresh tree."""
+    from .download import _install_lock, _rename_dir
+
+    ver_dir = _version_dir(root, version)
+    os.makedirs(root, exist_ok=True)
+    with _install_lock(root, quiet=True, timeout=LOCK_WAIT_SECONDS):
+        if _valid_cdm(ver_dir):  # another process installed it while we waited
+            return ver_dir
+        _sweep_leftovers(root)
         if not quiet:
-            print("[widevine] already present:", ver_dir)
-        return ver_dir
-    if not quiet:
-        print("[widevine] fetching CDM %s" % (version or "(latest)"))
-    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": _UA}),
-                                timeout=120) as r:
-        blob = r.read()
-    # The CDM is a NATIVE DLL loaded into the browser process — never install it unverified. A
-    # missing hash in the update response is treated as a hard failure, not a skip.
-    if not sha256:
-        raise RuntimeError("Widevine update response had no sha256 — refusing to install an "
-                           "unverified CDM")
-    if hashlib.sha256(blob).hexdigest() != sha256.lower():
-        raise RuntimeError("Widevine CDM sha256 mismatch — refusing to install")
-    os.makedirs(ver_dir, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(_crx3_to_zip(blob))) as zf:
-        zf.extractall(ver_dir)
-    if not os.path.isfile(dll):
-        # some CRX layouts nest the platform dir differently; surface a clear error
-        raise RuntimeError("extracted CDM but the CDM binary was not at %s" % dll)
+            print("[widevine] fetching CDM %s" % (version or "(latest)"))
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": _UA}),
+                                    timeout=120) as r:
+            blob = r.read()
+        if hashlib.sha256(blob).hexdigest() != sha256.lower():
+            raise RuntimeError("Widevine CDM sha256 mismatch — refusing to install")
+        tmp = os.path.join(root, ".tmp-" + uuid.uuid4().hex)
+        try:
+            os.makedirs(tmp)
+            with zipfile.ZipFile(io.BytesIO(_crx3_to_zip(blob))) as zf:
+                zf.extractall(tmp)
+            if not _valid_cdm(tmp):
+                # some CRX layouts nest the platform dir differently; surface a clear error
+                raise RuntimeError("extracted CDM but the CDM binary was not at %s"
+                                   % _cdm_binary(ver_dir))
+            if os.path.lexists(ver_dir):  # an incomplete tree (an older SDK extracted in place): move it aside
+                trash = os.path.join(root, ".trash-" + uuid.uuid4().hex)
+                _rename_dir(ver_dir, trash)
+                shutil.rmtree(trash, ignore_errors=True)
+            _rename_dir(tmp, ver_dir)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     if not quiet:
         print("[widevine] installed:", ver_dir)
     return ver_dir
+
+
+def fetch_widevine(dest=None, quiet=False):
+    """Download + verify the current OS's x64 Widevine CDM into ``dest`` (default
+    CLEARCOTE_WIDEVINE_DIR, else ~/.clearcote/WidevineCdm) as <version>/. Returns the versioned CDM
+    directory (manifest.json + _platform_specific/<os>_x64/<cdm binary>).
+
+    Always asks Google's update server for the latest version; the download is skipped when that
+    version is already installed. Installs take the install lock and land with a rename (see
+    :func:`_install`). A version that does not look like one is refused (see :func:`_version_dir`)."""
+    resp = _post_json(OMAHA_URL, _omaha_request_body())
+    url, sha256, version = _parse_update(resp)
+    root = dest or _cache_root()
+    ver_dir = _version_dir(root, version)
+    if _valid_cdm(ver_dir):
+        _touch_stamp(root)
+        if not quiet:
+            print("[widevine] already present:", ver_dir)
+        return ver_dir
+    # The CDM is a NATIVE library loaded into the browser process — never install it unverified. A
+    # missing hash in the update response is a hard failure, not a skip (checked before downloading).
+    if not sha256:
+        raise RuntimeError("Widevine update response had no sha256 — refusing to install an "
+                           "unverified CDM")
+    ver_dir = _install(root, url, sha256, version, quiet)
+    _touch_stamp(root)
+    return ver_dir
+
+
+def resolve_cdm(quiet=False):
+    """The CDM directory a launch should use, network only when needed.
+
+    The cached CDM when Google was asked within the last day (no network); otherwise
+    :func:`fetch_widevine` (one update check, a download only for a new version). When that fails --
+    offline, a firewall, Google refusing the request -- the CDM already on disk still works and is
+    used, and the failed check is recorded (the stamp is touched), so no launch asks again for a day.
+    Raises only when there is no CDM at all."""
+    root = _cache_root()
+    cached = cached_cdm(root)
+    if cached and _stamp_fresh(root):
+        return cached
+    try:
+        return fetch_widevine(quiet=quiet)  # module global, looked up per call (tests stand in for it)
+    except Exception:
+        if cached:
+            _touch_stamp(root)
+            return cached
+        raise
+
+
+def widevine_mode(option, licensed, env=None):
+    """``"explicit"``, ``"default"`` or ``"off"`` for a launch.
+
+    ``option`` (the ``widevine`` launch option) wins: True -> explicit, False -> off. Unset follows
+    CLEARCOTE_WIDEVINE (1/true/yes/on -> explicit, 0/false/no/off -> off). Otherwise a licensed launch
+    (``licensed``: a licence key resolved, which selects the PRO build) gets the default, and a free
+    launch stays off. Same rules in the Node and .NET SDKs."""
+    if option is not None:
+        return "explicit" if option else "off"
+    env = os.environ if env is None else env
+    value = str(env.get(WIDEVINE_ENV) or "").strip().lower()
+    if value in _TRUTHY:
+        return "explicit"
+    if value in _FALSY:
+        return "off"
+    return "default" if licensed else "off"
+
+
+def timeout_seconds(env=None):
+    """How long a default (not requested) launch waits for a first download: CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS,
+    clamped to 1-600, else 15. An unparsable or non-positive value (or NaN) falls back to 15."""
+    env = os.environ if env is None else env
+    try:
+        value = float(str(env.get(TIMEOUT_ENV) or "").strip())
+    except ValueError:
+        return DEFAULT_TIMEOUT_SECONDS
+    if not value > 0:  # also NaN
+        return DEFAULT_TIMEOUT_SECONDS
+    return min(max(value, MIN_TIMEOUT_SECONDS), MAX_TIMEOUT_SECONDS)
+
+
+# The default path's process state: the first download in flight (one at a time), the background refresh of a
+# stale cached CDM (one at a time), and when a first download last failed.
+_DEFAULT_LOCK = threading.Lock()
+_DEFAULT = {"job": None, "refresh": None, "failed_at": None}
+
+
+def _reset_default_state():
+    """Tests: forget the in-flight fetch, the refresh and the last failure."""
+    with _DEFAULT_LOCK:
+        _DEFAULT["job"] = None
+        _DEFAULT["refresh"] = None
+        _DEFAULT["failed_at"] = None
+
+
+def _warn_default(reason, quiet):
+    from ._warnings import warn_once
+    warn_once(WARN_CODE,
+              "Widevine is on by default for licensed launches, but the CDM could not be loaded (%s); "
+              "launching without it. Set CLEARCOTE_WIDEVINE=0 (or pass widevine=False) to stop trying."
+              % reason, quiet=quiet)
+
+
+def _refresh_in_background():
+    """Ask Google whether a newer CDM exists, without anyone waiting: a daemon thread, one at a time, quiet.
+    :func:`resolve_cdm` records a failed check (stamp), so a broken network is asked once a day."""
+    with _DEFAULT_LOCK:
+        running = _DEFAULT["refresh"]
+        if running is not None and running.is_alive():
+            return running
+
+        def run():
+            try:
+                resolve_cdm(quiet=True)
+            except Exception:  # noqa: BLE001, S110 - the cached CDM keeps working; nothing to report
+                pass
+
+        thread = threading.Thread(target=run, name="clearcote-widevine-refresh", daemon=True)
+        _DEFAULT["refresh"] = thread
+        thread.start()
+        return thread
+
+
+def default_cdm(quiet=False, timeout=None):
+    """The CDM for a launch that did not ask for Widevine (the licensed default), or None.
+
+    A CDM in the cache is used AT ONCE, with no network on the launch path; when its last update check is
+    over a day old, a background thread asks Google for a newer one (it is used from the next launch on).
+    Only with nothing cached does the launch wait for a download, at most ``timeout`` seconds (default
+    :func:`timeout_seconds`). FAIL-SOFT: never raises. When there is no CDM to use (the download failed or
+    did not finish in time) it warns once per process on stderr (unless quiet) and answers None, so the
+    launch goes on without DRM; the download is not retried for RETRY_AFTER_SECONDS in this process, and one
+    still running after the wait carries on in the background (a later launch uses what it installs). The
+    fetches here are quiet: the default path never prints progress."""
+    root = _cache_root()
+    cached = cached_cdm(root)
+    if cached:
+        if not _stamp_fresh(root):
+            _refresh_in_background()
+        return cached
+    wait = timeout_seconds() if timeout is None else timeout
+    with _DEFAULT_LOCK:
+        job = _DEFAULT["job"]
+        failed_at = _DEFAULT["failed_at"]
+        running = job is not None and job["thread"].is_alive()
+        if failed_at is not None and time.monotonic() - failed_at < RETRY_AFTER_SECONDS:
+            return None  # failed (or timed out) recently: launch at once, without waiting again
+        if not running:
+            job = {"result": None, "error": None}
+
+            def run(box=job):
+                try:
+                    box["result"] = resolve_cdm(quiet=True)
+                except BaseException as exc:  # noqa: BLE001 - reported to the waiting launch
+                    box["error"] = exc
+
+            job["thread"] = threading.Thread(target=run, name="clearcote-widevine", daemon=True)
+            _DEFAULT["job"] = job
+            job["thread"].start()
+    job["thread"].join(wait)
+    if job["thread"].is_alive():
+        with _DEFAULT_LOCK:
+            _DEFAULT["failed_at"] = time.monotonic()
+        _warn_default("not ready within %g s" % wait, quiet)
+        return None
+    if job["error"] is not None:
+        with _DEFAULT_LOCK:
+            _DEFAULT["failed_at"] = time.monotonic()
+        _warn_default(_short_reason(job["error"]), quiet)
+        return None
+    return job["result"]
+
+
+def _short_reason(exc):
+    text = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    return "%s: %s" % (type(exc).__name__, text[:160]) if text else type(exc).__name__
 
 
 def apply_widevine_launch(user_data_dir, kwargs, quiet=False):
@@ -201,9 +491,9 @@ def apply_widevine_launch(user_data_dir, kwargs, quiet=False):
 
 def seed_widevine(user_data_dir, cdm_dir=None, quiet=False):
     """Make a persistent profile load the fetched CDM: copy it under <user_data_dir>/WidevineCdm/
-    <version>/ and write the component hint file the engine reads. Fetches the CDM first if needed.
-    No-op-safe to call on every launch."""
-    src = cdm_dir or fetch_widevine(quiet=quiet)
+    <version>/ and write the component hint file the engine reads. Fetches the CDM first if needed
+    (:func:`resolve_cdm`: the cached one when it is current). No-op-safe to call on every launch."""
+    src = cdm_dir or resolve_cdm(quiet=quiet)
     version = os.path.basename(src.rstrip(os.sep))
     wv_root = os.path.join(user_data_dir, "WidevineCdm")
     target = os.path.join(wv_root, version)
@@ -226,13 +516,36 @@ def seed_widevine(user_data_dir, cdm_dir=None, quiet=False):
 def widevine_cdm_args(exe, quiet=False):
     """``["--widevine-cdm-path=<the fetched CDM>"]`` when the engine implements that switch (patch 1022),
     else ``[]``. Such an engine registers the CDM at startup in every profile, Playwright's throwaway ones
-    included, so DRM no longer depends on the component updater; the hint file that
-    :func:`apply_widevine_launch` seeds keeps older engines working. Best-effort, like the rest of DRM:
-    any failure answers ``[]`` and the launch goes on."""
+    and incognito launches included, so DRM no longer depends on the component updater; the hint file
+    that :func:`apply_widevine_launch` seeds keeps older engines working. Best-effort, like the rest of
+    DRM: any failure answers ``[]`` and the launch goes on."""
     try:
         from ._launchopts import engine_supports_switch
         if not engine_supports_switch(exe, "widevine-cdm-path"):
             return []
-        return ["--widevine-cdm-path=" + fetch_widevine(quiet=quiet)]
+        return ["--widevine-cdm-path=" + resolve_cdm(quiet=quiet)]
     except Exception:
         return []
+
+
+def _caller_set_cdm_path(user_args):
+    return any(str(a).split("=", 1)[0] == "--widevine-cdm-path" for a in (user_args or ()))
+
+
+def widevine_launch_args(exe, option, licensed, user_args=(), quiet=False, timeout=None):
+    """The Widevine switch for one launch, by :func:`widevine_mode`.
+
+    explicit: :func:`widevine_cdm_args` (the behaviour ``widevine=True`` always had). default: the
+    same switch, only on an engine that implements it (r32+; an older engine keeps the old default,
+    off), with the CDM from :func:`default_cdm` (bounded, fail-soft, warns once). off: nothing. A
+    ``--widevine-cdm-path`` the caller put in ``args`` is theirs: nothing is added then."""
+    mode = widevine_mode(option, licensed)
+    if mode == "off" or _caller_set_cdm_path(user_args):
+        return []
+    if mode == "explicit":
+        return widevine_cdm_args(exe, quiet=quiet)
+    from ._launchopts import engine_supports_switch
+    if not engine_supports_switch(exe, "widevine-cdm-path"):
+        return []
+    cdm = default_cdm(quiet=quiet, timeout=timeout)
+    return ["--widevine-cdm-path=" + cdm] if cdm else []

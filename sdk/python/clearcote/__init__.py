@@ -83,7 +83,9 @@ from ._profileauto import (
 )
 from ._render import check_render_coherence
 from ._warnings import emit_coherence_warnings
-from ._widevine import apply_widevine_launch, fetch_widevine, seed_widevine, widevine_cdm_args
+from ._widevine import (  # noqa: F401  (widevine_cdm_args re-exported for tests)
+    apply_widevine_launch, fetch_widevine, seed_widevine, widevine_cdm_args, widevine_launch_args, widevine_mode,
+)
 from ._license import (
     STALE_TOKEN_REFUSAL,
     ConcurrencyLimitError,
@@ -354,10 +356,12 @@ def _apply_auto_profile(fp, exe, select, quiet=False, pro=None, lease=None):
     # _cc_lease: run the probe on the CALLER's slot. Checking out a second one deadlocks the
     # caller against itself on a per-browser plan, and the probe is strictly inside this launch.
     # cloud=False: the probe measures THIS host, whatever CLEARCOTE_CLOUD says.
+    # widevine=False: the probe reads GPU + display only; the CDM (on by default for a licensed launch)
+    # would only cost it a fetch.
     host = measure_host(
         lambda **kw: launch(
             license_key=license_key, license_api_base=api_base, ephemeral_profile=False,
-            _cc_lease=lease, cloud=False, docker=False, **kw
+            _cc_lease=lease, cloud=False, docker=False, widevine=False, **kw
         ),
         exe,
         major,
@@ -423,9 +427,11 @@ def _prepare(kwargs):
     geoip = kwargs.pop("geoip", False)
     humanize = kwargs.pop("humanize", False)
     show_cursor = kwargs.pop("show_cursor", False)
-    # widevine= is seeded into a persistent profile by launch_persistent_context; pop it here so it
-    # never leaks to Playwright from launch()/the async path (incognito can't load the component CDM).
-    kwargs.pop("widevine", None)
+    # widevine: True/False/None (None = CLEARCOTE_WIDEVINE, else on for a licensed launch). The profile
+    # seeding for widevine=True happens in launch_persistent_context; the --widevine-cdm-path switch is
+    # added below, for every launch path (an engine with it loads the CDM without a profile, incognito
+    # included). Popped here so it never leaks to Playwright.
+    widevine = kwargs.pop("widevine", None)
     fp = {k: kwargs.pop(k) for k in list(kwargs) if k in FINGERPRINT_KEYS}
     agent = {k: kwargs.pop(k) for k in list(kwargs) if k in AGENT_KEYS}
     exe_path = kwargs.pop("executable_path", None)
@@ -544,6 +550,11 @@ def _prepare(kwargs):
     # Last: drop 152 r22+ switches this engine does not implement (with a warning), wherever they
     # came from.
     args, _gate_notes = gate_engine_switches(exe, args, quiet=quiet)
+    # Widevine: on by default for a licensed launch (_cc_pro: the key that selects the PRO build, which
+    # claims the Google Chrome brand) on an engine with --widevine-cdm-path; opt-in for a free one.
+    # The default is bounded and fail-soft (see _widevine.default_cdm); widevine=True keeps its old
+    # best-effort behaviour. The engine was probed already, so this goes after the gate.
+    args = args + widevine_launch_args(exe, widevine, bool(_cc_pro), user, quiet=quiet)
     # Drop Playwright's default automation flag so the engine's AutomationControlled feature stays
     # OFF (it otherwise flips navigator.webdriver-adjacent tells), --enable-unsafe-swiftshader and the
     # headless --hide-scrollbars (see DEFAULT_IGNORED_ARGS). The control transport (--remote-debugging-pipe) is left intact.
@@ -1055,8 +1066,10 @@ def launch(cloud=None, **kwargs):
     gpu_vendor, gpu_renderer, hardware_concurrency, location, timezone, accept_language,
     webrtc_ip, disable_gpu_fingerprint. Pass geoip=True to resolve the proxy's exit-IP geo and
     auto-fill any unset timezone/accept_language/location. Pass license_key=... (or set
-    CLEARCOTE_LICENSE_KEY) to check out a concurrency slot for the PRO engine. All other kwargs
-    (headless, proxy, args, timeout, ...) pass through to Playwright.
+    CLEARCOTE_LICENSE_KEY) to check out a concurrency slot for the PRO engine. ``widevine``: Google's
+    Widevine CDM, on by default for a licensed launch and opt-in for a free one (see
+    :func:`launch_persistent_context`). All other kwargs (headless, proxy, args, timeout, ...) pass
+    through to Playwright.
 
     PROFILE-BACKED BY DEFAULT (changed in 0.23.0). This used to be ``chromium.launch()`` —
     incognito, no profile directory. Incognito cannot load a component-updated CDM, so
@@ -1137,9 +1150,15 @@ def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
     """Launch Clearcote with a persistent profile directory; returns a Playwright
     ``BrowserContext`` (cookies/storage persist in ``user_data_dir``).
 
-    Pass ``widevine=True`` to seed + enable the (opt-in, user-fetched) Widevine CDM so DRM/EME works
+    WIDEVINE. A licensed launch (licence key set: the PRO build, branded Google Chrome) on an engine
+    with ``--widevine-cdm-path`` (r32+) loads Google's Widevine CDM by default, so DRM/EME works
     (``requestMediaKeySystemAccess('com.widevine.alpha')`` resolves) and the EME surface matches a
-    real Chrome instead of being a no-Widevine tell.
+    real Chrome instead of being a no-Widevine tell. The CDM is downloaded from Google on first use
+    and cached; later launches use the cache with no network. When the first download cannot be had in
+    CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS (default 15) the launch goes on without it and warns once (stderr).
+    CLEARCOTE_WIDEVINE=0 (or ``widevine=False``) turns it off. A
+    free launch stays opt-in: ``widevine=True`` (or CLEARCOTE_WIDEVINE=1) fetches the CDM, seeds it
+    into this profile and enables it.
 
     CLOUD: ``launch_persistent_context(cloud=True, profile="name")`` returns the context of a hosted
     session that loads the cloud profile ``name`` and saves it back when the context closes (which
@@ -1155,9 +1174,11 @@ def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
     # --disable-component-update to it rather than replacing it (which would lose the AutomationControlled
     # strip on Widevine launches).
     kwargs.setdefault("ignore_default_args", list(DEFAULT_IGNORED_ARGS))
-    widevine, wv_quiet = bool(kwargs.get("widevine")), kwargs.get("quiet", False)
-    if widevine:
-        apply_widevine_launch(user_data_dir, kwargs, quiet=wv_quiet)
+    # Widevine ASKED FOR (widevine=True or CLEARCOTE_WIDEVINE=1): seed the CDM into this profile too, so
+    # an engine without --widevine-cdm-path loads it (best-effort, as always). The licensed DEFAULT only
+    # uses that switch, which _prepare adds (with the explicit case's) once the engine is known.
+    if widevine_mode(kwargs.get("widevine"), licensed=False) == "explicit":
+        apply_widevine_launch(user_data_dir, kwargs, quiet=kwargs.get("quiet", False))
     shader_dialect = kwargs.pop("shader_dialect", None)  # popped before _prepare: not a PW option
     persona_env = kwargs.pop("persona_env", None)  # 1021 env mode (_personaenv.py): not a PW option
     font_dirs = check_font_dirs(kwargs.pop("font_dirs", None))  # Linux fontconfig dirs; a typo raises before the lease
@@ -1183,9 +1204,7 @@ def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
         geom = apply_headless_geometry(pw_kwargs, seed, args)
     if engine_decides_color_scheme(exe):  # r32+: the persona's colour scheme, not Playwright's light
         default_color_scheme(pw_kwargs)
-    launch_args = _with_geometry_args(args, geom)
-    if widevine:
-        launch_args = launch_args + widevine_cdm_args(exe, quiet=wv_quiet)
+    launch_args = _with_geometry_args(args, geom)  # carries --widevine-cdm-path when on (see _prepare)
     launch_args = _personaenv.apply_to_pw_kwargs(exe, launch_args, pw_kwargs, persona_env)
     context = _release_lease_on_failure(lease if owns_lease else None, lambda: _retry_on_stale_run_token(
         lease, pw_kwargs, launch_token, lambda: _win_av_retry(

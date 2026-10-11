@@ -1059,6 +1059,10 @@ export function cloudSessionOf(target: Browser | BrowserContext): Json | undefin
 function prepareLaunch(options: Record<string, unknown>, persistent: boolean, userDataDir?: string | null) {
   const opts: Record<string, unknown> = { ...options };
   delete opts.cloud;
+  // widevine: false (or unset): the opt-out of the licensed LOCAL default. A hosted browser loads its own CDM, so
+  // there is nothing to turn off here: dropped, so code written for both (and the warning's advice) works with
+  // cloud: true. widevine: true is still refused, as before.
+  if ("widevine" in opts && !opts.widevine) delete opts.widevine;
   const sdk: Record<string, unknown> = {};
   for (const k of SDK_SIDE_OPTIONS) {
     if (k in opts) {

@@ -25,11 +25,35 @@ public sealed class IsolatedWorld
     private readonly IPage _page;
     private ICDPSession? _cdp;
     private int? _ctx;
+    private string? _frame;
 
     private IsolatedWorld(IPage page) => _page = page;
 
     /// The page's isolated world (created on first use).
     public static IsolatedWorld For(IPage page) => Worlds.GetValue(page, p => new IsolatedWorld(p));
+
+    private async Task EnsureAsync()
+    {
+        _cdp ??= await _page.Context.NewCDPSessionAsync(_page).ConfigureAwait(false);
+        if (_ctx is null)
+        {
+            var tree = await _cdp.SendAsync("Page.getFrameTree").ConfigureAwait(false);
+            _frame = tree!.Value.GetProperty("frameTree").GetProperty("frame").GetProperty("id").GetString();
+            var created = await _cdp.SendAsync("Page.createIsolatedWorld",
+                new Dictionary<string, object> { ["frameId"] = _frame! }).ConfigureAwait(false);
+            _ctx = created!.Value.GetProperty("executionContextId").GetInt32();
+        }
+    }
+
+    private static JsonElement? Value(JsonElement? r)
+    {
+        if (r is not { } res || res.ValueKind != JsonValueKind.Object || res.TryGetProperty("exceptionDetails", out _))
+            return null;
+        return res.TryGetProperty("result", out var result) && result.ValueKind == JsonValueKind.Object
+               && result.TryGetProperty("value", out var value)
+            ? value.Clone()
+            : null;
+    }
 
     /// Run <c>(fnSource)(arg)</c> (<paramref name="arg"/> JSON-serialisable) and return its JSON value,
     /// or null.
@@ -39,25 +63,125 @@ public sealed class IsolatedWorld
         {
             try
             {
-                _cdp ??= await _page.Context.NewCDPSessionAsync(_page).ConfigureAwait(false);
-                if (_ctx is null)
-                {
-                    var tree = await _cdp.SendAsync("Page.getFrameTree").ConfigureAwait(false);
-                    var frameId = tree!.Value.GetProperty("frameTree").GetProperty("frame").GetProperty("id").GetString();
-                    var created = await _cdp.SendAsync("Page.createIsolatedWorld",
-                        new Dictionary<string, object> { ["frameId"] = frameId! }).ConfigureAwait(false);
-                    _ctx = created!.Value.GetProperty("executionContextId").GetInt32();
-                }
-                var r = await _cdp.SendAsync("Runtime.evaluate", new Dictionary<string, object>
+                await EnsureAsync().ConfigureAwait(false);
+                var r = await _cdp!.SendAsync("Runtime.evaluate", new Dictionary<string, object>
                 {
                     ["expression"] = $"({fnSource})({JsonSerializer.Serialize(arg)})",
-                    ["contextId"] = _ctx.Value,
+                    ["contextId"] = _ctx!.Value,
                     ["returnByValue"] = true,
                 }).ConfigureAwait(false);
-                if (r is not { } res || res.TryGetProperty("exceptionDetails", out _)) return null;
-                return res.TryGetProperty("result", out var result) && result.TryGetProperty("value", out var value)
-                    ? value.Clone()
-                    : null;
+                return Value(r);
+            }
+            catch (Exception)
+            {
+                _ctx = null;
+            }
+        }
+        return null;
+    }
+
+    /// A raw CDP call on this page's session (DOM reads that run no script), or null when it fails.
+    internal async Task<JsonElement?> SendAsync(string method, Dictionary<string, object>? args = null)
+    {
+        try
+        {
+            _cdp ??= await _page.Context.NewCDPSessionAsync(_page).ConfigureAwait(false);
+            var r = await _cdp.SendAsync(method, args ?? new Dictionary<string, object>()).ConfigureAwait(false);
+            return r?.Clone();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// The main frame's (scrollX, scrollY), read in the isolated world; (0, 0) if unknown.
+    internal async Task<(double X, double Y)> ScrollAsync()
+    {
+        var s = await EvaluateAsync(Scroll).ConfigureAwait(false);
+        return s is { ValueKind: JsonValueKind.Array } a && a.GetArrayLength() == 2
+               && a[0].ValueKind == JsonValueKind.Number && a[1].ValueKind == JsonValueKind.Number
+            ? (a[0].GetDouble(), a[1].GetDouble())
+            : (0.0, 0.0);
+    }
+
+    // DOM.getNodeForLocation hit-tests in DOCUMENT coordinates (the viewport point plus the scroll
+    // offset); Playwright's boxes, CDP's box model and the mouse are all VIEWPORT coordinates. Measured
+    // on r37: a field scrolled 547 px down answered "No node found" at its viewport centre and the input
+    // itself at centre + scroll.
+    internal static Dictionary<string, object> NodeAtParams(double x, double y, (double X, double Y)? scroll)
+    {
+        var (sx, sy) = scroll ?? (0, 0);
+        return new Dictionary<string, object>
+        {
+            // Math.Round's default (to even) is Python's round().
+            ["x"] = (int)Math.Round(x + sx), ["y"] = (int)Math.Round(y + sy),
+            ["includeUserAgentShadowDOM"] = false, ["ignorePointerEventsNone"] = true,
+        };
+    }
+
+    /// backendNodeId of the MAIN-FRAME element at viewport point (x, y), or null. <paramref name="scroll"/>:
+    /// the page's (scrollX, scrollY) if the caller already has it (read here otherwise).
+    ///
+    /// <para>CDP's hit test (DOM.getNodeForLocation) runs in the renderer with no script at all, so this is
+    /// how humanize finds the element a Playwright locator means -- GetByRole, GetByLabel, <c>&gt;&gt; nth=</c>,
+    /// Filter() -- without document.querySelector, which cannot parse those selectors.</para>
+    internal async Task<int?> NodeAtAsync(double x, double y, (double X, double Y)? scroll = null)
+    {
+        try
+        {
+            await EnsureAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            _ctx = null;
+            return null;
+        }
+        var hit = await SendAsync("DOM.getNodeForLocation",
+            NodeAtParams(x, y, scroll ?? await ScrollAsync().ConfigureAwait(false))).ConfigureAwait(false);
+        if (hit is not { ValueKind: JsonValueKind.Object } h || !h.TryGetProperty("backendNodeId", out var id)
+            || id.ValueKind != JsonValueKind.Number)
+            return null;
+        if (h.TryGetProperty("frameId", out var f) && f.ValueKind == JsonValueKind.String
+            && !string.IsNullOrEmpty(f.GetString()) && _frame is not null && f.GetString() != _frame)
+            return null;   // inside an iframe: not this world's document
+        return id.GetInt32();
+    }
+
+    /// Run <paramref name="fnSource"/> -- a <c>function (arg) { ... }</c> whose <c>this</c> is the node --
+    /// in the isolated world and return its JSON value, or null.
+    internal async Task<JsonElement?> CallOnNodeAsync(int backendNodeId, string fnSource, object? arg = null)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                await EnsureAsync().ConfigureAwait(false);
+                var resolved = await _cdp!.SendAsync("DOM.resolveNode", new Dictionary<string, object>
+                {
+                    ["backendNodeId"] = backendNodeId, ["executionContextId"] = _ctx!.Value,
+                }).ConfigureAwait(false);
+                var objectId = resolved!.Value.GetProperty("object").GetProperty("objectId").GetString()!;
+                try
+                {
+                    var r = await _cdp.SendAsync("Runtime.callFunctionOn", new Dictionary<string, object>
+                    {
+                        ["objectId"] = objectId,
+                        ["functionDeclaration"] = fnSource,
+                        ["arguments"] = new object[] { new Dictionary<string, object?> { ["value"] = arg } },
+                        ["returnByValue"] = true,
+                    }).ConfigureAwait(false);
+                    return Value(r);
+                }
+                finally
+                {
+                    try
+                    {
+                        await _cdp.SendAsync("Runtime.releaseObject",
+                            new Dictionary<string, object> { ["objectId"] = objectId }).ConfigureAwait(false);
+                    }
+                    catch (Exception) { /* best effort */ }
+                }
             }
             catch (Exception)
             {
@@ -77,4 +201,97 @@ public sealed class IsolatedWorld
         const b = el.getBoundingClientRect();
         return (b.width && b.height) ? { x: b.x, y: b.y, w: b.width, h: b.height } : null;
     }";
+
+    // The sources below are copied verbatim from sdk/python/clearcote/_isolated.py.
+    internal const string Scroll = "() => [scrollX, scrollY]";
+
+    // The value of whatever has focus (input/textarea value, or a contenteditable's text): how the typing
+    // path checks that a fat-finger key actually landed before it deletes anything.
+    internal const string ActiveValue = @"() => { let e = document.activeElement;
+  while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (!e || e.tagName === 'IFRAME' || e.tagName === 'FRAME') return null;
+  if (typeof e.value === 'string' && e.tagName !== 'BUTTON') return e.value;
+  return e.isContentEditable ? e.textContent : null; }";
+    // What the typo gate needs about the focused field (type / inputmode / autocomplete), or null.
+    // Focus inside an open shadow root is followed to the real field; focus inside a frame cannot be read
+    // from here, so it reports {frame: true} and the gate fails CLOSED (no slips in a card or login form
+    // that lives in an iframe).
+    internal const string ActiveField = @"() => { let e = document.activeElement; if (!e || e === document.body) return null;
+  while (e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') return { frame: true };
+  return { type: e.tagName === 'INPUT' ? e.type : '', inputmode: e.getAttribute('inputmode'),
+           autocomplete: e.getAttribute('autocomplete') }; }";
+    // Everything the form routes need about ONE element, read from the node the hit test found (a CDP
+    // callFunctionOn target: `this` is that node). `want` walks up to the control the locator means (a
+    // click on a <select>'s padding hits the select; one on a label's text does not, and then the caller
+    // tries another point). Returns null when no such ancestor exists.
+    internal const string Describe = @"function (a) {
+  let e = this.nodeType === 1 ? this : this.parentElement;
+  if (!e) return null;
+  if (a && a.want) { const c = e.closest(a.want); if (!c) return null; e = c; }
+  const r = e.getBoundingClientRect(), cs = getComputedStyle(e), tag = e.tagName.toLowerCase();
+  const o = { tag, type: tag === 'input' ? e.type : '', ce: !!e.isContentEditable,
+    rect: [r.x, r.y, r.width, r.height], focused: e === document.activeElement,
+    value: typeof e.value === 'string' ? e.value : (e.isContentEditable ? e.textContent : null),
+    min: e.getAttribute('min'), max: e.getAttribute('max'), step: e.getAttribute('step'),
+    maxlength: typeof e.maxLength === 'number' ? e.maxLength : -1,
+    inputmode: e.getAttribute('inputmode'), autocomplete: e.getAttribute('autocomplete'),
+    readonly: !!e.readOnly, disabled: !!e.disabled, dir: cs.direction, wm: cs.writingMode,
+    bl: e.clientLeft || 0, bt: e.clientTop || 0 };
+  if (tag === 'select') {
+    o.multiple = e.multiple; o.size = e.size; o.selectedIndex = e.selectedIndex;
+    o.options = Array.from(e.options, x => ({ value: x.value, label: x.label,
+      disabled: x.disabled || !!(x.parentElement && x.parentElement.tagName === 'OPTGROUP' && x.parentElement.disabled),
+      selected: x.selected }));
+    if (e.multiple || e.size > 1)
+      o.optRects = Array.from(e.options, x => { const q = x.getBoundingClientRect(); return [q.x, q.y, q.width, q.height]; });
+  }
+  return o; }";
+    // The controls a locator can mean for the form routes.
+    internal const string FormControl = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']";
+    // Does the element the browser's hit test found at a click point belong to the element whose box the
+    // caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
+    // that box? `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
+    // press). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
+    // element and back and performs a press whose events Playwright blocks, so a page saw a mousemove
+    // inside the target, a jump back and a pointerdown/click before every humanized click (verifier B).
+    internal const string HitInBox = @"function (b) {
+  let e = this.nodeType === 1 ? this : this.parentElement;
+  for (let n = 0; e && n < 128; n++) {
+    const r = e.getBoundingClientRect();
+    if (Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
+        Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5) return true;
+    const p = e.parentNode;
+    e = e.parentElement || (p && p.nodeType === 11 && p.host) || null;
+  }
+  return false; }";
+    // A list box's scroll state and one row's box, from any node inside the <select> (`this`): where its
+    // visible rows are (top / bottom of the client area), how far it is scrolled (st, of max), the row's
+    // rect, and which rows are selected.
+    internal const string ListboxRow = @"function (a) {
+  const n = this.nodeType === 1 ? this : this.parentElement;
+  const e = n && n.closest('select');
+  if (!e || !e.options[a.i]) return null;
+  const r = e.getBoundingClientRect(), q = e.options[a.i].getBoundingClientRect();
+  return { box: [r.x, r.y, r.width, r.height], row: [q.x, q.y, q.width, q.height],
+    top: r.y + e.clientTop, bottom: r.y + e.clientTop + e.clientHeight,
+    st: e.scrollTop, max: e.scrollHeight - e.clientHeight,
+    sel: Array.from(e.options, x => x.selected) }; }";
+    // The first match of a plain-CSS selector, by the browser's own querySelectorAll in this world (the
+    // page's hooks on its prototypes never see it): how many match, and the first one's box -- scrolled
+    // into view first when `scroll` is set (centred, only if needed: what Playwright's
+    // scroll_into_view_if_needed does). null when the selector is not CSS the browser accepts.
+    internal const string CssBox = @"(a) => { let l;
+  try { l = document.querySelectorAll(a.sel); } catch (e) { return null; }
+  if (!l.length) return { n: 0 };
+  const e = l[0];
+  if (a.scroll) { if (e.scrollIntoViewIfNeeded) e.scrollIntoViewIfNeeded(true);
+                  else e.scrollIntoView({ block: 'center', inline: 'center' }); }
+  const r = e.getBoundingClientRect();
+  return { n: l.length, rect: [r.x, r.y, r.width, r.height] }; }";
+    // Scroll the window by [dx, dy] at once (no smooth-scroll animation to wait out) and return how far
+    // it actually moved: the box humanize already holds moves by exactly that much.
+    internal const string ScrollBy = @"(d) => { const x = scrollX, y = scrollY;
+  scrollBy({ left: d[0], top: d[1], behavior: 'instant' });
+  return [scrollX - x, scrollY - y]; }";
 }

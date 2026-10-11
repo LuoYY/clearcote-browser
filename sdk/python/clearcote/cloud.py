@@ -1138,6 +1138,11 @@ def _prepare_launch(kwargs, persistent=False, user_data_dir=None):
     """Split launch kwargs into the SDK-side options and the API body. Pure: raises ValueError for
     an option a cloud browser cannot take before anything is created."""
     opts = dict(kwargs)
+    # widevine=False (or None): the opt-out of the licensed LOCAL default. A hosted browser loads its own CDM, so
+    # there is nothing to turn off here: dropped, so code written for both (and the warning's advice) works with
+    # cloud=True. widevine=True is still refused, as before.
+    if "widevine" in opts and not opts["widevine"]:
+        opts.pop("widevine")
     sdk = {k: opts.pop(k) for k in SDK_SIDE_OPTIONS if k in opts}
     if persistent:
         if user_data_dir is not None:

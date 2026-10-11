@@ -819,7 +819,8 @@ public static class Download
         }
     }
 
-    private static void MoveDir(string src, string dst)
+    /// Move a directory, retrying on Windows while a scanner holds a file in the fresh tree (also the Widevine install's).
+    internal static void MoveDir(string src, string dst)
     {
         for (var attempt = 0; ; attempt++)
         {

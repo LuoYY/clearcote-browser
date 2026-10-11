@@ -1,0 +1,142 @@
+<!doctype html>
+<!-- Shared live fixture for humanized form input (Python, Node and .NET live suites). Every input,
+     key and pointer event is recorded in window.__ev with its target id, isTrusted and a timestamp,
+     so a test can assert what a page would see. Opened as a file:// URL. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>humanize forms</title>
+<style>
+  body { font: 16px Arial, sans-serif; margin: 24px; }
+  .row { margin: 10px 0; }
+  .wrap { position: relative; display: inline-block; }
+  .floating { position: absolute; left: 4px; top: 2px; width: 220px; height: 18px; color: #888;
+              pointer-events: auto; background: rgba(255,255,255,.01); }
+  #btn, #trialbtn { width: 160px; height: 40px; }
+  #lb, #ms { width: 200px; }
+</style>
+</head>
+<body>
+<div class="row"><input id="name" type="text" autocomplete="name"></div>
+<div class="row"><input id="email" type="email"></div>
+<div class="row"><input id="pw" type="password"></div>
+<div class="row"><input id="num" type="number"></div>
+<div class="row"><input id="tel" type="tel"></div>
+<div class="row"><input id="url" type="url"></div>
+<div class="row"><input id="otp" type="text" autocomplete="one-time-code"></div>
+<div class="row"><input id="zip" type="text" maxlength="5"></div>
+<div class="row"><input id="masked" type="text" placeholder="digits only"></div>
+<div class="row"><input id="prefilled" type="text" value="old value here"></div>
+<div class="row"><label for="city">City</label> <input id="city" type="text"></div>
+<div class="row"><span class="wrap"><input id="float" type="text" style="width:240px"><span class="floating"
+  onclick="document.getElementById('float').focus()">Floating label</span></span></div>
+<div class="row"><textarea id="bio" rows="2" cols="30"></textarea></div>
+<div class="row"><div id="ce" contenteditable="true" style="border:1px solid #999;min-height:20px;width:240px"></div></div>
+
+<div class="row"><select id="country"></select></div>
+<div class="row"><select id="dup"><option value="p1">Paris</option><option value="p2">Paris</option>
+  <option value="l">London</option></select></div>
+<div class="row"><select id="dis"><option value="a">Alpha</option><option value="b" disabled>Bravo</option>
+  <option value="c">Charlie</option><option value="d" disabled>Delta</option><option value="e">Echo</option></select></div>
+<div class="row"><select id="lb" size="5"></select></div>
+<div class="row"><select id="ms" multiple size="4"></select></div>
+
+<div class="row"><input id="rng" type="range" min="0" max="200" step="5" value="20" style="width:300px"></div>
+<div class="row"><input id="rng2" type="range" min="3" max="20" step="4" value="3" style="width:300px"></div>
+<div class="row"><input id="rngrtl" type="range" min="0" max="100" value="80" dir="rtl" style="width:300px"></div>
+
+<div class="row"><input id="d" type="date"></div>
+<div class="row"><input id="dpre" type="date" value="2020-01-15"></div>
+<div class="row"><input id="t" type="time"></div>
+<div class="row"><input id="ts" type="time" step="1"></div>
+<div class="row"><input id="m" type="month"></div>
+<div class="row"><input id="w" type="week"></div>
+<div class="row"><input id="dtl" type="datetime-local"></div>
+<div class="row"><input id="col" type="color" value="#000000"></div>
+<div class="row"><input id="cb" type="checkbox"> <input id="rb" type="radio" name="r"></div>
+
+<div class="row"><button id="btn">Target</button> <button id="trialbtn">Trial</button>
+  <button class="dup">Twin</button> <button class="dup">Twin</button></div>
+
+<!-- Cases the first verification found missing (SC 197 verify-final-A). -->
+<div class="row"><iframe id="fr" style="width:420px;height:40px"
+  srcdoc="<input id='fi' value='old'> <input id='fpw' type='password' maxlength='5'>"></iframe></div>
+<div class="row"><span class="wrap"><input id="cov" type="text" value="old" style="width:200px"><span id="covlay"
+  style="position:absolute;left:0;top:0;width:210px;height:100%;background:rgba(0,0,0,.02)"></span></span></div>
+<div class="row"><input id="phone" type="tel" placeholder="(555) 123-4567"></div>
+<textarea id="helper" style="position:absolute;left:-9999px;top:0"></textarea>
+<div class="row"><button id="counter" onclick="window.__clicks = (window.__clicks || 0) + 1">Count</button>
+  <input id="stubborn" type="checkbox" onclick="return false"></div>
+<div class="row"><button id="hiddenbtn" style="visibility:hidden">Hidden</button>
+  <input id="hiddendate" type="date" style="visibility:hidden"></div>
+<div class="row"><span class="wrap"><select id="selfloat" style="width:200px"><option value="a">Alpha</option>
+  <option value="c">Charlie</option><option value="e">Echo</option></select><span class="floatsel"
+  style="position:absolute;left:25%;top:0;width:50%;height:100%;background:rgba(0,0,0,.02)"></span></span></div>
+<div class="row"><shadow-pw id="spw"></shadow-pw></div>
+
+<!-- Cases verifier B found (SC 197 verify-final-B). -->
+<div class="row"><select id="long"></select> <select id="same"></select> <select id="lbmid" size="6"></select></div>
+<div class="row"><div id="scroller" style="height:60px;width:260px;overflow:auto;border:1px solid #999">
+  <div style="height:220px">scrolled content</div><button id="innerbtn">Inner one</button><div style="height:120px"></div></div></div>
+<div style="height:1600px"></div>
+<div class="row"><button id="far">Far away</button></div>
+
+<script>
+(function () {
+  const COUNTRIES = ["Afghanistan","Albania","Algeria","Andorra","Angola","Argentina","Armenia","Australia","Austria",
+    "Belgium","Brazil","Bulgaria","Canada","Chile","China","Colombia","Croatia","Cyprus","Czechia","Denmark","Egypt",
+    "Estonia","Finland","France","Georgia","Germany","Ghana","Greece","Hungary","Iceland","India","Indonesia","Ireland",
+    "Israel","Italy","Japan","Jordan","Kenya","Latvia","Lithuania","Luxembourg","Malta","Mexico","Netherlands","Norway",
+    "Poland","Portugal","Romania","Spain","Sweden","Switzerland","Turkey","Ukraine","United Kingdom","United States","Uruguay"];
+  const country = document.getElementById('country');
+  COUNTRIES.forEach((c, i) => { const o = document.createElement('option'); o.value = c.slice(0, 3).toLowerCase() + i; o.textContent = c; country.appendChild(o); });
+  const lb = document.getElementById('lb');
+  for (let i = 0; i < 20; i++) { const o = document.createElement('option'); o.value = 'opt' + i; o.textContent = 'Option ' + i; lb.appendChild(o); }
+  const fillSel = (id, n, label, value) => { const s = document.getElementById(id);
+    for (let i = 0; i < n; i++) { const o = document.createElement('option'); o.value = value(i); o.textContent = label(i); s.appendChild(o); } };
+  const pad = (i, n) => String(i).padStart(n, '0');
+  fillSel('long', 400, i => 'Item ' + pad(i, 3), i => 'v' + pad(i, 3));   // labels share a SPACED prefix
+  fillSel('same', 120, i => 'Same', i => 's' + pad(i, 3));                 // nothing to type: arrows only
+  fillSel('lbmid', 25, i => 'Multi ' + pad(i, 2), i => 'm' + pad(i, 2));   // rows that need a mid-list scroll
+  const ms = document.getElementById('ms');
+  'abcdefghij'.split('').forEach(c => { const o = document.createElement('option'); o.value = c; o.textContent = 'Item ' + c.toUpperCase(); ms.appendChild(o); });
+  // a page-side input mask: anything but a digit is rejected before it lands
+  document.getElementById('masked').addEventListener('beforeinput', e => {
+    if (e.data && /\D/.test(e.data)) e.preventDefault();
+  });
+  // a REFORMATTING mask: digits are re-punctuated as (555) 123-4567 while typing
+  const phone = document.getElementById('phone');
+  phone.addEventListener('input', () => {
+    const d = phone.value.replace(/\D/g, '').slice(0, 10);
+    phone.value = d.length > 6 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`
+                : d.length > 3 ? `(${d.slice(0, 3)}) ${d.slice(3)}` : d;
+  });
+  // a password field inside an open shadow root (web components, embedded logins)
+  customElements.define('shadow-pw', class extends HTMLElement {
+    constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = "<input id='inner' type='password'>"; }
+  });
+  // The recorder reads a contenteditable's text through the getter saved HERE, so a test that hooks
+  // Node.prototype.textContent (to count the reads humanize causes in the page's world) counts none of its own.
+  const TEXT = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').get;
+  window.__ev = [];
+  const T = ['keydown','keyup','input','change','beforeinput','mousedown','mouseup','click','dblclick','auxclick',
+             'contextmenu','pointerdown','pointerup','focus','wheel','scroll','mousemove'];
+  for (const t of T) {
+    document.addEventListener(t, e => {
+      const el = e.target && e.target.nodeType === 1 ? e.target : null;
+      if (t === 'mousemove' && __ev.length && __ev[__ev.length - 1].t === 'mousemove') {
+        __ev[__ev.length - 1].n++; return;   // collapse move runs: count only
+      }
+      __ev.push({ t, id: el ? (el.id || el.className || el.tagName) : '', tr: e.isTrusted, ts: e.timeStamp,
+        key: e.key || '', code: e.code || '', button: (typeof e.button === 'number') ? e.button : null,
+        buttons: (typeof e.buttons === 'number') ? e.buttons : null, detail: e.detail || 0,
+        shift: !!e.shiftKey, ctrl: !!e.ctrlKey, alt: !!e.altKey, meta: !!e.metaKey,
+        ox: (typeof e.offsetX === 'number') ? e.offsetX : null, oy: (typeof e.offsetY === 'number') ? e.offsetY : null,
+        value: el && typeof el.value === 'string' ? el.value : (el && el.isContentEditable ? TEXT.call(el) : null),
+        it: e.inputType || '', n: 1 });
+    }, true);
+  }
+})();
+</script>
+</body>
+</html>

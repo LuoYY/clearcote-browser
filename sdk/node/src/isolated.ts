@@ -18,30 +18,147 @@
 
 type CdpLike = { send(method: string, params?: Record<string, unknown>): Promise<any> };
 
+const resultValue = <T>(r: any): T | undefined => {
+  if (!r || typeof r !== "object" || r.exceptionDetails) return undefined;
+  return r.result?.value as T;
+};
+
+/** @internal exported for tests. DOM.getNodeForLocation hit-tests in DOCUMENT coordinates (the
+ * viewport point plus the scroll offset); Playwright's boxes, CDP's box model and the mouse are all
+ * VIEWPORT coordinates. Measured on r37: a field scrolled 547 px down answered "No node found" at its
+ * viewport centre and the input itself at centre + scroll. */
+export function nodeAtParams(x: number, y: number, scroll?: readonly [number, number] | null): Record<string, unknown> {
+  const [sx, sy] = scroll ?? [0, 0];
+  return { x: roundHalfEven(x + sx), y: roundHalfEven(y + sy), includeUserAgentShadowDOM: false, ignorePointerEventsNone: true };
+}
+
+/** Python's round(): half to even (60.5 -> 60), so the hit test picks the same pixel in every SDK. */
+function roundHalfEven(v: number): number {
+  const f = Math.floor(v), d = v - f;
+  if (d > 0.5) return f + 1;
+  if (d < 0.5) return f;
+  return f % 2 === 0 ? f : f + 1;
+}
+
+/** One isolated world in the page's main frame, plus the frame id it lives in. */
+type WorldCtx = { id: number; frame: string };
+
 export class IsolatedWorld {
-  private cdp: CdpLike | null = null;
-  private ctx: number | null = null;
+  // Promises, not values: two humanized calls racing on one page (Promise.all of two fills) must share
+  // ONE CDP session and ONE isolated world. With plain fields both saw "none yet" across the await and
+  // each created its own.
+  private cdp: Promise<CdpLike> | null = null;
+  private ctx: Promise<WorldCtx> | null = null;
+  private frame: string | null = null;
 
   constructor(private readonly page: any) {}
+
+  private session(): Promise<CdpLike> {
+    if (!this.cdp) {
+      const p: Promise<CdpLike> = Promise.resolve().then(() => this.page.context().newCDPSession(this.page));
+      this.cdp = p;
+      p.catch(() => { if (this.cdp === p) this.cdp = null; }); // a failed attach may be retried later
+    }
+    return this.cdp;
+  }
+
+  private async ensure(): Promise<{ cdp: CdpLike; world: Promise<WorldCtx> }> {
+    const cdp = await this.session();
+    if (!this.ctx) {
+      const p: Promise<WorldCtx> = (async () => {
+        const tree = await cdp.send("Page.getFrameTree");
+        const frame = tree.frameTree.frame.id as string;
+        const created = await cdp.send("Page.createIsolatedWorld", { frameId: frame });
+        this.frame = frame;
+        return { id: created.executionContextId as number, frame };
+      })();
+      this.ctx = p;
+      p.catch(() => this.drop(p));
+    }
+    const world = this.ctx;
+    await world;
+    return { cdp, world };
+  }
+
+  /** Forget `world` (a navigation destroyed it) -- only if no other call has already replaced it. */
+  private drop(world: Promise<WorldCtx> | null | undefined): void {
+    if (world && this.ctx === world) this.ctx = null;
+  }
 
   /** Run `(fnSource)(arg)` (`arg` JSON-serialisable) and resolve to its JSON value, or undefined. */
   async evaluate<T = unknown>(fnSource: string, arg?: unknown): Promise<T | undefined> {
     for (let attempt = 0; attempt < 2; attempt++) { // a stale context (navigation) is re-created once
+      let world: Promise<WorldCtx> | undefined;
       try {
-        if (!this.cdp) this.cdp = await this.page.context().newCDPSession(this.page);
-        const cdp = this.cdp as CdpLike;
-        if (this.ctx === null) {
-          const tree = await cdp.send("Page.getFrameTree");
-          const created = await cdp.send("Page.createIsolatedWorld", { frameId: tree.frameTree.frame.id });
-          this.ctx = created.executionContextId as number;
-        }
-        const r = await cdp.send("Runtime.evaluate", {
-          expression: `(${fnSource})(${JSON.stringify(arg ?? null)})`, contextId: this.ctx, returnByValue: true,
-        });
-        if (!r || r.exceptionDetails) return undefined;
-        return r.result?.value as T;
+        const e = await this.ensure();
+        world = e.world;
+        return resultValue<T>(await e.cdp.send("Runtime.evaluate", {
+          expression: `(${fnSource})(${JSON.stringify(arg ?? null)})`, contextId: (await world).id, returnByValue: true,
+        }));
       } catch {
-        this.ctx = null;
+        this.drop(world);
+      }
+    }
+    return undefined;
+  }
+
+  /** A raw CDP call on this page's session (DOM reads that run no script), or undefined. */
+  async send<T = any>(method: string, params?: Record<string, unknown>): Promise<T | undefined> {
+    try {
+      const cdp = await this.session();
+      return (await cdp.send(method, params ?? {})) as T;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The main frame's [scrollX, scrollY], read in the isolated world; [0, 0] if unknown. */
+  async scroll(): Promise<[number, number]> {
+    const s = await this.evaluate<unknown>(ISO_SCROLL);
+    return Array.isArray(s) && s.length === 2 ? [Number(s[0]), Number(s[1])] : [0, 0];
+  }
+
+  /** backendNodeId of the MAIN-FRAME element at viewport point (x, y), or undefined. `scroll`: the
+   * page's [scrollX, scrollY] if the caller already has it (read here otherwise).
+   *
+   * CDP's hit test (DOM.getNodeForLocation) runs in the renderer with no script at all, so this is how
+   * humanize finds the element a Playwright locator means -- getByRole, getByLabel, `>> nth=`,
+   * .filter() -- without document.querySelector, which cannot parse those selectors (the old helpers
+   * threw on them and silently dropped to stock Playwright input). */
+  async nodeAt(x: number, y: number, scroll?: readonly [number, number] | null): Promise<number | undefined> {
+    try {
+      await this.ensure();
+    } catch {
+      return undefined;
+    }
+    const hit = await this.send("DOM.getNodeForLocation", nodeAtParams(x, y, scroll ?? await this.scroll()));
+    if (!hit || hit.backendNodeId === undefined || hit.backendNodeId === null) return undefined;
+    if (hit.frameId && this.frame && hit.frameId !== this.frame) return undefined; // inside an iframe
+    return hit.backendNodeId as number;
+  }
+
+  /** Run `fnSource` -- a `function (arg) { ... }` whose `this` is the node -- in the isolated world and
+   * resolve to its JSON value, or undefined. */
+  async callOnNode<T = unknown>(backendNodeId: number, fnSource: string, arg?: unknown): Promise<T | undefined> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let world: Promise<WorldCtx> | undefined;
+      try {
+        const e = await this.ensure();
+        world = e.world;
+        const obj = (await e.cdp.send("DOM.resolveNode", { backendNodeId, executionContextId: (await world).id })).object;
+        try {
+          return resultValue<T>(await e.cdp.send("Runtime.callFunctionOn", {
+            objectId: obj.objectId, functionDeclaration: fnSource, arguments: [{ value: arg ?? null }],
+            returnByValue: true,
+          }));
+        } finally {
+          try { await e.cdp.send("Runtime.releaseObject", { objectId: obj.objectId }); } catch { /* best effort */ }
+        }
+      } catch (err) {
+        // A stale world (a navigation destroyed it) is re-created once. A node that is simply gone
+        // ("No node with given id") says nothing about the world, which stays.
+        if (world && !/context/i.test(String((err as any)?.message ?? err))) return undefined;
+        this.drop(world);
       }
     }
     return undefined;
@@ -59,20 +176,133 @@ export function worldFor(page: object): IsolatedWorld {
 
 /** How long a trial action may look for a covered click point before the native path takes over. */
 export const COVER_CHECK_MS = 400;
+/** The one longer look when that trial timed out only because the element was not "stable" yet (no
+ *  "intercepts pointer events" in Playwright's call log): slow first frames, not an overlay. */
+export const COVER_RETRY_MS = 2000;
 
 // The reads humanize makes, as functions of one JSON argument (run by IsolatedWorld.evaluate).
 export const ISO_VIEWPORT = "() => [innerWidth, innerHeight]";
 // The platform the page believes (the persona's), for the wheel notch size.
 export const ISO_PLATFORM = "() => { const d = navigator.userAgentData; return (d && d.platform) || navigator.platform || ''; }";
-export const ISO_IS_FOCUSED =
-  "(s) => { const e = document.querySelector(s); return !!e && e === document.activeElement; }";
-export const ISO_SELECT_PLAN = `(a) => { const s = document.querySelector(a.sel);
-     if (!s || s.multiple || s.disabled) return null;
-     const os = [...s.options];
-     let i = -1;
-     if (a.by === 'index') i = (a.want >= 0 && a.want < os.length) ? a.want : -1;
-     else if (a.by === 'label') i = os.findIndex(o => (o.label || o.textContent || '').trim() === String(a.want).trim());
-     else i = os.findIndex(o => o.value === a.want);
-     if (i < 0 || os[i].disabled) return null;
-     return { to: i, from: s.selectedIndex, ret: os[i].value }; }`;
-export const ISO_SELECTED_INDEX = "(s) => { const e = document.querySelector(s); return e ? e.selectedIndex : -1; }";
+// The main frame's scroll offset: DOM.getNodeForLocation wants document coordinates.
+export const ISO_SCROLL = "() => [scrollX, scrollY]";
+
+// The value of whatever has focus (input/textarea value, or a contenteditable's text): how the typing
+// path checks that a fat-finger key actually landed before it deletes anything.
+export const ISO_ACTIVE_VALUE = `() => { let e = document.activeElement;
+  while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (!e || e.tagName === 'IFRAME' || e.tagName === 'FRAME') return null;
+  if (typeof e.value === 'string' && e.tagName !== 'BUTTON') return e.value;
+  return e.isContentEditable ? e.textContent : null; }`;
+// What the typo gate needs about the focused field (type / inputmode / autocomplete), or null.
+// Focus inside an open shadow root is followed to the real field; focus inside a frame cannot be read
+// from here, so it reports {frame: true} and the gate fails CLOSED (no slips in a card or login form
+// that lives in an iframe).
+export const ISO_ACTIVE_FIELD = `() => { let e = document.activeElement; if (!e || e === document.body) return null;
+  while (e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
+  if (e.tagName === 'IFRAME' || e.tagName === 'FRAME') return { frame: true };
+  return { type: e.tagName === 'INPUT' ? e.type : '', inputmode: e.getAttribute('inputmode'),
+           autocomplete: e.getAttribute('autocomplete') }; }`;
+// Everything the form routes need about ONE element, read from the node the hit test found (a
+// CDP callFunctionOn target: `this` is that node). `want` walks up to the control the locator means
+// (a click on a <select>'s padding hits the select; one on a label's text does not, and then the
+// caller tries another point). Returns null when no such ancestor exists.
+export const ISO_DESCRIBE = `function (a) {
+  let e = this.nodeType === 1 ? this : this.parentElement;
+  if (!e) return null;
+  if (a && a.want) { const c = e.closest(a.want); if (!c) return null; e = c; }
+  const r = e.getBoundingClientRect(), cs = getComputedStyle(e), tag = e.tagName.toLowerCase();
+  const o = { tag, type: tag === 'input' ? e.type : '', ce: !!e.isContentEditable,
+    rect: [r.x, r.y, r.width, r.height], focused: e === document.activeElement,
+    value: typeof e.value === 'string' ? e.value : (e.isContentEditable ? e.textContent : null),
+    min: e.getAttribute('min'), max: e.getAttribute('max'), step: e.getAttribute('step'),
+    maxlength: typeof e.maxLength === 'number' ? e.maxLength : -1,
+    inputmode: e.getAttribute('inputmode'), autocomplete: e.getAttribute('autocomplete'),
+    readonly: !!e.readOnly, disabled: !!e.disabled, dir: cs.direction, wm: cs.writingMode,
+    bl: e.clientLeft || 0, bt: e.clientTop || 0 };
+  if (tag === 'select') {
+    o.multiple = e.multiple; o.size = e.size; o.selectedIndex = e.selectedIndex;
+    o.options = Array.from(e.options, x => ({ value: x.value, label: x.label,
+      disabled: x.disabled || !!(x.parentElement && x.parentElement.tagName === 'OPTGROUP' && x.parentElement.disabled),
+      selected: x.selected }));
+    if (e.multiple || e.size > 1)
+      o.optRects = Array.from(e.options, x => { const q = x.getBoundingClientRect(); return [q.x, q.y, q.width, q.height]; });
+  }
+  return o; }`;
+// The controls a locator can mean for the form routes.
+export const ISO_FORM_CONTROL = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']";
+// Does the element the browser's hit test found at a click point belong to the element whose box the
+// caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
+// that box? `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
+// press). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
+// element and back and performs a press whose events Playwright blocks, so a page saw a mousemove
+// inside the target, a jump back and a pointerdown/click before every humanized click (verifier B).
+export const ISO_HIT_IN_BOX = `function (b) {
+  let e = this.nodeType === 1 ? this : this.parentElement;
+  for (let n = 0; e && n < 128; n++) {
+    const r = e.getBoundingClientRect();
+    if (Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
+        Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5) return true;
+    const p = e.parentNode;
+    e = e.parentElement || (p && p.nodeType === 11 && p.host) || null;
+  }
+  return false; }`;
+// A list box's scroll state and one row's box, from any node inside the <select> (`this`): where its
+// visible rows are (top / bottom of the client area), how far it is scrolled (st, of max), the row's
+// rect, and which rows are selected.
+export const ISO_LISTBOX_ROW = `function (a) {
+  const n = this.nodeType === 1 ? this : this.parentElement;
+  const e = n && n.closest('select');
+  if (!e || !e.options[a.i]) return null;
+  const r = e.getBoundingClientRect(), q = e.options[a.i].getBoundingClientRect();
+  return { box: [r.x, r.y, r.width, r.height], row: [q.x, q.y, q.width, q.height],
+    top: r.y + e.clientTop, bottom: r.y + e.clientTop + e.clientHeight,
+    st: e.scrollTop, max: e.scrollHeight - e.clientHeight,
+    sel: Array.from(e.options, x => x.selected) }; }`;
+// The first match of a plain-CSS selector, by the browser's own querySelectorAll in this world (the
+// page's hooks on its prototypes never see it): how many match, and the first one's box -- scrolled
+// into view first when `scroll` is set (centred, only if needed: what Playwright's
+// scrollIntoViewIfNeeded does). null when the selector is not CSS the browser accepts.
+export const ISO_CSS_BOX = `(a) => { let l;
+  try { l = document.querySelectorAll(a.sel); } catch (e) { return null; }
+  if (!l.length) return { n: 0 };
+  const e = l[0];
+  if (a.scroll) { if (e.scrollIntoViewIfNeeded) e.scrollIntoViewIfNeeded(true);
+                  else e.scrollIntoView({ block: 'center', inline: 'center' }); }
+  const r = e.getBoundingClientRect();
+  return { n: l.length, rect: [r.x, r.y, r.width, r.height] }; }`;
+// Scroll the window by [dx, dy] at once (no smooth-scroll animation to wait out) and return how far
+// it actually moved: the box humanize already holds moves by exactly that much.
+export const ISO_SCROLL_BY = `(d) => { const x = scrollX, y = scrollY;
+  scrollBy({ left: d[0], top: d[1], behavior: 'instant' });
+  return [scrollX - x, scrollY - y]; }`;
+
+/** What ISO_DESCRIBE returns for one element (plus `node`, the backendNodeId it was read from). */
+export interface DescribedElement {
+  tag: string;
+  type: string;
+  ce: boolean;
+  rect: [number, number, number, number];
+  focused: boolean;
+  value: string | null;
+  min: string | null;
+  max: string | null;
+  step: string | null;
+  maxlength: number;
+  inputmode: string | null;
+  autocomplete: string | null;
+  readonly: boolean;
+  disabled: boolean;
+  dir: string;
+  wm: string;
+  bl: number;
+  bt: number;
+  multiple?: boolean;
+  size?: number;
+  selectedIndex?: number;
+  options?: { value: string; label: string; disabled: boolean; selected: boolean }[];
+  optRects?: [number, number, number, number][];
+  node?: number;
+  /** The probe point (fractions of the box) that proved the control; set by humanize. */
+  probe?: [number, number];
+}

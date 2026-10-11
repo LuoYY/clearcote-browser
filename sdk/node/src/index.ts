@@ -66,7 +66,7 @@ import {
   type PwProxy,
 } from "./launchopts.js";
 import { RELEASE, platformRelease } from "./release.js";
-import { fetchWidevine, seedWidevine, widevineArgs, widevineCdmArgs } from "./widevine.js";
+import { fetchWidevine, seedWidevine, widevineArgs, widevineLaunchArgs, widevineMode } from "./widevine.js";
 import { emitCoherenceWarnings, emitWarnings, serveExposureWarnings } from "./warnings.js";
 import { checkFontDirs, fontLaunchEnv } from "./fonts.js";
 import { withShaderDialect, type ShaderDialect } from "./shaderdialect.js";
@@ -281,6 +281,24 @@ interface EngineExtrasOption {
   stockRuntime?: boolean;
 }
 
+/** Google's Widevine CDM (DRM/EME), see ./widevine.ts. */
+interface WidevineOption {
+  /**
+   * Load Google's Widevine CDM so DRM/EME works (`requestMediaKeySystemAccess('com.widevine.alpha')`
+   * resolves) and the EME surface matches a real Chrome instead of being a no-Widevine tell.
+   *
+   * ON BY DEFAULT for a licensed launch (a licence key resolved: the PRO build, which claims the Google
+   * Chrome brand) on an engine with `--widevine-cdm-path` (r32+), since 0.48.0. The CDM is downloaded
+   * from Google's component server on first use and cached; later launches use the cache with no network.
+   * When the first download cannot be had within CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS (default 15) the launch
+   * goes on without it and warns once. CLEARCOTE_WIDEVINE=0 (or `false`) turns it off; `false` is also
+   * accepted, and ignored, by a cloud or Docker launch. A free launch stays opt-in: `true` (or
+   * CLEARCOTE_WIDEVINE=1) fetches it, and a persistent context also gets it seeded into its profile.
+   * An explicit value wins over the environment. clearcote never bundles Google's blob.
+   */
+  widevine?: boolean;
+}
+
 /** Opt-in SOCKS5 UDP relaying (see {@link socks5UdpArgs}). */
 interface Socks5UdpOption {
   /** Relay WebRTC's UDP through the SOCKS5 proxy using UDP ASSOCIATE, instead of letting it egress
@@ -308,7 +326,7 @@ interface CloudSwitchOption {
 }
 
 /** Options for {@link launch}: Playwright launch options + Clearcote fingerprint + agent + download options. */
-export interface LaunchOptions extends PlaywrightLaunchOptions, FingerprintOptions, AgentOptions, GeoipOption, ProfileOption, ExtensionsOption, EphemeralProfileOption, HumanizeOptions, DownloadOptions, LicenseOptions, ShaderDialectOption, PersonaEnvOption, FontDirsOption, Socks5UdpOption, EngineExtrasOption, CloudSwitchOption, DockerOption {}
+export interface LaunchOptions extends PlaywrightLaunchOptions, FingerprintOptions, AgentOptions, GeoipOption, ProfileOption, ExtensionsOption, EphemeralProfileOption, HumanizeOptions, DownloadOptions, LicenseOptions, ShaderDialectOption, PersonaEnvOption, FontDirsOption, Socks5UdpOption, EngineExtrasOption, CloudSwitchOption, DockerOption, WidevineOption {}
 
 /** The account options a local launch drops (see CloudSwitchOption). */
 function withoutCloudOptions<T extends object>(options: T): T {
@@ -333,15 +351,8 @@ export interface PersistentContextOptions
     FontDirsOption,
     Socks5UdpOption,
     EngineExtrasOption,
-    CloudSwitchOption {
-  /**
-   * Seed + enable the opt-in Widevine CDM in this profile so DRM/EME works
-   * (`requestMediaKeySystemAccess('com.widevine.alpha')` resolves) and the EME surface matches a
-   * real Chrome instead of being a no-Widevine tell. The CDM is fetched once from Google's
-   * component server (see {@link fetchWidevine}); clearcote never bundles Google's blob.
-   */
-  widevine?: boolean;
-}
+    CloudSwitchOption,
+    WidevineOption {}
 
 /**
  * Fill unset timezone/acceptLanguage/location/webrtcIp on `fp` from the proxy's exit-IP geo.
@@ -631,6 +642,7 @@ async function applyAutoProfile(
       licenseApiBase: opts.apiBase,
       ephemeralProfile: false,
       cloud: false, // the probe measures THIS host, whatever CLEARCOTE_CLOUD says
+      widevine: false, // reads GPU + display only: the CDM (on by default when licensed) would only cost a fetch
     }) as unknown as Promise<{
       newContext: () => Promise<{ newPage: () => Promise<unknown> }>;
       version?: () => string;
@@ -1041,7 +1053,7 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   // profile= a saved persona: its options are the base, explicit options override. ("auto" is
   // resolved later, once the executable is known.)
   const merged = mergeSavedProfile(options);
-  const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, version, licenseKey, licenseApiBase, licenseThroughProxy, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
+  const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
   const { fingerprint, rest: afterFp } = splitFingerprintOptions(rest);
   const { agent, rest: pwOptions } = splitAgentOptions(afterFp);
   const fontDirList = checkFontDirs(fontDirs);  // Linux fontconfig dirs: a typo throws before the lease
@@ -1052,10 +1064,15 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   // The binary is resolved before the proxy route is chosen: http(s) credentials go to the
   // engine's --proxy-auth only when THIS engine implements it (r19+); older engines keep
   // Playwright's handling, which authenticates (routing blindly would leave every request at 407).
-  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro: proSelector(licenseKey, licenseApiBase) });  // capability-gated proxy route
+  const pro = proSelector(licenseKey, licenseApiBase);
+  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
   ensureRunnableHere(exe);
   // Before the warnings below, so they judge the persona that will actually run (as in Python).
   await applyProfileAuto(profile, fingerprint, exe, { quiet, licenseKey, licenseApiBase, profileSelect });
+  // Widevine: on by default for a licensed launch (`pro`: the key that selects the PRO build, which claims
+  // the Google Chrome brand) on an engine with --widevine-cdm-path, which loads the CDM without a profile;
+  // opt-in for a free one. Bounded + fail-soft by default (see ./widevine.ts).
+  const widevineCdm = await widevineLaunchArgs(exe, widevine, !!pro, args, { quiet });
   // SOCKS5-with-credentials must go through --proxy-server (Playwright rejects it); drop it from PW.
   const { args: proxyArgs, proxy } = resolveProxy((pwOptions as PlaywrightLaunchOptions).proxy as PwProxy | undefined, engineSupportsSwitch(exe, "proxy-auth"));
   warnUnsupportedEngineOptions(exe, fingerprint as Record<string, unknown>, proxyOpt as PwProxy | undefined, quiet);
@@ -1093,7 +1110,7 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   const geom = headed
     ? null
     : applyHeadlessGeometry({ ...(pwOptions as Record<string, unknown>) }, fingerprint.fingerprint, engineArgs, fingerprint);
-  const launchArgs = [...engineArgs, ...(geom?.args ?? [])];
+  const launchArgs = [...engineArgs, ...(geom?.args ?? []), ...widevineCdm];
   const browser = await releaseLeaseOnFailure(lease, () => retryOnStaleRunToken(lease, () => winAvRetry((exePath) => {
     // Last step on both: on a 1021 engine the persona leaves the command line for the env (./personaenv.ts).
     const { args: finalArgs, env } = applyPersonaEnv(exe, launchArgs, runtimeEnv(), personaEnv);
@@ -1169,7 +1186,8 @@ async function launchLocalPersistentContext(
   const geo = geoip ? await applyGeoip(fingerprint, (pwOptions as PlaywrightLaunchOptions).proxy, quiet) : undefined;
   // A rotating proxy changes the exit per connection; checked alongside the launch, awaited at the end.
   const egressDrift = startEgressDriftCheck((pwOptions as PlaywrightLaunchOptions).proxy as PwProxy | undefined, geo?.ip ?? undefined, quiet);
-  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro: proSelector(licenseKey, licenseApiBase) });  // capability-gated proxy route
+  const pro = proSelector(licenseKey, licenseApiBase);
+  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
   ensureRunnableHere(exe);
   await applyProfileAuto(profile, fingerprint, exe, { quiet, licenseKey, licenseApiBase, profileSelect });
   const { args: proxyArgs, proxy } = resolveProxy((pwOptions as PlaywrightLaunchOptions).proxy as PwProxy | undefined, engineSupportsSwitch(exe, "proxy-auth"));
@@ -1185,14 +1203,16 @@ async function launchLocalPersistentContext(
   const opts = pwOptions as PlaywrightLaunchOptions & BrowserContextOptions;
   // headed + no explicit viewport -> disable the emulated viewport (impossible-window tell)
   if (opts.headless === false && opts.viewport === undefined) opts.viewport = null;
-  // widevine=true: seed the CDM into the profile + un-suppress the component updater (Playwright
-  // disables it by default) so the engine registers it. Failure -> DRM gracefully off, launch proceeds.
+  // Widevine ASKED FOR (widevine: true or CLEARCOTE_WIDEVINE=1): seed the CDM into the profile +
+  // un-suppress the component updater (Playwright disables it by default) so an engine without
+  // --widevine-cdm-path registers it too. Failure -> DRM gracefully off, launch proceeds. The licensed
+  // DEFAULT only uses the switch (widevineLaunchArgs below).
   // Default the automation strip BEFORE the Widevine helper so it appends --disable-component-update
   // to ['--enable-automation'] rather than clobbering it (losing the strip). Caller's own wins.
   let ignoreDefaultArgs: string[] | boolean | undefined =
     (opts.ignoreDefaultArgs as string[] | boolean | undefined) ?? [...DEFAULT_IGNORED_ARGS];
   let userArgs = args ?? [];
-  if (widevine) {
+  if (widevineMode(widevine, false) === "explicit") {
     try {
       await seedWidevine(userDataDir, { quiet });
       // The --component-updater=fast-update scan is Windows-only (on Linux the hint file registers
@@ -1209,8 +1229,9 @@ async function launchLocalPersistentContext(
     }
   }
   // A 1022 engine registers the CDM from --widevine-cdm-path in every profile; the seeding above keeps
-  // older engines working. Best-effort on its own: [] on any failure, and the launch goes on.
-  const widevineCdm = widevine ? await widevineCdmArgs(exe, { quiet }) : [];
+  // older engines working. On by default for a licensed launch (`pro`), bounded + fail-soft; asked for,
+  // best-effort as always: [] on any failure, and the launch goes on.
+  const widevineCdm = await widevineLaunchArgs(exe, widevine, !!pro, args, { quiet });
   delete (opts as Record<string, unknown>).ignoreDefaultArgs;  // passed explicitly below
   // A license key selects the PRO (gated) binary; no key -> the free binary (unchanged path).
   // License (opt-in): check out a concurrency slot + inject CLEARCOTE_RUN_TOKEN. Inert in free mode.
@@ -1462,7 +1483,7 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
   const merged = mergeSavedProfile(launchOpts);
   const {
     profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption,
-    args: userArgs, geoip, autoUpdate, cacheDir, quiet, version, licenseKey, licenseApiBase, licenseThroughProxy, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest
+    args: userArgs, geoip, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest
   } = merged;
   const { fingerprint, rest: afterFp } = splitFingerprintOptions(rest);
   const { agent, rest: pwOptions } = splitAgentOptions(afterFp);
@@ -1471,9 +1492,12 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
   const geo = geoip ? await applyGeoip(fingerprint, proxyOpt, quiet) : undefined;
   // A rotating proxy changes the exit per connection; checked alongside the launch, awaited at the end.
   const egressDrift = startEgressDriftCheck(proxyOpt, geo?.ip ?? undefined, quiet);
-  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro: proSelector(licenseKey, licenseApiBase) });  // capability-gated proxy route
+  const pro = proSelector(licenseKey, licenseApiBase);
+  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
   ensureRunnableHere(exe);
   await applyProfileAuto(profile, fingerprint, exe, { quiet, licenseKey, licenseApiBase, profileSelect });
+  // Widevine: as launch() (on by default for a licensed launch on an r32+ engine, opt-in otherwise).
+  const widevineCdm = await widevineLaunchArgs(exe, widevine, !!pro, userArgs, { quiet });
   // passProxy: what is left for a plain --proxy-server once credentials went to the engine's own
   // switches (undefined then — proxyArgs already carries --proxy-server).
   const { args: proxyArgs, proxy: passProxy } = resolveProxy(proxyOpt, engineSupportsSwitch(exe, "proxy-auth"));
@@ -1517,6 +1541,7 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
   // client's context options or CDP overrides would reach every page (see ./geometry.ts).
   const geometry = servedGeometry(engineArgs, fingerprint, headless);
   if (geometry) cdpArgs.push(...geometry.args);
+  cdpArgs.push(...widevineCdm);
 
   // License (opt-in): check out a concurrency slot + inject CLEARCOTE_RUN_TOKEN. Inert in free mode.
   const lease = await acquireLease({

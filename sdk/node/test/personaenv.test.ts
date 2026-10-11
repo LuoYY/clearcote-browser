@@ -442,9 +442,16 @@ describe("1022: --widevine-cdm-path", () => {
   });
 
   it("is best-effort", async () => {
-    cachedCdm();
+    process.env.CLEARCOTE_WIDEVINE_DIR = join(root, "wv-empty"); // nothing cached
     updateCheck(true);
     expect(await widevineCdmArgs(fakeEngine([ENGINE_1022]), { quiet: true })).toEqual([]);
+    expect(fetched).toEqual([OMAHA_URL]);
+  });
+
+  it("keeps using the cached CDM when the update check fails (0.48.0)", async () => {
+    const cdm = cachedCdm();
+    updateCheck(true);
+    expect(await widevineCdmArgs(fakeEngine([ENGINE_1022]), { quiet: true })).toEqual([`--widevine-cdm-path=${cdm}`]);
     expect(fetched).toEqual([OMAHA_URL]);
   });
 

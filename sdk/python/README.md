@@ -256,6 +256,11 @@ page.locator("#pwd").type("s3cr3t")        # locators are humanized too
 page.mouse.wheel(0, 800)                   # whole wheel notches, in finger-flick bursts
 # a held-button drag (slider captchas): the button stays pressed across the move
 page.mouse.move(x0, y0); page.mouse.down(); page.mouse.move(x1, y0); page.mouse.up()
+
+page.select_option("#country", "Germany")  # click it open, type "ger", Enter: one trusted change
+page.fill("#volume", "70")                 # a range slider is dragged, then nudged to exactly 70
+page.fill("#birthday", "1990-04-12")       # a date field is typed segment by segment
+page.click("#row", button="right")         # click options are honoured (button, modifiers, ...)
 ```
 
 `humanize=True` installs **one consistent human-input standard** covering moving, clicking,
@@ -269,13 +274,48 @@ slightly over/undershoots plus a corrective move, i.e. the multi-peak velocity o
 one symmetric bell. Because they use native input, the button held by `mouse.down()` stays held
 across the move, so `down → move → up` is a real drag (slider captchas work). Clicks get an
 actionability pre-flight (visible + enabled + stable + not covered) and fall back to the native click
-if it fails. Typing goes key-by-key with **gaussian inter-key timing** + word-boundary pauses, the
+if it fails. The "not covered" check is the browser's own hit test, read in an isolated world: the
+pointer does not move before the glide and nothing is pressed (only a click point inside a child frame
+still uses Playwright's `trial`, which does both). With a CSS selector the element is also found and
+scrolled into view there, so the page's own scripts see no read at all; a `get_by_role` / `get_by_label` /
+text locator costs one Playwright `bounding_box`, which reads the element's `textContent` in the page. Typing goes key-by-key with **gaussian inter-key timing** + word-boundary pauses, the
 occasional fat-finger correction and **key rollover** (on some fast pairs the next key goes down
 before the previous one comes up, at a rate fixed per identity); `page.fill` over 200 chars stays
 atomic (skips per-key typing) to avoid crawling. Scrolling moves in **whole wheel notches** (100 px on
 a Windows identity, 120 on Linux, 40 on macOS), because a browser reports every wheel event as one
 full notch: the requested distance is rounded to the nearest notch (at least one). Notches come in
 short flicks with the occasional reading pause.
+
+**Click options** are honoured with humanize on: `button`, `click_count`, `delay` (the hold),
+`modifiers` (held around the press), `position` and `force`; `trial=True` performs no action, exactly as
+in Playwright. Locator actions stay strict, and every Playwright locator works (`get_by_role`,
+`get_by_label`, `.filter()`, `.nth()`).
+
+**`fill` follows the field.** Text is typed (cleared with held keys only when it has a value, then
+checked through Playwright; a field whose value cannot be confirmed, or one the click could not reach, is
+filled by Playwright instead). A range slider is dragged (or its track clicked) and nudged with the arrow
+keys to the exact value; a value the slider cannot hold (off its step, out of range, not a number) raises
+Playwright's own "Malformed value", as before. A date / time / month / week / datetime-local field is typed
+segment by segment, in the order the browser shows them. Colour pickers, non-text inputs and fields inside
+frames keep Playwright's own behaviour.
+
+**Waits and errors are Playwright's.** Humanized actions wait with your timeout (or the page's default),
+`force=True` skips the waits exactly as in Playwright, and a timeout raises once — it is never retried
+natively. `type` / `press` click into a text field first; a button, link or hidden helper element is
+focused by Playwright without a click, so it is activated once.
+
+**`select_option`** opens a drop-down with a click, finds the option by typing the start of its label
+(spaces included: `Item 371` of 400 `Item NNN` rows takes a few seconds) and commits with Enter, so the
+browser fires **one trusted `change`** — not one per row. Rows that cannot be typed to are reached with a
+held arrow key. A list box is
+clicked row by row (scrolled with the wheel when needed, notch by notch until the row shows), with Ctrl (Cmd on a Mac engine) held for the
+extra rows of a multi-select. `check` / `uncheck` / `set_checked` click only when the state must change.
+
+**Typos** are never made in password, e-mail, number, phone, URL or one-time-code fields (nor in a field
+inside a frame, which cannot be checked), and only what actually landed is deleted (an input mask or
+`maxlength` can swallow a slip). Set `CLEARCOTE_HUMANIZE_TYPO_RATE` to change the per-key rate (default
+`0.02`; `0` turns typos off). Since 0.48.0 the asyncio API (`clearcote.async_api`) makes the same slips as
+the sync API, and humanizes `page.press` / `page.dblclick` too.
 
 `show_cursor=True` injects a red cursor dot that follows the real mouse, handy for watching a
 headed run. Both default to off for a local launch (a cloud launch defaults `humanize` to on); everything
@@ -384,18 +424,36 @@ context = launch_persistent_context(
 )
 ```
 
-### Widevine / DRM (`widevine=True`)
+### Widevine / DRM (`widevine`)
 
 clearcote ships the **EME/Widevine plumbing** compiled in, but — being 100% open source — it does
-**not** bundle Google's proprietary CDM. Pass `widevine=True` on a **persistent** context and the SDK
-fetches that CDM once from Google's own component server (same as a real Chrome receives it), seeds it
-into the profile, and enables it — so `navigator.requestMediaKeySystemAccess('com.widevine.alpha')`
-resolves and DRM streams play, instead of EME being a "no-Widevine" tell.
+**not** bundle Google's proprietary CDM. The SDK fetches that CDM from Google's own component server
+(same as a real Chrome receives it), caches it, and enables it — so
+`navigator.requestMediaKeySystemAccess('com.widevine.alpha')` resolves and DRM streams play, instead of
+EME being a "no-Widevine" tell.
+
+**On by default for PRO launches (since 0.48.0).** A licensed launch (a licence key set: the PRO build,
+which claims the Google Chrome brand) on an engine from r32 loads the CDM by default, in `launch()`,
+`launch_persistent_context()`, `serve()` and the async API alike:
+
+- The first such launch **downloads Google's CDM from Google** (`update.googleapis.com`), checks its
+  SHA-256 and caches it under `~/.clearcote/WidevineCdm` (`CLEARCOTE_WIDEVINE_DIR` overrides). Later launches
+  use the cache **at once, with no network**; once a day a background check asks Google for a newer CDM
+  (used from the next launch on). A failed check counts as that day's check: the cached CDM keeps working.
+- **Fail-soft**: only a launch with nothing cached waits for the download, at most
+  `CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS` (default 15, clamped to 1-600). If it fails — offline, a firewall,
+  Google refusing the request — the launch goes on without Widevine and prints one warning per process on
+  stderr (`quiet=True` or `CLEARCOTE_NO_WARN=1` silences it); that process retries the download after 10
+  minutes. The default path prints nothing on stdout.
+- **Opt out** with `CLEARCOTE_WIDEVINE=0` (every launch), or `widevine=False`. An explicit `widevine=` wins
+  over the environment; `widevine=False` is also accepted (and ignored) by `cloud=True` and Docker launches.
+- **Free (open) builds stay opt-in**: pass `widevine=True` (or set `CLEARCOTE_WIDEVINE=1`). On a
+  persistent context that also seeds the CDM into the profile, so an engine before r32 loads it too.
 
 ```python
 from clearcote import launch_persistent_context
 
-ctx = launch_persistent_context("./profile-drm", widevine=True)   # fetch + seed + enable the CDM
+ctx = launch_persistent_context("./profile-drm", widevine=True)   # free build: fetch + seed + enable the CDM
 page = ctx.pages[0] if ctx.pages else ctx.new_page()
 page.goto("https://example.com")
 ok = page.evaluate("""async () => {
@@ -408,13 +466,13 @@ print("Widevine:", ok)            # True
 ctx.close()
 ```
 
-- Requires a **persistent** context (the CDM lives in `user_data_dir`) — not the incognito `launch()`.
-- The CDM is cached under `~/.clearcote/WidevineCdm`; fetch it ahead of time with `fetch_widevine()`.
-- On an engine from r32 the SDK also passes `--widevine-cdm-path`, pointing at the fetched CDM, so the browser
-  registers it at startup in every profile without waiting for the component updater. Older engines keep the
-  seeded-profile route. For a launch the option does not cover, add `--widevine-cdm-path=<dir>` to `args` yourself,
-  with the directory `fetch_widevine()` returns.
-- It's **opt-in**: the clearcote package never distributes Google's CDM — *you* trigger the download.
+- On an engine from r32 the SDK passes `--widevine-cdm-path`, pointing at the cached CDM, so the browser
+  registers it at startup in every profile — incognito (`ephemeral_profile=False`) included — without waiting
+  for the component updater. Older engines need `widevine=True` on a **persistent** context (the seeded-profile
+  route). Your own `--widevine-cdm-path=<dir>` in `args` is left as it is.
+- Fetch the CDM ahead of time (e.g. in a Docker build step) with `fetch_widevine()`.
+- The clearcote package never distributes Google's CDM: it is downloaded from Google, on your machine.
+- Cloud launches (`cloud=True`) are unchanged: hosted browsers load Widevine on the server.
 - Software-secure (L3) playback. Hardware-secure (L1) paths are out of scope.
 
 ### AI agent (OpenRouter)

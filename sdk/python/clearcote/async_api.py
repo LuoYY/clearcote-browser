@@ -314,7 +314,9 @@ async def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
     """Launch Clearcote with a persistent profile dir; returns a Playwright **async**
     ``BrowserContext`` (cookies/storage persist in ``user_data_dir``).
 
-    Pass ``widevine=True`` to seed + enable the (opt-in) Widevine CDM so DRM/EME works.
+    Widevine: on by default for a licensed launch on an r32+ engine, opt-in (``widevine=True``) for a
+    free one; ``widevine=False`` or CLEARCOTE_WIDEVINE=0 turns it off (see the sync
+    ``launch_persistent_context``).
 
     ``cloud=True`` with ``profile="name"``: the context of a hosted session on that cloud profile
     (see the sync ``launch_persistent_context``)."""
@@ -327,10 +329,11 @@ async def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
     # Automation strip before the Widevine helper (it appends --disable-component-update rather than
     # clobbering ['--enable-automation']) — mirrors the sync path.
     kwargs.setdefault("ignore_default_args", list(DEFAULT_IGNORED_ARGS))
-    widevine, wv_quiet = bool(kwargs.get("widevine")), kwargs.get("quiet", False)
-    if widevine:
-        from ._widevine import apply_widevine_launch
-        await asyncio.to_thread(apply_widevine_launch, user_data_dir, kwargs, wv_quiet)
+    # Widevine asked for: seed this profile too (as the sync path). The licensed default and the
+    # --widevine-cdm-path switch come from _prepare, off the event loop.
+    from ._widevine import apply_widevine_launch, widevine_mode
+    if widevine_mode(kwargs.get("widevine"), licensed=False) == "explicit":
+        await asyncio.to_thread(apply_widevine_launch, user_data_dir, kwargs, kwargs.get("quiet", False))
     # seed reflects the merged/effective fingerprint (profile-aware) -> stable motor persona
     shader_dialect = kwargs.pop("shader_dialect", None)  # popped before _prepare: not a PW option
     persona_env = kwargs.pop("persona_env", None)  # 1021 env mode (_personaenv.py): not a PW option
@@ -350,10 +353,7 @@ async def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
         geom = apply_headless_geometry(pw_kwargs, seed, args)
     if await asyncio.to_thread(engine_decides_color_scheme, exe):  # r32+ (mirror sync)
         default_color_scheme(pw_kwargs)
-    launch_args = _with_geometry_args(args, geom)
-    if widevine:
-        from ._widevine import widevine_cdm_args
-        launch_args = launch_args + await asyncio.to_thread(widevine_cdm_args, exe, wv_quiet)
+    launch_args = _with_geometry_args(args, geom)  # carries --widevine-cdm-path when on (see _prepare)
     launch_args = _personaenv.apply_to_pw_kwargs(exe, launch_args, pw_kwargs, persona_env)
     pw = await _start_driver()
     try:

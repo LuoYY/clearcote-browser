@@ -71,8 +71,9 @@ class _SyncPage:
         return lambda *a, **k: None
 
 
-def test_sync_typing_holds_shift_for_capitals_and_symbols():
+def test_sync_typing_holds_shift_for_capitals_and_symbols(monkeypatch):
     from clearcote._humanize import attach_humanize
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "0")   # an exact key sequence: no slips
     page = _SyncPage()
     attach_humanize(None, page, humanize=True)
     page.keyboard.type("Hi!")

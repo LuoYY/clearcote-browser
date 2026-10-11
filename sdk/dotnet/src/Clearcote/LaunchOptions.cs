@@ -49,6 +49,20 @@ public class LaunchOptions : FingerprintOptions
     /// launches without it, with one warning per process. Local and Docker launches only: a cloud launch says once
     /// that it was not applied. A normal browser argument, never part of the persona payload.</para>
     public bool? StockRuntime { get; set; }
+    /// Google's Widevine CDM, so DRM/EME works (<c>requestMediaKeySystemAccess('com.widevine.alpha')</c>
+    /// resolves) and the EME surface matches a real Chrome instead of being a no-Widevine tell.
+    ///
+    /// <para>Null (the default) follows CLEARCOTE_WIDEVINE (1/true/yes/on: on, 0/false/no/off: off); otherwise it is
+    /// ON for a licensed launch (a licence key resolved: the PRO build, which claims the Google Chrome brand) on an
+    /// engine with <c>--widevine-cdm-path</c> (r32+), since 0.48.0, and off for a free one. The CDM is downloaded from
+    /// Google's component server on first use and cached (CLEARCOTE_WIDEVINE_DIR, else ~/.clearcote/WidevineCdm); later
+    /// launches use the cache with no network. When the first download cannot be had within
+    /// CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS (default 15) the launch goes on without it and warns once. False turns it off;
+    /// true turns it on for any launch, and a persistent context also gets it seeded into its profile (for an engine
+    /// without the switch). An explicit value wins over the environment. Local launches only: a hosted browser loads
+    /// its own (false is accepted, and ignored, by cloud and Docker launches; true is refused there). See
+    /// <see cref="global::Clearcote.Widevine"/>.</para>
+    public bool? Widevine { get; set; }
 
     // ── binary resolution ────────────────────────────────────────────────────
     /// Explicit chrome binary path (wins over everything, incl. CLEARCOTE_BINARY and the auto-download).

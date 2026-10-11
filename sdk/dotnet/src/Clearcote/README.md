@@ -83,6 +83,43 @@ var context = await Clearcote.Clearcote.LaunchPersistentContextAsync("./profile-
 });
 ```
 
+## Widevine / DRM (`Widevine`)
+
+clearcote ships the EME/Widevine plumbing but, being open source, not Google's proprietary CDM. The SDK fetches
+that CDM from Google's own component server (as a real Chrome receives it), caches it and enables it, so
+`navigator.requestMediaKeySystemAccess('com.widevine.alpha')` resolves and DRM streams play instead of EME being a
+"no-Widevine" tell.
+
+**On by default for PRO launches (since 0.48.0).** A licensed launch (a licence key set: the PRO build, which claims
+the Google Chrome brand) on an engine from r32 loads the CDM by default, in `LaunchAsync`,
+`LaunchPersistentContextAsync`, `LaunchEphemeralProfileAsync` and `ServeAsync` alike:
+
+- The first such launch **downloads Google's CDM from Google** (`update.googleapis.com`), checks its SHA-256 and
+  caches it under `~/.clearcote/WidevineCdm` (`CLEARCOTE_WIDEVINE_DIR` overrides). Later launches use the cache **at
+  once, with no network**; once a day a background check asks Google for a newer CDM (used from the next launch
+  on). A failed check counts as that day's check: the cached CDM keeps working.
+- **Fail-soft**: only a launch with nothing cached waits for the download, at most
+  `CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS` (default 15, clamped to 1-600). If it fails — offline, a firewall, Google
+  refusing the request — the launch goes on without Widevine and prints one warning per process (`Quiet` or
+  `CLEARCOTE_NO_WARN=1` silences it); the unfinished download is cancelled, and that process retries it after 10
+  minutes.
+- **Opt out** with `CLEARCOTE_WIDEVINE=0` (every launch), or `Widevine = false`. An explicit value wins over the
+  environment; `Widevine = false` is also accepted (and ignored) by cloud and Docker launches.
+- **Free (open) builds stay opt-in**: set `Widevine = true` (or `CLEARCOTE_WIDEVINE=1`). On a persistent context
+  that also seeds the CDM into the profile, so an engine before r32 loads it too.
+
+```csharp
+var context = await Clearcote.Clearcote.LaunchPersistentContextAsync("./profile-drm", new LaunchOptions
+{
+    Widevine = true,   // free build: fetch + seed + enable (a PRO launch has it on already)
+});
+var cdmDir = await Widevine.FetchAsync();   // or fetch it ahead of time, e.g. in a Docker build step
+```
+
+Your own `--widevine-cdm-path=<dir>` in `Args` is left as it is. Cloud launches are unchanged (hosted browsers load
+Widevine on the server). The package never distributes Google's CDM: it is downloaded from Google, on your
+machine. Software-secure (L3) playback only.
+
 ## Local or cloud
 
 The same call can run the browser on Clearcote's hosted servers instead of this machine. `Cloud = true`
@@ -148,11 +185,51 @@ one full notch.
 var page = await browser.NewPageAsync();
 Humanize.Attach(page, "acct-1");        // same seed as your fingerprint => same motor signature
 
-await page.Locator("#submit").HumanClickAsync();
+await page.HumanFillAsync("#name", "Ada Lovelace");                 // click, clear if needed, type, verify
 await page.Locator("#email").HumanTypeAsync("someone@example.com");
-await page.Locator("#country").HumanSelectOptionAsync("NL");
+await page.HumanSelectOptionAsync("#country", "Netherlands");       // value or label, one trusted change
+await page.HumanFillAsync("#volume", "40");                         // a range: dragged, then nudged
+await page.HumanFillAsync("#date", "2026-10-11");                   // typed segment by segment
+await page.HumanCheckAsync("#terms");
+await page.HumanClickAsync("#menu", new HumanClickOptions { Button = MouseButton.Right });
 await page.HumanPressAsync("Enter");
 ```
+
+Forms (`HumanFillAsync`, `HumanSelectOptionAsync`, `HumanCheckAsync` / `HumanUncheckAsync` /
+`HumanSetCheckedAsync`) are handled the way a person handles them: a text field is clicked, emptied
+only if it holds something (held Ctrl/Cmd+A, Backspace) and typed; a drop-down is opened with a click,
+moved by type-ahead and committed with Enter, so it fires **one** trusted change; list boxes get row
+clicks with Ctrl/Cmd held for more rows; a range thumb is dragged; date and time editors are typed
+segment by segment in the order the browser shows them. Each result is verified, and anything the
+humane route cannot prove goes to Playwright's own method. The click family (`HumanClickAsync`,
+`HumanDblClickAsync`, `HumanHoverAsync`) honours every Playwright click option — button, click count,
+hold, modifiers, a padding-box position, force and trial — through `HumanClickOptions` or
+`LocatorClickOptions`. Typing makes the occasional fat-finger slip and corrects it, never in password,
+e-mail, number, phone, URL or one-time-code fields, nor in a field inside an iframe.
+
+**Behaviour changes in this release** (from the forms work):
+
+- **Typos are on by default** (2 % of eligible characters) in `HumanTypeAsync` and `HumanFillAsync`; earlier
+  .NET releases made no slips. Turn them off with `CLEARCOTE_HUMANIZE_TYPO_RATE=0` (the name is also
+  `Humanize.TypoRateEnv`); any value from 0 to 1 sets the rate, read at every call.
+- **A timeout is raised once, on the caller's deadline** (the option's `Timeout`, else the page's default
+  timeout), instead of falling back to the native call and waiting a second time.
+- **A range fill only takes values the browser keeps.** A value off the step, out of range or not a number
+  raises Playwright's "Malformed value", exactly as `FillAsync` does; it is never snapped or clamped.
+- **`page.HumanSelectOptionAsync(selector, …)` takes the first match**, like `page.SelectOptionAsync`
+  (pass `Strict = true` for a strict one), and a string matches an option's label as well as its value,
+  as in Playwright. The old closed-select arrow route is gone: whatever the humane route cannot do goes to
+  `SelectOptionAsync`.
+- **`HumanPressAsync` on a button or link focuses it without a click** (one activation); a text field is
+  clicked into first, unless it already has focus.
+- `Delay = 0` (Playwright's default) or a negative `Delay` holds the button for the persona's time, not
+  0 ms; locators inside a frame (`FrameLocator`) go to Playwright's own method; and concurrent `Human*`
+  calls on one page take turns instead of interleaving their keys.
+- **Humanized clicks no longer run a Playwright `trial`** before pressing: the covered-point check is the
+  browser's own hit test, read where the page cannot see it, so the pointer is not moved onto the target
+  and back and no blocked press reaches the page. Only a click point inside a child frame still uses a
+  trial. A plain-CSS target (`"#id"`, `page.Locator(".cls")`) is located without any Playwright element
+  handle; a long drop-down list is crossed with a held arrow key and type-ahead that includes spaces.
 
 `Attach` is optional — the first humanized call creates a random persona. Pass the same seed you pass
 to `Fingerprint` and the identity moves the same way in the Python and Node SDKs too: the persona is
@@ -161,9 +238,8 @@ language.
 
 **These are extension methods, not replacements.** C# cannot patch `IPage`/`ILocator` the way the
 Python and Node SDKs patch their page objects, so ordinary `ClickAsync` stays exactly as Playwright
-wrote it and you opt in per call. `HumanSelectOptionAsync` falls back to `SelectOptionAsync` for
-multi-selects and anywhere the keyboard route cannot be verified to have worked (it re-reads
-`selectedIndex` afterwards rather than assuming).
+wrote it and you opt in per call. The locator forms are strict like Playwright's (more than one match
+raises its strict-mode error), and a timeout is raised once, on the caller's deadline.
 
 ## A standing, stealthy CDP endpoint (`ServeAsync`)
 
@@ -245,7 +321,9 @@ await Geometry.FitWindowToWorkAreaAsync(page);
 `CLEARCOTE_LICENSE_KEY`, `CLEARCOTE_LICENSE_API`, `CLEARCOTE_INSTANCE_ID`, `CLEARCOTE_BINARY`,
 `CLEARCOTE_CACHE`, `CLEARCOTE_AUTO_UPDATE`, `CLEARCOTE_STOCK_RUNTIME`, `CLEARCOTE_PERSONA_ENV`,
 `CLEARCOTE_FONT_DIRS`, `CLEARCOTE_FALLBACK_FONT_DIRS`, `CLEARCOTE_GEOIP_TIMEOUT_SECONDS`, `CLEARCOTE_GEOIP_ECHO_URL`,
-`CLEARCOTE_GEOIP_IPAPI`, `CLEARCOTE_NO_WARN`; for the cloud, `CLEARCOTE_CLOUD`,
+`CLEARCOTE_GEOIP_IPAPI`, `CLEARCOTE_NO_WARN`, `CLEARCOTE_WIDEVINE`, `CLEARCOTE_WIDEVINE_DIR`,
+`CLEARCOTE_WIDEVINE_TIMEOUT_SECONDS`, `CLEARCOTE_HUMANIZE_TYPO_RATE` (the humanized typing's slip rate, 0-1,
+default 0.02; `0` turns typos off); for the cloud, `CLEARCOTE_CLOUD`,
 `CLEARCOTE_API_KEY` and `CLEARCOTE_API_URL`.
 
 Downloaded browsers are cached per build, in the same place the Python and Node SDKs use (`CLEARCOTE_CACHE`
@@ -259,8 +337,9 @@ not wait for it.
 This SDK covers the core: persona → engine switches, free + PRO binary resolution (download / verify /
 extract / cache, with the Windows first-launch AV-race work-around), the full floating-concurrency licensing
 client, `LaunchAsync` / `LaunchPersistentContextAsync` / `ServeAsync` / `ExecutablePathAsync`, the default
-stealth args, and cloud mode with the full hosted API (see [Local or cloud](#local-or-cloud)). The higher-level add-ons in the Node/Python SDKs — the humanized cursor, in-browser AI agent,
-Widevine/EME helper, saved-profile manager, and render-coherence linter — are planned follow-ups; the
+stealth args, and cloud mode with the full hosted API (see [Local or cloud](#local-or-cloud)). The Widevine/EME helper is here too since 0.48.0 (see [Widevine / DRM](#widevine--drm-widevine)). The
+higher-level add-ons in the Node/Python SDKs — the humanized cursor, in-browser AI agent,
+saved-profile manager, and render-coherence linter — are planned follow-ups; the
 underlying engine switches are all reachable today via `Args`.
 
 Also available (0.29.0): `Geoip = true` (through the proxy, incl. SOCKS5; one

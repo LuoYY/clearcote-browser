@@ -178,7 +178,10 @@ def _proxy_url(proxy) -> str:
 def container_env(kwargs: dict) -> dict:
     """The CC_* (and licence) variables the image is started with, from launch()'s keywords. Raises
     ValueError naming the first option the image cannot take."""
-    unknown = sorted(k for k, v in kwargs.items() if k not in ACCEPTED and v is not None)
+    # widevine=False: the opt-out of the licensed LOCAL default; the container has no default to turn off, so it is
+    # accepted and dropped (widevine=True is still refused).
+    unknown = sorted(k for k, v in kwargs.items() if k not in ACCEPTED and v is not None
+                     and not (k == "widevine" and v is False))
     if unknown:
         raise ValueError(
             f"{unknown[0]} is not available when launch() runs Clearcote in Docker (there is no native "

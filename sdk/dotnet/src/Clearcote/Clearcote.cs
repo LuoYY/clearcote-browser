@@ -128,6 +128,10 @@ public static class Clearcote
 
         var licVersion = options.Version ?? Environment.GetEnvironmentVariable("CLEARCOTE_BROWSER_VERSION");
         var licKey = License.ResolveLicenseKey(options.LicenseKey);
+        // Widevine: on by default for a licensed launch (licKey: the key that selects the PRO build, which claims
+        // the Google Chrome brand) on an engine with --widevine-cdm-path, which loads the CDM without a profile;
+        // opt-in for a free one. Bounded + fail-soft by default; before the lease, so a slow fetch holds no slot.
+        args.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
         var lease = await License.AcquireLeaseAsync(
             new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy },
             Version, options.Quiet,   // sdk_version = the SDK PACKAGE version
@@ -231,15 +235,37 @@ public static class Clearcote
         EnsureRunnableHere(exe);
         var fontDirs = Fonts.CheckFontDirs(options.FontDirs);  // Linux fontconfig dirs: a typo throws before the lease
 
+        // Widevine ASKED FOR (Widevine = true or CLEARCOTE_WIDEVINE=1): seed the CDM into this profile and let the
+        // component updater register it, so an engine without --widevine-cdm-path loads it too. Best-effort: a
+        // failure says so (unless Quiet) and the launch goes on without DRM. The licensed DEFAULT only uses the
+        // switch (below). IgnoreDefaultArgs then carries --disable-component-update on top of the SDK's strip.
+        var userArgs = options.Args ?? Array.Empty<string>();
+        var ignoreDefaultArgs = options.IgnoreDefaultArgs ?? LaunchOpts.DefaultIgnoredArgs;
+        if (Widevine.Mode(options.Widevine, licensed: false) == WidevineMode.Explicit)
+        {
+            try
+            {
+                await Widevine.SeedAsync(userDataDir, quiet: options.Quiet).ConfigureAwait(false);
+                (ignoreDefaultArgs, userArgs) = Widevine.ComponentUpdaterArgs(options.IgnoreDefaultArgs, options.Args, options.Quiet);
+            }
+            catch (Exception e)
+            {
+                if (!options.Quiet) Console.Error.WriteLine($"[clearcote] [widevine] setup failed (continuing without DRM): {e.Message}");
+            }
+        }
+
         var (proxyArgs, proxy) = LaunchOpts.ResolveProxy(options.Proxy);
         var args = AssembleArgs(Fingerprint.Args(options), LaunchOpts.ExtensionArgs(options.Extensions),
-            proxyArgs, options.DisablePrivacySandbox, options.WebrtcIp, options.Args ?? Array.Empty<string>(), options.Proxy, options.Socks5Udp,
+            proxyArgs, options.DisablePrivacySandbox, options.WebrtcIp, userArgs, options.Proxy, options.Socks5Udp,
             Extras(options, exe, headed: options.Headless == false));
         LaunchWarnings.Emit(LaunchWarnings.ForArgs(options.Args), options.Quiet);
         LaunchWarnings.EmitOnce(LaunchWarnings.ForPersonaHost(options), options.Quiet);   // a Linux persona on Windows
 
         var licVersion = options.Version ?? Environment.GetEnvironmentVariable("CLEARCOTE_BROWSER_VERSION");
         var licKey = License.ResolveLicenseKey(options.LicenseKey);
+        // Widevine: on by default for a licensed launch (licKey selects the PRO build) on an r32+ engine; asked for,
+        // best-effort as always. Before the lease, so a slow fetch holds no slot.
+        args.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
         var lease = await License.AcquireLeaseAsync(
             new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy },
             Version, options.Quiet,   // sdk_version = the SDK PACKAGE version
@@ -277,7 +303,7 @@ public static class Clearcote
                 Channel = options.Channel,
                 SlowMo = options.SlowMo,
                 Timeout = options.Timeout,
-                IgnoreDefaultArgs = options.IgnoreDefaultArgs ?? LaunchOpts.DefaultIgnoredArgs.ToArray(),
+                IgnoreDefaultArgs = ignoreDefaultArgs.ToArray(),  // the caller's, else the SDK's strip (+ component updater on when Widevine is asked for)
                 Env = persona.Env(envFor()),
                 Proxy = ToPwProxy(proxy),
                 // Headed with no explicit viewport -> real window size (matches launch()).
@@ -366,6 +392,8 @@ public static class Clearcote
 
         var licVersion = options.Version ?? Environment.GetEnvironmentVariable("CLEARCOTE_BROWSER_VERSION");
         var licKey = License.ResolveLicenseKey(options.LicenseKey);
+        // Widevine: as LaunchAsync (on by default for a licensed launch on an r32+ engine, opt-in otherwise).
+        cdpArgs.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
         var lease = await License.AcquireLeaseAsync(
             new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy },
             Version, options.Quiet,   // sdk_version = the SDK PACKAGE version

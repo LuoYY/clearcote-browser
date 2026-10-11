@@ -71,6 +71,9 @@ internal static class CloudLaunch
         foreach (var p in LocalOnlyOptions)
         {
             var value = p.GetValue(o);
+            // Widevine = false: the opt-out of the licensed LOCAL default. A hosted browser loads its own CDM, so
+            // there is nothing to turn off: accepted and dropped (Widevine = true is still refused).
+            if (p.Name == nameof(LaunchOptions.Widevine) && value is false) continue;
             if (value is not null && !Equals(value, p.GetValue(defaults)))
                 throw new ArgumentException($"{p.Name} is not available for cloud browsers");
         }

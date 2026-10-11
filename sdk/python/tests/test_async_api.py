@@ -1,7 +1,10 @@
 import inspect
 
+import pytest
+
 from clearcote import async_api
 from clearcote._humanize_async import attach_humanize, install_humanize
+from clearcote._isolated import DESCRIBE, HIT_IN_BOX
 
 
 def test_async_surface_is_coroutines():
@@ -69,6 +72,57 @@ class _FakeLocator:
     async def element_handle(self):
         return object()
 
+    # Playwright's utility-world queries, which fill() classifies the field with when the isolated
+    # world cannot prove it (this fake page has no CDP session): an <input type=email>.
+    def locator(self, sel):
+        return _FakeCount(1 if sel == "xpath=self::input" else 0)
+
+    async def get_attribute(self, name):
+        return "email" if name == "type" else None
+
+    async def is_visible(self):
+        return True
+
+    def and_(self, other):
+        return _FakeCount(1)   # loc.and_(page.locator(":focus")): the clicked field has the focus
+
+    async def input_value(self, timeout=None):
+        # what the keys typed so far left in the field (fill verifies through this read)
+        return "".join(k for k in getattr(self, "page").keyboard.presses if len(k) == 1)
+
+
+class _FakeCount:
+    def __init__(self, n):
+        self.n = n
+
+    async def count(self):
+        return self.n
+
+
+class _FakeWorld:
+    """The isolated world for the fake page: one <input type=email> fills the locator's box and owns
+    every point of it (the browser's hit test, read where the page cannot see it)."""
+
+    async def evaluate(self, src, arg=None):
+        return None   # no CSS box, no viewport read (page.viewport_size is used), no active field
+
+    async def scroll(self):
+        return (0.0, 0.0)
+
+    async def node_at(self, x, y, scroll=None):
+        return 1
+
+    async def call_on_node(self, nid, src, arg=None):
+        if src == HIT_IN_BOX:
+            return True
+        if src == DESCRIBE:
+            return {"tag": "input", "type": "email", "ce": False, "rect": [10, 10, 100, 20], "value": "",
+                    "disabled": False, "readonly": False, "bl": 0, "bt": 0}
+        return None
+
+    async def send(self, method, params=None):
+        return None
+
 
 class _FakePage:
     def __init__(self):
@@ -78,6 +132,8 @@ class _FakePage:
         self.evals = []
         self.fill_fallback, self.type_fallback = [], []
         self.main_frame = object()
+        self.viewport_size = {"width": 1280, "height": 800}
+        self._cc_isolated_world = _FakeWorld()
 
     async def evaluate(self, *a, **k):
         self.evals.append(a)
@@ -89,6 +145,7 @@ class _FakePage:
         pass
 
     def locator(self, sel):
+        self.loc.page = self
         return self.loc
 
     async def fill(self, sel, val, **k):
@@ -121,7 +178,8 @@ async def test_humanize_click_presses_after_gliding():
     assert page.mouse.moves and page.mouse.moves[-1] == (120, 140)
 
 
-async def test_humanize_typing_is_per_character_not_paste():
+async def test_humanize_typing_is_per_character_not_paste(monkeypatch):
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "0")
     page = _FakePage()
     await attach_humanize(None, page, humanize=True)
     await page.fill("#email", "abc")
@@ -129,8 +187,11 @@ async def test_humanize_typing_is_per_character_not_paste():
     # (keyboard.type has no hold). Intent unchanged: one key per char, not a bulk paste.
     assert [p for p in page.keyboard.presses if p in ("a", "b", "c")] == ["a", "b", "c"]
     assert page.fill_fallback == []                       # native bulk fill (paste) NOT used
-    assert "ControlOrMeta+a" in page.keyboard.presses     # field cleared first
-    assert page.loc.clicked == 1                           # field focused via a click
+    # An empty field is not select-all'ed first (a person does not clear an empty field; the
+    # prefilled case is in test_humanize_forms_async.py).
+    assert "ControlOrMeta+a" not in page.keyboard.presses
+    # Focused with ONE trusted mouse click at the end of a glide, not Playwright's locator.click.
+    assert len(page.mouse.clicks) == 1 and page.loc.clicked == 0
 
 
 async def test_show_cursor_injects_overlay():
@@ -240,7 +301,14 @@ class _ShiftKeyboard(_FakeKeyboard):
         self.events.append(("up", key))
 
 
-async def test_humanize_types_capitals_and_symbols_behind_a_real_shift():
+@pytest.fixture
+def no_typos(monkeypatch):
+    """These tests pin exact key sequences; a planned fat-finger slip (2 % per letter by default)
+    would add its wrong key and Backspace to them."""
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "0")
+
+
+async def test_humanize_types_capitals_and_symbols_behind_a_real_shift(no_typos):
     # r28 sent "A" and "!" with shiftKey=false and no Shift keydown at all.
     page = _FakePage()
     page.keyboard = _ShiftKeyboard()
@@ -254,7 +322,7 @@ async def test_humanize_types_capitals_and_symbols_behind_a_real_shift():
     ]
 
 
-async def test_humanize_releases_shift_when_typing_ends_on_a_capital():
+async def test_humanize_releases_shift_when_typing_ends_on_a_capital(no_typos):
     page = _FakePage()
     page.keyboard = _ShiftKeyboard()
     await attach_humanize(None, page, humanize=True)
@@ -262,7 +330,7 @@ async def test_humanize_releases_shift_when_typing_ends_on_a_capital():
     assert page.keyboard.events[-2:] == [("press", "B"), ("up", "Shift")]
 
 
-async def test_humanize_types_without_shift_when_keyboard_has_no_down_up():
+async def test_humanize_types_without_shift_when_keyboard_has_no_down_up(no_typos):
     page = _FakePage()  # _FakeKeyboard has press/type only
     await attach_humanize(None, page, humanize=True)
     await page.keyboard.type("Ab")

@@ -172,6 +172,7 @@ def _overlaps(events):
 
 def _type(monkeypatch, rate, text):
     monkeypatch.setattr(_humanize, "rollover_rate", lambda p: rate)
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "0")   # exact key sequences: no slips
     page = _Page()
     _humanize.attach_humanize(None, page, humanize=True, seed="t")
     page.keyboard.type(text)
