@@ -302,8 +302,8 @@ else:
     # colour depth is deliberately NOT pinned from CC_SCREEN's third field: Chrome reports 24 on a
     # 24- AND a 32-bit X visual, so forwarding the Xvfb number would turn a routine "x32" into a
     # screen.colorDepth no desktop Chrome emits. Set CC_COLOR_DEPTH to override it explicitly.
-    print("[clearcote] screen: %dx%d claimed, avail %dx%d, window %dx%d @0,0"
-          % (screen_w, screen_h, avail_w, avail_h, avail_w, avail_h), flush=True)
+    print("[clearcote] screen: %dx%d claimed, avail %dx%d" % (screen_w, screen_h, avail_w, avail_h),
+          flush=True)
 
 # Widevine CDM -- seeded ONLY for a Windows persona on this Linux host, which is where its absence
 # is a measured contradiction: a build branded Google Chrome that claims Windows and carries no CDM
@@ -348,11 +348,30 @@ internal = os.environ.get("CC_INTERNAL_PORT", "9223")  # chrome's loopback DevTo
 # --window-position is not itself page-observable -- the engine synthesizes screenX/Y -- it only
 # keeps the real surface wholly on the virtual display. Skipped entirely when fingerprint_args has
 # already sized the window (light_stealth's own fit), so the SDK's choice is never fought.
+#
+# Engine r39+ opens a persona's window itself (components/ungoogled/persona_window.h): inside the
+# work area pinned above, at a size, position and state derived from the seed -- maximized for most
+# seeds, a restored window for the rest -- so every container no longer shows the same maximized
+# 1920x1040 window. Then this entrypoint passes no window switch at all (a --window-size would also
+# force every popup to that size). Older engines, light_stealth (no persona) and an explicit
+# CC_EXTRA_ARGS window keep the old behaviour.
+def _engine_places_persona_window(argv):
+    try:
+        from clearcote._geometry import engine_places_persona_window
+    except ImportError:  # an image built with an SDK older than this entrypoint
+        return False
+    return engine_places_persona_window(exe, argv)
+
+
 window_args = []
-if pin_screen:
+if pin_screen and not _engine_places_persona_window(list(args) + list(extra)):
     window_args.append("--window-position=0,0")
     if not any(str(a).startswith("--window-size=") for a in args):
         window_args.append("--window-size=%d,%d" % (avail_w, avail_h))
+    print("[clearcote] window: %dx%d @0,0" % (avail_w, avail_h), flush=True)
+elif pin_screen:
+    print("[clearcote] window: the persona's own, opened by the engine inside the claimed work area",
+          flush=True)
 
 # Proxy (CC_PROXY="[scheme://][user:pass@]host:port"). launch() hands a proxy to its automation driver; this
 # entrypoint exec's chrome itself, so it has to become switches. A proxy that needs a password is logged in

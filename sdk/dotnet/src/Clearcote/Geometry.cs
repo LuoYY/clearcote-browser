@@ -56,6 +56,16 @@ namespace Clearcote;
 /// <see cref="Clearcote.LaunchAsync"/> callers create themselves.
 /// </para>
 /// <para>
+/// R39+ PERSONA WINDOW. From engine r39 the engine opens a persona's real window itself: the headless
+/// display is the persona's and the first window has the persona's own bounds and show state before any
+/// page exists (<see cref="WindowGeom"/> mirrors the derivation). On such an engine
+/// (<see cref="EnginePlacesPersonaWindow"/>) a persona launch gets <see cref="Mode.PersonaNative"/>: no
+/// <c>--screen-info</c>, no work-area fit (and none of the old per-page screen overrides), only NoViewport
+/// when the caller chose no viewport or screen; an explicit viewport keeps its size and its window is
+/// only moved back onto the work area if it hangs over an edge (<see cref="ReconcileWindowPositionAsync"/>).
+/// Older engines, seedless launches and schema 1-3 pins keep everything below unchanged.
+/// </para>
+/// <para>
 /// PARITY: the seed still selects the same screen row in every SDK (<see cref="HeadlessGeometry"/>);
 /// only how it is applied changed.
 /// </para>
@@ -129,6 +139,47 @@ public static class Geometry
         }) == true;
 
     /// <summary>
+    /// The engine switch an r39+ engine implements when it opens a persona's window itself
+    /// (<see cref="EnginePlacesPersonaWindow"/>), without the leading dashes.
+    /// </summary>
+    /// <remarks>
+    /// r39+: the ENGINE owns a persona's window (components/ungoogled/persona_window.h). With a persona it
+    /// makes the headless display the persona's display (screen size + taskbar) and opens the first
+    /// browser window with the persona's own bounds and show state — maximized for most seeds, a restored
+    /// window of a seed-derived size and position for the rest (<see cref="WindowGeom"/> mirrors the
+    /// derivation) — before any page exists. The SDK then sends no <c>--screen-info</c> and runs no fit
+    /// for a persona: either would only move a real window that is already right, and the fit was the one
+    /// step a page could see (a late resize event on ~1 page in 10, measured on r37). Probed per engine,
+    /// like every new switch: older engines keep the fit.
+    /// </remarks>
+    public const string PersonaWindowSwitch = "fingerprint-window";
+
+    private static readonly string[] PersonaWindowOff = { "off", "0", "false" };
+    private static readonly string[] PersonaWindowOn = { "on", "1", "true" };
+
+    /// <summary>
+    /// Whether the engine that will run opens a persona's window itself (r39+).
+    /// </summary>
+    /// <remarks>
+    /// True when a persona is active on this command line (<see cref="PersonaActive"/>), the binary
+    /// implements <c>--fingerprint-window</c> (<see cref="LaunchOpts.EngineSupportsSwitch"/>), and the
+    /// engine's own rule turns it on: <c>--fingerprint-window=on</c>, or no/<c>auto</c> value on schema 4
+    /// (a <c>--fingerprint-schema=1..3</c> pin keeps the old window, byte for byte).
+    /// <c>--fingerprint-window=off</c> and phone personas (android) are false.
+    /// </remarks>
+    /// <param name="exe">The engine binary that will run; null is false.</param>
+    /// <param name="args">The launch's command line (before the persona transport moves anything).</param>
+    public static bool EnginePlacesPersonaWindow(string? exe, IEnumerable<string>? args)
+    {
+        if (string.IsNullOrEmpty(exe) || !PersonaActive(args)) return false;
+        var mode = (SwitchValue(args, PersonaWindowSwitch) ?? "auto").Trim().ToLowerInvariant();
+        if (PersonaWindowOff.Contains(mode)
+            || (SwitchValue(args, "fingerprint-platform") ?? "").ToLowerInvariant() == "android") return false;
+        if (!PersonaWindowOn.Contains(mode) && SwitchValue(args, "fingerprint-schema") is "1" or "2" or "3") return false;
+        return LaunchOpts.EngineSupportsSwitch(exe, PersonaWindowSwitch);
+    }
+
+    /// <summary>
     /// True when the caller passed their own window geometry flag (size, position or maximize): the
     /// window is theirs, so the SDK neither moves nor fits it.
     /// </summary>
@@ -159,7 +210,18 @@ public static class Geometry
     /// <param name="args">The caller's command line.</param>
     /// <param name="linuxHost">Null reads this host; tests pass true/false.</param>
     public static bool HeadedLinuxFit(IEnumerable<string>? args, bool? linuxHost = null) =>
-        (linuxHost ?? OperatingSystem.IsLinux()) && !CallerSizedTheWindow(args);
+        HeadedLinuxFit(args, linuxHost, exe: null);
+
+    /// <summary>
+    /// <see cref="HeadedLinuxFit(IEnumerable{string}?, bool?)"/>, and never for a persona on an engine
+    /// that opens the persona's window itself (r39+, <see cref="EnginePlacesPersonaWindow"/>): the engine
+    /// sizes it at creation.
+    /// </summary>
+    /// <param name="args">The caller's command line.</param>
+    /// <param name="linuxHost">Null reads this host; tests pass true/false.</param>
+    /// <param name="exe">The engine binary that will run.</param>
+    public static bool HeadedLinuxFit(IEnumerable<string>? args, bool? linuxHost, string? exe) =>
+        (linuxHost ?? OperatingSystem.IsLinux()) && !CallerSizedTheWindow(args) && !EnginePlacesPersonaWindow(exe, args);
 
     /// <summary>
     /// Weighted, deterministic choice from <see cref="HeadlessScreenProfiles"/>. Same construction as
@@ -317,20 +379,35 @@ public static class Geometry
         Profile,
         /// <summary>Regime 2: the SDK's headless display (<see cref="HeadlessPlan.Args"/>) plus NoViewport and a window fit.</summary>
         Display,
+        /// <summary>
+        /// A persona on an engine that opens the persona's window itself (r39+,
+        /// <see cref="EnginePlacesPersonaWindow"/>): no display switch, no fit. The context takes
+        /// NoViewport only when the caller chose no viewport or screen; an explicit viewport gets only a
+        /// position reconcile (<see cref="HeadlessPlan.Reconcile"/>).
+        /// </summary>
+        PersonaNative,
     }
 
-    /// <summary>What a headless launch should do; see <see cref="ResolveHeadless"/>.</summary>
+    /// <summary>What a headless launch should do; see <see cref="ResolveHeadless(bool?, string?, IEnumerable{string}?, bool, string?, bool)"/>.</summary>
     /// <param name="Mode">The regime, or <see cref="Mode.None"/> to leave geometry alone.</param>
     /// <param name="Display">Regime 2's display, or null (other regimes, or the caller passed their own <c>--screen-info</c>).</param>
     /// <param name="Args">Switches to APPEND to the command line. Keep passing the caller's own args to the fit.</param>
-    public sealed record HeadlessPlan(Mode Mode, Display? Display, string[] Args);
+    public sealed record HeadlessPlan(Mode Mode, Display? Display, string[] Args)
+    {
+        /// <summary>
+        /// <see cref="Mode.PersonaNative"/> under an explicit caller viewport: the window keeps the
+        /// caller's viewport and is only moved back onto the work area if it hangs over an edge
+        /// (<see cref="ReconcileWindowPositionAsync"/>). False for every other plan.
+        /// </summary>
+        public bool Reconcile { get; init; }
+    }
 
     /// <summary>Resolve the geometry a headless launch should use.</summary>
     /// <remarks>
     /// <see cref="Mode.None"/> when the launch is headed (the real window is already coherent) or the
     /// caller set ViewportSize / ScreenSize themselves; a null <paramref name="headless"/> means
     /// headless, matching Playwright. Otherwise the context takes NoViewport and the window is fitted
-    /// to the work area (<see cref="InstallWindowFixupAsync"/>). A caller's own <c>--screen-info</c>
+    /// to the work area (<see cref="InstallWindowFixupAsync(IBrowserContext, IEnumerable{string}?, HeadlessPlan)"/>). A caller's own <c>--screen-info</c>
     /// keeps their display; a caller's own window switch keeps their window (the display is still set).
     /// Under a persona the seed's display still goes on the command line, on every platform: the
     /// engine's persona display wins over it, so it only ever serves a persona that does not engage.
@@ -339,9 +416,34 @@ public static class Geometry
         bool? headless,
         string? seed,
         IEnumerable<string>? args,
-        bool callerSetGeometry)
+        bool callerSetGeometry) =>
+        ResolveHeadless(headless, seed, args, callerSetGeometry, exe: null);
+
+    /// <summary>
+    /// <see cref="ResolveHeadless(bool?, string?, IEnumerable{string}?, bool)"/> for the engine that will
+    /// run: a persona on an r39+ engine (<see cref="EnginePlacesPersonaWindow"/>) gets
+    /// <see cref="Mode.PersonaNative"/> — no display switch and no fit, whatever the caller set — and
+    /// every other launch the plan it always got.
+    /// </summary>
+    /// <param name="headless">The launch's Headless option (null means headless).</param>
+    /// <param name="seed">The fingerprint seed.</param>
+    /// <param name="args">The caller's command line.</param>
+    /// <param name="callerSetGeometry">The caller set ViewportSize (NoViewport included) or ScreenSize.</param>
+    /// <param name="exe">The engine binary that will run; null keeps the plan for an older engine.</param>
+    /// <param name="callerViewport">The caller set an explicit ViewportSize other than NoViewport
+    /// (<see cref="IsExplicitViewport"/>): a persona-native window then gets only the position reconcile.</param>
+    public static HeadlessPlan ResolveHeadless(
+        bool? headless,
+        string? seed,
+        IEnumerable<string>? args,
+        bool callerSetGeometry,
+        string? exe,
+        bool callerViewport = false)
     {
-        if (headless == false || callerSetGeometry) return new(Mode.None, null, Array.Empty<string>());
+        if (headless == false) return new(Mode.None, null, Array.Empty<string>());
+        if (EnginePlacesPersonaWindow(exe, args))
+            return new(Mode.PersonaNative, null, Array.Empty<string>()) { Reconcile = callerViewport };
+        if (callerSetGeometry) return new(Mode.None, null, Array.Empty<string>());
         if (PersonaActive(args))
         {
             // Headless otherwise starts with an 800x600/host-shaped display even though Blink exposes
@@ -360,6 +462,30 @@ public static class Geometry
         if (display is not null) extra.Add(ScreenInfoSwitch(display));
         if (!CallerSizedTheWindow(args)) extra.Add("--window-position=0,0");
         return new(Mode.Display, display, extra.ToArray());
+    }
+
+    /// <summary>
+    /// True for a ViewportSize that emulates a viewport, i.e. anything but null and
+    /// <c>ViewportSize.NoViewport</c> (Playwright's own test is the -1 width).
+    /// </summary>
+    public static bool IsExplicitViewport(ViewportSize? viewport) =>
+        viewport is not null
+        && !ReferenceEquals(viewport, ViewportSize.NoViewport)
+        && !(viewport.Width == ViewportSize.NoViewport.Width && viewport.Height == ViewportSize.NoViewport.Height);
+
+    /// <summary>
+    /// The ViewportSize a persistent-context launch hands Playwright for a geometry plan: the caller's
+    /// own when set; otherwise NoViewport when headed or when the plan manages the window — for
+    /// <see cref="Mode.PersonaNative"/> only when the caller set no ScreenSize either (a caller's own
+    /// geometry reaches Playwright untouched) — and Playwright's default (null) when the caller set a
+    /// ScreenSize on an older engine.
+    /// </summary>
+    internal static ViewportSize? ContextViewport(HeadlessPlan plan, bool? headless, ViewportSize? viewport, ScreenSize? screen)
+    {
+        if (viewport is not null) return viewport;
+        if (headless == false) return ViewportSize.NoViewport;
+        if (plan.Mode == Mode.PersonaNative) return screen is null ? ViewportSize.NoViewport : null;
+        return plan.Mode != Mode.None ? ViewportSize.NoViewport : null;
     }
 
     /// <summary>The earlier regime-2 geometry (a CDP screen override sized against the linux frame).</summary>
@@ -532,6 +658,63 @@ public static class Geometry
     }
 
     /// <summary>
+    /// The <c>(left, top)</c> that puts a normal window back on a work area of <paramref name="avail"/>
+    /// (moving it, never resizing it), or null when it is on it already or is not a normal window.
+    /// </summary>
+    /// <param name="left">The window's left edge.</param>
+    /// <param name="top">The window's top edge.</param>
+    /// <param name="width">The window's outer width.</param>
+    /// <param name="height">The window's outer height.</param>
+    /// <param name="windowState">CDP's windowState; null counts as "normal".</param>
+    /// <param name="avail">The work area, <c>[availWidth, availHeight]</c>.</param>
+    public static (int Left, int Top)? ReconcilePlan(int left, int top, int width, int height, string? windowState, int[] avail)
+    {
+        if ((windowState ?? "normal") != "normal") return null;
+        var (aw, ah) = (avail[0], avail[1]);
+        var moved = (Math.Max(0, Math.Min(left, aw - width)), Math.Max(0, Math.Min(top, ah - height)));
+        return moved == (left, top) ? null : moved;
+    }
+
+    /// <summary><see cref="ReconcilePlan(int, int, int, int, string?, int[])"/> for CDP <c>Browser.Bounds</c>; a missing size throws.</summary>
+    private static (int Left, int Top)? ReconcilePlan(JsonElement bounds, int[] avail)
+    {
+        var state = bounds.TryGetProperty("windowState", out var s) ? s.GetString() : null;
+        if ((state ?? "normal") != "normal") return null;
+        return ReconcilePlan(bounds.GetProperty("left").GetInt32(), bounds.GetProperty("top").GetInt32(),
+            bounds.GetProperty("width").GetInt32(), bounds.GetProperty("height").GetInt32(), state, avail);
+    }
+
+    /// <summary>
+    /// A persona window (r39+, <see cref="Mode.PersonaNative"/>) with an explicit viewport: Playwright
+    /// sizes the real window around the caller's viewport, which can leave it hanging over the right or
+    /// bottom edge of the persona's work area. Move it back on with left/top only (a move fires no resize
+    /// event, and the caller's viewport is kept); a viewport larger than the work area is the caller's
+    /// choice. Headless, where the display is the persona's and window coordinates are work-area
+    /// coordinates. Returns the new <c>(left, top)</c>, or null when nothing moved. Never throws.
+    /// </summary>
+    public static async Task<(int Left, int Top)?> ReconcileWindowPositionAsync(IPage page)
+    {
+        try
+        {
+            var avail = await page.EvaluateAsync<int[]>(WorkareaJs).ConfigureAwait(false);
+            var cdp = await page.Context.NewCDPSessionAsync(page).ConfigureAwait(false);
+            var win = (await cdp.SendAsync("Browser.getWindowForTarget").ConfigureAwait(false))!.Value;
+            var plan = ReconcilePlan(win.GetProperty("bounds"), avail);
+            if (plan is { } p)
+                await cdp.SendAsync("Browser.setWindowBounds", new Dictionary<string, object>
+                {
+                    ["windowId"] = win.GetProperty("windowId").GetInt32(),
+                    ["bounds"] = new Dictionary<string, object> { ["left"] = p.Left, ["top"] = p.Top },
+                }).ConfigureAwait(false);
+            return plan;
+        }
+        catch (Exception)
+        {
+            return null;   // deliberately silent: never fail a launch over geometry
+        }
+    }
+
+    /// <summary>
     /// The earlier regime 2: move the real window to (0, 0). Returns the position applied, or null if skipped.
     /// </summary>
     /// <remarks>
@@ -584,6 +767,31 @@ public static class Geometry
 #pragma warning disable CS0618   // the documented compatibility path
         else await MoveWindowToOriginAsync(page, args).ConfigureAwait(false);
 #pragma warning restore CS0618
+    }
+
+    /// <summary>
+    /// Run a launch geometry plan's first-page window step once, on the context's existing page (a
+    /// persistent context always has one) or its first new page: the work-area fit
+    /// (<see cref="InstallWindowFixupAsync(IBrowserContext, IEnumerable{string}?, bool)"/>) for every plan
+    /// but <see cref="Mode.PersonaNative"/>; for that one (an r39+ persona window, which the engine
+    /// opened at the persona's bounds) only the position reconcile when the plan asks for it
+    /// (<see cref="HeadlessPlan.Reconcile"/>), and otherwise nothing at all.
+    /// </summary>
+    /// <param name="context">The context whose window to place.</param>
+    /// <param name="args">The caller's command line.</param>
+    /// <param name="plan">The launch's plan (<see cref="ResolveHeadless(bool?, string?, IEnumerable{string}?, bool, string?, bool)"/>).</param>
+    public static async Task InstallWindowFixupAsync(IBrowserContext context, IEnumerable<string>? args, HeadlessPlan plan)
+    {
+        if (plan.Mode != Mode.PersonaNative)
+        {
+            await InstallWindowFixupAsync(context, args).ConfigureAwait(false);
+            return;
+        }
+        if (!plan.Reconcile) return;
+        var page = context.Pages.Count > 0
+            ? context.Pages[0]
+            : await context.NewPageAsync().ConfigureAwait(false);
+        await ReconcileWindowPositionAsync(page).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -670,10 +878,12 @@ public static class Geometry
 
     /// <summary>What ServeAsync adds for a headless launch.</summary>
     /// <param name="Persona">Whether a persona is active (its own display wins over the <c>--screen-info</c> in <paramref name="Args"/>).</param>
-    /// <param name="Display">The headless display <paramref name="Args"/> sets: the display without a persona, the fallback under one.</param>
+    /// <param name="Display">The headless display <paramref name="Args"/> sets: the display without a persona, the fallback under one; null when <paramref name="Native"/>.</param>
     /// <param name="Args">Switches to APPEND to the command line.</param>
     /// <param name="Fit">Whether the served window fit runs; false when the caller placed the window themselves.</param>
-    internal sealed record ServedPlan(bool Persona, Display Display, string[] Args, bool Fit);
+    /// <param name="Native">An r39+ engine opened the persona's display and window itself (<see cref="EnginePlacesPersonaWindow"/>):
+    /// no switches, and the fit applies only an explicit WindowSize.</param>
+    internal sealed record ServedPlan(bool Persona, Display? Display, string[] Args, bool Fit, bool Native = false);
 
     /// <summary>
     /// The served-browser geometry, or null to leave it alone: headed, or the caller passed a display
@@ -682,10 +892,21 @@ public static class Geometry
     /// the switch says where the window goes, not how big the screen is. Only the fit is skipped then
     /// (<see cref="ServedPlan.Fit"/> false), so their position holds.
     /// </summary>
+    /// <remarks>
+    /// On an engine that opens a persona's window itself (r39+, <paramref name="exe"/>) a persona launch
+    /// gets nothing: no display switch and no <c>--window-position</c>; the engine already put the display
+    /// and the window where the persona has them. Only an explicit <paramref name="windowSize"/> is still
+    /// applied (<see cref="ServedPlan.Fit"/> and <see cref="ServedPlan.Native"/> true): the caller's size,
+    /// at the persona window's own position, kept on the work area.
+    /// </remarks>
     internal static ServedPlan? ServedGeometry(
-        IReadOnlyCollection<string> engineArgs, string? seed, bool lightStealth, bool headless)
+        IReadOnlyCollection<string> engineArgs, string? seed, bool lightStealth, bool headless,
+        string? exe = null, ViewportSize? windowSize = null)
     {
         if (!headless || CallerFixedTheSize(engineArgs) || CallerSetTheDisplay(engineArgs)) return null;
+        if (EnginePlacesPersonaWindow(exe, engineArgs))
+            return new(Persona: true, Display: null, Args: Array.Empty<string>(),
+                Fit: windowSize is not null && !CallerSizedTheWindow(engineArgs), Native: true);
         var placed = CallerSizedTheWindow(engineArgs);   // a bare --window-position: keep theirs, skip the fit
         var display = HeadlessDisplay(seed, engineArgs, lightStealth);
         var args = placed
@@ -718,10 +939,17 @@ public static class Geometry
     /// page, and every change is browser-level, so nothing lingers when the connection closes.
     /// <c>settleMs</c> bounds the wait for each resize to reach the page (<see cref="SettledOuterAsync"/>).
     /// </summary>
+    /// <remarks>
+    /// <paramref name="native"/> (an r39+ engine with a persona, <see cref="ServedPlan.Native"/>): the
+    /// display already is the persona's and the window already the persona's, so there is no
+    /// Emulation.updateScreen and only an explicit <paramref name="windowSize"/> is applied: a window
+    /// that is not in the normal state is restored first, then gets that size at its own position,
+    /// moved just enough to stay on the work area. Without a size it does nothing (null).
+    /// </remarks>
     /// <returns>The display and the window's outer size, or null when it could not act (no page, an
     /// implausible display, or an engine without Emulation.updateScreen under a persona). Never throws.</returns>
     internal static async Task<(Display Display, int[] Outer)?> FitWindowOverCdpAsync(
-        ICdpSend cdp, bool persona, ViewportSize? windowSize = null, int settleMs = SettleMs)
+        ICdpSend cdp, bool persona, ViewportSize? windowSize = null, int settleMs = SettleMs, bool native = false)
     {
         string? sessionId = null;
         try
@@ -747,6 +975,39 @@ public static class Geometry
             var d = await ReadAsync(DisplayJs).ConfigureAwait(false);
             var (sw, sh, al, at, aw, ah) = (d[0], d[1], d[2], d[3], d[4], d[5]);
             if (!Plausible(new[] { aw, ah }) || aw > sw || ah > sh) return null;
+            if (native)
+            {
+                // r39+ persona window: only an explicit size, at the window's own position kept on the work area.
+                if (windowSize is null) return null;
+                var win = await cdp.SendAsync("Browser.getWindowForTarget",
+                    new Dictionary<string, object> { ["targetId"] = targetId }).ConfigureAwait(false);
+                var nativeId = win.GetProperty("windowId").GetInt32();
+                var cur = win.TryGetProperty("bounds", out var b) && b.ValueKind == JsonValueKind.Object ? b : default;
+                int Cur(string key, int fallback) =>
+                    cur.ValueKind == JsonValueKind.Object && cur.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number
+                        ? (int)Math.Round(v.GetDouble())
+                        : fallback;
+                var nw = Math.Min(windowSize.Width, aw);
+                var nh = Math.Min(windowSize.Height, ah);
+                var nLeft = Math.Min(Math.Max(Cur("left", al), al), al + aw - nw);
+                var nTop = Math.Min(Math.Max(Cur("top", at), at), at + ah - nh);
+                var state = cur.ValueKind == JsonValueKind.Object && cur.TryGetProperty("windowState", out var st)
+                    ? st.GetString() : null;
+                if ((state ?? "normal") != "normal")   // a size cannot be set on a maximized window
+                    await cdp.SendAsync("Browser.setWindowBounds", new Dictionary<string, object>
+                    {
+                        ["windowId"] = nativeId,
+                        ["bounds"] = new Dictionary<string, object> { ["windowState"] = "normal" },
+                    }).ConfigureAwait(false);
+                Task SetNativeAsync(int bw, int bh) => cdp.SendAsync("Browser.setWindowBounds", new Dictionary<string, object>
+                {
+                    ["windowId"] = nativeId,
+                    ["bounds"] = new Dictionary<string, object> { ["left"] = nLeft, ["top"] = nTop, ["width"] = bw, ["height"] = bh },
+                });
+                var nativeOuter = await FitWindowAsync(SetNativeAsync, () => ReadAsync(OuterJs), new[] { nw, nh },
+                    new[] { al + aw - nLeft, at + ah - nTop }, settleMs).ConfigureAwait(false);
+                return (new Display(sw, sh, aw, ah), nativeOuter);
+            }
             if (persona)
             {
                 var screens = await cdp.SendAsync("Emulation.getScreenInfos").ConfigureAwait(false);
@@ -855,13 +1116,13 @@ public static class Geometry
 
     /// <summary><see cref="FitWindowOverCdpAsync"/> on the SDK's own short connection. Never throws.</summary>
     internal static async Task<(Display Display, int[] Outer)?> FitServedWindowAsync(
-        string? wsUrl, bool persona, ViewportSize? windowSize = null, int timeoutMs = 5000)
+        string? wsUrl, bool persona, ViewportSize? windowSize = null, int timeoutMs = 5000, bool native = false)
     {
         if (string.IsNullOrEmpty(wsUrl)) return null;
         try
         {
             using var cdp = await CdpSocket.ConnectAsync(wsUrl, TimeSpan.FromMilliseconds(timeoutMs)).ConfigureAwait(false);
-            return await FitWindowOverCdpAsync(cdp, persona, windowSize).ConfigureAwait(false);
+            return await FitWindowOverCdpAsync(cdp, persona, windowSize, native: native).ConfigureAwait(false);
         }
         catch (Exception)
         {

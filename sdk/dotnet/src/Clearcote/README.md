@@ -180,7 +180,9 @@ await srv.CloseAsync();
 Headless, `ServeAsync` gives the browser a real-size display (the persona's, or one drawn from real
 desktops) and maximizes its window onto the work area before any client attaches, so every page, tab
 and popup reports a window that fits its screen. Set `WindowSize` for a smaller window (clamped to the
-work area), or pass your own `--window-size` / `--screen-info` in `Args` to opt out.
+work area), or pass your own `--window-size` / `--screen-info` in `Args` to opt out. On an engine with
+persona windows a seeded `ServeAsync` opens the persona's own window instead (see
+[Window geometry](#the-personas-own-window-r39)); `WindowSize` still wins.
 
 ## Just the binary
 
@@ -239,6 +241,35 @@ recommended for DRM/CDM reasons), or finish it yourself:
 var page = await browser.NewPageAsync(new() { ViewportSize = ViewportSize.NoViewport });
 await Geometry.FitWindowToWorkAreaAsync(page);
 ```
+
+### The persona's own window (r39+)
+
+On an engine with persona window support (licensed builds from r39), a `Fingerprint` seed decides the
+browser window too, not only the screen. The engine derives the window that machine has open on its
+screen — maximized for most seeds, a restored window of a seed-derived size and position for the rest,
+always inside the work area — and creates the **real** window with those bounds and that state before the
+first page exists; in headless mode the headless display becomes the persona's display. `outerWidth`,
+`outerHeight`, `screenX` and `screenY` are then the real window's, so they agree with the viewport,
+screenshots, mouse-event coordinates, pop-ups and `device-width` media queries. The same seed opens the
+same window in every process and on every launch path (including `LaunchAsync`, `ServeAsync`, raw CLI
+and CDP); different seeds open different windows. The SDK then adds no `--screen-info` and runs no window
+fit for that launch (older engines keep the fit). A seedless launch has no persona and keeps the
+behaviour above.
+
+Precedence, first match wins:
+
+1. **Your explicit configuration**: `ViewportSize` (including `NoViewport`) / `ScreenSize`, `WindowSize` for
+   `ServeAsync`, and `--window-size`, `--window-position`, `--start-maximized` in `Args`. An explicit
+   `ViewportSize` is honoured as given; the SDK only moves the window back onto the work area if it hangs
+   over an edge.
+2. **The placement this identity saved in its profile**: a `UserDataDir` reused with the same seed restores
+   the window it closed with; a profile last used with another seed (or an older engine) gets the new
+   seed's window.
+3. **The persona's window**, derived from the seed and its final screen and work area.
+4. **No persona** (no seed, or `LightStealth`): the SDK's display and a window maximized onto its work area.
+
+`--fingerprint-window=off` in `Args` keeps a seeded launch on the previous behaviour; a pinned
+`--fingerprint-schema=1`..`3` keeps it too unless you add `--fingerprint-window=on`.
 
 ## Environment variables
 
