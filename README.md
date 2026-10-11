@@ -15,7 +15,9 @@
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white&labelColor=07080a)](https://discord.gg/WxvCjAnXZm)
 [![llms.txt](https://img.shields.io/badge/for%20agents-llms.txt-24292f?style=flat-square&logo=readme&logoColor=white)](llms.txt)
 
-**[Website](https://www.clearcotelabs.com/)** · [Docs](https://www.clearcotelabs.com/docs) · [Pricing](https://www.clearcotelabs.com/pricing) · [Playground](https://www.clearcotelabs.com/dashboard/playground) · [Discord](https://discord.gg/WxvCjAnXZm)
+### [Get the latest build free with GitHub →](https://www.clearcotelabs.com/pricing?utm_source=github&utm_medium=readme&utm_content=hero-cta#free)
+
+[Website](https://www.clearcotelabs.com/?utm_source=github&utm_medium=readme&utm_content=hero-nav) · [Docs](https://www.clearcotelabs.com/docs?utm_source=github&utm_medium=readme&utm_content=hero-nav) · [Pricing](https://www.clearcotelabs.com/pricing?utm_source=github&utm_medium=readme&utm_content=hero-nav) · [Playground](https://www.clearcotelabs.com/dashboard/playground?utm_source=github&utm_medium=readme&utm_content=hero-nav) · [Discord](https://discord.gg/WxvCjAnXZm)
 
 </div>
 
@@ -23,6 +25,28 @@ Clearcote is an open-source Chromium with its fingerprint controls compiled into
 browser presents one coherent machine: the JavaScript surface, the HTTP headers and the TLS handshake
 all come from the same real Chromium, so they agree with each other. You drive it with the Playwright
 or Puppeteer code you already have.
+
+## Quickstart
+
+```bash
+pip install clearcote
+```
+
+```python
+from clearcote import launch
+
+browser = launch(fingerprint="user-7423")   # same seed -> same machine on every launch
+page = browser.new_page()                   # a standard Playwright Browser from here on
+page.goto("https://example.com")
+browser.close()
+```
+
+The SDK downloads the browser on first use and checks its SHA-256. Node.js: `npm install clearcote`.
+.NET: `dotnet add package Clearcote`. Docker, a CDP endpoint or hosted browsers: [choose how to run it](#choose-how-to-run-it).
+
+To hear about new builds, click **Watch → Custom → Releases** at the top of this page.
+
+## At a glance
 
 | | |
 |---|---|
@@ -32,7 +56,7 @@ or Puppeteer code you already have.
 | **Runs on** | Windows x64, Linux x64, Docker. Or hosted on our servers, with nothing to install |
 | **License** | BSD-3-Clause for the code and patches. The open build is reproducible from this repo |
 | **Cost** | Open build: free. Latest build: free for one browser at a time with GitHub. Pro: $49/month. Hosted: €1 per GB |
-| **Website** | [clearcotelabs.com](https://www.clearcotelabs.com/): docs, pricing, the dashboard and hosted browsers |
+| **Website** | [clearcotelabs.com](https://www.clearcotelabs.com/?utm_source=github&utm_medium=readme&utm_content=at-a-glance): docs, pricing, the dashboard and hosted browsers |
 | **For AI agents** | [`llms.txt`](llms.txt) · [`AGENTS.md`](AGENTS.md) · an [MCP server](mcp/) |
 
 ---
@@ -73,6 +97,9 @@ line that starts or finds the browser. The code after that line stays the same.
 + import { launch } from "clearcote";
 + const browser = await launch({ fingerprint: "user-7423" });
 ```
+
+<details>
+<summary><b>From a CDP tool (browser-use, Crawl4AI, Stagehand, …), a hosted browser service, a stealth plugin, a closed anti-detect browser, or Selenium</b></summary>
 
 **From a tool that connects over CDP.** Start Clearcote as an endpoint (`clearcote-serve --port 9222`,
 the [Docker image](#run-it-in-docker) or `serve()`), then point the tool at it:
@@ -120,7 +147,9 @@ as well, or use the [Profile Manager](https://github.com/clearcotelabs/clearcote
 **From Selenium or WebDriver.** This is the exception. Clearcote is driven over CDP, so those scripts need
 porting to Playwright, Puppeteer or nodriver.
 
-Side-by-side comparisons with other tools: [clearcotelabs.com/alternatives](https://www.clearcotelabs.com/alternatives).
+</details>
+
+Side-by-side comparisons with other tools: [clearcotelabs.com/alternatives](https://www.clearcotelabs.com/alternatives?utm_source=github&utm_medium=readme&utm_content=switch-from-another-tool).
 
 ---
 
@@ -268,7 +297,7 @@ docker run -d --shm-size=1g -p 127.0.0.1:9222:9222 \
 
 The CDP port gives full control of the browser. Publish it on `127.0.0.1` or a trusted network only.
 The image bakes in the signed Linux binary and the fonts a Windows persona needs.
-Details: [`docker/README.md`](docker/README.md) · [deployment guide](https://www.clearcotelabs.com/docs/deployment).
+Details: [`docker/README.md`](docker/README.md) · [deployment guide](https://www.clearcotelabs.com/docs/deployment?utm_source=github&utm_medium=readme&utm_content=run-it-in-docker).
 
 ---
 
@@ -304,10 +333,10 @@ const browser = await chromium.connectOverCDP(connectUrl);
 - **The same `identity` label returns the same device on the same exit IP** in later sessions.
 - **€1 per GB of traffic, and nothing else**: no plan, no hourly charge, no separate proxy bill. Prepaid from €5; `maxGb` caps a session.
 - **Dedicated physical servers**, not shared cloud virtual machines.
-- **The dashboard [Playground](https://www.clearcotelabs.com/dashboard/playground)** runs a task or a script in a cloud browser and shows the live view, every step and the result.
+- **The dashboard [Playground](https://www.clearcotelabs.com/dashboard/playground?utm_source=github&utm_medium=readme&utm_content=run-it-in-the-cloud)** runs a task or a script in a cloud browser and shows the live view, every step and the result.
 
 New accounts that sign in with a GitHub account at least 30 days old get a one-time welcome credit.
-API keys: [dashboard](https://www.clearcotelabs.com/dashboard/api-keys) · Docs: [hosted browsers](https://www.clearcotelabs.com/docs/hosted-browsers).
+API keys: [dashboard](https://www.clearcotelabs.com/dashboard/api-keys?utm_source=github&utm_medium=readme&utm_content=run-it-in-the-cloud) · Docs: [hosted browsers](https://www.clearcotelabs.com/docs/hosted-browsers?utm_source=github&utm_medium=readme&utm_content=run-it-in-the-cloud).
 
 ---
 
@@ -349,7 +378,7 @@ print(run["status"], run["result"]["output"])
 ```
 
 Runs can pause and hand the browser to a person, be recorded, and report to a webhook.
-Reference: [agent runs](https://www.clearcotelabs.com/docs/runs).
+Reference: [agent runs](https://www.clearcotelabs.com/docs/runs?utm_source=github&utm_medium=readme&utm_content=let-an-agent-do-the-task).
 
 **On your machine.** The SDK also ships an in-browser agent that uses Chrome's own Actor framework and
 any model on [OpenRouter](https://openrouter.ai) or another OpenAI-compatible endpoint:
@@ -408,7 +437,7 @@ There is one open build and one licensed build. The licensed build is offered tw
 - The licensed build adds stealth work that is kept private, so it is **not** reproducible from public source.
 - A licence key goes in `CLEARCOTE_LICENSE_KEY=cc_lic_...`, `license_key=` / `licenseKey`, or `clearcote login`. Free with GitHub needs SDK 0.30.0 or newer.
 
-[Get it free with GitHub](https://www.clearcotelabs.com/pricing#free) · [Get Pro](https://www.clearcotelabs.com/pricing) · per-feature table: [Node](sdk/node/README.md#whats-in-each-tier)
+[Get it free with GitHub](https://www.clearcotelabs.com/pricing?utm_source=github&utm_medium=readme&utm_content=builds-and-tiers#free) · [Get Pro](https://www.clearcotelabs.com/pricing?utm_source=github&utm_medium=readme&utm_content=builds-and-tiers) · per-feature table: [Node](sdk/node/README.md#whats-in-each-tier)
 
 ### Build availability (October 2026)
 
@@ -476,10 +505,10 @@ Privacy, QA and testing, research and lawful automation. Respect site terms and 
 
 | | |
 |---|---|
-| **Website** | [clearcotelabs.com](https://www.clearcotelabs.com/) · [Docs](https://www.clearcotelabs.com/docs) · [Pricing](https://www.clearcotelabs.com/pricing) · [Compare alternatives](https://www.clearcotelabs.com/alternatives) · [Blog](https://www.clearcotelabs.com/blog) |
+| **Website** | [clearcotelabs.com](https://www.clearcotelabs.com/?utm_source=github&utm_medium=readme&utm_content=more) · [Docs](https://www.clearcotelabs.com/docs?utm_source=github&utm_medium=readme&utm_content=more) · [Pricing](https://www.clearcotelabs.com/pricing?utm_source=github&utm_medium=readme&utm_content=more) · [Compare alternatives](https://www.clearcotelabs.com/alternatives?utm_source=github&utm_medium=readme&utm_content=more) · [Blog](https://www.clearcotelabs.com/blog?utm_source=github&utm_medium=readme&utm_content=more) |
 | **SDK references** | [Python](sdk/python/README.md) · [Node](sdk/node/README.md) · [.NET](sdk/dotnet) |
 | **Docs** | [VERIFY](docs/VERIFY.md) · [BUILDING](docs/BUILDING.md) · [PATCHES](docs/PATCHES.md) · [UPGRADING](docs/UPGRADING.md) · [CANVAS-BRIDGE](docs/CANVAS-BRIDGE.md) · [STEALTH-COHERENCE](docs/STEALTH-COHERENCE.md) |
-| **Hosted** | [Hosted browsers](https://www.clearcotelabs.com/docs/hosted-browsers) · [Agent runs](https://www.clearcotelabs.com/docs/runs) · [Playground](https://www.clearcotelabs.com/dashboard/playground) |
+| **Hosted** | [Hosted browsers](https://www.clearcotelabs.com/docs/hosted-browsers?utm_source=github&utm_medium=readme&utm_content=more) · [Agent runs](https://www.clearcotelabs.com/docs/runs?utm_source=github&utm_medium=readme&utm_content=more) · [Playground](https://www.clearcotelabs.com/dashboard/playground?utm_source=github&utm_medium=readme&utm_content=more) |
 | **Profiles** | [clearcote-profiles](https://github.com/clearcotelabs/clearcote-profiles) · [collector](tools/fingerprint-collect) · [Profile Manager app](https://github.com/clearcotelabs/clearcote-profile-manager) |
 | **For agents** | [llms.txt](llms.txt) · [AGENTS.md](AGENTS.md) |
 | **Project** | [ROADMAP](ROADMAP.md) · [CONTRIBUTING](CONTRIBUTING.md) · [SECURITY](SECURITY.md) · [Discord](https://discord.gg/WxvCjAnXZm) |

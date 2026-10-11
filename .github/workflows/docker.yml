@@ -4,6 +4,9 @@ name: Publish Docker image
 # release is exactly when `pip install clearcote` resolves to a new pinned browser binary, so
 # the image must be rebuilt then. Runs AFTER "Publish PyPI SDK" succeeds (the upload is done;
 # the first step still waits for pip's index to catch up), or manually via workflow_dispatch.
+# The same image also goes to ghcr.io/clearcotelabs/clearcote with the workflow's GITHUB_TOKEN,
+# which links the package to this repository (its "Packages" box) and gives users a registry
+# without Docker Hub's anonymous pull limits.
 on:
   workflow_run:
     workflows: ["Publish PyPI SDK"]
@@ -14,12 +17,17 @@ on:
         description: "clearcote SDK version to bake in (blank = current pyproject version)"
         required: false
       dry_run:
-        description: "Dry run: wait for PyPI and build the image, but do not log in to Docker Hub or push"
+        description: "Dry run: wait for PyPI and build the image, but do not log in to a registry or push"
+        type: boolean
+        default: false
+      ghcr_only:
+        description: "Push to ghcr.io only and leave Docker Hub alone (e.g. to backfill GHCR for a released SDK)"
         type: boolean
         default: false
 
 permissions:
   contents: read
+  packages: write   # push ghcr.io/clearcotelabs/clearcote with GITHUB_TOKEN
 
 # One publish at a time, in order: the PyPI wait can hold a run for up to half an hour, and two
 # SDK releases inside that window must not finish out of order and leave `latest` on the older
@@ -121,14 +129,39 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      - name: Image names and tags
+        id: img
+        env:
+          GHCR_ONLY: ${{ inputs.ghcr_only == true }}
+          BROWSER: ${{ steps.v.outputs.browser }}
+          SDK: ${{ steps.v.outputs.sdk }}
+        run: |
+          # ghcr.io names must be lowercase; the org already is.
+          images="ghcr.io/clearcotelabs/clearcote"
+          [ "$GHCR_ONLY" = true ] || images="teamflatearth/clearcote $images"
+          {
+            echo "names=$images"
+            echo "tags<<EOF"
+            for img in $images; do printf '%s\n' "$img:latest" "$img:$BROWSER" "$img:sdk-$SDK"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Log in to Docker Hub
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && !inputs.ghcr_only }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build + push teamflatearth/clearcote
+      - name: Log in to GitHub Container Registry
+        if: ${{ !inputs.dry_run }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push the image
         uses: docker/build-push-action@v6
         with:
           context: docker
@@ -137,19 +170,18 @@ jobs:
           platforms: linux/amd64
           build-args: |
             CLEARCOTE_SPEC===${{ steps.v.outputs.sdk }}
-          tags: |
-            teamflatearth/clearcote:latest
-            teamflatearth/clearcote:${{ steps.v.outputs.browser }}
-            teamflatearth/clearcote:sdk-${{ steps.v.outputs.sdk }}
+          tags: ${{ steps.img.outputs.tags }}
 
       - name: Summary
         env:
           DRY_RUN: ${{ inputs.dry_run == true }}
+          NAMES: ${{ steps.img.outputs.names }}
         run: |
+          names=$(printf '`%s` ' $NAMES)
           if [ "$DRY_RUN" = true ]; then
-            echo "### Dry run: built \`teamflatearth/clearcote\`, pushed nothing" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Dry run: built ${names}, pushed nothing" >> "$GITHUB_STEP_SUMMARY"
             echo "- would have pushed \`latest\`, \`${{ steps.v.outputs.browser }}\`, \`sdk-${{ steps.v.outputs.sdk }}\` (browser binary v${{ steps.v.outputs.browser }})" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### Pushed \`teamflatearth/clearcote\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Pushed ${names}" >> "$GITHUB_STEP_SUMMARY"
             echo "- \`latest\`, \`${{ steps.v.outputs.browser }}\`, \`sdk-${{ steps.v.outputs.sdk }}\` (browser binary v${{ steps.v.outputs.browser }})" >> "$GITHUB_STEP_SUMMARY"
           fi
