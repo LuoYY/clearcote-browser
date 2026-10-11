@@ -238,7 +238,10 @@ Anything you set explicitly wins over `geoip`. With no proxy it uses your direct
 
 The whole lookup has one deadline, `CLEARCOTE_GEOIP_TIMEOUT_SECONDS` (default 20). If the region can't be resolved in time, `launch()` raises `GeoipError` (code `GEOIP_UNRESOLVED`) **before** any browser starts, instead of launching with this machine's clock and language. If you set both `timezone` and `accept_language` yourself, it warns and launches anyway.
 
-Geo data comes from the offline [geoip-all-in-one](https://github.com/daijro/geoip-all-in-one) MaxMind database (downloaded + cached on first use; GPL-3.0 data, the same source Camoufox uses) — more accurate than a single online API — with `ip-api.com` as a fallback.
+Geo data comes from the offline [geoip-all-in-one](https://github.com/daijro/geoip-all-in-one) MaxMind database (downloaded + cached on first use, ~52 MB; GPL-3.0 data, the same source Camoufox uses) — more accurate than a single online API. The exit IP comes from a small IP echo through the proxy (`api.ipify.org`, then `icanhazip.com`).
+
+- `CLEARCOTE_GEOIP_ECHO_URL`: your own IP-echo endpoint(s), comma-separated, used instead of the public ones, so no third party learns that the proxy is in use. It should answer with the IP as plain text, or JSON with an `ip` field.
+- `CLEARCOTE_GEOIP_IPAPI=1`: also ask `ip-api.com` when the database has no answer, e.g. while it is still downloading on first use. Off by default: ip-api.com's free endpoint is for non-commercial use only and allows 45 requests a minute per IP.
 
 ### Humanized input (`humanize`, `show_cursor`)
 
@@ -347,6 +350,13 @@ contexts and `serve()`):
   directory raises before the licence lease.
 - `CLEARCOTE_FALLBACK_FONT_DIRS`: fonts used only for characters nothing else covers (CJK, Indic scripts, emoji,
   …), listed after the bundle; they take no family over. The Docker image sets it to the script fonts it ships.
+  A persona hides a family's name from CSS, but the browser can still draw characters that only that font covers,
+  so put only fonts in these directories that you are happy for a page to see.
+
+The font configuration is written next to the browser binary. When that directory is not writable (a binary
+unpacked by another user, a read-only image layer), it goes to `CLEARCOTE_CACHE/fontconfig` or
+`~/.cache/clearcote/fontconfig` instead, then to a private temp directory; if none can be written, the SDK warns
+once, because the browser would then see this machine's own fonts.
 
 ```python
 from clearcote import launch

@@ -1,16 +1,22 @@
 // geoip: resolve the egress IP's geo (timezone + lat/lon + language) so the browser matches the
-// proxy actually in use — the way Camoufox does it. Primary source is daijro's offline
-// "geoip-all-in-one" MaxMind DB (more accurate than a single online API; merges IP2Location +
-// GeoLite2 + DB-IP, timezone computed from coordinates). Flow: discover the exit IP via a small
-// IP-echo *through the proxy*, then look that IP up in the cached .mmdb. Falls back to ip-api.com
-// (direct geo through the proxy) if the DB can't be fetched/opened.
+// proxy actually in use — the way Camoufox does it. Source: daijro's offline "geoip-all-in-one"
+// MaxMind DB (more accurate than a single online API; merges IP2Location + GeoLite2 + DB-IP,
+// timezone computed from coordinates). Flow: discover the exit IP via a small IP-echo *through the
+// proxy*, then look that IP up in the cached .mmdb.
 //
 // The .mmdb (GPL-3.0 data) is downloaded + cached on first use (≈52 MB zip → ≈120 MB), NOT bundled.
-// The exit-IP and ip-api lookups go THROUGH the proxy (HTTP or SOCKS5, see ./net.ts); we never fall
-// back to the local IP under a proxy, which would give the wrong region.
+// The exit-IP lookup goes THROUGH the proxy (HTTP or SOCKS5, see ./net.ts); we never fall back to the
+// local IP under a proxy, which would give the wrong region.
 //
-// Budget: CLEARCOTE_GEOIP_TIMEOUT_SECONDS (default 20) bounds the whole resolution. A lookup that
-// runs out of budget fails rather than hanging a launch.
+// Settings:
+// - CLEARCOTE_GEOIP_ECHO_URL — your own IP-echo endpoint(s), comma-separated, used instead of the public
+//   ones (api.ipify.org, icanhazip.com). The answer is the IP as plain text, or JSON with an `ip` (or
+//   `query`) field.
+// - CLEARCOTE_GEOIP_IPAPI=1 — also ask ip-api.com (exit IP + geo in one call) when the database has no
+//   answer, e.g. while it is still downloading on first use. Off by default: ip-api.com's free endpoint is
+//   for non-commercial use only and allows 45 requests a minute per IP.
+// - CLEARCOTE_GEOIP_TIMEOUT_SECONDS (default 20) bounds the whole resolution. A lookup that runs out of
+//   budget fails rather than hanging a launch.
 
 import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
@@ -23,9 +29,38 @@ import { PROXIED_REQUEST_SCHEMES, proxiedRequest, toProxySpec, type ProxySpec } 
 
 const MMDB_URL = "https://github.com/daijro/geoip-all-in-one/releases/latest/download/geoip-aio-all.mmdb.zip";
 const MMDB_MAX_AGE_DAYS = 30;
-/** @internal mutable so tests can point the exit-IP echo at a local server */
-export const IPECHO_URLS: string[] = ["http://api.ipify.org", "http://ip-api.com/line/?fields=query"];
-const IPAPI_URL = "http://ip-api.com/json/?fields=status,message,countryCode,timezone,lat,lon,query";
+/** @internal Public IP-echo services with no usage limit, tried in order; CLEARCOTE_GEOIP_ECHO_URL replaces
+ * them. Mutable so tests can point the exit-IP echo at a local server. */
+export const IPECHO_URLS: string[] = ["http://api.ipify.org", "http://icanhazip.com"];
+export const ECHO_URL_ENV = "CLEARCOTE_GEOIP_ECHO_URL";
+export const IPAPI_ENV = "CLEARCOTE_GEOIP_IPAPI";
+/** @internal mutable so tests can point the ip-api fallback at a local server */
+export const geoUrls = { ipApi: "http://ip-api.com/json/?fields=status,message,countryCode,timezone,lat,lon,query" };
+
+/** The IP-echo endpoints, in order: CLEARCOTE_GEOIP_ECHO_URL (comma-separated) when set, else the public defaults. */
+export function echoUrls(env: Record<string, string | undefined> = process.env): string[] {
+  const custom = (env[ECHO_URL_ENV] ?? "").split(",").map((u) => u.trim()).filter(Boolean);
+  return custom.length ? custom : [...IPECHO_URLS];
+}
+
+/** Whether CLEARCOTE_GEOIP_IPAPI opts in to the ip-api.com fallback (1/true/yes/on). */
+export function ipapiEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return ["1", "true", "yes", "on"].includes((env[IPAPI_ENV] ?? "").trim().toLowerCase());
+}
+
+/** @internal The IP an echo answered: plain text (first word), or JSON with an `ip` or `query` field. */
+export function ipFromEcho(text: string): string {
+  let t = (text ?? "").trim();
+  if (t.startsWith("{")) {
+    try {
+      const j = JSON.parse(t);
+      t = String(j?.ip ?? j?.query ?? "");
+    } catch {
+      return "";
+    }
+  }
+  return t ? t.split(/\s+/)[0] : "";
+}
 
 export interface Geo {
   ip?: string;
@@ -69,11 +104,11 @@ function looksLikeIp(s: string): boolean {
 
 /** Discover the egress IP via an IP-echo through the proxy (or direct), within `deadline`. */
 async function exitIp(proxy: ProxySpec | null, deadline: number, quiet?: boolean): Promise<string | null> {
-  for (const url of IPECHO_URLS) {
+  for (const url of echoUrls()) {
     const left = deadline - Date.now();
     if (left <= 0) break;
     try {
-      const ip = (await getText(url, proxy, Math.min(left, 8000))).split(/\s+/)[0];
+      const ip = ipFromEcho(await getText(url, proxy, Math.min(left, 8000)));
       if (looksLikeIp(ip)) return ip;
     } catch {
       /* try next */
@@ -114,8 +149,8 @@ async function ensureMmdb(quiet?: boolean): Promise<string | null> {
       log(quiet, "geoip: database ready");
       return file;
     } catch (e) {
-      log(quiet, `geoip: database fetch failed (${(e as Error).message}) — falling back to ip-api`);
-      return null;
+      log(quiet, `geoip: database fetch failed (${(e as Error).message})`);
+      return existsSync(file) ? file : null; // a stale database still beats none
     } finally {
       _mmdbInflight = null;
     }
@@ -136,19 +171,26 @@ function findMmdb(dir: string): string | null {
   return null;
 }
 
+/** @internal Why a lookup had no database: still downloading (first use), or it could not be fetched. */
+export interface DbInfo { db?: "downloading" | "unavailable" }
+
 let _reader: Reader<any> | null = null;
-async function mmdbLookup(ip: string, deadline: number, quiet?: boolean): Promise<Geo | null> {
+async function mmdbLookup(ip: string, deadline: number, quiet?: boolean, info: DbInfo = {}): Promise<Geo | null> {
   // The first-run database download (~52 MB) may outlast the budget. It keeps going in the
-  // background and caches for the next launch; this launch falls back to ip-api instead of waiting.
+  // background and caches for the next launch.
   const left = deadline - Date.now();
   if (left <= 0) return null;
   let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
   const file = await Promise.race([
     ensureMmdb(quiet),
-    new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), left); }),
+    new Promise<null>((resolve) => { timer = setTimeout(() => { timedOut = true; resolve(null); }, left); }),
   ]);
   if (timer) clearTimeout(timer);
-  if (!file) return null;
+  if (!file) {
+    info.db = timedOut ? "downloading" : "unavailable";
+    return null;
+  }
   try {
     if (!_reader) _reader = await maxmind.open(file);
     const rec: any = _reader.get(ip);
@@ -171,12 +213,16 @@ async function mmdbLookup(ip: string, deadline: number, quiet?: boolean): Promis
   }
 }
 
-// Fallback: ip-api.com returns geo directly (through the proxy), no DB needed.
+/** @internal the database lookup, replaceable in tests */
+export const geoDb = { lookup: mmdbLookup };
+
+// Opt-in fallback (CLEARCOTE_GEOIP_IPAPI=1): ip-api.com returns geo directly (through the proxy), no DB
+// needed. Its free endpoint is for non-commercial use only.
 async function ipApiFallback(proxy: ProxySpec | null, deadline: number): Promise<Geo | null> {
   const left = deadline - Date.now();
   if (left <= 0) return null;
   try {
-    const txt = await getText(IPAPI_URL, proxy, Math.min(left, 8000));
+    const txt = await getText(geoUrls.ipApi, proxy, Math.min(left, 8000));
     const j = JSON.parse(txt);
     if (j?.status !== "success") return null;
     return {
@@ -263,26 +309,33 @@ export async function resolveGeoDetailed(
     return { geo: null, reason: `${scheme}:// proxies are not supported; use http, https or socks5`, elapsedMs: Date.now() - started };
   }
   const ip = await exitIp(spec, deadline, opts.quiet);
-  let geo: Geo | null = ip ? await mmdbLookup(ip, deadline, opts.quiet) : null;
-  if (!geo) geo = await ipApiFallback(spec, deadline);
+  const info: DbInfo = {};
+  let geo: Geo | null = ip ? await geoDb.lookup(ip, deadline, opts.quiet, info) : null;
+  const ipapi = ipapiEnabled();
+  if ((!geo || !geo.timezone) && ipapi) geo = (await ipApiFallback(spec, deadline)) ?? geo;
   const elapsedMs = Date.now() - started;
   if (geo && geo.timezone) {
     log(opts.quiet, `geoip: ${geo.ip} -> ${geo.country} tz=${geo.timezone} lang=${geo.acceptLanguage}`);
     return { geo, elapsedMs };
   }
-  const reason = Date.now() >= deadline
-    ? `timed out after ${Math.round(budget / 1000)}s (CLEARCOTE_GEOIP_TIMEOUT_SECONDS)`
-    : !ip
-      ? `could not determine the exit IP${spec ? " through the proxy" : ""}`
-      : geo
-        ? `no timezone for exit IP ${ip}`
-        : `no geo data for exit IP ${ip}`;
+  const dbReason = info.db === "downloading"
+    ? "the geoip database is still downloading (~52 MB, first use only); launch again in a moment or raise CLEARCOTE_GEOIP_TIMEOUT_SECONDS"
+    : "the geoip database could not be downloaded";
+  const reason = ip && info.db && !ipapi
+    ? `${dbReason} -- or set ${IPAPI_ENV}=1 to ask ip-api.com (non-commercial use only)`
+    : Date.now() >= deadline
+      ? `timed out after ${Math.round(budget / 1000)}s (CLEARCOTE_GEOIP_TIMEOUT_SECONDS)`
+      : !ip
+        ? `could not determine the exit IP${spec ? " through the proxy" : ""}`
+        : geo
+          ? `no timezone for exit IP ${ip}`
+          : `no geo data for exit IP ${ip}`;
   return { geo, reason, elapsedMs };
 }
 
 /**
  * Resolve geo for the egress (through `proxy` if given, else direct). Never throws — returns null
- * on failure. Uses the geoip-all-in-one offline DB first, ip-api.com as a fallback.
+ * on failure. Uses the geoip-all-in-one offline DB (ip-api.com only with CLEARCOTE_GEOIP_IPAPI=1).
  */
 export async function resolveGeo(
   proxy?: string | { server?: string; username?: string; password?: string },

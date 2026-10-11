@@ -29,9 +29,11 @@ Both are lists separated by ``os.pathsep``. Never point either at all of ``/usr/
 the host's Latin families then compete with the clones and change the Windows widths.
 """
 
+import atexit
 import hashlib
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -365,9 +367,16 @@ def build_conf(template, fonts_dir, cache_dir, user_dirs=(), fallback_dirs=(), g
 
 def _write_atomic(path, text):
     tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def engine_honours_genuine_faces(exe_path):
@@ -392,7 +401,9 @@ def linux_font_env(exe_path, font_dirs=None, args=()):
     ``font_dirs`` (and CLEARCOTE_FONT_DIRS / CLEARCOTE_FALLBACK_FONT_DIRS) add directories: see the
     module docstring. Without any, the file is ``fonts.generated.conf`` exactly as before; with some,
     each distinct result gets its own ``fonts.generated-<hash>.conf``, so launches with different
-    directories never rewrite each other's file. ``args`` is the engine's command line (see
+    directories never rewrite each other's file. When the binary's directory is not writable the file
+    goes to the user's cache (see _user_conf_dir), then to a private temp directory; when none of them
+    can be written, it warns once and returns ``{}``. ``args`` is the engine's command line (see
     genuine_faces_disabled)."""
     if sys.platform != "linux":
         return {}
@@ -401,23 +412,76 @@ def linux_font_env(exe_path, font_dirs=None, args=()):
     template = os.path.join(fonts_dir, "fonts.conf.template")
     if not os.path.isfile(template):
         return {}
+    cache_dir = os.path.join(tempfile.gettempdir(), "cc-fc-cache")
     try:
-        cache_dir = os.path.join(tempfile.gettempdir(), "cc-fc-cache")
         os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        pass  # fontconfig still works without a cache, only slower
+    try:
         with open(template, "r", encoding="utf-8") as fh:
             text = fh.read()
-        # The rules follow your fonts only on an engine that draws them (GENUINE_FACES_SWITCH).
-        genuine = (dir_families(user_dirs) if user_dirs and engine_honours_genuine_faces(exe_path)
-                   and not genuine_faces_disabled(args) else frozenset())
-        conf = build_conf(text, fonts_dir, cache_dir, user_dirs, fallback_dirs, genuine)
-        name = "fonts.generated.conf"
-        if user_dirs or fallback_dirs:
-            name = "fonts.generated-%s.conf" % hashlib.sha256(conf.encode("utf-8")).hexdigest()[:12]
-        conf_path = os.path.join(fonts_dir, name)
-        _write_atomic(conf_path, conf)
-        return {"FONTCONFIG_FILE": conf_path}
-    except OSError:
+    except OSError as e:
+        _warn_no_font_conf(fonts_dir, [f"{template} ({e.strerror or type(e).__name__})"])
         return {}  # never block a launch on font wiring
+    # The rules follow your fonts only on an engine that draws them (GENUINE_FACES_SWITCH).
+    genuine = (dir_families(user_dirs) if user_dirs and engine_honours_genuine_faces(exe_path)
+               and not genuine_faces_disabled(args) else frozenset())
+    conf = build_conf(text, fonts_dir, cache_dir, user_dirs, fallback_dirs, genuine)
+    hashed = "fonts.generated-%s.conf" % hashlib.sha256(conf.encode("utf-8")).hexdigest()[:12]
+    name = hashed if user_dirs or fallback_dirs else "fonts.generated.conf"
+    # Next to the binary first (as always). A binary in a directory this user cannot write (unpacked by
+    # root, a read-only image layer) used to lose the file silently, and the browser then saw every font
+    # on the host instead of the bundle. The conf names fonts_dir itself, so it works from anywhere.
+    tried = []
+    for directory, fname in ((fonts_dir, name), (_user_conf_dir(), hashed), (None, hashed)):
+        try:
+            directory = directory or _private_tmp_conf_dir()
+            if directory != fonts_dir:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+            conf_path = os.path.join(directory, fname)
+            _write_atomic(conf_path, conf)
+            return {"FONTCONFIG_FILE": conf_path}
+        except OSError as e:
+            tried.append(f"{directory or 'a private temp directory'} ({e.strerror or type(e).__name__})")
+    _warn_no_font_conf(fonts_dir, tried)
+    return {}  # never block a launch on font wiring
+
+
+def _user_conf_dir(environ=None):
+    """Where the generated font config goes when the binary's own directory is not writable:
+    CLEARCOTE_CACHE/fontconfig, else $XDG_CACHE_HOME (or ~/.cache)/clearcote/fontconfig."""
+    environ = os.environ if environ is None else environ
+    if environ.get("CLEARCOTE_CACHE"):
+        return os.path.join(environ["CLEARCOTE_CACHE"], "fontconfig")
+    base = environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "clearcote", "fontconfig")
+
+
+_PRIVATE_TMP = []
+
+
+def _private_tmp_conf_dir():
+    """Last resort: a directory of this process's own under the temp dir (mode 0700, removed at exit)."""
+    if not _PRIVATE_TMP:
+        path = tempfile.mkdtemp(prefix="cc-fontconfig-")
+        atexit.register(shutil.rmtree, path, True)
+        _PRIVATE_TMP.append(path)
+    return _PRIVATE_TMP[0]
+
+
+_WARNED_NO_CONF = set()
+
+
+def _warn_no_font_conf(fonts_dir, tried):
+    """Say once per bundle that the font config could not be written. The launch goes on, but with the
+    host's fonts: text widths change and host fonts can be told apart from the persona's."""
+    if os.environ.get("CLEARCOTE_NO_WARN") or fonts_dir in _WARNED_NO_CONF:
+        return
+    _WARNED_NO_CONF.add(fonts_dir)
+    print("clearcote: warning: could not write the font configuration for the bundled fonts (tried: "
+          f"{'; '.join(tried)}). The browser falls back to this machine's own fonts instead of the "
+          "bundle: text widths change and host fonts can show through. Make one of those directories "
+          "writable, or set CLEARCOTE_CACHE to a writable directory.", file=sys.stderr, flush=True)
 
 
 def linux_font_report(exe_path, font_dirs=None, environ=None):

@@ -188,6 +188,77 @@ def test_linux_font_env_without_extra_dirs_is_unchanged(linux, tmp_path):
     assert sorted(os.listdir(fonts)) == ["fonts.conf.template", "fonts.generated.conf"]  # no temp file left
 
 
+def _block(path):
+    """Make writing a file at <path> fail even as root: a non-empty directory stands where it would go."""
+    os.makedirs(os.path.join(str(path), "x"))
+
+
+def test_linux_font_env_uses_the_user_cache_when_the_bundle_dir_is_not_writable(linux, monkeypatch, tmp_path):
+    # A binary unpacked by root (or in a read-only image layer) used to lose its font config silently,
+    # and the browser then drew with every font on the host instead of the bundle.
+    exe, fonts = _bundle(tmp_path)
+    _block(fonts / "fonts.generated.conf")
+    monkeypatch.setenv("CLEARCOTE_CACHE", str(tmp_path / "cache"))
+    path = _fonts.linux_font_env(exe)["FONTCONFIG_FILE"]
+    assert os.path.dirname(path) == str(tmp_path / "cache" / "fontconfig")
+    assert os.path.basename(path).startswith("fonts.generated-") and path.endswith(".conf")
+    cache = os.path.join(tempfile.gettempdir(), "cc-fc-cache")
+    assert _read(path) == _template().replace("@FONTS_DIR@", str(fonts)).replace("@CACHE_DIR@", cache)
+    assert sorted(os.listdir(fonts)) == ["fonts.conf.template", "fonts.generated.conf"]  # no temp file left
+
+
+def test_linux_font_env_user_cache_follows_xdg(linux, monkeypatch, tmp_path):
+    monkeypatch.delenv("CLEARCOTE_CACHE", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    assert _fonts._user_conf_dir() == str(tmp_path / "xdg" / "clearcote" / "fontconfig")
+
+
+def test_linux_font_env_last_resort_is_a_private_temp_dir(linux, monkeypatch, tmp_path):
+    exe, fonts = _bundle(tmp_path)
+    _block(fonts / "fonts.generated.conf")
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("CLEARCOTE_CACHE", str(blocker))  # nothing can be created under a file
+    monkeypatch.setattr(_fonts, "_PRIVATE_TMP", [])
+    path = _fonts.linux_font_env(exe)["FONTCONFIG_FILE"]
+    directory = os.path.dirname(path)
+    try:
+        assert os.path.basename(directory).startswith("cc-fontconfig-")
+        assert os.stat(directory).st_mode & 0o777 == 0o700
+        assert str(fonts) in _read(path)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def test_linux_font_env_warns_once_when_nothing_is_writable(linux, monkeypatch, tmp_path, capsys):
+    exe, fonts = _bundle(tmp_path)
+    _block(fonts / "fonts.generated.conf")
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("CLEARCOTE_CACHE", str(blocker))
+    monkeypatch.setattr(_fonts, "_private_tmp_conf_dir", lambda: str(blocker / "tmp"))
+    monkeypatch.setattr(_fonts, "_WARNED_NO_CONF", set())
+    monkeypatch.delenv("CLEARCOTE_NO_WARN", raising=False)
+    assert _fonts.linux_font_env(exe) == {}
+    assert _fonts.linux_font_env(exe) == {}  # still launches, without the bundle's font config
+    err = capsys.readouterr().err
+    assert err.count("could not write the font configuration") == 1
+    assert str(fonts) in err and str(blocker) in err and "CLEARCOTE_CACHE" in err
+
+
+def test_linux_font_env_warning_respects_no_warn(linux, monkeypatch, tmp_path, capsys):
+    exe, fonts = _bundle(tmp_path)
+    _block(fonts / "fonts.generated.conf")
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("CLEARCOTE_CACHE", str(blocker))
+    monkeypatch.setattr(_fonts, "_private_tmp_conf_dir", lambda: str(blocker / "tmp"))
+    monkeypatch.setattr(_fonts, "_WARNED_NO_CONF", set())
+    monkeypatch.setenv("CLEARCOTE_NO_WARN", "1")
+    assert _fonts.linux_font_env(exe) == {}
+    assert capsys.readouterr().err == ""
+
+
 def test_linux_font_env_with_your_windows_fonts(linux, monkeypatch, tmp_path):
     exe, fonts = _bundle(tmp_path, genuine_faces=True)
     win = tmp_path / "winfonts"

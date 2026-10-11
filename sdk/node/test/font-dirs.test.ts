@@ -1,13 +1,14 @@
 // Your own fonts (fontDirs / CLEARCOTE_FONT_DIRS), fallback fonts (CLEARCOTE_FALLBACK_FONT_DIRS) and the
 // font lines of `clearcote info` on Linux. Mirrors sdk/python/tests/test_font_dirs.py.
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
-  FALLBACK_FONT_DIRS_ENV, FONT_DIRS_ENV, GENUINE_FACES_SWITCH, SCRIPT_SAMPLES, buildConf, checkFontDirs, fontFiles, fontLaunchEnv, fontLines,
-  genuineFacesDisabled, genuineRules, linuxFontEnv, linuxFontReport, readFont, resolveFontDirs,
+  FALLBACK_FONT_DIRS_ENV, FONT_DIRS_ENV, GENUINE_FACES_SWITCH, SCRIPT_SAMPLES, buildConf, checkFontDirs, confDirs, fontFiles, fontLaunchEnv,
+  fontLines, genuineFacesDisabled, genuineRules, linuxFontEnv, linuxFontReport, readFont, resetFontConfWarnings, resolveFontDirs,
+  userConfDir,
 } from "../src/fonts.js";
 import { makeCollection, makeFont } from "./helpers/fontfiles.js";
 import { removeAfterFile, tempDir } from "./helpers/temp.js";
@@ -177,6 +178,89 @@ describe("the generated fontconfig file", () => {
       expect(path).toBe(join(fonts, "fonts.generated.conf"));
       expect(readFileSync(path, "utf8")).toBe(TEMPLATE.split("@FONTS_DIR@").join(fonts).split("@CACHE_DIR@").join(FC_CACHE));
       expect(readdirSync(fonts).sort()).toEqual(["fonts.conf.template", "fonts.generated.conf"]);
+    });
+  });
+
+  describe("when the binary's directory is not writable", () => {
+    // A binary unpacked by root (or in a read-only image layer) used to lose its font config silently, and
+    // the browser then drew with every font on the host instead of the bundle.
+    const block = (path: string) => mkdirSync(join(path, "x"), { recursive: true }); // fails even as root
+    let env: Record<string, string | undefined>;
+    beforeEach(() => {
+      env = { CLEARCOTE_CACHE: process.env.CLEARCOTE_CACHE, XDG_CACHE_HOME: process.env.XDG_CACHE_HOME, CLEARCOTE_NO_WARN: process.env.CLEARCOTE_NO_WARN };
+      delete process.env.CLEARCOTE_NO_WARN;
+      resetFontConfWarnings();
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+      for (const [k, v] of Object.entries(env)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+
+    it("goes to the user's cache instead", () => {
+      withPlatform("linux", () => {
+        const { dir, exe, fonts } = bundle();
+        block(join(fonts, "fonts.generated.conf"));
+        process.env.CLEARCOTE_CACHE = join(dir, "cache");
+        const path = linuxFontEnv(exe).FONTCONFIG_FILE;
+        expect(dirname(path)).toBe(join(dir, "cache", "fontconfig"));
+        expect(basename(path)).toMatch(/^fonts\.generated-[0-9a-f]{12}\.conf$/);
+        expect(readFileSync(path, "utf8")).toBe(TEMPLATE.split("@FONTS_DIR@").join(fonts).split("@CACHE_DIR@").join(FC_CACHE));
+        expect(readdirSync(fonts).sort()).toEqual(["fonts.conf.template", "fonts.generated.conf"]); // no temp file left
+      });
+    });
+
+    it("the user's cache follows XDG_CACHE_HOME", () => {
+      expect(userConfDir({ XDG_CACHE_HOME: "/x/cache" })).toBe(join("/x/cache", "clearcote", "fontconfig"));
+      expect(userConfDir({ CLEARCOTE_CACHE: "/c" })).toBe(join("/c", "fontconfig"));
+    });
+
+    it("then to a private temp directory", () => {
+      withPlatform("linux", () => {
+        const { dir, exe, fonts } = bundle();
+        block(join(fonts, "fonts.generated.conf"));
+        writeFileSync(join(dir, "a-file"), "");
+        process.env.CLEARCOTE_CACHE = join(dir, "a-file"); // nothing can be created under a file
+        const path = linuxFontEnv(exe).FONTCONFIG_FILE;
+        expect(basename(dirname(path))).toMatch(/^cc-fontconfig-/);
+        expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
+        expect(readFileSync(path, "utf8")).toContain(fonts);
+        rmSync(path, { force: true });
+      });
+    });
+
+    it("warns once when nothing can be written, and still launches", () => {
+      withPlatform("linux", () => {
+        const { dir, exe, fonts } = bundle();
+        block(join(fonts, "fonts.generated.conf"));
+        writeFileSync(join(dir, "a-file"), "");
+        process.env.CLEARCOTE_CACHE = join(dir, "a-file");
+        vi.spyOn(confDirs, "privateTmp").mockReturnValue(join(dir, "a-file", "tmp"));
+        const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        expect(linuxFontEnv(exe)).toEqual({});
+        expect(linuxFontEnv(exe)).toEqual({});
+        const out = err.mock.calls.map((c) => String(c[0])).join("");
+        expect(out.split("could not write the font configuration").length - 1).toBe(1);
+        expect(out).toContain(fonts);
+        expect(out).toContain(join(dir, "a-file"));
+        expect(out).toContain("CLEARCOTE_CACHE");
+      });
+    });
+
+    it("CLEARCOTE_NO_WARN silences the warning", () => {
+      withPlatform("linux", () => {
+        const { dir, exe, fonts } = bundle();
+        block(join(fonts, "fonts.generated.conf"));
+        writeFileSync(join(dir, "a-file"), "");
+        process.env.CLEARCOTE_CACHE = join(dir, "a-file");
+        process.env.CLEARCOTE_NO_WARN = "1";
+        vi.spyOn(confDirs, "privateTmp").mockReturnValue(join(dir, "a-file", "tmp"));
+        const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+        expect(linuxFontEnv(exe)).toEqual({});
+        expect(err).not.toHaveBeenCalled();
+      });
     });
   });
 

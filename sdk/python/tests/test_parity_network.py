@@ -170,23 +170,85 @@ def test_geoip_refused_proxy_reports_exit_ip_reason():
     assert "exit IP through the proxy" in reason or "timed out" in reason
 
 
+def _geo_origin(servers):
+    """A local origin answering as an IP echo (/echo, /myecho) and as ip-api (/ipapi)."""
+    return servers(start_origin(lambda m, path, h, b: (
+        200, "203.0.113.7" if "echo" in path else json.dumps(
+            {"status": "success", "countryCode": "JP", "timezone": "Asia/Tokyo", "lat": 1, "lon": 2,
+             "query": "203.0.113.7"}))))
+
+
 def test_geoip_goes_through_socks5_with_auth(servers, monkeypatch):
     # Point the IP echo + ip-api at a local origin and prove both requests went through SOCKS5.
     from clearcote import geoip
-    origin = servers(start_origin(lambda m, path, h, b: (
-        200, "203.0.113.7" if path.startswith("/echo") else json.dumps(
-            {"status": "success", "countryCode": "JP", "timezone": "Asia/Tokyo", "lat": 1, "lon": 2,
-             "query": "203.0.113.7"}))))
+    origin = _geo_origin(servers)
     socks = servers(start_socks5(user="u1", password="p1"))
     monkeypatch.setattr(geoip, "IPECHO_URLS", (f"http://localhost:{origin.port}/echo",))
     monkeypatch.setattr(geoip, "IPAPI_URL", f"http://localhost:{origin.port}/ipapi")
-    monkeypatch.setattr(geoip, "_mmdb_lookup", lambda ip, deadline, quiet: None)
+    monkeypatch.setattr(geoip, "_mmdb_lookup", lambda *a, **k: None)
+    monkeypatch.setenv("CLEARCOTE_GEOIP_IPAPI", "1")
     geo, reason, _ms = resolve_geo_detailed(
         {"server": f"socks5://127.0.0.1:{socks.port}", "username": "u1", "password": "p1"}, quiet=True)
     assert reason is None
     assert geo["timezone"] == "Asia/Tokyo" and geo["accept_language"].startswith("ja-JP")
     assert [e["host"] for e in socks.log] == ["localhost", "localhost"]
     assert all(e["user"] == "u1" for e in socks.log)
+
+
+def test_geoip_never_asks_ip_api_unless_opted_in(servers, monkeypatch):
+    # ip-api.com's free endpoint is for non-commercial use only (45 requests/min per IP): it is not
+    # in the default chain any more. Without the database there is no answer, and the reason says how.
+    from clearcote import geoip
+    origin = _geo_origin(servers)
+    monkeypatch.setattr(geoip, "IPECHO_URLS", (f"http://localhost:{origin.port}/echo",))
+    monkeypatch.setattr(geoip, "IPAPI_URL", f"http://localhost:{origin.port}/ipapi")
+
+    def no_db(ip, deadline, quiet, info=None):
+        info["db"] = "downloading"
+        return None
+    monkeypatch.setattr(geoip, "_mmdb_lookup", no_db)
+    monkeypatch.delenv("CLEARCOTE_GEOIP_IPAPI", raising=False)
+    geo, reason, _ms = resolve_geo_detailed(None, quiet=True, timeout=5)
+    assert geo is None
+    assert "still downloading" in reason and "CLEARCOTE_GEOIP_IPAPI=1" in reason
+    assert [e["url"] for e in origin.log] == ["/echo"]
+    monkeypatch.setenv("CLEARCOTE_GEOIP_IPAPI", "1")
+    geo, reason, _ms = resolve_geo_detailed(None, quiet=True, timeout=5)
+    assert reason is None and geo["timezone"] == "Asia/Tokyo"
+    assert [e["url"] for e in origin.log] == ["/echo", "/echo", "/ipapi"]
+
+
+def test_geoip_echo_url_setting_replaces_the_public_echoes(servers, monkeypatch):
+    from clearcote import geoip
+    origin = _geo_origin(servers)
+    monkeypatch.setattr(geoip, "IPECHO_URLS", ("http://127.0.0.1:1/never",))
+    monkeypatch.setenv("CLEARCOTE_GEOIP_ECHO_URL", f" http://localhost:{origin.port}/myecho ,")
+    seen = []
+
+    def db(ip, deadline, quiet, info=None):
+        seen.append(ip)
+        return {"ip": ip, "country": "NL", "timezone": "Europe/Amsterdam", "accept_language": "nl-NL",
+                "location": None}
+    monkeypatch.setattr(geoip, "_mmdb_lookup", db)
+    geo, reason, _ms = resolve_geo_detailed(None, quiet=True, timeout=5)
+    assert reason is None and geo["timezone"] == "Europe/Amsterdam"
+    assert seen == ["203.0.113.7"]
+    assert [e["url"] for e in origin.log] == ["/myecho"]
+
+
+def test_geoip_echo_settings_and_answers():
+    from clearcote import geoip
+    assert geoip.echo_urls({}) == ("http://api.ipify.org", "http://icanhazip.com")
+    assert not any("ip-api" in u for u in geoip.echo_urls({}))
+    assert geoip.echo_urls({"CLEARCOTE_GEOIP_ECHO_URL": "http://a/ip, http://b/ip"}) == ("http://a/ip", "http://b/ip")
+    assert geoip.echo_urls({"CLEARCOTE_GEOIP_ECHO_URL": " , "}) == geoip.IPECHO_URLS
+    assert geoip.ipapi_enabled({}) is False
+    assert all(geoip.ipapi_enabled({"CLEARCOTE_GEOIP_IPAPI": v}) for v in ("1", "true", "YES", "on"))
+    assert not geoip.ipapi_enabled({"CLEARCOTE_GEOIP_IPAPI": "0"})
+    assert geoip._ip_from_echo("203.0.113.7\n") == "203.0.113.7"
+    assert geoip._ip_from_echo('{"ip": "2001:db8::1"}') == "2001:db8::1"
+    assert geoip._ip_from_echo('{"query": "203.0.113.8", "status": "success"}') == "203.0.113.8"
+    assert geoip._ip_from_echo("{not json") == ""
 
 
 @pytest.fixture

@@ -244,7 +244,8 @@ await Geometry.FitWindowToWorkAreaAsync(page);
 
 `CLEARCOTE_LICENSE_KEY`, `CLEARCOTE_LICENSE_API`, `CLEARCOTE_INSTANCE_ID`, `CLEARCOTE_BINARY`,
 `CLEARCOTE_CACHE`, `CLEARCOTE_AUTO_UPDATE`, `CLEARCOTE_STOCK_RUNTIME`, `CLEARCOTE_PERSONA_ENV`,
-`CLEARCOTE_FONT_DIRS`, `CLEARCOTE_FALLBACK_FONT_DIRS`, `CLEARCOTE_NO_WARN`; for the cloud, `CLEARCOTE_CLOUD`,
+`CLEARCOTE_FONT_DIRS`, `CLEARCOTE_FALLBACK_FONT_DIRS`, `CLEARCOTE_GEOIP_TIMEOUT_SECONDS`, `CLEARCOTE_GEOIP_ECHO_URL`,
+`CLEARCOTE_GEOIP_IPAPI`, `CLEARCOTE_NO_WARN`; for the cloud, `CLEARCOTE_CLOUD`,
 `CLEARCOTE_API_KEY` and `CLEARCOTE_API_URL`.
 
 Downloaded browsers are cached per build, in the same place the Python and Node SDKs use (`CLEARCOTE_CACHE`
@@ -264,7 +265,10 @@ underlying engine switches are all reachable today via `Args`.
 
 Also available (0.29.0): `Geoip = true` (through the proxy, incl. SOCKS5; one
 `CLEARCOTE_GEOIP_TIMEOUT_SECONDS` deadline; throws `GeoipException` before launch if unresolved unless
-`Timezone` and `AcceptLanguage` are both set), `Fingerprint = "off"` (no persona), `FingerprintVoices = false`,
+`Timezone` and `AcceptLanguage` are both set; the exit IP comes from an IP echo through the proxy, its geo from the
+offline geoip-all-in-one database shared with the Python and Node SDKs, downloaded on first use;
+`CLEARCOTE_GEOIP_ECHO_URL` points the echo at your own endpoint(s), and `CLEARCOTE_GEOIP_IPAPI=1` also asks
+ip-api.com, whose free endpoint is for non-commercial use only), `Fingerprint = "off"` (no persona), `FingerprintVoices = false`,
 `TransparentProxy = true` (engine 152 r22+; skipped with a warning on older engines), `LicenseThroughProxy`,
 `ReleaseChannel`, and `License.GetSessionSeatsAsync()`. Third-party cookies are allowed by default since 0.45.0,
 as in Chrome; `AllowThirdPartyCookies = false` blocks them (an engine before 152 r22 always blocks them).
@@ -302,7 +306,11 @@ Helvetica, Times, Courier and the CSS generics follow; an older engine keeps its
 persona lists and uses the directories only for characters nothing else covers. `CLEARCOTE_FALLBACK_FONT_DIRS`
 adds fonts used only for characters nothing else covers (CJK, Indic scripts, emoji). A path that is not a directory
 throws before the licence lease. Never list all of `/usr/share/fonts`: its Latin families change the widths a
-Windows persona reports. Ignored on Windows and macOS; refused for cloud and Docker launches. Only use fonts you
+Windows persona reports. A persona hides a family's name from CSS, but the browser can still draw characters that
+only that font covers, so put only fonts in these directories that you are happy for a page to see. The font
+configuration is written next to the browser binary; when that directory is not writable it goes to
+`CLEARCOTE_CACHE/fontconfig` or `~/.cache/clearcote/fontconfig`, then to a private temp directory, and if none can
+be written the SDK warns once. Ignored on Windows and macOS; refused for cloud and Docker launches. Only use fonts you
 are licensed to use.
 
 ```csharp

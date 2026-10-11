@@ -11,23 +11,37 @@ public class ParityNetworkTests : IDisposable
 {
     private readonly string[] _savedEcho = GeoIp.IpEchoUrls;
     private readonly string _savedApi = GeoIp.IpApiUrl;
+    private readonly Func<string, Stopwatch, int, bool, GeoIp.DbInfo, Task<GeoInfo?>> _savedDb = GeoIp.DbLookup;
+    private readonly string? _savedIpApi = Environment.GetEnvironmentVariable(GeoIp.IpApiEnv);
+    private readonly string? _savedEchoEnv = Environment.GetEnvironmentVariable(GeoIp.EchoUrlEnv);
 
     public ParityNetworkTests()
     {
         // Never reach the real services from a unit test: default to an unroutable local port.
         GeoIp.IpEchoUrls = new[] { "http://127.0.0.1:1/ip" };
         GeoIp.IpApiUrl = "http://127.0.0.1:1/json";
+        // ...and never download the real database: the stand-in knows one exit IP.
+        GeoIp.DbLookup = (ip, _, _, _, _) => Task.FromResult<GeoInfo?>(
+            ip == "203.0.113.7" ? new GeoInfo(ip, "DE", "Europe/Berlin", "de-DE", "52.5,13.4") : null);
+        Environment.SetEnvironmentVariable(GeoIp.IpApiEnv, null);
+        Environment.SetEnvironmentVariable(GeoIp.EchoUrlEnv, null);
     }
 
     public void Dispose()
     {
         GeoIp.IpEchoUrls = _savedEcho;
         GeoIp.IpApiUrl = _savedApi;
+        GeoIp.DbLookup = _savedDb;
+        Environment.SetEnvironmentVariable(GeoIp.IpApiEnv, _savedIpApi);
+        Environment.SetEnvironmentVariable(GeoIp.EchoUrlEnv, _savedEchoEnv);
     }
 
     private static string Basic(string user, string pass) => "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{pass}"));
 
     private const string GeoJson = "{\"status\":\"success\",\"countryCode\":\"DE\",\"timezone\":\"Europe/Berlin\",\"lat\":52.5,\"lon\":13.4,\"query\":\"203.0.113.7\"}";
+
+    /// A local origin answering as an IP echo (any path with "echo") and as ip-api (anything else).
+    private static TestOrigin GeoOrigin() => new(r => (200, r.Url.Contains("echo") ? "203.0.113.7" : GeoJson));
 
     // ── ProxySpec ────────────────────────────────────────────────────────────
 
@@ -69,9 +83,9 @@ public class ParityNetworkTests : IDisposable
     [Fact]
     public async Task Geoip_resolves_through_an_authenticated_socks5_proxy()
     {
-        await using var api = new TestOrigin(_ => (200, GeoJson));
+        await using var api = GeoOrigin();
         await using var socks = new TestSocks5("alice", "s3cret");
-        GeoIp.IpApiUrl = $"http://localhost:{api.Port}/json";
+        GeoIp.IpEchoUrls = new[] { $"http://localhost:{api.Port}/echo" };
         var r = await GeoIp.ResolveDetailedAsync(new ProxyOptions { Server = $"socks5://alice:s3cret@127.0.0.1:{socks.Port}" }, quiet: true, timeoutMs: 5000);
         Assert.Equal(new GeoInfo("203.0.113.7", "DE", "Europe/Berlin", "de-DE", "52.5,13.4"), r.Geo);
         Assert.Null(r.Reason);
@@ -83,17 +97,91 @@ public class ParityNetworkTests : IDisposable
     [Fact]
     public async Task Geoip_resolves_through_an_authenticated_http_proxy_and_fills_only_unset_fields()
     {
-        await using var api = new TestOrigin(_ => (200, GeoJson));
+        await using var api = GeoOrigin();
         await using var proxy = new TestHttpProxy(requireAuth: Basic("u", "p"));
-        GeoIp.IpApiUrl = $"http://127.0.0.1:{api.Port}/json";
+        GeoIp.IpEchoUrls = new[] { $"http://127.0.0.1:{api.Port}/echo" };
         var fp = new FingerprintOptions { AcceptLanguage = "fr-FR,fr" };
         await GeoIp.ApplyAsync(fp, new ProxyOptions { Server = $"http://127.0.0.1:{proxy.Port}", Username = "u", Password = "p" }, quiet: true, timeoutMs: 5000);
         Assert.Equal("Europe/Berlin", fp.Timezone);
         Assert.Equal("fr-FR,fr", fp.AcceptLanguage);  // explicit value kept
         Assert.Equal("52.5,13.4", fp.Location);
         Assert.Equal("203.0.113.7", fp.WebrtcIp);
-        Assert.Contains(proxy.Log, h => h.Kind == "absolute" && h.Target == GeoIp.IpApiUrl && h.Auth == Basic("u", "p"));
+        Assert.Contains(proxy.Log, h => h.Kind == "absolute" && h.Target == GeoIp.IpEchoUrls[0] && h.Auth == Basic("u", "p"));
         Assert.Single(api.Log);
+    }
+
+    [Fact]
+    public async Task Geoip_never_asks_ip_api_unless_CLEARCOTE_GEOIP_IPAPI_opts_in()
+    {
+        // ip-api.com's free endpoint is for non-commercial use only (45 requests/min per IP): it is not in the
+        // default chain any more. Without the database there is no answer, and the reason says how to get one.
+        await using var api = GeoOrigin();
+        GeoIp.IpEchoUrls = new[] { $"http://127.0.0.1:{api.Port}/echo" };
+        GeoIp.IpApiUrl = $"http://127.0.0.1:{api.Port}/json";
+        GeoIp.DbLookup = (_, _, _, _, info) => { info.Db = "downloading"; return Task.FromResult<GeoInfo?>(null); };
+        var r = await GeoIp.ResolveDetailedAsync(null, quiet: true, timeoutMs: 5000);
+        Assert.Null(r.Geo);
+        Assert.Contains("still downloading", r.Reason);
+        Assert.Contains("CLEARCOTE_GEOIP_IPAPI=1", r.Reason);
+        Assert.Equal(new[] { "/echo" }, api.Log.Select(x => x.Url).ToArray());
+        Environment.SetEnvironmentVariable(GeoIp.IpApiEnv, "1");
+        r = await GeoIp.ResolveDetailedAsync(null, quiet: true, timeoutMs: 5000);
+        Assert.Null(r.Reason);
+        Assert.Equal("Europe/Berlin", r.Geo?.Timezone);
+        Assert.Equal(new[] { "/echo", "/echo", "/json" }, api.Log.Select(x => x.Url).ToArray());
+    }
+
+    [Fact]
+    public async Task Geoip_echo_url_setting_replaces_the_public_echoes()
+    {
+        await using var api = GeoOrigin();
+        GeoIp.IpEchoUrls = new[] { "http://127.0.0.1:1/never" };
+        Environment.SetEnvironmentVariable(GeoIp.EchoUrlEnv, $" http://127.0.0.1:{api.Port}/myecho ,");
+        var seen = new List<string>();
+        GeoIp.DbLookup = (ip, _, _, _, _) =>
+        {
+            seen.Add(ip);
+            return Task.FromResult<GeoInfo?>(new GeoInfo(ip, "NL", "Europe/Amsterdam", "nl-NL", null));
+        };
+        var r = await GeoIp.ResolveDetailedAsync(null, quiet: true, timeoutMs: 5000);
+        Assert.Null(r.Reason);
+        Assert.Equal("Europe/Amsterdam", r.Geo?.Timezone);
+        Assert.Equal(new[] { "203.0.113.7" }, seen.ToArray());
+        Assert.Equal(new[] { "/myecho" }, api.Log.Select(x => x.Url).ToArray());
+    }
+
+    [Fact]
+    public void Geoip_echo_settings_and_answers()
+    {
+        GeoIp.IpEchoUrls = _savedEcho;  // the shipped defaults, not the constructor's unroutable stand-in
+        var none = new Dictionary<string, string?>();
+        Assert.Equal(new[] { "http://api.ipify.org", "http://icanhazip.com" }, GeoIp.EchoUrls(none));
+        Assert.DoesNotContain(GeoIp.EchoUrls(none), u => u.Contains("ip-api"));
+        Assert.Equal(new[] { "http://a/ip", "http://b/ip" }, GeoIp.EchoUrls(new Dictionary<string, string?> { [GeoIp.EchoUrlEnv] = "http://a/ip, http://b/ip" }));
+        Assert.Equal(GeoIp.IpEchoUrls, GeoIp.EchoUrls(new Dictionary<string, string?> { [GeoIp.EchoUrlEnv] = " , " }));
+        Assert.False(GeoIp.IpApiEnabled(none));
+        foreach (var v in new[] { "1", "true", "YES", "on" })
+            Assert.True(GeoIp.IpApiEnabled(new Dictionary<string, string?> { [GeoIp.IpApiEnv] = v }));
+        Assert.False(GeoIp.IpApiEnabled(new Dictionary<string, string?> { [GeoIp.IpApiEnv] = "0" }));
+        Assert.Equal("203.0.113.7", GeoIp.IpFromEcho("203.0.113.7\n"));
+        Assert.Equal("2001:db8::1", GeoIp.IpFromEcho("{\"ip\": \"2001:db8::1\"}"));
+        Assert.Equal("203.0.113.8", GeoIp.IpFromEcho("{\"query\": \"203.0.113.8\", \"status\": \"success\"}"));
+        Assert.Equal("", GeoIp.IpFromEcho("{not json"));
+    }
+
+    [Fact]
+    public async Task Geoip_database_lookup_reads_the_real_database_when_asked()
+    {
+        // Live, opt-in (downloads ~52 MB once): CLEARCOTE_LIVE_GEOIP=1. Proves the MaxMind.Db reader and the
+        // geoip-all-in-one record shape against the real file, for the address this machine is seen from.
+        if (Environment.GetEnvironmentVariable("CLEARCOTE_LIVE_GEOIP") != "1") return;
+        GeoIp.IpEchoUrls = _savedEcho;
+        GeoIp.DbLookup = _savedDb;
+        var r = await GeoIp.ResolveDetailedAsync(null, quiet: false, timeoutMs: 180_000);
+        Assert.Null(r.Reason);
+        Assert.False(string.IsNullOrEmpty(r.Geo?.Timezone));
+        Assert.Matches(@"^-?\d+(\.\d+)?,-?\d+(\.\d+)?$", r.Geo?.Location ?? "");
+        Console.Error.WriteLine($"[live geoip] {r.Geo}");
     }
 
     [Fact]
@@ -172,9 +260,9 @@ public class ParityNetworkTests : IDisposable
     [Fact]
     public async Task Prepare_applies_geoip_to_a_copy()
     {
-        await using var api = new TestOrigin(_ => (200, GeoJson));
+        await using var api = GeoOrigin();
         await using var socks = new TestSocks5();
-        GeoIp.IpApiUrl = $"http://127.0.0.1:{api.Port}/json";
+        GeoIp.IpEchoUrls = new[] { $"http://127.0.0.1:{api.Port}/echo" };
         var opts = new ServeOptions { Geoip = true, Quiet = true, Port = 1234, Proxy = new ProxyOptions { Server = $"socks5://127.0.0.1:{socks.Port}" } };
         var copy = await Clearcote.PrepareAsync(opts);
         Assert.IsType<ServeOptions>(copy);

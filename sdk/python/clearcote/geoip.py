@@ -1,17 +1,23 @@
 """geoip: resolve the egress IP's geo (timezone + lat/lon + language) so the browser matches the
-proxy actually in use — the way Camoufox does it. Primary source is daijro's offline
-"geoip-all-in-one" MaxMind DB (more accurate than a single online API; merges IP2Location +
-GeoLite2 + DB-IP, timezone computed from coordinates). Flow: discover the exit IP via a small
-IP-echo *through the proxy*, then look that IP up in the cached .mmdb. Falls back to ip-api.com
-(direct geo through the proxy) if the DB can't be fetched/opened.
+proxy actually in use — the way Camoufox does it. Source: daijro's offline "geoip-all-in-one"
+MaxMind DB (more accurate than a single online API; merges IP2Location + GeoLite2 + DB-IP,
+timezone computed from coordinates). Flow: discover the exit IP via a small IP-echo *through the
+proxy*, then look that IP up in the cached .mmdb.
 
 The .mmdb (GPL-3.0 data) is downloaded + cached on first use (~52 MB zip -> ~120 MB), NOT bundled.
-The exit-IP and ip-api lookups go THROUGH the proxy (HTTP or SOCKS5, see ``_net``); we never fall
-back to the local IP under a proxy, which would give the wrong region. Needs the `maxminddb`
-package (a dependency); if it's missing, falls back to ip-api.com.
+The exit-IP lookup goes THROUGH the proxy (HTTP or SOCKS5, see ``_net``); we never fall back to the
+local IP under a proxy, which would give the wrong region. Needs the `maxminddb` package (a
+dependency).
 
-Budget: CLEARCOTE_GEOIP_TIMEOUT_SECONDS (default 20) bounds the whole resolution. A lookup that
-runs out of budget fails rather than hanging a launch.
+Settings:
+* CLEARCOTE_GEOIP_ECHO_URL -- your own IP-echo endpoint(s), comma-separated, used instead of the
+  public ones (api.ipify.org, icanhazip.com). The answer is the IP as plain text, or JSON with an
+  ``ip`` (or ``query``) field.
+* CLEARCOTE_GEOIP_IPAPI=1 -- also ask ip-api.com (exit IP + geo in one call) when the database has
+  no answer, e.g. while it is still downloading on first use. Off by default: ip-api.com's free
+  endpoint is for non-commercial use only and allows 45 requests a minute per IP.
+* CLEARCOTE_GEOIP_TIMEOUT_SECONDS (default 20) bounds the whole resolution. A lookup that runs out
+  of budget fails rather than hanging a launch.
 """
 
 import json
@@ -35,7 +41,10 @@ except ImportError:
 
 MMDB_URL = "https://github.com/daijro/geoip-all-in-one/releases/latest/download/geoip-aio-all.mmdb.zip"
 MMDB_MAX_AGE_DAYS = 30
-IPECHO_URLS = ("http://api.ipify.org", "http://ip-api.com/line/?fields=query")
+# Public IP-echo services with no usage limit, tried in order. CLEARCOTE_GEOIP_ECHO_URL replaces them.
+IPECHO_URLS = ("http://api.ipify.org", "http://icanhazip.com")
+ECHO_URL_ENV = "CLEARCOTE_GEOIP_ECHO_URL"
+IPAPI_ENV = "CLEARCOTE_GEOIP_IPAPI"
 IPAPI_URL = "http://ip-api.com/json/?fields=status,message,countryCode,timezone,lat,lon,query"
 # dotted record paths for the geoip-all-in-one schema (GeoLite2-City shaped)
 _PATHS = {"iso_code": "country.iso_code", "longitude": "location.longitude",
@@ -115,14 +124,39 @@ def _looks_like_ip(s):
     return ":" in s and all(c in "0123456789abcdefABCDEF:" for c in s)
 
 
+def echo_urls(environ=None):
+    """The IP-echo endpoints, in order: CLEARCOTE_GEOIP_ECHO_URL (comma-separated) when set, else the
+    public defaults."""
+    environ = os.environ if environ is None else environ
+    custom = [u.strip() for u in str(environ.get(ECHO_URL_ENV) or "").split(",") if u.strip()]
+    return tuple(custom) or IPECHO_URLS
+
+
+def ipapi_enabled(environ=None):
+    """Whether CLEARCOTE_GEOIP_IPAPI opts in to the ip-api.com fallback (1/true/yes/on)."""
+    environ = os.environ if environ is None else environ
+    return str(environ.get(IPAPI_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ip_from_echo(text):
+    """The IP an echo answered: plain text (first word), or JSON with an ``ip`` or ``query`` field."""
+    text = (text or "").strip()
+    if text.startswith("{"):
+        try:
+            j = json.loads(text)
+            text = str(j.get("ip") or j.get("query") or "")
+        except ValueError:
+            return ""
+    return text.split()[0].strip() if text else ""
+
+
 def _exit_ip(spec, deadline, quiet):
-    for url in IPECHO_URLS:
+    for url in echo_urls():
         left = deadline - time.monotonic()
         if left <= 0:
             break
         try:
-            text = _get_text(url, spec, min(left, 8.0))
-            ip = text.split()[0].strip() if text else ""
+            ip = _ip_from_echo(_get_text(url, spec, min(left, 8.0)))
             if _looks_like_ip(ip):
                 return ip
         except Exception:  # noqa: BLE001
@@ -166,7 +200,7 @@ def _ensure_mmdb(quiet):
         _log(quiet, "geoip: database ready")
         return mmdb
     except Exception as e:  # noqa: BLE001
-        _log(quiet, f"geoip: database fetch failed ({type(e).__name__}: {e}) — falling back to ip-api")
+        _log(quiet, f"geoip: database fetch failed ({type(e).__name__}: {e})")
         return None
 
 
@@ -174,11 +208,15 @@ _MMDB_LOCK = threading.Lock()
 _MMDB_THREAD = None
 
 
-def _ensure_mmdb_within(quiet, left):
+def _ensure_mmdb_within(quiet, left, info=None):
     """_ensure_mmdb bounded by ``left`` seconds. The first-run database download (~52 MB) may
-    outlast the budget: it keeps going in a background thread and caches for the next launch,
-    while this launch falls back to ip-api instead of waiting."""
+    outlast the budget: it keeps going in a background thread and caches for the next launch.
+    ``info["db"]`` says why there is no database: "missing-module", "downloading" or "unavailable"."""
     global _MMDB_THREAD
+    info = {} if info is None else info
+    if not _HAVE_MAXMINDDB:
+        info["db"] = "missing-module"
+        return None
     result = {}
     with _MMDB_LOCK:
         if _MMDB_THREAD is None or not _MMDB_THREAD.is_alive():
@@ -189,18 +227,22 @@ def _ensure_mmdb_within(quiet, left):
         thread = _MMDB_THREAD  # possibly a download already in flight from an earlier launch
     thread.join(max(0.0, left))
     if thread.is_alive():
+        info["db"] = "downloading"
         return None
-    if "path" in result:
+    if result.get("path"):
         return result["path"]
     mmdb = os.path.join(_geo_cache_root(), "geoip-aio-all.mmdb")
-    return mmdb if os.path.exists(mmdb) else None
+    if os.path.exists(mmdb):
+        return mmdb
+    info["db"] = "unavailable"
+    return None
 
 
-def _mmdb_lookup(ip, deadline, quiet):
+def _mmdb_lookup(ip, deadline, quiet, info=None):
     left = deadline - time.monotonic()
     if left <= 0:
         return None
-    mmdb = _ensure_mmdb_within(quiet, left)
+    mmdb = _ensure_mmdb_within(quiet, left, info)
     if not mmdb:
         return None
     try:
@@ -269,14 +311,23 @@ def resolve_geo_detailed(proxy=None, quiet=False, timeout=None):
     if spec and scheme not in PROXIED_REQUEST_SCHEMES:
         return None, f"{scheme}:// proxies are not supported; use http, https or socks5", elapsed()
     ip = _exit_ip(spec, deadline, quiet)
-    geo = _mmdb_lookup(ip, deadline, quiet) if ip else None
-    if not geo:
-        geo = _ip_api_fallback(spec, deadline)
+    info = {}
+    geo = _mmdb_lookup(ip, deadline, quiet, info) if ip else None
+    if (not geo or not geo.get("timezone")) and ipapi_enabled():
+        geo = _ip_api_fallback(spec, deadline) or geo
     if geo and geo.get("timezone"):
         _log(quiet, f"geoip: {geo['ip']} -> {geo['country']} "
                     f"tz={geo['timezone']} lang={geo['accept_language']}")
         return geo, None, elapsed()
-    if time.monotonic() >= deadline:
+    db = info.get("db")
+    if ip and db and not ipapi_enabled():
+        reason = {
+            "downloading": "the geoip database is still downloading (~52 MB, first use only); "
+                           "launch again in a moment or raise CLEARCOTE_GEOIP_TIMEOUT_SECONDS",
+            "missing-module": "the maxminddb package is not installed (pip install maxminddb)",
+        }.get(db, "the geoip database could not be downloaded")
+        reason += f" -- or set {IPAPI_ENV}=1 to ask ip-api.com (non-commercial use only)"
+    elif time.monotonic() >= deadline:
         secs = "%g" % round(budget, 1)
         reason = f"timed out after {secs}s (CLEARCOTE_GEOIP_TIMEOUT_SECONDS)"
     elif not ip:
@@ -334,7 +385,7 @@ def warn_on_egress_drift(proxy, first_ip, quiet=False):
 
 def resolve_geo(proxy=None, quiet=False, timeout=None):
     """Resolve geo for the egress (through ``proxy`` if given, else direct). Never raises — returns
-    None on failure. geoip-all-in-one offline DB first, ip-api.com fallback. Returns a dict
+    None on failure. geoip-all-in-one offline DB (ip-api.com only with CLEARCOTE_GEOIP_IPAPI=1). Returns a dict
     {ip, country, timezone, accept_language, location} or None. ``timeout`` bounds the whole
     resolution in seconds (default CLEARCOTE_GEOIP_TIMEOUT_SECONDS, else 20)."""
     return resolve_geo_detailed(proxy, quiet=quiet, timeout=timeout)[0]

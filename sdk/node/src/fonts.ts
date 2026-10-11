@@ -28,7 +28,7 @@
 // Both are lists separated by the path delimiter. Never point either at all of /usr/share/fonts:
 // the host's Latin families then compete with the clones and change the Windows widths.
 
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -386,9 +386,52 @@ export function buildConf(template: string, fontsDir: string, cacheDir: string, 
 
 function writeAtomic(path: string, text: string): void {
   const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, text);
-  renameSync(tmp, path);
+  try {
+    writeFileSync(tmp, text);
+    renameSync(tmp, path);
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* never written */ }
+    throw e;
+  }
 }
+
+/** Where the generated font config goes when the binary's own directory is not writable:
+ * CLEARCOTE_CACHE/fontconfig, else $XDG_CACHE_HOME (or ~/.cache)/clearcote/fontconfig. */
+export function userConfDir(env: Record<string, string | undefined> = process.env): string {
+  if (env.CLEARCOTE_CACHE) return join(env.CLEARCOTE_CACHE, "fontconfig");
+  return join(env.XDG_CACHE_HOME || join(homedir(), ".cache"), "clearcote", "fontconfig");
+}
+
+let privateTmp: string | undefined;
+/** @internal Last resort: a directory of this process's own under the temp dir (mode 0700, removed at exit).
+ * Replaceable so tests can make it fail. */
+export const confDirs = {
+  privateTmp(): string {
+    if (!privateTmp) {
+      const dir = mkdtempSync(join(tmpdir(), "cc-fontconfig-"));
+      process.once("exit", () => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
+      privateTmp = dir;
+    }
+    return privateTmp;
+  },
+};
+
+const warnedNoConf = new Set<string>();
+/** @internal forget which bundles were warned about (tests). */
+export function resetFontConfWarnings(): void { warnedNoConf.clear(); }
+
+/** Say once per bundle that the font config could not be written. The launch goes on, but with the host's
+ * fonts: text widths change and host fonts can be told apart from the persona's. */
+function warnNoFontConf(fontsDir: string, tried: readonly string[]): void {
+  if (process.env.CLEARCOTE_NO_WARN || warnedNoConf.has(fontsDir)) return;
+  warnedNoConf.add(fontsDir);
+  process.stderr.write("clearcote: warning: could not write the font configuration for the bundled fonts (tried: " +
+    `${tried.join("; ")}). The browser falls back to this machine's own fonts instead of the bundle: text widths ` +
+    "change and host fonts can show through. Make one of those directories writable, or set CLEARCOTE_CACHE to a " +
+    "writable directory.\n");
+}
+
+const errText = (e: unknown): string => (e as NodeJS.ErrnoException)?.code || (e as Error)?.message || String(e);
 
 /**
  * Returns `{ FONTCONFIG_FILE }` on Linux when the font bundle is present, else `{}`.
@@ -396,7 +439,9 @@ function writeAtomic(path: string, text: string): void {
  * `fontDirs` (and CLEARCOTE_FONT_DIRS / CLEARCOTE_FALLBACK_FONT_DIRS) add directories: see the top of
  * this file. Without any, the file is `fonts.generated.conf` exactly as before; with some, each
  * distinct result gets its own `fonts.generated-<hash>.conf`, so launches with different directories
- * never rewrite each other's file. `args` is the engine's command line (see genuineFacesDisabled).
+ * never rewrite each other's file. When the binary's directory is not writable the file goes to the user's
+ * cache (see userConfDir), then to a private temp directory; when none of them can be written, it warns once
+ * and returns `{}`. `args` is the engine's command line (see genuineFacesDisabled).
  */
 /** Whether the launch turns genuine faces off itself (`--disable-genuine-font-faces` in `args`). The engine
  * then keeps every substitute, so the rules must stay as the template has them: measured on an engine with
@@ -412,22 +457,42 @@ export function linuxFontEnv(exePath: string, fontDirs?: unknown, args?: readonl
   const fontsDir = join(dirname(exePath), "fonts");
   const template = join(fontsDir, "fonts.conf.template");
   if (!existsSync(template)) return {};
+  const cacheDir = join(tmpdir(), "cc-fc-cache");
   try {
-    const cacheDir = join(tmpdir(), "cc-fc-cache");
     mkdirSync(cacheDir, { recursive: true });
-    // The rules follow your fonts only on an engine that draws them (GENUINE_FACES_SWITCH).
-    const genuine = user.length && engineHonoursGenuineFaces(exePath) && !genuineFacesDisabled(args)
-      ? dirFamilies(user) : new Set<string>();
-    const conf = buildConf(readFileSync(template, "utf8"), fontsDir, cacheDir, user, fallback, genuine);
-    const name = user.length || fallback.length
-      ? `fonts.generated-${createHash("sha256").update(conf, "utf8").digest("hex").slice(0, 12)}.conf`
-      : "fonts.generated.conf";
-    const confPath = join(fontsDir, name);
-    writeAtomic(confPath, conf);
-    return { FONTCONFIG_FILE: confPath };
-  } catch {
+  } catch { /* fontconfig still works without a cache, only slower */ }
+  let text: string;
+  try {
+    text = readFileSync(template, "utf8");
+  } catch (e) {
+    warnNoFontConf(fontsDir, [`${template} (${errText(e)})`]);
     return {}; // never block a launch on font wiring
   }
+  // The rules follow your fonts only on an engine that draws them (GENUINE_FACES_SWITCH).
+  const genuine = user.length && engineHonoursGenuineFaces(exePath) && !genuineFacesDisabled(args)
+    ? dirFamilies(user) : new Set<string>();
+  const conf = buildConf(text, fontsDir, cacheDir, user, fallback, genuine);
+  const hashed = `fonts.generated-${createHash("sha256").update(conf, "utf8").digest("hex").slice(0, 12)}.conf`;
+  const name = user.length || fallback.length ? hashed : "fonts.generated.conf";
+  // Next to the binary first (as always). A binary in a directory this user cannot write (unpacked by root, a
+  // read-only image layer) used to lose the file silently, and the browser then saw every font on the host
+  // instead of the bundle. The conf names fontsDir itself, so it works from anywhere.
+  const tried: string[] = [];
+  const candidates: [() => string, string][] = [[() => fontsDir, name], [() => userConfDir(), hashed], [() => confDirs.privateTmp(), hashed]];
+  for (const [where, fname] of candidates) {
+    let dir = "a private temp directory";
+    try {
+      dir = where();
+      if (dir !== fontsDir) mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const confPath = join(dir, fname);
+      writeAtomic(confPath, conf);
+      return { FONTCONFIG_FILE: confPath };
+    } catch (e) {
+      tried.push(`${dir} (${errText(e)})`);
+    }
+  }
+  warnNoFontConf(fontsDir, tried);
+  return {}; // never block a launch on font wiring
 }
 
 export interface FontReport {

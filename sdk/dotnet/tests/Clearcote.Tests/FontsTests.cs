@@ -305,6 +305,107 @@ public class FontsTests : IDisposable
         Assert.Null(Fonts.LinuxFontConfig(Path.Join(_root, "nobundle", "chrome"), null, isLinux: true));
     }
 
+    /// Make writing a file at <paramref name="path"/> fail even as root: a non-empty directory stands where it would go.
+    private static void Block(string path) => Directory.CreateDirectory(Path.Join(path, "x"));
+
+    /// Run <paramref name="body"/> with CLEARCOTE_CACHE / CLEARCOTE_NO_WARN set, the private temp dir optionally
+    /// replaced, and the warn-once memory cleared; everything restored afterwards.
+    private static void WithConfEnv(string? cache, string? noWarn, Func<string>? privateTmp, Action body)
+    {
+        var savedCache = Environment.GetEnvironmentVariable("CLEARCOTE_CACHE");
+        var savedNoWarn = Environment.GetEnvironmentVariable("CLEARCOTE_NO_WARN");
+        var savedTmp = Fonts.PrivateTmpDir;
+        Environment.SetEnvironmentVariable("CLEARCOTE_CACHE", cache);
+        Environment.SetEnvironmentVariable("CLEARCOTE_NO_WARN", noWarn);
+        if (privateTmp is not null) Fonts.PrivateTmpDir = privateTmp;
+        Fonts.ResetFontConfWarnings();
+        try { body(); }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CLEARCOTE_CACHE", savedCache);
+            Environment.SetEnvironmentVariable("CLEARCOTE_NO_WARN", savedNoWarn);
+            Fonts.PrivateTmpDir = savedTmp;
+        }
+    }
+
+    [Fact]
+    public void A_bundle_dir_that_is_not_writable_sends_the_file_to_the_user_cache()
+    {
+        // A binary unpacked by root (or in a read-only image layer) used to lose its font config silently, and
+        // the browser then drew with every font on the host instead of the bundle.
+        var (exe, fonts) = Bundle();
+        Block(Path.Join(fonts, "fonts.generated.conf"));
+        var cache = Path.Join(_root, "cache");
+        WithConfEnv(cache, null, null, () =>
+        {
+            var path = Fonts.LinuxFontConfig(exe, null, isLinux: true);
+            Assert.Equal(Path.Join(cache, "fontconfig"), Path.GetDirectoryName(path));
+            Assert.Matches(@"^fonts\.generated-[0-9a-f]{12}\.conf$", Path.GetFileName(path));
+            Assert.Equal(Template.Replace("@FONTS_DIR@", fonts).Replace("@CACHE_DIR@", Cache), File.ReadAllText(path!));
+            Assert.Equal(new[] { "fonts.conf.template" }, Directory.GetFiles(fonts).Select(Path.GetFileName));  // no temp file left
+        });
+    }
+
+    [Fact]
+    public void The_user_cache_follows_XDG_CACHE_HOME()
+    {
+        Assert.Equal(Path.Join("/x/cache", "clearcote", "fontconfig"), Fonts.UserConfDir(new Dictionary<string, string?> { ["XDG_CACHE_HOME"] = "/x/cache" }));
+        Assert.Equal(Path.Join("/c", "fontconfig"), Fonts.UserConfDir(new Dictionary<string, string?> { ["CLEARCOTE_CACHE"] = "/c" }));
+    }
+
+    [Fact]
+    public void The_last_resort_is_a_private_temp_dir()
+    {
+        var (exe, fonts) = Bundle();
+        Block(Path.Join(fonts, "fonts.generated.conf"));
+        var aFile = Path.Join(_root, "a-file");
+        File.WriteAllText(aFile, "");
+        WithConfEnv(aFile, null, null, () =>  // nothing can be created under a file
+        {
+            var path = Fonts.LinuxFontConfig(exe, null, isLinux: true)!;
+            var dir = Path.GetDirectoryName(path)!;
+            Assert.StartsWith("cc-fontconfig-", Path.GetFileName(dir));
+            if (!OperatingSystem.IsWindows())
+                Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, File.GetUnixFileMode(dir));
+            Assert.Contains(fonts, File.ReadAllText(path));
+            File.Delete(path);
+        });
+    }
+
+    [Fact]
+    public void Nothing_writable_warns_once_and_still_launches()
+    {
+        var (exe, fonts) = Bundle();
+        Block(Path.Join(fonts, "fonts.generated.conf"));
+        var aFile = Path.Join(_root, "a-file");
+        File.WriteAllText(aFile, "");
+        WithConfEnv(aFile, null, () => Path.Join(aFile, "tmp"), () =>
+        {
+            using var err = new StderrCapture();
+            Assert.Null(Fonts.LinuxFontConfig(exe, null, isLinux: true));
+            Assert.Null(Fonts.LinuxFontConfig(exe, null, isLinux: true));
+            Assert.Single(err.Text.Split("could not write the font configuration").Skip(1));
+            Assert.Contains(fonts, err.Text);
+            Assert.Contains(aFile, err.Text);
+            Assert.Contains("CLEARCOTE_CACHE", err.Text);
+        });
+    }
+
+    [Fact]
+    public void CLEARCOTE_NO_WARN_silences_the_font_config_warning()
+    {
+        var (exe, fonts) = Bundle();
+        Block(Path.Join(fonts, "fonts.generated.conf"));
+        var aFile = Path.Join(_root, "a-file");
+        File.WriteAllText(aFile, "");
+        WithConfEnv(aFile, "1", () => Path.Join(aFile, "tmp"), () =>
+        {
+            using var err = new StderrCapture();
+            Assert.Null(Fonts.LinuxFontConfig(exe, null, isLinux: true));
+            Assert.Equal("", err.Text);
+        });
+    }
+
     [Fact]
     public void Your_windows_fonts_are_listed_first_and_lose_their_lookalike()
     {

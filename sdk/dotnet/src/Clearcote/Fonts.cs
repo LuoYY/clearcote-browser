@@ -392,6 +392,8 @@ internal static class Fonts
     /// The FONTCONFIG_FILE for a launch of <paramref name="exePath"/>, or null off Linux or for a build with
     /// no font bundle. Without extra directories the file is <c>fonts.generated.conf</c>, exactly as the Python
     /// and Node SDKs write it; with some, each distinct result gets its own <c>fonts.generated-&lt;hash&gt;.conf</c>.
+    /// When the binary's directory is not writable the file goes to the user's cache (see <see cref="UserConfDir"/>),
+    /// then to a private temp directory; when none of them can be written, it warns once and returns null.
     internal static string? LinuxFontConfig(string exePath, IEnumerable<string>? fontDirs, bool? isLinux = null,
         IEnumerable<string>? args = null)
     {
@@ -400,27 +402,112 @@ internal static class Fonts
         var fontsDir = Path.Join(Path.GetDirectoryName(exePath), "fonts");
         var template = Path.Join(fontsDir, "fonts.conf.template");
         if (!File.Exists(template)) return null;
-        try
-        {
-            var cacheDir = Path.Join(Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar), "cc-fc-cache");
-            Directory.CreateDirectory(cacheDir);
-            // The rules follow your fonts only on an engine that draws them (GenuineFacesSwitch).
-            var genuine = user.Count > 0 && EngineHonoursGenuineFaces(exePath) && !GenuineFacesDisabled(args)
-                ? DirFamilies(user) : new HashSet<string>();
-            var conf = BuildConf(File.ReadAllText(template), fontsDir, cacheDir, user, fallback, genuine);
-            var name = user.Count > 0 || fallback.Count > 0
-                ? $"fonts.generated-{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(conf)))[..12].ToLowerInvariant()}.conf"
-                : "fonts.generated.conf";
-            var confPath = Path.Join(fontsDir, name);
-            var tmp = $"{confPath}.{Environment.ProcessId}.tmp";
-            File.WriteAllText(tmp, conf, new UTF8Encoding(false));
-            File.Move(tmp, confPath, overwrite: true);
-            return confPath;
-        }
+        var cacheDir = Path.Join(Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar), "cc-fc-cache");
+        try { Directory.CreateDirectory(cacheDir); }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { /* fontconfig works without a cache, only slower */ }
+        string text;
+        try { text = File.ReadAllText(template); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
+            WarnNoFontConf(fontsDir, new[] { $"{template} ({e.Message})" });
             return null;  // never block a launch on font wiring
         }
+        // The rules follow your fonts only on an engine that draws them (GenuineFacesSwitch).
+        var genuine = user.Count > 0 && EngineHonoursGenuineFaces(exePath) && !GenuineFacesDisabled(args)
+            ? DirFamilies(user) : new HashSet<string>();
+        var conf = BuildConf(text, fontsDir, cacheDir, user, fallback, genuine);
+        var hashed = $"fonts.generated-{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(conf)))[..12].ToLowerInvariant()}.conf";
+        var name = user.Count > 0 || fallback.Count > 0 ? hashed : "fonts.generated.conf";
+        // Next to the binary first (as always). A binary in a directory this user cannot write (unpacked by
+        // root, a read-only image layer) used to lose the file silently, and the browser then saw every font on
+        // the host instead of the bundle. The conf names fontsDir itself, so it works from anywhere.
+        var tried = new List<string>();
+        var candidates = new (Func<string> Dir, string File)[] { (() => fontsDir, name), (() => UserConfDir(), hashed), (() => PrivateTmpDir(), hashed) };
+        foreach (var (where, fname) in candidates)
+        {
+            var dir = "a private temp directory";
+            try
+            {
+                dir = where();
+                if (dir != fontsDir)
+                {
+                    if (OperatingSystem.IsWindows()) Directory.CreateDirectory(dir);
+                    else Directory.CreateDirectory(dir, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
+                var confPath = Path.Join(dir, fname);
+                WriteAtomic(confPath, conf);
+                return confPath;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                tried.Add($"{dir} ({e.Message})");
+            }
+        }
+        WarnNoFontConf(fontsDir, tried);
+        return null;  // never block a launch on font wiring
+    }
+
+    private static void WriteAtomic(string path, string text)
+    {
+        var tmp = $"{path}.{Environment.ProcessId}.tmp";
+        try
+        {
+            File.WriteAllText(tmp, text, new UTF8Encoding(false));
+            File.Move(tmp, path, overwrite: true);
+        }
+        catch
+        {
+            try { File.Delete(tmp); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            throw;
+        }
+    }
+
+    /// Where the generated font config goes when the binary's own directory is not writable:
+    /// CLEARCOTE_CACHE/fontconfig, else $XDG_CACHE_HOME (or ~/.cache)/clearcote/fontconfig.
+    internal static string UserConfDir(IDictionary<string, string?>? env = null)
+    {
+        string? Get(string k) => env is null ? Environment.GetEnvironmentVariable(k) : env.TryGetValue(k, out var v) ? v : null;
+        var cache = Get("CLEARCOTE_CACHE");
+        if (!string.IsNullOrEmpty(cache)) return Path.Join(cache, "fontconfig");
+        var xdg = Get("XDG_CACHE_HOME");
+        var basePath = string.IsNullOrEmpty(xdg) ? Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache") : xdg;
+        return Path.Join(basePath, "clearcote", "fontconfig");
+    }
+
+    private static string? _privateTmp;
+    private static readonly object PrivateTmpLock = new();
+
+    /// Last resort: a directory of this process's own under the temp dir (mode 0700, removed at exit).
+    /// Replaceable so tests can make it fail.
+    internal static Func<string> PrivateTmpDir = () =>
+    {
+        lock (PrivateTmpLock)
+        {
+            if (_privateTmp is null)
+            {
+                var dir = Directory.CreateTempSubdirectory("cc-fontconfig-").FullName;
+                AppDomain.CurrentDomain.ProcessExit += (_, _) => { try { Directory.Delete(dir, true); } catch { /* best effort */ } };
+                _privateTmp = dir;
+            }
+            return _privateTmp;
+        }
+    };
+
+    private static readonly HashSet<string> WarnedNoConf = new();
+
+    /// Forget which bundles were warned about (tests).
+    internal static void ResetFontConfWarnings() { lock (WarnedNoConf) WarnedNoConf.Clear(); }
+
+    /// Say once per bundle that the font config could not be written. The launch goes on, but with the host's
+    /// fonts: text widths change and host fonts can be told apart from the persona's.
+    private static void WarnNoFontConf(string fontsDir, IEnumerable<string> tried)
+    {
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CLEARCOTE_NO_WARN"))) return;
+        lock (WarnedNoConf) if (!WarnedNoConf.Add(fontsDir)) return;
+        Console.Error.WriteLine("clearcote: warning: could not write the font configuration for the bundled fonts (tried: " +
+            $"{string.Join("; ", tried)}). The browser falls back to this machine's own fonts instead of the bundle: text " +
+            "widths change and host fonts can show through. Make one of those directories writable, or set CLEARCOTE_CACHE " +
+            "to a writable directory.");
     }
 
     /// Add FONTCONFIG_FILE to the browser env. The caller's own FONTCONFIG_FILE (in

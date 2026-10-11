@@ -1,7 +1,10 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.Compression;
+using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using MaxMind.Db;
 
 namespace Clearcote;
 
@@ -25,16 +28,198 @@ public sealed class GeoipException : Exception
 
 /// Region lookup for the connection a launch will use (ports geoip.ts).
 ///
-/// Every lookup goes THROUGH the proxy (HTTP or SOCKS5), never from the host, or the timezone and
-/// locale would describe the wrong place. The whole resolution is bounded by
-/// CLEARCOTE_GEOIP_TIMEOUT_SECONDS (default 20).
+/// The exit IP comes from a small IP echo THROUGH the proxy (HTTP or SOCKS5), never from the host, or the
+/// timezone and locale would describe the wrong place. That IP is then looked up in daijro's offline
+/// "geoip-all-in-one" MaxMind database (GPL-3.0 data, ~52 MB download on first use, cached in the same place
+/// the Python and Node SDKs use). The whole resolution is bounded by CLEARCOTE_GEOIP_TIMEOUT_SECONDS
+/// (default 20).
 ///
-/// Unlike the Node/Python SDKs there is no offline GeoIP database here: the geo comes from
-/// ip-api.com through the proxy (the Node SDK's fallback path).
+/// Settings: CLEARCOTE_GEOIP_ECHO_URL — your own IP-echo endpoint(s), comma-separated, instead of the public
+/// ones (api.ipify.org, icanhazip.com); the answer is the IP as plain text, or JSON with an <c>ip</c> (or
+/// <c>query</c>) field. CLEARCOTE_GEOIP_IPAPI=1 — also ask ip-api.com when the database has no answer (e.g.
+/// while it is still downloading). Off by default: ip-api.com's free endpoint is for non-commercial use only
+/// and allows 45 requests a minute per IP.
 public static class GeoIp
 {
-    internal static string[] IpEchoUrls = { "http://api.ipify.org", "http://ip-api.com/line/?fields=query" };
+    /// Public IP-echo services with no usage limit, tried in order; CLEARCOTE_GEOIP_ECHO_URL replaces them.
+    internal static string[] IpEchoUrls = { "http://api.ipify.org", "http://icanhazip.com" };
     internal static string IpApiUrl = "http://ip-api.com/json/?fields=status,message,countryCode,timezone,lat,lon,query";
+    internal static string MmdbUrl = "https://github.com/daijro/geoip-all-in-one/releases/latest/download/geoip-aio-all.mmdb.zip";
+    private const int MmdbMaxAgeDays = 30;
+    public const string EchoUrlEnv = "CLEARCOTE_GEOIP_ECHO_URL";
+    public const string IpApiEnv = "CLEARCOTE_GEOIP_IPAPI";
+
+    private static string? Env(IDictionary<string, string?>? env, string key)
+        => env is null ? Environment.GetEnvironmentVariable(key) : env.TryGetValue(key, out var v) ? v : null;
+
+    /// The IP-echo endpoints, in order: CLEARCOTE_GEOIP_ECHO_URL (comma-separated) when set, else the public defaults.
+    internal static string[] EchoUrls(IDictionary<string, string?>? env = null)
+    {
+        var custom = (Env(env, EchoUrlEnv) ?? "").Split(',').Select(u => u.Trim()).Where(u => u.Length > 0).ToArray();
+        return custom.Length > 0 ? custom : IpEchoUrls.ToArray();
+    }
+
+    /// Whether CLEARCOTE_GEOIP_IPAPI opts in to the ip-api.com fallback (1/true/yes/on).
+    internal static bool IpApiEnabled(IDictionary<string, string?>? env = null)
+        => (Env(env, IpApiEnv) ?? "").Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on";
+
+    /// The IP an echo answered: plain text (first word), or JSON with an <c>ip</c> or <c>query</c> field.
+    internal static string IpFromEcho(string? text)
+    {
+        var t = (text ?? "").Trim();
+        if (t.StartsWith('{'))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(t);
+                var r = doc.RootElement;
+                t = r.ValueKind == JsonValueKind.Object && (r.TryGetProperty("ip", out var v) || r.TryGetProperty("query", out v))
+                    && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
+            }
+            catch (JsonException) { return ""; }
+        }
+        return t.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+    }
+
+    /// Where the geoip database is cached (CLEARCOTE_CACHE/geoip when set) — the same place the Python and Node
+    /// SDKs use, so one download serves all three.
+    public static string GeoCacheRoot()
+    {
+        var cache = Environment.GetEnvironmentVariable("CLEARCOTE_CACHE");
+        if (!string.IsNullOrEmpty(cache)) return Path.Join(cache, "geoip");
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        if (OperatingSystem.IsWindows())
+        {
+            var local = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+            return Path.Join(string.IsNullOrEmpty(local) ? Path.Join(home, "AppData", "Local") : local, "clearcote", "geoip");
+        }
+        if (OperatingSystem.IsMacOS()) return Path.Join(home, "Library", "Caches", "clearcote", "geoip");
+        var xdg = Environment.GetEnvironmentVariable("XDG_CACHE_HOME");
+        return Path.Join(string.IsNullOrEmpty(xdg) ? Path.Join(home, ".cache") : xdg, "clearcote", "geoip");
+    }
+
+    /// Why a lookup had no database: "downloading" (first use, still going) or "unavailable".
+    internal sealed class DbInfo { public string? Db { get; set; } }
+
+    private static readonly object MmdbLock = new();
+    private static Task<string?>? _mmdbInflight;
+
+    private static Task<string?> EnsureMmdbAsync(bool quiet)
+    {
+        var file = Path.Join(GeoCacheRoot(), "geoip-aio-all.mmdb");
+        if (File.Exists(file) && (DateTime.UtcNow - File.GetLastWriteTimeUtc(file)).TotalDays < MmdbMaxAgeDays)
+            return Task.FromResult<string?>(file);
+        lock (MmdbLock)
+        {
+            // One download per process: a launch that runs out of budget leaves it going for the next one.
+            if (_mmdbInflight is null || _mmdbInflight.IsCompleted) _mmdbInflight = Task.Run(() => DownloadMmdbAsync(file, quiet));
+            return _mmdbInflight;
+        }
+    }
+
+    private static async Task<string?> DownloadMmdbAsync(string file, bool quiet)
+    {
+        var zip = Path.Join(Path.GetTempPath(), $"cc-geoip-{Environment.ProcessId}-{Guid.NewGuid():N}.zip");
+        var part = $"{file}.part-{Environment.ProcessId}";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+            if (!quiet) Console.Error.WriteLine("[clearcote] geoip: downloading the geoip-all-in-one database (~52 MB, first run only)");
+            using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(120) })
+            {
+                http.DefaultRequestHeaders.UserAgent.ParseAdd("clearcote-sdk");
+                await using var src = await http.GetStreamAsync(MmdbUrl).ConfigureAwait(false);
+                await using var dst = File.Create(zip);
+                await src.CopyToAsync(dst).ConfigureAwait(false);
+            }
+            using (var archive = ZipFile.OpenRead(zip))
+            {
+                var entry = archive.Entries.FirstOrDefault(e => e.Name.EndsWith(".mmdb", StringComparison.OrdinalIgnoreCase))
+                            ?? throw new InvalidDataException("no .mmdb in archive");
+                entry.ExtractToFile(part, overwrite: true);
+            }
+            File.Move(part, file, overwrite: true);  // atomic: a waiter never opens a half-written file
+            if (!quiet) Console.Error.WriteLine("[clearcote] geoip: database ready");
+            return file;
+        }
+        catch (Exception e)
+        {
+            if (!quiet) Console.Error.WriteLine($"[clearcote] geoip: database fetch failed ({e.GetType().Name}: {e.Message})");
+            return File.Exists(file) ? file : null;  // a stale database still beats none
+        }
+        finally
+        {
+            foreach (var f in new[] { zip, part })
+            {
+                try { File.Delete(f); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            }
+        }
+    }
+
+    private static readonly object ReaderLock = new();
+    private static Reader? _reader;
+    private static string? _readerPath;
+
+    private static object? Field(Dictionary<string, object> rec, string a, string b)
+        => rec.TryGetValue(a, out var o) && o is Dictionary<string, object> d && d.TryGetValue(b, out var v) ? v : null;
+
+    private static double? Number(object? o) => o switch
+    {
+        double d => d, float f => f, int i => i, long l => l, uint u => u, ulong ul => ul,
+        decimal m => (double)m, _ => null,
+    };
+
+    private static async Task<GeoInfo?> MmdbLookupAsync(string ip, Stopwatch sw, int budget, bool quiet, DbInfo info)
+    {
+        var left = budget - (int)sw.ElapsedMilliseconds;
+        if (left <= 0) return null;
+        var ensure = EnsureMmdbAsync(quiet);
+        if (await Task.WhenAny(ensure, Task.Delay(left)).ConfigureAwait(false) != ensure)
+        {
+            info.Db = "downloading";
+            return null;
+        }
+        var path = await ensure.ConfigureAwait(false);
+        if (path is null)
+        {
+            info.Db = "unavailable";
+            return null;
+        }
+        try
+        {
+            Reader reader;
+            lock (ReaderLock)
+            {
+                if (_reader is null || _readerPath != path)
+                {
+                    _reader?.Dispose();
+                    // Read into memory, as the Node SDK does: no open handle keeps a refreshed download from replacing it.
+                    _reader = new Reader(path, FileAccessMode.Memory);
+                    _readerPath = path;
+                }
+                reader = _reader;
+            }
+            var rec = reader.Find<Dictionary<string, object>>(IPAddress.Parse(ip));
+            if (rec is null) return null;
+            var country = Field(rec, "country", "iso_code") as string;
+            var lat = Number(Field(rec, "location", "latitude"));
+            var lon = Number(Field(rec, "location", "longitude"));
+            var tz = Field(rec, "location", "time_zone") as string;
+            if (string.IsNullOrEmpty(tz) && lat is null) return null;
+            return new GeoInfo(ip, country?.ToUpperInvariant(), string.IsNullOrEmpty(tz) ? null : tz, AcceptLanguageForCountry(country),
+                lat is not null && lon is not null
+                    ? $"{lat.Value.ToString(CultureInfo.InvariantCulture)},{lon.Value.ToString(CultureInfo.InvariantCulture)}"
+                    : null);
+        }
+        catch (Exception e)
+        {
+            if (!quiet) Console.Error.WriteLine($"[clearcote] geoip: mmdb read failed ({e.GetType().Name}: {e.Message})");
+            return null;
+        }
+    }
+
+    /// The database lookup, replaceable in tests.
+    internal static Func<string, Stopwatch, int, bool, DbInfo, Task<GeoInfo?>> DbLookup = MmdbLookupAsync;
 
     private static readonly Regex Ipv4 = new(@"^(?:\d{1,3}\.){3}\d{1,3}$");
     private static readonly Regex Ipv6 = new(@"^[0-9a-fA-F:]+$");
@@ -63,13 +248,13 @@ public static class GeoIp
 
     private static async Task<string?> ExitIpAsync(HttpClient client, Stopwatch sw, int budget)
     {
-        foreach (var url in IpEchoUrls)
+        foreach (var url in EchoUrls())
         {
             var left = budget - (int)sw.ElapsedMilliseconds;
             if (left <= 0) break;
             try
             {
-                var ip = (await GetTextAsync(client, url, Math.Min(left, 8000)).ConfigureAwait(false)).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                var ip = IpFromEcho(await GetTextAsync(client, url, Math.Min(left, 8000)).ConfigureAwait(false));
                 if (LooksLikeIp(ip)) return ip;
             }
             catch { /* try next */ }
@@ -109,22 +294,30 @@ public static class GeoIp
         catch (Exception e) { return new GeoResult(null, $"invalid proxy ({e.Message})", sw.ElapsedMilliseconds); }
 
         using var client = ProxiedHttp.Create(spec);
-        // ip-api answers with the exit IP AND its geo in one round-trip through the proxy.
-        var geo = await IpApiAsync(client, sw, budget).ConfigureAwait(false);
+        var ip = await ExitIpAsync(client, sw, budget).ConfigureAwait(false);
+        var info = new DbInfo();
+        var geo = ip is not null ? await DbLookup(ip, sw, budget, quiet, info).ConfigureAwait(false) : null;
+        var ipapi = IpApiEnabled();
+        // Opt-in only: ip-api answers with the exit IP AND its geo in one round-trip through the proxy, but its
+        // free endpoint is for non-commercial use.
+        if (geo is not { Timezone.Length: > 0 } && ipapi) geo = await IpApiAsync(client, sw, budget).ConfigureAwait(false) ?? geo;
         if (geo is { Timezone.Length: > 0 })
         {
             if (!quiet) Console.Error.WriteLine($"[clearcote] geoip: {geo.Ip} -> {geo.Country} tz={geo.Timezone} lang={geo.AcceptLanguage}");
             return new GeoResult(geo, null, sw.ElapsedMilliseconds);
         }
-        // Failed: find out whether the proxy works at all, for an actionable reason.
-        var ip = sw.ElapsedMilliseconds < budget ? await ExitIpAsync(client, sw, budget).ConfigureAwait(false) : null;
-        var reason = sw.ElapsedMilliseconds >= budget
-            ? $"timed out after {Math.Round(budget / 1000.0)}s (CLEARCOTE_GEOIP_TIMEOUT_SECONDS)"
-            : ip is null
-                ? $"could not determine the exit IP{(spec is not null ? " through the proxy" : "")}"
-                : geo is not null
-                    ? $"no timezone for exit IP {ip}"
-                    : $"no geo data for exit IP {ip}";
+        var dbReason = info.Db == "downloading"
+            ? "the geoip database is still downloading (~52 MB, first use only); launch again in a moment or raise CLEARCOTE_GEOIP_TIMEOUT_SECONDS"
+            : "the geoip database could not be downloaded";
+        var reason = ip is not null && info.Db is not null && !ipapi
+            ? $"{dbReason} -- or set {IpApiEnv}=1 to ask ip-api.com (non-commercial use only)"
+            : sw.ElapsedMilliseconds >= budget
+                ? $"timed out after {Math.Round(budget / 1000.0)}s (CLEARCOTE_GEOIP_TIMEOUT_SECONDS)"
+                : ip is null
+                    ? $"could not determine the exit IP{(spec is not null ? " through the proxy" : "")}"
+                    : geo is not null
+                        ? $"no timezone for exit IP {ip}"
+                        : $"no geo data for exit IP {ip}";
         return new GeoResult(geo, reason, sw.ElapsedMilliseconds);
     }
 
