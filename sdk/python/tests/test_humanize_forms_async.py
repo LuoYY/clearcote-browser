@@ -285,6 +285,16 @@ class Keyboard:
         for ch in text:
             self.p.key(ch)
 
+    async def insert_text(self, text):
+        await _real_sleep(0)
+        self.p.log.append(("insert", text))
+        f = self.p.focused
+        if f is not None:
+            if f.all:
+                f.value, f.all = "", False
+            room = len(text) if f.maxlength < 0 else max(0, f.maxlength - len(f.value))
+            f.value += text[:room]
+
     async def down(self, key):
         await _real_sleep(0)
         self.p.log.append(("kdown", key))
@@ -688,7 +698,8 @@ def test_fill_an_empty_field_types_and_presses_no_clear_keys(fast):
         assert f.value == "hello"
         assert not [e for e in kinds(p, "press") if e[1] in ("ControlOrMeta+a", "Backspace")]
         assert not [e for e in kinds(p, "kdown") if e[1] == "ControlOrMeta"]
-        assert len(kinds(p, "click")) == 1, "focused with ONE trusted click"
+        assert len(kinds(p, "down")) == 1 and len(kinds(p, "up")) == 1, "focused with ONE trusted press"
+        assert not kinds(p, "click"), "no mouse.click: it moves the pointer again right before the press"
         assert p.native == []
     run(go())
 
@@ -806,7 +817,7 @@ def test_type_does_not_click_a_field_that_already_has_the_caret(fast):
         assert f.value == "abcd" and not kinds(p, "click", "down")
         p.focused = None
         await p.type("#f", "e")
-        assert f.value == "abcde" and len(kinds(p, "click")) == 1
+        assert f.value == "abcde" and len(kinds(p, "down")) == 1
     run(go())
 
 
@@ -835,12 +846,113 @@ def test_keyboard_press_holds_for_the_persona_unless_a_real_delay_is_given(fast)
     run(go())
 
 
-def test_bulk_and_non_string_values_go_native(fast):
+def test_a_bulk_value_is_clicked_into_then_inserted(fast):
+    # Over 200 characters: still one insert (typing thousands of keys would crawl), but after a glide
+    # and a press into the field, the way a person pastes. Before: Playwright's fill, no pointer at all.
+    async def go():
+        f = Field(value="old")
+        p = await attached(("#f", f))
+        await p.fill("#f", "z" * 201)
+        assert f.value == "z" * 201 and p.native == []
+        seq = [e[0] for e in p.log if e[0] in ("move", "down", "up", "insert", "press")]
+        assert seq.index("down") < seq.index("insert") and "move" in seq[:seq.index("down")]
+        assert [e[1] for e in kinds(p, "insert")] == ["z" * 201]
+        assert not [e for e in kinds(p, "press", "kdown") if e[1] == "z"], "not typed key by key"
+    run(go())
+
+
+def test_a_bulk_value_respects_maxlength_and_never_falls_back(fast):
+    async def go():
+        f = Field(maxlength=250)
+        p = await attached(("#f", f))
+        await p.fill("#f", "q" * 300)
+        assert f.value == "q" * 250 and p.native == []
+        assert [e[1] for e in kinds(p, "insert")] == ["q" * 250]
+    run(go())
+
+
+def test_maxlength_types_only_what_fits(fast):
+    # fill('1234567') on maxlength=5 typed all seven, saw 12345, wiped it, typed seven again and then
+    # handed the field to Playwright (measured on r38). Playwright's own fill leaves 12345 too.
+    async def go():
+        f = Field(maxlength=5)
+        p = await attached(("#f", f))
+        await p.fill("#f", "1234567")
+        assert f.value == "12345" and p.native == []
+        typed = [e[1] for e in kinds(p, "press", "kdown") if len(e[1]) == 1]
+        assert typed == list("12345"), typed
+        assert not [e for e in kinds(p, "press") if e[1] in ("Backspace", "ControlOrMeta+a")]
+        assert not kinds(p, "insert")
+    run(go())
+
+
+def test_non_string_values_go_native(fast):
     async def go():
         f = Field()
         p = await attached(("#f", f))
-        await p.fill("#f", "z" * 201)
-        assert [n[0] for n in p.native] == ["fill"] and not kinds(p, "press", "kdown")
+        await p.fill("#f", 5)
+        assert [n[0] for n in p.native] == ["fill"] and not kinds(p, "press", "kdown", "insert")
+    run(go())
+
+
+def _sleeps(monkeypatch):
+    """Record every asyncio.sleep (seconds) humanize makes, in order with the pointer log."""
+    async def rec(s=0, *a, **k):
+        _sleeps.page.log.append(("sleep", s))
+    monkeypatch.setattr(H.asyncio, "sleep", rec)
+
+
+def _pause_before_down(p):
+    """Seconds slept between the last pointer move and each press."""
+    out, acc = [], None
+    for e in p.log:
+        if e[0] == "move":
+            acc = 0.0
+        elif e[0] == "sleep" and acc is not None:
+            acc += e[1]
+        elif e[0] == "down":
+            out.append(acc)
+            acc = None
+    return out
+
+
+@pytest.mark.parametrize("act", ["fill", "type", "click", "range", "drag"])
+def test_every_sdk_press_waits_after_the_pointer_arrives(fast, monkeypatch, act):
+    # The focus click before typing pressed ~4 ms after the last pointermove and a drag grab ~21 ms
+    # (r38). Every SDK-issued press now waits the identity's pre-press pause, 40-250 ms.
+    async def go():
+        f = Field(type="range" if act == "range" else "text", rmin="0", rmax="100", rstep="1",
+                  value="10" if act == "range" else "", rect=(100.0, 300.0, 200.0, 24.0))
+        p = await attached(("#f", f), _btn())
+        _sleeps.page = p
+        _sleeps(monkeypatch)
+        if act == "fill":
+            await p.fill("#f", "abc")
+        elif act == "type":
+            await p.type("#f", "abc")
+        elif act == "click":
+            await p.click("#b")
+        elif act == "range":
+            random.seed(3)   # 0.65: the thumb is grabbed and dragged
+            await p.fill("#f", "60")
+        else:
+            await p.mouse.move(150, 120)
+            await p.mouse.down()
+            await p.mouse.up()
+        pauses = _pause_before_down(p)
+        assert pauses, "a press was made"
+        assert all(x is not None and 0.040 <= x for x in pauses), pauses
+    run(go())
+
+
+def test_a_bare_mouse_down_with_no_move_stays_instant(fast, monkeypatch):
+    async def go():
+        p = await attached(_btn())
+        _sleeps.page = p
+        _sleeps(monkeypatch)
+        await p.mouse.down()
+        await p.mouse.up()
+        assert not kinds(p, "sleep"), "nothing arrived, so nothing to wait for"
     run(go())
 
 
@@ -1020,7 +1132,7 @@ def test_a_list_box_is_clicked_row_by_row_with_ctrl_for_the_rest(fast):
         got = await p.select_option("#ms", ["b", "d", "f"])
         assert sorted(got) == ["b", "d", "f"] and ms[1].selected == {1, 3, 5}
         presses = kinds(p, "click", "down")
-        assert presses[0][0] == "click", "the first row: a plain click"
+        assert presses[0][0] == "down" and presses[0][3] == frozenset(), "the first row: a plain press"
         assert [d[3] for d in presses[1:]] == [{"ControlOrMeta"}, {"ControlOrMeta"}]
         assert p.native == []
     run(go())

@@ -242,5 +242,39 @@
     {"options": {"delay": 50}, "want": false},
     {"options": {"delay": 0}, "want": true},
     {"options": {"position": {"x": 1, "y": 2}}, "want": true}
+  ],
+  "fit_maxlength": [
+    {"value": "1234567", "maxlength": 5, "tag": "input", "type": "text", "want": "12345"},
+    {"value": "12345", "maxlength": 5, "tag": "input", "type": "text", "want": "12345"},
+    {"value": "123", "maxlength": 5, "tag": "input", "type": "tel", "want": "123"},
+    {"value": "abcdef", "maxlength": 0, "tag": "input", "type": "search", "want": ""},
+    {"value": "abcdef", "maxlength": -1, "tag": "input", "type": "text", "want": "abcdef"},
+    {"value": "abcdef", "maxlength": null, "tag": "input", "type": "text", "want": "abcdef"},
+    {"value": "secret-pass", "maxlength": 6, "tag": "input", "type": "password", "want": "secret"},
+    {"value": "a@b.example", "maxlength": 3, "tag": "input", "type": "email", "want": "a@b"},
+    {"value": "https://x.y", "maxlength": 4, "tag": "input", "type": "url", "want": "http"},
+    {"value": "line one\nline two", "maxlength": 10, "tag": "textarea", "type": "", "want": "line one\nl"},
+    {"value": "123456", "maxlength": 3, "tag": "input", "type": "number", "want": "123456"},
+    {"value": "2026-01-15", "maxlength": 4, "tag": "input", "type": "date", "want": "2026-01-15"},
+    {"value": "abcdef", "maxlength": 2, "tag": "div", "type": "", "want": "abcdef"},
+    {"value": "ab\ud83d\ude00cd", "maxlength": 3, "tag": "input", "type": "text", "want": "ab"},
+    {"value": "ab\ud83d\ude00cd", "maxlength": 4, "tag": "input", "type": "text", "want": "ab\ud83d\ude00"},
+    {"value": "ab\ud83d\ude00cd", "maxlength": 5, "tag": "input", "type": "text", "want": "ab\ud83d\ude00c"},
+    {"value": "caf\u00e9s", "maxlength": 4, "tag": "input", "type": "", "want": "caf\u00e9"},
+    {"value": "abc", "maxlength": 2, "tag": "INPUT", "type": "TEXT", "want": "ab"}
+  ],
+  "pre_press_center": [
+    {"seed": 0, "center": 114.802718742},
+    {"seed": 1, "center": 92.970815435},
+    {"seed": 12345, "center": 107.640855608},
+    {"seed": 4294967295, "center": 85.34300301},
+    {"seed": 690103844, "center": 88.016229029},
+    {"seed": 740436701, "center": 114.342634963},
+    {"seed": 1247329221, "center": 127.77118283}
+  ],
+  "pre_press_ms": [
+    {"seed": 0, "rng_seed": 7, "ms": [112.054731147, 84.459661855, 118.087988994, 109.352020284, 163.89028821, 90.102920137, 78.308428399, 72.259044833]},
+    {"seed": 690103844, "rng_seed": 42, "ms": [68.379011276, 81.321159315, 57.437867016, 65.637443498, 75.886115721, 134.37384119, 81.423746729, 57.824121472]},
+    {"seed": 4294967295, "rng_seed": 1, "ms": [117.133802489, 124.096351451, 84.131797372, 81.048961994, 132.998748124, 62.782716905, 58.454858708, 116.193831529]}
   ]
 }

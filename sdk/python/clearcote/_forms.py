@@ -24,6 +24,8 @@ import math
 import random
 import re
 
+from ._motion import gauss_from, mulberry32
+
 # ----------------------------------------------------------------------------- field classes
 # The fill() routes. Playwright's own split (kInputTypesToSetValue / kInputTypesToTypeInto):
 # text-like types are typed into, value types have their value set, everything else raises.
@@ -155,6 +157,75 @@ def formatted_equal(got, want):
     a = [c.casefold() for c in got if c.isalnum()]
     b = [c.casefold() for c in want if c.isalnum()]
     return bool(b) and a == b
+
+
+# ------------------------------------------------------------------------------- maxlength
+# The input types whose maxlength the browser enforces on what is typed or inserted (HTML: text,
+# search, url, tel, email, password), plus textarea. number, date and the rest ignore it.
+MAXLENGTH_TYPES = frozenset(["", "text", "search", "url", "tel", "email", "password"])
+
+
+def fit_maxlength(value, maxlength, tag="input", input_type=""):
+    """The part of ``value`` an EMPTY control with ``maxlength`` ends up holding: what Playwright's
+    fill (Input.insertText) leaves there, and what a person types before the field stops taking keys.
+
+    maxlength counts UTF-16 code units, as Blink does; a character that would be cut in half (an
+    emoji beyond the BMP) is dropped whole, like Blink's LimitLength. A negative or missing maxlength,
+    a contenteditable and a type that ignores maxlength (number, date, ...) keep the whole value.
+
+    Measured on r38 before this existed: fill('#zip', '1234567') on maxlength=5 typed all seven
+    digits, saw 12345, wiped the field, typed seven again and then handed the field to Playwright."""
+    if value is None:
+        return value
+    try:
+        n = int(maxlength) if maxlength is not None else -1
+    except (TypeError, ValueError):
+        n = -1
+    tag = (tag or "").lower()
+    if n < 0 or tag not in ("input", "textarea"):
+        return value
+    if tag == "input" and (input_type or "").lower() not in MAXLENGTH_TYPES:
+        return value
+    units = 0
+    for k, ch in enumerate(value):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > n:
+            return value[:k]
+    return value
+
+
+# ------------------------------------------------------------------------------ pre-press pause
+# The pause between the pointer coming to rest and the button going down. A hand that has arrived
+# confirms the target before it presses: 40-250 ms, right-skewed (most presses come quickly, a few
+# after a look). Measured on r38 before this existed: the focus click before typing pressed ~4 ms
+# after the last pointermove (Playwright's mouse.click moves again right before it presses), a drag
+# grab ~21 ms; the targeted click's flat 40-130 ms was the only humane one.
+PRE_PRESS_MIN_MS = 40.0
+PRE_PRESS_MAX_MS = 250.0
+# Salt for the per-identity centre: a separate mulberry32 stream keeps make_persona's draw order (and
+# every existing seed's motor identity) unchanged. Same value in forms.ts and Forms.cs.
+_PRE_PRESS_SALT = 0x5BD1E995
+
+
+def pre_press_center(seed_int):
+    """The identity's typical pre-press pause (ms), 70..135, stable per persona seed."""
+    r = mulberry32((int(seed_int) ^ _PRE_PRESS_SALT) & 0xFFFFFFFF)()
+    return 70.0 + (135.0 - 70.0) * r
+
+
+def pre_press_ms(seed_int, rng=None):
+    """One pre-press pause (ms): a log-normal above the 40 ms floor, its median at the identity's centre
+    (sigma 0.55, so right-skewed and never below the floor). A draw past 250 ms is drawn again (up to
+    four times, then capped), so no value piles up at either bound."""
+    if rng is None:
+        rng = random.random
+    c = pre_press_center(seed_int) - PRE_PRESS_MIN_MS
+    ms = PRE_PRESS_MAX_MS
+    for _ in range(4):
+        ms = PRE_PRESS_MIN_MS + c * math.exp(0.55 * gauss_from(rng))
+        if ms <= PRE_PRESS_MAX_MS:
+            return ms
+    return PRE_PRESS_MAX_MS
 
 
 # ------------------------------------------------------------------------------ select-all

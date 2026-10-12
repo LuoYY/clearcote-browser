@@ -708,3 +708,161 @@ def test_click_a_button_clipped_by_a_scrolling_container(page, how):
     assert [e["tr"] for e in ev(page, "click", "innerbtn")] == [True]
     assert page.evaluate("document.getElementById('scroller').scrollTop") > 0
     assert ev(page, "mousemove"), "the pointer travelled to it"
+
+
+# ------------------------------------------------- SC 210 lane F: maxlength, pre-press, bulk, date timing
+LONG_VALUE = ("A long note pasted into a text area: it runs well past the two hundred character limit so the "
+              "SDK inserts it in one go instead of typing it key by key, but a person still has to click into "
+              "the field before pasting anything into it, which is what this checks. The end.")
+
+
+def press_gaps(events, id=None):
+    """ms from the last mousemove (end of its collapsed run) to each pointerdown on ``id``."""
+    last, out = None, []
+    for e in events:
+        if e["t"] == "mousemove":
+            last = e.get("te", e["ts"])
+        elif e["t"] == "pointerdown" and (id is None or e["id"] == id):
+            out.append(None if last is None else e["ts"] - last)
+    return out
+
+
+def test_maxlength_types_only_what_fits(page, typos):
+    typos(0)
+    reset(page)
+    page.fill("#zip", "1234567")
+    assert page.input_value("#zip") == "12345", "Playwright's fill leaves the same five digits"
+    keys = [e["key"] for e in ev(page, "keydown", "zip")]
+    assert keys == list("12345"), "only what fits is typed, no wipe and retype: %s" % keys
+    inputs = ev(page, "input", "zip")
+    assert [e["value"] for e in inputs] == ["1", "12", "123", "1234", "12345"], "one key each, no insertText"
+    assert all(e["tr"] for e in inputs)
+
+
+def test_maxlength_with_typos_still_types_only_what_fits(page, typos):
+    typos(1)
+    for _ in range(3):
+        page.evaluate("document.getElementById('zip').value = ''")   # empty: no clear expected
+        reset(page)
+        page.fill("#zip", "9876543")
+        assert page.input_value("#zip") == "98765"
+        values = [""] + [e["value"] for e in ev(page, "input", "zip")]
+        assert all(abs(len(b) - len(a)) <= 1 for a, b in zip(values, values[1:])), "keys, never a whole value"
+        assert not [e for e in ev(page, "keydown", "zip") if e["ctrl"] or e["meta"]], "no select-all and retype"
+
+
+@pytest.mark.parametrize("act", ["fill_text", "type", "slider_drag", "range_fill", "select", "listbox",
+                                 "date", "check", "click"])
+def test_every_sdk_press_waits_after_the_pointer_arrives(page, act):
+    reset(page)
+    target = {"fill_text": "name", "type": "city", "slider_drag": "rng", "range_fill": "rng2",
+              "select": "country", "listbox": "OPTION", "date": "d", "check": "cb", "click": "btn"}[act]
+    if act == "fill_text":
+        page.fill("#name", "Ada Lovelace")
+    elif act == "type":
+        page.type("#city", "Leiden")
+    elif act == "slider_drag":
+        b = page.locator("#rng").bounding_box()
+        y = b["y"] + b["height"] / 2
+        page.mouse.move(b["x"] + 30, y)
+        page.mouse.down()
+        page.mouse.move(b["x"] + 200, y)
+        page.mouse.up()
+    elif act == "range_fill":
+        page.fill("#rng2", "15")
+    elif act == "select":
+        page.select_option("#country", label="Iceland")
+    elif act == "listbox":
+        page.select_option("#lb", "opt3")
+    elif act == "date":
+        page.fill("#d", "1990-04-12")
+    elif act == "check":
+        page.check("#cb")
+    else:
+        page.click("#btn")
+    gaps = press_gaps(ev(page), target)
+    assert gaps, "a press reached #%s" % target
+    short = [round(g, 1) for g in gaps if g is None or g < 40]
+    assert not short, "pressed too soon after the pointer arrived: %s ms" % short
+
+
+def test_a_bulk_fill_clicks_into_the_field_before_inserting(page):
+    assert len(LONG_VALUE) > 200
+    reset(page)
+    page.fill("#bio", LONG_VALUE)
+    assert page.input_value("#bio") == LONG_VALUE
+    events = ev(page)
+    downs = [e for e in events if e["t"] == "pointerdown" and e["id"] == "bio"]
+    inputs = [e for e in events if e["t"] == "input" and e["id"] == "bio"]
+    assert downs and downs[0]["tr"], "a trusted press into the field"
+    assert inputs and downs[0]["ts"] < inputs[0]["ts"], "the press comes before the insert"
+    assert ev(page, "mousemove"), "the pointer glided there"
+    assert len(inputs) == 1 and inputs[0]["it"] == "insertText", "one insert, not typed key by key"
+    assert not [e for e in ev(page, "keydown", "bio") if len(e["key"]) == 1]
+
+
+def test_a_bulk_fill_replaces_a_prefilled_value(page):
+    page.fill("#prefilled", LONG_VALUE)
+    assert page.input_value("#prefilled") == LONG_VALUE
+
+
+DATE_VALUES = {"#d": ["1990-04-12", "2031-11-03"], "#t": ["14:35", "07:58"], "#m": ["2026-10", "1999-03"],
+               "#w": ["2026-W41", "2019-W07"], "#dtl": ["2026-01-15T09:30", "1987-06-24T21:12"]}
+
+
+def _date_round(page, gaps, rolls):
+    for sel, values in DATE_VALUES.items():
+        for value in values:
+            reset(page)
+            page.fill(sel, value)
+            assert page.input_value(sel) == value, (sel, value)
+            events = ev(page)
+            kd = [e for e in events if e["t"] == "keydown" and e["id"] == sel[1:]]
+            ku = [e for e in events if e["t"] == "keyup" and e["id"] == sel[1:]]
+            gaps += [b["ts"] - a["ts"] for a, b in zip(kd, kd[1:]) if b["ts"] - a["ts"] < 2000]
+            for i, d in enumerate(kd[:-1]):
+                up = next((u for u in ku if u["code"] == d["code"] and u["ts"] >= d["ts"]), None)
+                if up is not None and kd[i + 1]["ts"] < up["ts"]:
+                    rolls.append(1)
+
+
+def test_date_segments_use_the_typing_model_across_identities():
+    import statistics
+    import clearcote
+    gaps, rolls = [], []
+    for ident in ("dt-id-1", "dt-id-2", "dt-id-3"):
+        b = clearcote.launch(executable_path=LIVE, headless=True, humanize=True, fingerprint=ident, quiet=True)
+        try:
+            p = b.new_page()
+            p.goto(FIXTURE)
+            _date_round(p, gaps, rolls)
+        finally:
+            b.close()
+    cv = statistics.pstdev(gaps) / statistics.mean(gaps)
+    assert 0.3 <= cv <= 1.0, "inter-key variation %.2f over %d gaps" % (cv, len(gaps))
+
+
+def test_date_segments_survive_rollover_on_every_key(page, monkeypatch):
+    # Every eligible digit pair rolled over (the next key down before the last one is up): a segment
+    # that auto-advances must still get the right digits.
+    from clearcote import _humanize
+    monkeypatch.setattr(_humanize, "rollover_rate", lambda p: 1.0)
+    gaps, rolls = [], []
+    _date_round(page, gaps, rolls)
+    assert rolls, "rollover happened"
+
+
+def test_select_open_click_is_held_as_planned(page, monkeypatch):
+    # The open click's hold was the click-hold model PLUS the time the page took to open the popup
+    # (mouse.down returns after the press is handled): ~206 ms in the SC 209 lab for a 60-150 ms plan.
+    import statistics
+    from clearcote import _humanize
+    monkeypatch.setattr(_humanize, "click_hold", lambda p, rng=None: 120.0)
+    holds = []
+    for label in ("Iceland", "Norway", "Chile", "Kenya", "Malta", "Spain"):
+        reset(page)
+        page.select_option("#country", label=label)
+        d, u = ev(page, "mousedown", "country"), ev(page, "mouseup", "country")
+        assert d and u
+        holds.append(u[0]["ts"] - d[0]["ts"])
+    assert statistics.median(holds) <= 135, "held %s ms for a planned 120" % [round(h) for h in holds]

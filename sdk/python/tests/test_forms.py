@@ -286,3 +286,52 @@ def test_segment_names_and_nodes_from_a_pierced_describe_tree():
         el("-webkit-calendar-picker-indicator", 9)])])
     assert F.segment_names_from_tree(tree) == ["month-field", "day-field", "year-field"]
     assert F.segment_nodes_from_tree(tree) == [("month-field", 4), ("day-field", 6), ("year-field", 8)]
+
+
+# ------------------------------------------------------------------- maxlength + pre-press pause
+@pytest.mark.parametrize("c", VEC["fit_maxlength"], ids=_ids(VEC["fit_maxlength"]))
+def test_fit_maxlength(c):
+    assert F.fit_maxlength(c["value"], c["maxlength"], c["tag"], c["type"]) == c["want"]
+
+
+@pytest.mark.parametrize("c", VEC["pre_press_center"], ids=_ids(VEC["pre_press_center"]))
+def test_pre_press_center(c):
+    assert F.pre_press_center(c["seed"]) == pytest.approx(c["center"], abs=1e-6)
+
+
+@pytest.mark.parametrize("c", VEC["pre_press_ms"], ids=_ids(VEC["pre_press_ms"]))
+def test_pre_press_ms(c):
+    from clearcote._motion import mulberry32
+    r = mulberry32(c["rng_seed"])
+    assert [F.pre_press_ms(c["seed"], r) for _ in c["ms"]] == pytest.approx(c["ms"], abs=1e-6)
+
+
+def test_pre_press_pause_is_40_to_250_ms_right_skewed_and_per_identity():
+    from clearcote._motion import hash_seed, mulberry32
+    centres = set()
+    for name in ("ha-1", "ha-2", "ha-3", "ha-4", "ha-5", "ha-6"):
+        seed = hash_seed(name)
+        r = mulberry32(seed)
+        xs = sorted(F.pre_press_ms(seed, r) for _ in range(4000))
+        assert 40.0 <= xs[0] and xs[-1] <= 250.0
+        med, mean = xs[len(xs) // 2], sum(xs) / len(xs)
+        assert mean > med, "right-skewed: the long tail is on the slow side"
+        assert sum(1 for x in xs if x == 40.0 or x == 250.0) <= 4, "no pile-up at the bounds"
+        assert 70.0 <= F.pre_press_center(seed) <= 135.0
+        centres.add(round(F.pre_press_center(seed), 3))
+    assert len(centres) == 6, "each identity has its own typical pause"
+
+
+def test_fit_maxlength_matches_what_insert_text_leaves():
+    # Playwright's fill on an empty field leaves exactly this prefix; typing only it is the parity.
+    rnd = random.Random(5)
+    for _ in range(500):
+        n = rnd.randint(-1, 12)
+        v = "".join(rnd.choice("ab1\U0001F600") for _ in range(rnd.randint(0, 10)))
+        got = F.fit_maxlength(v, n, "input", "text")
+        units = sum(2 if ord(ch) > 0xFFFF else 1 for ch in got)
+        assert v.startswith(got)
+        assert n < 0 and got == v or units <= n
+        if n >= 0 and got != v:
+            nxt = v[len(got)]
+            assert units + (2 if ord(nxt) > 0xFFFF else 1) > n, "the longest prefix that fits"
