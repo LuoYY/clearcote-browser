@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { attachHumanize, sendEngineCommand, POINTER_PATH, POINTER_PATH_LEGACY } from "../src/humanize.js";
+import { attachHumanize, engineHasNoPointerPath, sendEngineCommand, POINTER_PATH, POINTER_PATH_LEGACY } from "../src/humanize.js";
 
 // r34 renamed Browser.humanizedClick to Browser.dispatchPointerPath (the old name was listed in
 // /json/protocol, and "humanizedClick" is known vocabulary). r33 and older only know the old name.
@@ -55,6 +55,17 @@ describe("sendEngineCommand: new pointer-path name first, old name on method-not
     expect(s.names()).toEqual([POINTER_PATH, POINTER_PATH]);
   });
 
+  it("an engine with neither name: asked once per browser, then refused without a round trip", async () => {
+    const s = new FakeSession(() => NOT_FOUND_PW);
+    const key = {};
+    await expect(sendEngineCommand(s, key, POINTER_PATH, POINTER_PATH_LEGACY, params)).rejects.toBe(NOT_FOUND_PW);
+    expect(s.names()).toEqual([POINTER_PATH, POINTER_PATH_LEGACY]);
+    expect(engineHasNoPointerPath(key)).toBe(true);
+    await expect(sendEngineCommand(s, key, POINTER_PATH, POINTER_PATH_LEGACY, params)).rejects.toMatchObject({ code: -32601 });
+    expect(s.names()).toEqual([POINTER_PATH, POINTER_PATH_LEGACY]);
+    expect(engineHasNoPointerPath({})).toBe(false);   // another browser is asked afresh
+  });
+
   it("an old name that also fails propagates its error and caches nothing", async () => {
     const legacyErr = new Error("Protocol error (Browser.humanizedClick): Target closed");
     const s = new FakeSession((m) => (m === POINTER_PATH ? NOT_FOUND_RAW : legacyErr));
@@ -99,5 +110,16 @@ describe("mouse.click through the engine", () => {
     await p2.mouse.click(100, 100);
     expect(session.names()).toEqual([POINTER_PATH, POINTER_PATH_LEGACY, POINTER_PATH_LEGACY, POINTER_PATH_LEGACY]);
     expect(session.calls[1][1]).toMatchObject({ targetId: "T1", x: 300, y: 200, noClick: false });
+  }, 20_000);
+
+  it("an engine with neither name: the second page of the browser does not probe again", async () => {
+    const session = new FakeSession(() => NOT_FOUND_PW);
+    const browser = { newBrowserCDPSession: async () => session };
+    const p1 = fakePage(browser), p2 = fakePage(browser);
+    await attachHumanize(browser as never, p1, { humanize: true, seed: "t" });
+    await attachHumanize(browser as never, p2, { humanize: true, seed: "t" });
+    await p1.mouse.click(300, 200);
+    await p2.mouse.click(100, 100);
+    expect(session.names()).toEqual([POINTER_PATH, POINTER_PATH_LEGACY]);
   }, 20_000);
 });
