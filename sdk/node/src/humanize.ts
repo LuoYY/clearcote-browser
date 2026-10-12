@@ -30,7 +30,7 @@
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import {
   makePersona, planMove, dragDwell, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
-  wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Step, type WheelPlatform,
+  wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
 import {
   COVER_CHECK_MS, COVER_RETRY_MS, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_FORM_CONTROL,
@@ -184,6 +184,21 @@ export function createInputLock(): <T>(fn: () => Promise<T>) => Promise<T> {
 }
 
 /** Wrap a single page's input methods + (optionally) inject the cursor overlay. */
+/** Which clicks the engine pointer path (Browser.dispatchPointerPath) may walk, from
+ * CLEARCOTE_HUMANIZE_ENGINE_CLICKS: "off" (also 0/false/no) never; "all" (also "selector") coordinate
+ * clicks AND targeted page.click(selector) / locator.click() clicks; anything else (the default)
+ * coordinate clicks only, as before.
+ *
+ * Targeted clicks stay on the SDK planner by default (SC 210 lane S, measured on r38): the engine
+ * presses 9 ms after its last move (the planner's press waits 40-130 ms), and it walks from its own last
+ * position, which an SDK glide does not update. Same values as Python `_engine_clicks_mode`. */
+export function engineClicksMode(): "off" | "coords" | "all" {
+  const v = (process.env.CLEARCOTE_HUMANIZE_ENGINE_CLICKS || "").trim().toLowerCase();
+  if (["0", "off", "false", "no", "none"].includes(v)) return "off";
+  if (["all", "selector", "selectors"].includes(v)) return "all";
+  return "coords";
+}
+
 export async function attachHumanize(browser: Browser, page: Page, opts: HumanizeOptions): Promise<void> {
   // IDEMPOTENCY GUARD — do not remove.
   //
@@ -255,10 +270,16 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // recorded human paths for PRO, engine bezier for free, tiered by the engine license gate).
   // Held-button DRAGS stay native; falls back to the SDK bezier if the method is unavailable
   // (older engine / no browser session).
-  const eng: { session: any; key: object | null; tid: string | null; ok: boolean } =
-    { session: null, key: null, tid: null, ok: true };
+  const eng: { session: any; key: object | null; tid: string | null; ok: boolean; at: Point | null } =
+    { session: null, key: null, tid: null, ok: true, at: null };
+  // The engine walks from ITS OWN last position on this page, not from where an SDK glide left the
+  // pointer. Measured on r38 (SC 210): an engine click at (300,300), an SDK glide to (800,550), then
+  // mouse.click(400,200) through the engine -- its first sample was at (300,300), a 559 px teleport
+  // from where the pointer was. So the engine walks only while nothing else has moved the pointer
+  // since its own last walk (before its first walk: while nothing has moved it at all).
+  const engineInSync = (): boolean => (eng.at === null ? !st.placed : st.x === eng.at.x && st.y === eng.at.y);
   const engineGlide = async (x: number, y: number, noClick: boolean): Promise<boolean> => {
-    if (!eng.ok) return false;
+    if (!eng.ok || !engineInSync()) return false;
     try {
       if (eng.session === null) {
         const ctx: any = page.context();
@@ -272,6 +293,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       const dx = x - st.x, dy = y - st.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
       const dur = Math.min(1.10, Math.max(0.28, 0.30 + dist / 1700)) * (0.85 + 0.30 * Math.random());
+      const tSend = Date.now();
       await sendEngineCommand(eng.session, eng.key!, POINTER_PATH, POINTER_PATH_LEGACY,
         { targetId: eng.tid, x, y, duration: dur, noClick });
       // The engine walks the trajectory in the BROWSER process and answers this command before it
@@ -279,9 +301,13 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       // position — measured: a move to (110,58) then a press landed at (981,629), on <body>
       // instead of the target, so every move-then-press sequence (drag, press-and-hold,
       // drag-and-drop) acted on the wrong element.
-      await sleep(dur * 1000);
+      // r38 answers only after the walk AND the click (send returned 772 ms after a 600 ms walk, 2 ms
+      // after the release, SC 210): wait only for what is left of `dur`, so an engine that answers
+      // late does not add a second, idle `dur` after every click.
+      await sleep(Math.max(0, dur * 1000 - (Date.now() - tSend)));
       try { await nativeMove(x, y); } catch { /* keep playwright cursor pos in sync for drags */ }
       st.x = x; st.y = y; st.placed = true;
+      eng.at = { x, y };
       return true;
     } catch { eng.ok = false; return false; }
   };
@@ -389,7 +415,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // dropped those options and always left-clicked once.
   const hclick = async (x: number, y: number, options: any = {}): Promise<void> => {
     const o = normalizeClickOptions(options);
-    if (enginePathOk(o) && await engineGlide(x, y, false)) return;
+    if (enginePathOk(o) && engineClicksMode() !== "off" && await engineGlide(x, y, false)) return;
     await glide(x, y);
     try {
       if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) {
@@ -1564,6 +1590,12 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
         if (!(await reachesPoint(orig, selector, box, x, y))) throw new NativeSignal();
       }
       if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) throw new NativeSignal();
+      if (!noClick && !o.force && orig && engineClicksMode() === "all" && enginePathOk(o) && await engineGlide(x, y, false)) {
+        // Opt-in (CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and clicks the
+        // point the hit test above proved; plain left single clicks only, and only while the engine
+        // knows where the pointer is (engineInSync). Otherwise: the planner.
+        return;
+      }
       if (noClick && o.modifiers.length) {
         // hover with modifiers: Playwright holds them across the move
         const held: string[] = [];
