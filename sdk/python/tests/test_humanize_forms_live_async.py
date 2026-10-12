@@ -323,7 +323,8 @@ async def test_filter_and_first_locators_are_humanized(page):
     await assert_human_keys(page, "name")
 
 
-async def test_field_under_a_floating_label(page):
+async def test_field_under_a_floating_label(page, typos):
+    typos(0)   # the exact key list below: no slip (2 % per key otherwise; flaky)
     # The label covers every probe point of the field: a person clicks the label (it passes the focus on)
     # and types; the fill must not fall back to Playwright's insertText.
     await reset(page)
