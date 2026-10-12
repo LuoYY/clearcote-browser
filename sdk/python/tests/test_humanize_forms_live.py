@@ -708,3 +708,83 @@ def test_click_a_button_clipped_by_a_scrolling_container(page, how):
     assert [e["tr"] for e in ev(page, "click", "innerbtn")] == [True]
     assert page.evaluate("document.getElementById('scroller').scrollTop") > 0
     assert ev(page, "mousemove"), "the pointer travelled to it"
+
+
+# --------------------------------------------------------------- SC 210: pointer-events:none, trial
+def wev(page):
+    return page.evaluate("[window.__wev, window.__fev || []]")
+
+
+def reset_w(page):
+    page.evaluate("window.__wev.length = 0; (window.__fev || []).length = 0")
+
+
+def test_controls_under_a_pointer_events_none_layer_are_humanized(page):
+    """A decorative layer with pointer-events:none over controls: a real press goes through it, so
+    the hit test must skip it too. With ignorePointerEventsNone the layer answered instead and fill /
+    select_option / click fell back to stock Playwright (SC 209: untrusted change, 6/6)."""
+    reset(page)
+    page.fill("#pen", "glass")
+    assert page.input_value("#pen") == "glass"
+    assert_human_keys(page, "pen")
+    reset(page)
+    page.select_option("#pensel", "c")
+    assert page.input_value("#pensel") == "c"
+    changes = ev(page, "change", "pensel")
+    assert len(changes) == 1 and changes[0]["tr"], "one trusted change, not Playwright's synthetic one"
+    reset(page)
+    page.click("#penbtn")
+    assert sum(e["n"] for e in ev(page, "mousemove")) >= 5, "the click glided (humanized), not a native jump"
+    assert ev(page, "mousedown", "penbtn")[0]["tr"]
+
+
+def test_trial_moves_and_presses_nothing_a_window_listener_could_see(page):
+    """trial=True runs the checks only: Playwright's own trial moved the pointer onto the target and
+    dispatched pointerdown/pointerup/click that listeners registered before its blocker saw (SC 209)."""
+    page.locator("#trialbtn").scroll_into_view_if_needed()
+    page.locator("#frb").scroll_into_view_if_needed()
+    reset_w(page)
+    page.click("#trialbtn", trial=True)
+    page.locator("#trialbtn").click(trial=True)
+    page.dblclick("#trialbtn", trial=True)
+    page.hover("#trialbtn", trial=True)
+    page.locator("#trialbtn").tap(trial=True)
+    page.click("#trialbtn", trial=True, position={"x": 5, "y": 5})
+    page.check("#cb", trial=True)
+    page.locator("#cb").set_checked(True, trial=True)
+    page.locator("#btn").drag_to(page.locator("#trialbtn"), trial=True)
+    page.click("#frb", trial=True)   # the click point lies inside a child frame
+    assert wev(page) == [[], []], "a trial dispatched pointer events"
+    assert not page.is_checked("#cb")
+
+
+def test_trial_fails_like_playwright_when_a_check_never_passes(page):
+    from playwright.sync_api import TimeoutError as PWTimeout
+    page.locator("#disbtn").scroll_into_view_if_needed()
+    reset_w(page)
+    for sel in ("#disbtn", "#hiddenbtn", "#cov"):   # disabled; hidden; covered by #covlay
+        t0 = time.time()
+        with pytest.raises(PWTimeout):
+            page.click(sel, trial=True, timeout=600)
+        assert time.time() - t0 < 3, sel
+    page.set_default_timeout(700)   # no timeout given: the page default, as in Playwright
+    t0 = time.time()
+    with pytest.raises(PWTimeout):
+        page.click("#disbtn", trial=True)
+    assert time.time() - t0 < 3, "the page default timeout"
+    page.hover("#disbtn", trial=True, timeout=600)   # hover does not need enabled
+    assert wev(page) == [[], []]
+
+
+def test_a_click_on_a_frame_is_humanized_without_a_trial(page):
+    """The click point of an <iframe> lies in its child frame: the hit test answers it with the
+    <iframe> element, so the click glides and presses with no Playwright trial before it."""
+    page.locator("#frb").scroll_into_view_if_needed()
+    reset(page)
+    reset_w(page)
+    page.click("#frb")
+    main, inner = wev(page)
+    downs = [e for e in inner if e["t"] == "pointerdown"]
+    assert len(downs) == 1 and downs[0]["tr"], inner
+    assert sum(e["n"] for e in ev(page, "mousemove")) >= 5, "the click glided (humanized)"
+    assert not [e for e in main if e["t"] in ("pointerdown", "mousedown", "click")]

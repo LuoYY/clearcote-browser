@@ -735,4 +735,78 @@ describe.runIf(LIVE)("live humanized form input", () => {
     expect(await page.evaluate("document.getElementById('scroller').scrollTop")).toBeGreaterThan(0);
     expect((await ev("mousemove")).length, "the pointer travelled to it").toBeGreaterThan(0);
   }, T);
+
+  // --------------------------------------------------------------- SC 210: pointer-events:none, trial
+  type W = { t: string; id: string; tr: boolean };
+  const wev = async (): Promise<[W[], W[]]> => (await page.evaluate("[window.__wev, window.__fev || []]")) as [W[], W[]];
+  const resetW = () => page.evaluate("window.__wev.length = 0; (window.__fev || []).length = 0");
+  const moves = async () => (await ev("mousemove")).reduce((a, e) => a + e.n, 0);
+
+  it("controls under a pointer-events:none layer are humanized", async () => {
+    // A real press goes through such a layer, so the hit test must skip it too. With
+    // ignorePointerEventsNone the layer answered and fill / selectOption / click fell back to stock
+    // Playwright (SC 209: untrusted change, 6/6).
+    await reset();
+    await page.fill("#pen", "glass");
+    expect(await page.inputValue("#pen")).toBe("glass");
+    await assertHumanKeys("pen");
+    await reset();
+    await page.selectOption("#pensel", "c");
+    expect(await page.inputValue("#pensel")).toBe("c");
+    expect((await changes("pensel")).map((e) => e.tr), "one trusted change").toEqual([true]);
+    await reset();
+    await page.click("#penbtn");
+    expect(await moves(), "the click glided (humanized), not a native jump").toBeGreaterThanOrEqual(5);
+    expect((await ev("mousedown", "penbtn"))[0].tr).toBe(true);
+  }, T);
+
+  it("trial moves and presses nothing a window listener could see", async () => {
+    // Playwright's own trial moved the pointer onto the target and dispatched pointerdown/pointerup/click
+    // that listeners registered before its blocker saw (SC 209).
+    await page.locator("#trialbtn").scrollIntoViewIfNeeded();
+    await page.locator("#frb").scrollIntoViewIfNeeded();
+    await resetW();
+    await page.click("#trialbtn", { trial: true });
+    await page.locator("#trialbtn").click({ trial: true });
+    await page.dblclick("#trialbtn", { trial: true });
+    await page.hover("#trialbtn", { trial: true });
+    await page.locator("#trialbtn").tap({ trial: true });
+    await page.click("#trialbtn", { trial: true, position: { x: 5, y: 5 } });
+    await page.check("#cb", { trial: true });
+    await page.locator("#cb").setChecked(true, { trial: true });
+    await page.locator("#btn").dragTo(page.locator("#trialbtn"), { trial: true });
+    await page.click("#frb", { trial: true });   // the click point lies inside a child frame
+    expect(await wev(), "a trial dispatched pointer events").toEqual([[], []]);
+    expect(await page.isChecked("#cb")).toBe(false);
+  }, T);
+
+  it("trial fails like Playwright when a check never passes", async () => {
+    await page.locator("#disbtn").scrollIntoViewIfNeeded();
+    await resetW();
+    for (const sel of ["#disbtn", "#hiddenbtn", "#cov"]) {   // disabled; hidden; covered by #covlay
+      const t0 = Date.now();
+      await expect(page.click(sel, { trial: true, timeout: 600 }), sel).rejects.toBeInstanceOf(errors.TimeoutError);
+      expect(Date.now() - t0, sel).toBeLessThan(3000);
+    }
+    page.setDefaultTimeout(700);   // no timeout given: the page default, as in Playwright
+    const t1 = Date.now();
+    await expect(page.click("#disbtn", { trial: true })).rejects.toBeInstanceOf(errors.TimeoutError);
+    expect(Date.now() - t1, "the page default timeout").toBeLessThan(3000);
+    await page.hover("#disbtn", { trial: true, timeout: 600 });   // hover does not need enabled
+    expect(await wev()).toEqual([[], []]);
+  }, T);
+
+  it("a click on a frame is humanized without a trial", async () => {
+    // The click point of an <iframe> lies in its child frame: the hit test answers it with the <iframe>
+    // element, so the click glides and presses with no Playwright trial before it.
+    await page.locator("#frb").scrollIntoViewIfNeeded();
+    await reset();
+    await resetW();
+    await page.click("#frb");
+    const [main, inner] = await wev();
+    const downs = inner.filter((e) => e.t === "pointerdown");
+    expect(downs.map((d) => d.tr), JSON.stringify(inner)).toEqual([true]);
+    expect(await moves(), "the click glided (humanized)").toBeGreaterThanOrEqual(5);
+    expect(main.filter((e) => ["pointerdown", "mousedown", "click"].includes(e.t))).toEqual([]);
+  }, T);
 });

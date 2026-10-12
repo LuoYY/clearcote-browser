@@ -1018,4 +1018,94 @@ public class HumanizeFormsLiveTests : IClassFixture<FormsLiveBrowser>
         Assert.True(await page.EvaluateAsync<double>("document.getElementById('scroller').scrollTop") > 0);
         Assert.NotEmpty(await Ev(page, "mousemove"));   // the pointer travelled to it
     });
+
+    // --------------------------------------------------------------- SC 210: pointer-events:none, trial
+    private static async Task<(List<JsonElement> Main, List<JsonElement> Inner)> Wev(IPage page)
+    {
+        var both = await page.EvaluateAsync<JsonElement>("[window.__wev, window.__fev || []]");
+        return (both[0].EnumerateArray().Select(e => e.Clone()).ToList(), both[1].EnumerateArray().Select(e => e.Clone()).ToList());
+    }
+
+    private static Task ResetW(IPage page) => page.EvaluateAsync("window.__wev.length = 0; (window.__fev || []).length = 0");
+
+    private static async Task<int> Moves(IPage page) => (await Ev(page, "mousemove")).Sum(e => (int)D(e, "n"));
+
+    [Fact]
+    public Task Controls_under_a_pointer_events_none_layer_are_humanized() => Live(async page =>
+    {
+        // A real press goes through such a layer, so the hit test must skip it too. With ignorePointerEventsNone
+        // the layer answered and fill / select / click fell back to stock Playwright (SC 209: untrusted change, 6/6).
+        await Reset(page);
+        await page.HumanFillAsync("#pen", "glass");
+        Assert.Equal("glass", await page.InputValueAsync("#pen"));
+        await AssertHumanKeys(page, "pen");
+        await Reset(page);
+        await page.HumanSelectOptionAsync("#pensel", "c");
+        Assert.Equal("c", await page.InputValueAsync("#pensel"));
+        Assert.Equal(new[] { true }, (await Changes(page, "pensel")).Select(Tr).ToArray());
+        await Reset(page);
+        await page.HumanClickAsync("#penbtn");
+        Assert.True(await Moves(page) >= 5, "the click glided (humanized), not a native jump" + Why);
+        Assert.True(Tr((await Ev(page, "mousedown", "penbtn"))[0]));
+    });
+
+    [Fact]
+    public Task Trial_moves_and_presses_nothing_a_window_listener_could_see() => Live(async page =>
+    {
+        // Playwright's own trial moved the pointer onto the target and dispatched pointerdown/pointerup/click that
+        // listeners registered before its blocker saw (SC 209).
+        await page.Locator("#trialbtn").ScrollIntoViewIfNeededAsync();
+        await page.Locator("#frb").ScrollIntoViewIfNeededAsync();
+        await ResetW(page);
+        await page.HumanClickAsync("#trialbtn", new HumanClickOptions { Trial = true });
+        await page.Locator("#trialbtn").HumanClickAsync(new LocatorClickOptions { Trial = true });
+        await page.HumanDblClickAsync("#trialbtn", new HumanClickOptions { Trial = true });
+        await page.HumanHoverAsync("#trialbtn", new HumanClickOptions { Trial = true });
+        await page.HumanClickAsync("#trialbtn", new HumanClickOptions { Trial = true, Position = new Position { X = 5, Y = 5 } });
+        await page.HumanCheckAsync("#cb", new PageCheckOptions { Trial = true });
+        await page.Locator("#cb").HumanSetCheckedAsync(true, new LocatorSetCheckedOptions { Trial = true });
+        await page.HumanClickAsync("#frb", new HumanClickOptions { Trial = true });   // the click point lies inside a child frame
+        var (main, inner) = await Wev(page);
+        Assert.True(main.Count == 0 && inner.Count == 0, "a trial dispatched pointer events: "
+            + string.Join(",", main.Concat(inner).Select(e => S(e, "t") + "@" + S(e, "id"))));
+        Assert.False(await page.IsCheckedAsync("#cb"));
+    });
+
+    [Fact]
+    public Task Trial_fails_like_Playwright_when_a_check_never_passes() => Live(async page =>
+    {
+        await page.Locator("#disbtn").ScrollIntoViewIfNeededAsync();
+        await ResetW(page);
+        foreach (var sel in new[] { "#disbtn", "#hiddenbtn", "#cov" })   // disabled; hidden; covered by #covlay
+        {
+            var sw = Stopwatch.StartNew();
+            await Assert.ThrowsAsync<System.TimeoutException>(
+                () => page.HumanClickAsync(sel, new HumanClickOptions { Trial = true, Timeout = 600 }));
+            Assert.True(sw.ElapsedMilliseconds < 3000, sel);
+        }
+        page.SetDefaultTimeout(700);   // no Timeout: the page default, as in Playwright
+        var sw2 = Stopwatch.StartNew();
+        await Assert.ThrowsAsync<System.TimeoutException>(
+            () => page.HumanClickAsync("#disbtn", new HumanClickOptions { Trial = true }));
+        Assert.True(sw2.ElapsedMilliseconds < 3000, "the page default timeout");
+        await page.HumanHoverAsync("#disbtn", new HumanClickOptions { Trial = true, Timeout = 600 });   // hover does not need enabled
+        var (main, inner) = await Wev(page);
+        Assert.Empty(main);
+        Assert.Empty(inner);
+    });
+
+    [Fact]
+    public Task A_click_on_a_frame_is_humanized_without_a_trial() => Live(async page =>
+    {
+        // The click point of an <iframe> lies in its child frame: the hit test answers it with the <iframe>
+        // element, so the click glides and presses with no Playwright trial before it.
+        await page.Locator("#frb").ScrollIntoViewIfNeededAsync();
+        await Reset(page);
+        await ResetW(page);
+        await page.HumanClickAsync("#frb");
+        var (main, inner) = await Wev(page);
+        Assert.Equal(new[] { true }, inner.Where(e => S(e, "t") == "pointerdown").Select(Tr).ToArray());
+        Assert.True(await Moves(page) >= 5, "the click glided (humanized)" + Why);
+        Assert.DoesNotContain(main, e => S(e, "t") is "pointerdown" or "mousedown" or "click");
+    });
 }
