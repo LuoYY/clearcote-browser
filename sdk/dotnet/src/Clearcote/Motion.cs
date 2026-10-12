@@ -60,6 +60,8 @@ public readonly record struct Point(double X, double Y);
 /// <summary>One dispatched sample: move to (X,Y), then sleep SleepMs before the next.</summary>
 public readonly record struct Step(double X, double Y, double SleepMs);
 public readonly record struct Box(double X, double Y, double Width, double Height);
+/// <summary>Per-identity path-shape traits (see Motion.ShapeTraitsOf).</summary>
+public readonly record struct ShapeTraits(double OvershootRate, double Curve, double DragTempo);
 
 public static class Motion
 {
@@ -273,29 +275,69 @@ public static class Motion
 
     private sealed class Vec { public double X, Y; }
 
+    // Salt for the path-shape stream. Like the rollover salt, a separate Mulberry32(seed ^ salt) stream
+    // keeps MakePersona's draw ORDER (and so every existing seed's motor identity) unchanged.
+    private const uint ShapeSalt = 0x85ebca6b;
+
+    /// <summary>
+    /// The persona's path-shape traits, drawn from a salted stream of its seed: the share of aimed moves
+    /// that pass the target and come back (0.15–0.38), a scale on the primary submovement's bow
+    /// (0.75–1.3) and a scale on held-drag duration (0.85–1.2). Measured on r38 / SDK 0.48.0 (SC 209):
+    /// 1 of 36 planned approaches passed the target, against 15–40 % for real reaches. Same values as
+    /// Python <c>shape_traits</c> and Node <c>shapeTraits</c>.
+    /// </summary>
+    public static ShapeTraits ShapeTraitsOf(Persona p)
+    {
+        Rng r = Mulberry32(p.Seed ^ ShapeSalt);
+        double overshootRate = Lerp(0.15, 0.38, r());
+        double curve = Lerp(0.75, 1.3, r());
+        double dragTempo = Lerp(0.85, 1.2, r());
+        return new ShapeTraits(overshootRate, curve, dragTempo);
+    }
+
+    // Sub-pixel noise scale. The coloured noise (OU drift + 8–12 Hz tremor + AR(1) jitter) stays, but
+    // smaller and carried mostly while the hand is moving: a mouse resting on the pad reports no counts,
+    // so a slow tail full of ±0.5 px wobble is what a quantizing page turns into 1 px zigzags.
+    private const double Noise = 0.6;
+
+    /// <summary>floor(x + 0.5): JavaScript Math.round / Python _js_round, not banker's rounding.</summary>
+    private static double JsRound(double x) => Math.Floor(x + 0.5);
+
+    /// <summary>Time warp 1−(1−τ)^skew: skew &gt; 1 moves the min-jerk speed peak before the midpoint.</summary>
+    private static double Skewed(double tau, double skew)
+    {
+        double t = Clamp(tau, 0, 1);
+        return skew != 1.0 ? 1 - Math.Pow(1 - t, skew) : t;
+    }
+
     private static double SampleSubmove(
         List<Step> outSteps, Point a, Point b, double durMs, Persona p, Rng rng,
-        double t0, Vec drift, Vec jit, double tremorPhase, bool land)
+        double t0, Vec drift, Vec jit, double tremorPhase, bool land, double bowFrac, double skew)
     {
         double dx = b.X - a.X, dy = b.Y - a.Y;
         double dist = Hypot(dx, dy);
         if (dist == 0) dist = 1e-6;
         double stepMs = 1000 / p.DeviceHz;
-        int n = (int)Math.Min(180, Math.Max(4, Math.Round(durMs / stepMs)));
+        int n = (int)Math.Min(180, Math.Max(4, JsRound(durMs / stepMs)));
         double nx = -dy / dist, ny = dx / dist;
-        double bowSign = p.ApproachBias >= 0 ? 1 : -1;
-        double bow = bowSign * (0.04 + Math.Abs(GaussFrom(rng)) * 0.05) * Math.Min(dist, 260) * (0.5 + Math.Abs(p.ApproachBias));
-        double c1x = a.X + dx * 0.33 + nx * bow, c1y = a.Y + dy * 0.33 + ny * bow;
-        double c2x = a.X + dx * 0.66 + nx * bow, c2y = a.Y + dy * 0.66 + ny * bow;
+        // A cubic with both control points offset by c peaks at 0.75 c; the first control point carries
+        // more of it, so the widest point of the arc comes before the middle, as in a reach.
+        double c = bowFrac * dist / 0.75;
+        double c1x = a.X + dx * 0.3 + nx * c * 1.15, c1y = a.Y + dy * 0.3 + ny * c * 1.15;
+        double c2x = a.X + dx * 0.7 + nx * c * 0.85, c2y = a.Y + dy * 0.7 + ny * c * 0.85;
         double t = t0;
         for (int i = 1; i <= n; i++)
         {
-            double e = MinJerk((double)i / n);
+            double tau = (double)i / n;
+            double e = MinJerk(Skewed(tau, skew));
             double px = Bez(a.X, c1x, c2x, b.X, e);
             double py = Bez(a.Y, c1y, c2y, b.Y, e);
             bool last = i == n;
             if (!(last && land))
             {
+                // noise follows the speed envelope (min-jerk speed 30τ²(1−τ)² peaks at 1.875)
+                double v = 30 * tau * tau * (1 - tau) * (1 - tau) / 1.875;
+                double g = Noise * (0.35 + 0.65 * v);
                 double k = stepMs / p.DriftTau;
                 drift.X += -k * drift.X + Math.Sqrt(2 * k) * p.DriftAmp * GaussFrom(rng);
                 drift.Y += -k * drift.Y + Math.Sqrt(2 * k) * p.DriftAmp * GaussFrom(rng);
@@ -306,8 +348,8 @@ public static class Motion
                 // sample and manufactures spurious submovements.
                 jit.X = 0.7 * jit.X + GaussFrom(rng) * p.Jitter * 0.22;
                 jit.Y = 0.7 * jit.Y + GaussFrom(rng) * p.Jitter * 0.22;
-                px += drift.X + trX + jit.X;
-                py += drift.Y + trY + jit.Y;
+                px += (drift.X + trX + jit.X) * g;
+                py += (drift.Y + trY + jit.Y) * g;
             }
             else { px = b.X; py = b.Y; }
             double sleepMs = stepMs * Lerp(0.88, 1.12, rng());
@@ -319,11 +361,19 @@ public static class Motion
 
     /// <summary>
     /// Plan a cursor move from→to as minimum-jerk submovements (primary + corrections) with a
-    /// Fitts-scaled duration and coloured noise. Returns the samples to dispatch.
+    /// Fitts-scaled duration and coloured noise. Returns the samples to dispatch. A move with a button
+    /// held (<paramref name="held"/>) or one that seats a handle (<paramref name="settle"/>) is a drag,
+    /// planned by <see cref="PlanDrag"/>.
+    /// <para>Shape (SC 209/210): the primary submovement arcs (peak sideways deviation ~6–18 % of the
+    /// distance, per-persona curvature and handedness), reaches its speed peak before the middle of the
+    /// move, and either stops short of the target (a short correction closes the gap) or, in
+    /// <see cref="ShapeTraits.OvershootRate"/> of moves, passes it by 3–28 px and comes back.
+    /// Straightness of the planned points lands around 0.85–0.95, the band of real reaches.</para>
     /// </summary>
     public static List<Step> PlanMove(Point from, Point to, Persona p,
-        double targetW = 24, bool settle = false, Rng? rng = null)
+        double targetW = 24, bool settle = false, Rng? rng = null, bool held = false)
     {
+        if (settle || held) return PlanDrag(from, to, p, settle, rng);
         rng ??= Random.Shared.NextDouble;
         double W = Math.Max(6, targetW);
         double D = Hypot(to.X - from.X, to.Y - from.Y);
@@ -333,26 +383,26 @@ public static class Motion
         double id = Log2(D / W + 1);
         double mtLo = Math.Min(1700, Math.Max(70, 40 + D * 0.6));
         double mt = Clamp((p.FittsA + p.FittsB * id) * (0.85 + 0.3 * rng()), mtLo, 1700);
+        var tr = ShapeTraitsOf(p);
+        double ux = (to.X - from.X) / D, uy = (to.Y - from.Y) / D;
 
         var targets = new List<Point>();
+        bool over = false;
         if (D >= 40)
         {
-            double f = p.PrimaryFrac;
-            double spread = Math.Min(16, D * p.Overshoot);
-            var primary = new Point(
-                from.X + (to.X - from.X) * f + GaussFrom(rng) * spread,
-                from.Y + (to.Y - from.Y) * f + GaussFrom(rng) * spread);
-            targets.Add(primary);
-            int nCorr = rng() < 0.08 * p.MaxCorrections ? 2 : 1;
-            Point cur = primary;
-            for (int i = 0; i < nCorr; i++)
+            over = rng() < tr.OvershootRate;
+            double along = over
+                ? D + Clamp(D * Lerp(0.03, 0.08, rng()), 3, 28)
+                : D * Clamp(p.PrimaryFrac + 0.05 + GaussFrom(rng) * 0.015, 0.88, 0.985);
+            double lat = GaussFrom(rng) * Math.Min(6, D * 0.02);
+            targets.Add(new Point(from.X + ux * along - uy * lat, from.Y + uy * along + ux * lat));
+            if (rng() < 0.08 * p.MaxCorrections)
             {
+                Point cur = targets[0];
                 double close = Lerp(0.55, 0.8, rng());
-                var nx2 = new Point(
-                    cur.X + (to.X - cur.X) * close + GaussFrom(rng) * 1.2,
-                    cur.Y + (to.Y - cur.Y) * close + GaussFrom(rng) * 1.2);
-                targets.Add(nx2);
-                cur = nx2;
+                double mx = cur.X + (to.X - cur.X) * close + GaussFrom(rng) * 1.0;
+                double my = cur.Y + (to.Y - cur.Y) * close + GaussFrom(rng) * 1.0;
+                targets.Add(new Point(mx, my));
             }
         }
         targets.Add(to);
@@ -367,6 +417,13 @@ public static class Motion
             for (int i = 0; i < nc; i++) segDur.Add(rest / nc * Lerp(0.8, 1.2, rng()));
         }
 
+        // The primary's arc: handedness sign from the persona (1 move in 5 bends the other way), size
+        // from the persona's curvature trait. Corrections are short and nearly straight.
+        double sign = p.ApproachBias >= 0 ? 1 : -1;
+        if (rng() < 0.2) sign = -sign;
+        double bow = sign * Math.Min(0.25, (0.08 + Math.Abs(GaussFrom(rng)) * 0.11) * tr.Curve * (0.75 + Math.Abs(p.ApproachBias)));
+        if (D * Math.Abs(bow) > 110) bow = bow < 0 ? -110 / D : 110 / D;
+
         var drift = new Vec();
         var jit = new Vec();
         double tremorPhase = rng() * 2 * Math.PI;
@@ -376,21 +433,94 @@ public static class Motion
         {
             Point b = targets[s];
             bool last = s == targets.Count - 1;
-            t = SampleSubmove(outSteps, aPt, b, Math.Max(20, segDur[s]), p, rng, t, drift, jit, tremorPhase, last && !settle);
+            bool first = s == 0;
+            t = SampleSubmove(outSteps, aPt, b, Math.Max(20, segDur[s]), p, rng, t, drift, jit, tremorPhase, last,
+                first ? bow : bow * 0.15, first ? 1.25 : 1.0);
             if (!last && outSteps.Count > 0)
             {
+                // motor re-planning gap; a reversal after passing the target comes back quicker
                 var lastStep = outSteps[^1];
-                outSteps[^1] = lastStep with { SleepMs = lastStep.SleepMs + Lerp(40, 120, rng()) };
+                double gap = over && first ? Lerp(25, 90, rng()) : Lerp(40, 120, rng());
+                outSteps[^1] = lastStep with { SleepMs = lastStep.SleepMs + gap };
             }
             aPt = b;
+        }
+        return outSteps;
+    }
+
+    /// <summary>
+    /// Plan a held-button drag from→to (slider handle, drag-and-drop, range thumb). Measured on r38 /
+    /// SDK 0.48.0 (SC 209): the held leg reused the aimed-move planner, whose arc put the hand up to
+    /// 47 px off the line between grab and drop — off a 40 px slider track. A drag is a slower, flatter
+    /// movement: one skewed min-jerk leg along the line with at most ~5 px of arc and ±6 px of total
+    /// sideways error, 0.5–2 s for 300–400 px, and now and then (about 0.6× the persona's overshoot rate)
+    /// a 2.5–10 px overshoot and pull-back. <paramref name="settle"/> adds a couple of sub-pixel seating
+    /// jiggles before landing exactly on <paramref name="to"/>.
+    /// </summary>
+    public static List<Step> PlanDrag(Point from, Point to, Persona p, bool settle = false, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double D = Hypot(to.X - from.X, to.Y - from.Y);
+        var outSteps = new List<Step>();
+        double stepMs = 1000 / p.DeviceHz;
+        if (D < 1.5) { outSteps.Add(new Step(to.X, to.Y, stepMs)); return outSteps; }
+        var tr = ShapeTraitsOf(p);
+        double ux = (to.X - from.X) / D, uy = (to.Y - from.Y) / D;
+        double mt = Clamp((260 + 1.7 * D) * tr.DragTempo * Lerp(0.9, 1.1, rng()), Math.Min(500, 150 + 1.5 * D), 2000);
+        bool over = D >= 60 && rng() < tr.OvershootRate * 0.6;
+        double o = over ? Clamp(D * Lerp(0.01, 0.03, rng()), 2.5, 10) : 0;
+        double sign = p.ApproachBias >= 0 ? 1 : -1;
+        double h = sign * Math.Min(5, D * 0.015) * Lerp(0.3, 1.0, rng());
+        double tremorPhase = rng() * 2 * Math.PI;
+
+        var legs = new List<(double S0, double S1, double Dur, double H)> { (0, D + o, mt * (over ? 0.86 : 1.0), h) };
+        if (over) legs.Add((D + o, D, mt * 0.14, 0));
+        double drift = 0, jit = 0, t = 0;
+        for (int li = 0; li < legs.Count; li++)
+        {
+            var (s0, s1, dur, hh) = legs[li];
+            int n = (int)Math.Min(360, Math.Max(4, JsRound(dur / stepMs)));
+            double dt = dur / n;
+            bool lastLeg = li == legs.Count - 1;
+            for (int i = 1; i <= n; i++)
+            {
+                double tau = (double)i / n;
+                double e = MinJerk(Skewed(tau, 1.2));
+                double along = s0 + (s1 - s0) * e;
+                double v = 30 * tau * tau * (1 - tau) * (1 - tau) / 1.875;
+                double k = dt / p.DriftTau;
+                drift += -k * drift + Math.Sqrt(2 * k) * p.DriftAmp * 0.8 * GaussFrom(rng);
+                jit = 0.7 * jit + GaussFrom(rng) * p.Jitter * 0.12;
+                double tAmp = p.TremorAmp * (0.7 + 0.3 * Math.Sin(2 * Math.PI * t / 850 + tremorPhase));
+                double tremor = tAmp * Math.Sin(tremorPhase + 2 * Math.PI * p.TremorHz * t / 1000);
+                along += tAmp * 0.6 * Math.Sin(tremorPhase + 1.0 + 2 * Math.PI * (p.TremorHz * 0.93) * t / 1000) * v;
+                double side = hh * Math.Sin(Math.PI * e) + (drift + tremor + jit) * (0.6 + 0.4 * v);
+                side = Clamp(side, -6, 6);
+                double px, py;
+                if (lastLeg && i == n && !settle) { px = to.X; py = to.Y; }
+                else { px = from.X + ux * along - uy * side; py = from.Y + uy * along + ux * side; }
+                double sl = dt * Lerp(0.88, 1.12, rng());
+                outSteps.Add(new Step(px, py, sl));
+                t += sl;
+            }
+            if (!lastLeg && outSteps.Count > 0)
+            {
+                var ls = outSteps[^1];
+                outSteps[^1] = ls with { SleepMs = ls.SleepMs + Lerp(30, 80, rng()) };   // notices, stops, pulls back
+            }
         }
 
         if (settle)
         {
-            int jig = 1 + (int)(rng() * 2);
+            // A couple of tiny sub-pixel seating jiggles, then land exactly (handle "clunk" into place).
+            int jig = 1 + (int)Math.Floor(rng() * 2);
             for (int i = 0; i < jig; i++)
-                outSteps.Add(new Step(to.X + GaussFrom(rng) * 1.4, to.Y + GaussFrom(rng) * 1.4, Lerp(30, 90, rng())));
-            outSteps.Add(new Step(to.X, to.Y, 1000 / p.DeviceHz));
+            {
+                double jx = to.X + Clamp(GaussFrom(rng) * 0.8, -1.5, 1.5);
+                double jy = to.Y + Clamp(GaussFrom(rng) * 0.8, -1.5, 1.5);
+                outSteps.Add(new Step(jx, jy, Lerp(30, 90, rng())));
+            }
+            outSteps.Add(new Step(to.X, to.Y, stepMs));
         }
         return outSteps;
     }

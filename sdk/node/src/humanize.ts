@@ -245,8 +245,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
 
   // Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective homing)
   // with colored sub-pixel noise and Fitts-scaled duration. `settle` adds a seating jiggle (drag).
-  const glide = async (x: number, y: number, o: { settle?: boolean; targetW?: number } = {}): Promise<void> => {
-    await dispatch(planMove(st, { x, y }, persona, { settle: o.settle, targetW: o.targetW }));
+  const glide = async (x: number, y: number, o: { settle?: boolean; targetW?: number; held?: boolean } = {}): Promise<void> => {
+    await dispatch(planMove(st, { x, y }, persona, { settle: o.settle, targetW: o.targetW, held: o.held }));
     st.x = x; st.y = y;
   };
 
@@ -349,7 +349,9 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // mouse.click keeps engine routing: it performs move+click entirely engine-side, where nothing
   // races the trajectory. glide() is still fully humanized (minimum-jerk, colored noise, Fitts).
   mouse.move = async (x: number, y: number) => {
-    await glide(x, y);
+    // A move while the button is held is a DRAG leg: planDrag keeps it on the line between grab and
+    // drop (an aimed reach's arc took a slider handle 47 px off a 40 px track, SC 209).
+    await glide(x, y, { held: st.held });
   };
   // down/up are wrapped to TRACK the held state mouse.move needs, and — critically — to make the
   // press position DETERMINISTIC. The engine answers its pointer path before the trajectory has
