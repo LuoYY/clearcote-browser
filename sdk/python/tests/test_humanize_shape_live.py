@@ -111,7 +111,10 @@ def test_slider_drag_stays_on_the_track_and_lands(page):
     page.mouse.up()
     ev = take(page)
     held = [e for e in ev if e["t"] == "move" and e["b"]]
-    assert len(held) > 20
+    # Enough held samples to measure the leg. Not a rate check: the planned glide is now paced against a
+    # wall clock (lane P), so a loaded box sends fewer, later samples of the same ~0.7-1.2 s leg (20 at
+    # load 23 on the merged SDK) where the unpaced loop sent 3x more spread over 3x the time.
+    assert len(held) >= 10, len(held)
     assert all(e["tr"] for e in ev), "untrusted pointer event during the drag"
     # line from the grab point to the drop point; how far does the held leg stray from it?
     x0, y0, x1, y1 = x, y, x + 330, y + 2

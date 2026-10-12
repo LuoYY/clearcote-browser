@@ -96,7 +96,9 @@ describe.runIf(LIVE)("live path shape and engine routing", () => {
     await page.mouse.up();
     const ev = await take();
     const held = ev.filter((e) => e.t === "move" && e.b);
-    expect(held.length).toBeGreaterThan(20);
+    // Enough held samples to measure the leg, not a rate check: the glide is paced against a wall clock
+    // (lane P), so a loaded box sends fewer, later samples of the same leg than the unpaced loop did.
+    expect(held.length).toBeGreaterThanOrEqual(10);
     expect(ev.every((e) => e.tr)).toBe(true);
     const x1 = x + 330, y1 = y + 2, d = Math.hypot(x1 - x, y1 - y);
     const side = Math.max(...held.map((e) => Math.abs(((e.x - x) * (y1 - y)) / d - ((e.y - y) * (x1 - x)) / d)));
