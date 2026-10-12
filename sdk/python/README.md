@@ -290,8 +290,12 @@ text locator costs one Playwright `bounding_box`, which reads the element's `tex
 occasional fat-finger correction and **key rollover** (on some fast pairs the next key goes down
 before the previous one comes up, at a rate fixed per identity); `page.fill` over 200 chars glides to
 the field and clicks into it like any fill, then inserts the value in one go (no per-key typing, which
-would crawl). Every button press the SDK makes comes after a short pause once the pointer has arrived
-(40-250 ms, right-skewed, typical length fixed per identity), the way a hand confirms its target. Scrolling moves in **whole wheel notches** (100 px on
+would crawl). Every press the SDK makes itself (a selector click, the click into a field, `mouse.down()`
+after a move, a drag's grab, a drop-down or list-box click) comes after a short pause once the pointer
+has arrived (40-250 ms, right-skewed, typical length fixed per identity), the way a hand confirms its
+target. A `page.mouse.click(x, y)` that the engine's pointer path walks is pressed by the engine, not
+the SDK: engine builds up to r39 press about 10 ms after their last move, with no such pause
+(`CLEARCOTE_HUMANIZE_ENGINE_CLICKS=off` keeps those clicks on the SDK's path, pause included). Scrolling moves in **whole wheel notches** (100 px on
 a Windows identity, 120 on Linux, 40 on macOS), because a browser reports every wheel event as one
 full notch: the requested distance is rounded to the nearest notch (at least one). Notches come in
 short flicks with the occasional reading pause.
@@ -301,12 +305,16 @@ short flicks with the occasional reading pause.
 runs Playwright's checks itself (visible, enabled, stable, the click point receives the press) and
 raises Playwright's `TimeoutError` when they never pass within the timeout, without moving the pointer
 or pressing (Playwright's own trial does both, and listeners a page registered early see it). Locator actions stay strict, and every Playwright locator works (`get_by_role`,
-`get_by_label`, `.filter()`, `.nth()`).
+`get_by_label`, `.filter()`, `.nth()`). Errors are Playwright's own class, worded for the method you
+called (`Page.click: Timeout 800ms exceeded.`, `Locator.check: Error: Not a checkbox or radio button`),
+and `locator.tap()` in a context without `has_touch` raises Playwright's own error instead of clicking.
 
 **`fill` follows the field.** Text is typed (cleared with held keys only when it has a value, then
 checked through Playwright; a field whose value cannot be confirmed, or one the click could not reach, is
 filled by Playwright instead). A field with a `maxlength` gets only the characters it can hold, the same
-value Playwright's own `fill` leaves there. A range slider is dragged (or its track clicked) and nudged with the arrow
+value Playwright's own `fill` leaves there; a field whose input mask re-punctuates what is typed (an
+`MM/YY` expiry, a dashed phone number) is typed once, and a mask that then stops taking keys leaves what
+it would leave a person. A range slider is dragged (or its track clicked) and nudged with the arrow
 keys to the exact value; a value the slider cannot hold (off its step, out of range, not a number) raises
 Playwright's own "Malformed value", as before. A date / time / month / week / datetime-local field is typed
 segment by segment, in the order the browser shows them, with the same key timing as text. Colour pickers, non-text inputs and fields inside

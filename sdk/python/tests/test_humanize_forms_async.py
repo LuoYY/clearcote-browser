@@ -802,6 +802,9 @@ def _postcode(v):   # 1234 AB: upper case, a space after the digits, six places 
     return d[:4] + " " + d[4:] if len(d) > 4 else d
 
 
+SELECT_ALL_OR_ERASE = ("ControlOrMeta", "ControlOrMeta+a", "Backspace")
+
+
 @pytest.mark.parametrize("fmt,maxlength,value,want,keys", [
     (_expiry, 5, "123456", "12/34", "12345"),                 # verifier B: typed, Ctrl+A, Backspace, retyped
     (_tel_dashes, 12, "5551234567890", "555-123-4567", "555123456789"),
@@ -817,7 +820,7 @@ def test_a_mask_that_stops_taking_keys_is_typed_once(fast, fmt, maxlength, value
         assert f.value == want and p.native == [], (f.value, p.native)
         typed = [e[1] for e in p.log if e[0] in ("press", "kdown") and len(e[1]) == 1]
         assert "".join(typed) == keys, typed
-        assert not [e for e in p.log if e[0] in ("press", "kdown") and e[1] in ("ControlOrMeta", "ControlOrMeta+a", "Backspace")]
+        assert not [e for e in p.log if e[0] in ("press", "kdown") and e[1] in SELECT_ALL_OR_ERASE]
     run(go())
 
 
@@ -830,15 +833,15 @@ def test_a_value_cut_short_with_room_left_is_still_typed_again(fast):
         orig = f.key
         lost = {"n": 0}
 
-        def key(k, *a, **kw):   # the last key of the first pass never lands: "12345", a prefix
+        def key(k):   # the last key of the first pass never lands: "12345", a prefix of the value
             if k == "6" and not lost["n"]:
                 lost["n"] = 1
                 return None
-            return orig(k, *a, **kw)
+            return orig(k)
         f.key = key
         await p.fill("#f", "123456")
         assert f.value == "123456" and p.native == []
-        assert [e for e in p.log if e[0] in ("press", "kdown") and e[1] in ("ControlOrMeta", "ControlOrMeta+a")], "retyped once"
+        assert [e for e in p.log if e[0] in ("press", "kdown") and e[1] in SELECT_ALL_OR_ERASE[:2]], "retyped once"
     run(go())
 
 
@@ -1670,4 +1673,61 @@ def test_a_list_box_at_its_end_goes_native(fast):
         lb.max_st = lambda: 0.0   # a box that cannot scroll: the row never comes into view
         assert await p.select_option("#lbmid", "m20") == ["native"]
         assert not kinds(p, "wheel")
+    run(go())
+
+
+# ----------------------------------------------------- SC 210 fix 2: Playwright's error wording
+def test_errors_are_worded_as_the_api_the_caller_used():
+    from playwright._impl._errors import Error as PWError, TimeoutError as PWTimeout
+    from clearcote._humanize import as_api_error
+    e = PWTimeout('Locator.wait_for: Timeout 800ms exceeded.\nCall log:\n  - waiting for locator("#x")')
+    n = as_api_error(e, "Page.click")
+    assert type(n) is PWTimeout and str(n).split("\n")[0] == "Page.click: Timeout 800ms exceeded."
+    assert n.message.endswith('waiting for locator("#x")')
+    mine = as_api_error(PWError("Clicking the checkbox did not change its state"), "Locator.check")
+    assert str(mine) == "Locator.check: Clicking the checkbox did not change its state"
+    same = PWError("Page.fill: Error: not an input")
+    assert as_api_error(same, "Page.fill") is same
+    other = RuntimeError("Locator.wait_for: not Playwright's")
+    assert as_api_error(other, "Page.click") is other
+
+
+def test_a_humanized_call_raises_the_callers_api_name(fast):
+    from playwright._impl._errors import TimeoutError as PWTimeout
+
+    async def go():
+        p = await attached(_btn())
+
+        def boom(*a, **k):
+            raise PWTimeout("Locator.is_checked: Timeout 500ms exceeded.")
+        p.locator = lambda sel: type("L", (), {"first": type("F", (), {"is_checked": staticmethod(boom)})()})()
+        with pytest.raises(PWTimeout) as ei:
+            await p.check("#b", timeout=500)
+        assert str(ei.value) == "Page.check: Timeout 500ms exceeded."
+    run(go())
+
+
+# ------------------------------------------- SC 210 fix 2: paths stay in the viewport; whole-pixel press
+def test_glides_near_the_edges_stay_inside_the_viewport(fast):
+    """The planner's overshoot arcs left the window near its edges (verifier B: x past the right edge,
+    y < 0, then 138-383 ms with no events). This fake's viewport is 1280 x 800."""
+    async def go():
+        p = await attached(_btn())
+        for x, y in [(1276, 400), (640, 3), (4, 790), (1277, 797), (100, 2), (1270, 6), (3, 3)] * 3:
+            await p.mouse.move(x, y)
+        out = [e for e in kinds(p, "move") if not (0 <= e[1] <= 1280 and 0 <= e[2] <= 800)]
+        assert not out, "%d samples outside the viewport, e.g. %s" % (len(out), out[:3])
+    run(go())
+
+
+def test_a_humanized_click_presses_the_whole_pixel_the_hit_test_proved(fast):
+    """DOM.getNodeForLocation answers for a whole pixel: a press at 971.6 was proven at 972 and landed
+    on a badge next to the target (verifier B). The press goes to the pixel that was checked."""
+    async def go():
+        p = await attached(_btn())
+        for _ in range(6):
+            await p.click("#b")
+            moves = kinds(p, "move")
+            x, y = moves[-1][1], moves[-1][2]
+            assert x == int(x) and y == int(y), (x, y)
     run(go())

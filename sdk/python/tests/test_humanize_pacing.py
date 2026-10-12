@@ -210,7 +210,10 @@ def test_ambient_motion_lasts_what_was_asked(clock, lat, ms):
     page.ambient_motion(ms)
     took = clock.now() * 1000.0 - t0
     assert _moves(m), "ambient dispatched nothing"
-    assert 0.8 * ms <= took <= 1.2 * ms, f"ambient_motion({ms}) took {took:.0f} ms"
+    # With 25 ms dispatch latency a late walk now stretches instead of catching up with jumps (SC 210
+    # fix 2, lab v2: no hop over 40 px): ambient's fast flicks run long. Measured over 30 plans: median
+    # 1.04-1.06x, worst 1.67x (600 ms), 1.38x (1500), 1.13x (3000).
+    assert 0.8 * ms <= took <= (1.2 if lat == 0 else 1.8) * ms, f"ambient_motion({ms}) took {took:.0f} ms"
     assert _hops_ok(_moves(m))
 
 
@@ -233,7 +236,7 @@ def test_async_glide_and_ambient_are_paced(clock, monkeypatch, lat):
         t0 = clock.now() * 1000.0
         await page.ambient_motion(1500)
         took = clock.now() * 1000.0 - t0
-        assert 1200 <= took <= 1800, f"async ambient_motion(1500) took {took:.0f} ms"
+        assert 1200 <= took <= (1800 if lat == 0 else 2700), f"async ambient_motion(1500) took {took:.0f} ms"
 
     asyncio.run(run())
 
@@ -353,3 +356,33 @@ def test_trim_to_a_short_ask_does_not_stop_the_pointer_mid_flight():
         assert total <= 600 + 1e-6, (seed, total)
         if total > 1.1 * 300:   # moved forward: only ever to a slow point
             assert _pacing._speed(plan, len(cut) - 1) <= 0.3 * peak, seed
+
+
+@pytest.mark.parametrize("stall_ms", (200, 350, 500))
+def test_pacer_after_a_long_stall_stretches_instead_of_jumping(stall_ms):
+    """SC 210 lab v2 on r38 under load: 35 hops of 60-103 px between samples a few ms apart. A stall of
+    200-500 ms used to let the next skip hop 3 px/ms x the stall; now no skip hops more than 40 px, nor
+    more than 20 px right after an idle gap: the walk takes longer instead."""
+    from clearcote._motion import plan_move, make_persona
+    steps = plan_move((100.0, 500.0), (1150.0, 140.0), make_persona("stall-1"), target_w=24)
+    own = _max_gap([(s[0], s[1]) for s in steps])
+    c = Clock()
+    sent = []
+
+    def move(x, y):
+        c.t += stall_ms / 1000.0 if len(sent) in (3, 9, 15) else 0.025
+        sent.append((x, y, c.t))
+    _pacing.walk(steps, move, clock=c.now, sleep=c.sleep)
+    hops = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(sent, sent[1:])]
+    assert max(hops) <= max(40.0, own) + 1e-6, "a hop of %.0f px (planned spacing %.0f px)" % (max(hops), own)
+    after = [hops[k] for k in (3, 9, 15) if k < len(hops)]
+    assert max(after) <= max(20.0, own) + 1e-6, "the hop after a stall: %s" % [round(h) for h in after]
+    assert (sent[-1][0], sent[-1][1]) == (steps[-1][0], steps[-1][1])
+
+
+def test_keep_in_view_moves_samples_inside_but_never_the_target():
+    steps = [(10.0, 5.0, 8.0), (-12.0, -3.0, 8.0), (1290.0, 400.0, 8.0, True), (1279.0, 799.0, 8.0)]
+    out = _pacing.keep_in_view(steps, 1280, 800)
+    assert out == [(10.0, 5.0, 8.0), (2.0, 2.0, 8.0), (1279.0, 400.0, 8.0, True), (1279.0, 799.0, 8.0)]  # the target widens the box
+    aimed_out = [(10.0, 5.0, 8.0), (1300.0, 900.0, 8.0)]   # the caller aims outside: left as it is
+    assert _pacing.keep_in_view(aimed_out, 1280, 800) == aimed_out

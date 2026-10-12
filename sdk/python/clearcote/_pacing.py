@@ -14,9 +14,11 @@ sleeps before it) and keeps that clock:
                one, so the path keeps the plan's shape and the move keeps the plan's duration;
 * never skipped: the final sample (the move must land exactly where it was aimed), and a sample
   marked as changing button state;
-* never a teleport: a skip may not put more between two dispatched points than a fast hand covers in
-  the time between them (FAST_PX_PER_MS x dt, at least ``max_jump`` = 40 px); a longer hop dispatches
-  the in-between sample instead;
+* never a teleport: a skip may not put more than ``max_jump`` (40 px) between two dispatched points,
+  and no more than IDLE_HOP_PX (20 px) after IDLE_MS (40 ms) with nothing sent; a longer hop dispatches
+  the in-between sample instead, so a late walk stretches in time rather than jumping (SC 210 lab v2:
+  the old cap, 3 px/ms x the time since the last dispatch, let a slow dispatch under load turn into
+  35 hops of 60-103 px a few ms apart -- and an r40 engine walks any hop >= 24 px after >= 40 ms idle);
 * a stall is a pause: a single dispatch slower than ``STALL_MS`` shifts the schedule by the excess
   instead of being caught up by skipping.
 
@@ -34,9 +36,12 @@ MAX_JUMP_PX = 40.0
 # A single dispatch slower than this is a STALL (the page or the box was busy), not latency: nothing
 # reached the page while it lasted, so the plan pauses with it instead of skipping ahead afterwards.
 STALL_MS = 60.0
-# A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s). A skip may hop as far as that
-# covers in the time since the last dispatch, and never less than MAX_JUMP_PX.
+# A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s).
 FAST_PX_PER_MS = 3.0
+# After this long with nothing dispatched, a skip may hop at most IDLE_HOP_PX: what a hand moving at a
+# moderate 2.5 px/ms covers in one 125 Hz report (8 ms), and below the 24 px an r40 engine walks.
+IDLE_MS = 40.0
+IDLE_HOP_PX = 20.0
 
 
 def schedule(steps):
@@ -69,9 +74,10 @@ def next_index(steps, due, i, last, elapsed_ms, max_jump=MAX_JUMP_PX, pinned=_de
 
 
 def _jump_cap(max_jump, dt_ms):
-    """The largest hop allowed between two dispatched points ``dt_ms`` apart: what a fast hand covers in
-    that time, never less than ``max_jump``."""
-    return max(max_jump, FAST_PX_PER_MS * max(0.0, dt_ms))
+    """The largest hop a SKIP may make between two dispatched points ``dt_ms`` apart: ``max_jump``, and
+    IDLE_HOP_PX after an idle gap. Never more for a longer gap: a walk that fell behind stretches in time
+    instead of catching up with a jump (the planner's own consecutive samples always go out)."""
+    return max_jump if dt_ms < IDLE_MS else min(max_jump, IDLE_HOP_PX)
 
 
 def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned):
@@ -143,6 +149,35 @@ async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, 
     if el < total:
         await sleep((total - el) / 1000.0)
     return sent
+
+
+# How far inside the viewport a planned path is kept (SC 210 fix 2, verifier B: the planner's overshoot
+# arcs left the window near its edges -- x past the right edge, y < 0 -- and the page saw no events for
+# 138-383 ms while the pointer was outside).
+VIEW_MARGIN_PX = 2.0
+
+
+def keep_in_view(steps, vw, vh, margin=VIEW_MARGIN_PX):
+    """``steps`` with every sample but the last moved inside the viewport ``vw`` x ``vh`` (``margin`` px
+    in). The last sample -- where the move was aimed -- is never changed, and a move aimed outside the
+    viewport (the caller's own choice) is returned as it is. Only coordinates change: the timing, and
+    any further fields of a step, are kept."""
+    if not steps or not vw or not vh:
+        return steps
+    tx, ty = steps[-1][0], steps[-1][1]
+    if not (0 <= tx <= vw and 0 <= ty <= vh):
+        return steps
+    lo_x, hi_x = min(margin, tx), max(vw - margin, tx)
+    lo_y, hi_y = min(margin, ty), max(vh - margin, ty)
+    out = []
+    for k, st in enumerate(steps):
+        if k == len(steps) - 1:
+            out.append(st)
+            continue
+        x = min(max(st[0], lo_x), hi_x)
+        y = min(max(st[1], lo_y), hi_y)
+        out.append(st if (x, y) == (st[0], st[1]) else (x, y) + tuple(st[2:]))
+    return out
 
 
 def _stall_s(tb, ta):

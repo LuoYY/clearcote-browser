@@ -124,6 +124,16 @@ def test_after_an_sdk_glide_the_engine_does_not_walk_from_its_stale_position(pag
     assert ("down",) in page.log and ("up",) in page.log
 
 
+def test_after_a_native_fallback_click_the_engine_does_not_walk_from_its_stale_position(page):
+    """A selector click the SDK hands to Playwright moves the real pointer to the element; the engine
+    does not see it either (verifier A #6: only `placed` was recorded, so the engine walked again)."""
+    page.mouse.click(300, 300)            # engine: its cursor is now (300, 300)
+    page.click("#elsewhere")              # this fake cannot resolve it: Playwright's own click
+    page.mouse.click(400, 200)
+    assert len(page._eng.calls) == 1, "the engine walked from (300,300) after Playwright moved the pointer"
+    assert [e for e in page.log if e[0] == "move"][-1][1:] == (400, 200)
+
+
 def test_the_engine_answer_after_its_walk_is_not_followed_by_a_second_wait(page):
     page.mouse.click(300, 300)
     _, params = page._eng.calls[0]
@@ -250,6 +260,23 @@ def test_async_after_an_sdk_glide_the_engine_does_not_walk_from_its_stale_positi
     async def run():
         await page.mouse.click(300, 300)
         await page.mouse.move(800, 550)
+        await page.mouse.click(400, 200)
+    asyncio.run(run())
+    assert len(page._eng.calls) == 1
+    moves = [e for e in page.log if e[0] == "move"]
+    assert (moves[-1][1], moves[-1][2]) == (400, 200)
+
+
+def test_async_after_a_native_fallback_click_the_engine_does_not_walk_from_its_stale_position(monkeypatch):
+    import asyncio
+    import warnings
+    page = _async_page(monkeypatch)
+
+    async def run():
+        await page.mouse.click(300, 300)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)   # the fake's un-awaited locator()
+            await page.click("#elsewhere")   # unresolvable here: Playwright's own click
         await page.mouse.click(400, 200)
     asyncio.run(run())
     assert len(page._eng.calls) == 1

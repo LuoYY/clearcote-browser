@@ -11,6 +11,7 @@ the rationale and the measurements behind each step; comments here note what is 
 """
 
 import asyncio
+import functools
 import random
 import time
 
@@ -22,8 +23,8 @@ from ._forms import (
 )
 from ._humanize import (
     CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _engine_clicks_mode, _host_platform,
-    _is_timeout, _needs_shift, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, default_timeout_ms, engine_path_memo,
-    trial_timeout_error, typo_rate,
+    _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, as_api_error,
+    default_timeout_ms, engine_path_memo, trial_timeout_error, typo_rate,
 )
 from ._isolated import (
     ACTIVE_FIELD as ISO_ACTIVE_FIELD, ACTIVE_VALUE as ISO_ACTIVE_VALUE, COVER_CHECK_MS, COVER_RETRY_MS,
@@ -35,7 +36,7 @@ from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     platform_from_navigator, rollover_rate, wheel_notches,
 )
-from ._pacing import trim_to as _trim_ambient, walk_async as _paced_walk
+from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk_async as _paced_walk
 
 
 async def _release(coro):
@@ -45,6 +46,21 @@ async def _release(coro):
     action (asyncio.wait_for timing out, task.cancel()) never leaves a button or a key down. A button
     left down turns the next move into a drag; a key left down makes its next press an auto-repeat."""
     await asyncio.shield(coro)
+
+
+def api_errors(api, fn):
+    """``fn`` (a coroutine function), with every Playwright error it raises worded as ``api``'s:
+    see _humanize.as_api_error ("Page.click: Timeout ...", not "Locator.wait_for: Timeout ...")."""
+    @functools.wraps(fn)
+    async def call(*a, **kw):
+        try:
+            return await fn(*a, **kw)
+        except Exception as e:  # noqa: BLE001
+            n = as_api_error(e, api)
+            if n is e:
+                raise
+            raise n.with_traceback(e.__traceback__) from None
+    return call
 
 
 async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None):
@@ -113,12 +129,28 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         """Walk a planned trajectory (list of (x, y, sleep_ms)) via native trusted mouse.move +
         off-protocol asyncio.sleep. Native input carries button state (held-button drag works).
         Paced against a wall clock (_pacing.walk_async): samples go out at their planned time, late
-        ones are skipped (never the last, never a > 40 px jump), so the dispatch round trip no
+        ones are skipped (never the last; no hop longer than 3 px/ms of the time since the last
+        dispatch, at least 40 px), so the dispatch round trip no
         longer stretches every glide 3-5x (SC 209)."""
         async def mv(sx, sy):
             await native_move(sx, sy)
             st["placed"] = True
-        await _paced_walk(steps, mv)
+        vp = await _view_bounds()
+        await _paced_walk(_keep_in_view(steps, *vp) if vp else steps, mv)
+
+    async def _view_bounds():
+        """The viewport (innerWidth, innerHeight) a planned path is kept inside (_pacing.keep_in_view),
+        read in the isolated world at most every 2 s; None when it cannot be read."""
+        now = time.monotonic()
+        c = st.get("vp")
+        if c is None or now - c[0] > 2.0:
+            try:
+                wh = await async_world_for(page).evaluate(ISO_VIEWPORT)
+                vp = (float(wh[0]), float(wh[1])) if wh and wh[0] and wh[1] else None
+            except Exception:  # noqa: BLE001
+                vp = None
+            st["vp"] = c = (now, vp)
+        return c[1]
 
     async def _glide(x, y, settle=False, target_w=24, held=False):
         # minimum-jerk sum-of-submovements path with colored noise + Fitts duration (_motion.plan_move)
@@ -782,13 +814,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         except Exception:  # noqa: BLE001
             return None
         box = _rect_box(r)
-        if box and not (await _in_view(box) and await _hit_ok(box)):
+        if box and not (await _in_view(box) and await _hit_ok(box, selector)):
             # scrollIntoViewIfNeeded also scrolls a scrolling container that clips it, and does
             # nothing when it already shows (then the cover is an overlay: the click's own check)
             box = _rect_box(await w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": True}))
         return box
 
-    async def _hit_in_box(box, x, y):
+    async def _hit_in_box(box, x, y, sel=None):
         """Does a press at viewport (x, y) reach the element filling ``box``? True / False, or None
         when it cannot be told here (CDP is unavailable). A point inside a child frame is answered
         by the <iframe> element that holds it."""
@@ -796,14 +828,16 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         nid = await w.node_at(x, y)
         if nid is None:
             return None
-        res = await w.call_on_node(nid, ISO_HIT_IN_BOX,
-                                   {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]})
+        b = {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]}
+        if sel:
+            b["sel"] = sel   # a plain-CSS selector: the exact answer (see HIT_IN_BOX)
+        res = await w.call_on_node(nid, ISO_HIT_IN_BOX, b)
         return None if res is None else bool(res)
 
-    async def _hit_ok(box):
+    async def _hit_ok(box, sel=None):
         """Does the element filling ``box`` own its centre -- not clipped by a scrolling container,
         not covered? The browser's own hit test, read in the isolated world."""
-        return await _hit_in_box(box, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2) is True
+        return await _hit_in_box(box, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, sel) is True
 
     async def _scroll_window_to(box):
         """Scroll the WINDOW so ``box`` sits centred where it was off-screen, the way Playwright's
@@ -840,12 +874,12 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         if box is not None:
             return box
         box = await loc.bounding_box()
-        if box and not (await _in_view(box) and await _hit_ok(box)):
+        if box and not (await _in_view(box) and await _hit_ok(box, selector)):
             # Off-screen: scroll the window to it and prove it shows there (hit test), with no new
             # handle. Clipped by a scrolling container, covered, or the window scroll did not bring
             # it out: Playwright's scroll, which also scrolls containers, and a fresh box.
             moved = await _scroll_window_to(box) if not await _in_view(box) else None
-            if moved and await _in_view(moved) and await _hit_ok(moved):
+            if moved and await _in_view(moved) and await _hit_ok(moved, selector):
                 return moved
             await loc.scroll_into_view_if_needed(timeout=timeout)
             box = await loc.bounding_box()
@@ -902,6 +936,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         elif info.get("disabled"):
             return False
         pt = at if at is not None else click_point(box, st["pos"], persona)  # 2D gaussian toward centre
+        pt = (float(round(pt[0])), float(round(pt[1])))   # the pixel the hit test answered for
         await _glide(pt[0], pt[1])
         await _press_here(pt[0], pt[1])
         return True
@@ -1445,7 +1480,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         from playwright.async_api import Error as PlaywrightError
         raise PlaywrightError("Clicking the checkbox did not change its state")
 
-    async def _reaches_point(box, x, y):
+    async def _reaches_point(box, x, y, sel=None):
         """The covered-point check, through the browser's own hit test read in the isolated world:
         nothing is dispatched and the pointer does not move. It replaced a Playwright TRIAL action,
         which moves the REAL pointer onto the element and back and performs a press with its events
@@ -1454,10 +1489,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         for COVER_CHECK_MS (an overlay fading out); a point inside a child frame is answered by its
         <iframe> element. None when the hit test cannot run. See _humanize._reaches_point."""
         deadline = asyncio.get_running_loop().time() + COVER_CHECK_MS / 1000.0
-        hit = await _hit_in_box(box, x, y)
+        hit = await _hit_in_box(box, x, y, sel)
         while hit is False and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.08)
-            hit = await _hit_in_box(box, x, y)
+            hit = await _hit_in_box(box, x, y, sel)
         return hit
 
     async def _position_point(box, o):
@@ -1495,7 +1530,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                     else:
                         x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
                     await asyncio.sleep(0.05)   # stable: 50 ms on, the element still fills `box`
-                    if await _hit_in_box(box, x, y) is not False:
+                    if await _hit_in_box(box, x, y, selector) is not False:
                         return None
                     why = ("element is not stable, or another element would receive the pointer at "
                            "(%d, %d)" % (x, y))
@@ -1512,6 +1547,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         A Playwright TimeoutError propagates: falling back would wait the full timeout again."""
         o = normalize_click_options(options, await _platform())
 
+        aim = []   # where Playwright's own click lands, once the box is known (_native)
+
         async def _native():
             if orig is None:
                 raise RuntimeError("humanized click could not run")
@@ -1519,8 +1556,12 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 return await orig(selector, **(native_opts if native_opts is not None else options))
             finally:
                 # Native click/hover genuinely move the browser pointer to the element: record it,
-                # or the next wheel anchor glides away from the element the click just left.
+                # or the next wheel anchor glides away from the element the click just left -- and
+                # the engine path walks from its own stale point (verifier A #6): see _humanize.
                 st["placed"] = True
+                _eng["at"] = None
+                if aim:
+                    st["pos"] = aim[-1]
 
         if o["trial"]:
             return await _trial(selector, options, no_click)
@@ -1532,18 +1573,24 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             box = await _box_of(loc, timeout, o["force"], selector)
             if not box:
                 raise _Native()
+            aim.append((box["x"] + box["width"] / 2, box["y"] + box["height"] / 2))
             if not o["force"] and not await loc.is_enabled():
                 raise _Native()
             if o["position"]:
                 x, y = await _position_point(box, o)
+                aim.append((x, y))
             else:
                 x, y = click_point(box, st["pos"], persona)
+            # Whole pixels: the hit test below answers for the pixel DOM.getNodeForLocation rounds to,
+            # so the press goes to that pixel too. A press at 971.6 next to a badge ending at 972 was
+            # proven at 972 and landed on the badge, reported as a success (verifier B, SC 210).
+            x, y = float(round(x)), float(round(y))
             if not o["force"] and orig is not None:
                 # Stability, then covered-by: 50 ms on, the element must still fill `box` (an
                 # animation in flight does not) and own the click point -- no trusted press at a
                 # point some overlay owns. Either failing goes native: Playwright waits for it.
                 await asyncio.sleep(0.05)
-                if not await _reaches_point(box, x, y):
+                if not await _reaches_point(box, x, y, selector):
                     raise _Native()
             if o["modifiers"] and native_kb_down is None:
                 raise _Native()
@@ -1598,31 +1645,31 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # The public entry points, each serialised by the page's lock (see `lock` above). The functions
     # behind them call one another only through these internal names, never through page.*.
     if native_page_type is not None:
-        page.type = _serial(htype)
+        page.type = api_errors("Page.type", _serial(htype))
     if native_page_fill is not None:
-        page.fill = _serial(hfill)
+        page.fill = api_errors("Page.fill", _serial(hfill))
     if native_page_dblclick is not None:
-        page.dblclick = _serial(hdblclick)
+        page.dblclick = api_errors("Page.dblclick", _serial(hdblclick))
     if native_page_press is not None:
-        page.press = _serial(hpress)
+        page.press = api_errors("Page.press", _serial(hpress))
     if native_page_select_option is not None:
-        page.select_option = _serial(hselect_option)
+        page.select_option = api_errors("Page.select_option", _serial(hselect_option))
     for name, want in (("check", True), ("uncheck", False)):
         orig_c = getattr(page, name, None)
         if orig_c is not None:
-            setattr(page, name, _serial(
-                (lambda o, w: lambda selector, **opts: _set_checked(o, selector, w, opts))(orig_c, want)))
+            setattr(page, name, api_errors("Page." + name, _serial(
+                (lambda o, w: lambda selector, **opts: _set_checked(o, selector, w, opts))(orig_c, want))))
     orig_sc = getattr(page, "set_checked", None)
     if orig_sc is not None:
         async def hset_checked(selector, checked, **opts):
             async def orig(s, **o):
                 return await orig_sc(s, checked, **o)
             return await _set_checked(orig, selector, bool(checked), opts)
-        page.set_checked = _serial(hset_checked)
+        page.set_checked = api_errors("Page.set_checked", _serial(hset_checked))
     if native_page_click is not None:
-        page.click = _serial(_make_targeted(native_page_click, False))
+        page.click = api_errors("Page.click", _serial(_make_targeted(native_page_click, False)))
     if native_page_hover is not None:
-        page.hover = _serial(_make_targeted(native_page_hover, True))
+        page.hover = api_errors("Page.hover", _serial(_make_targeted(native_page_hover, True)))
     # Locator.drag_to(trial=True) answers its checks here too (see the Locator patch).
     page._clearcote_trial = _serial(_trial)
 
@@ -1750,6 +1797,8 @@ def _patch_locator_class():
         return r if done else await o_clear(self, **kw)
 
     async def tap(self, **kw):
+        if _no_touch(self):   # Playwright's own "does not support tap" error (see _humanize)
+            return await o_tap(self, **kw)
         done, r = await _route(self, lambda: self.page.click(_sel(self), **_fwd(kw, _HOVER)))
         return r if done else await o_tap(self, **kw)
 
@@ -1812,21 +1861,22 @@ def _patch_locator_class():
                 pass
         return await o_drag_to(self, target, **kw)
 
-    Locator.fill = fill
-    Locator.click = click
-    Locator.type = type_
-    Locator.dblclick = dblclick
-    Locator.hover = hover
-    Locator.press = press
-    Locator.press_sequentially = press_sequentially
-    Locator.clear = clear
-    Locator.tap = tap
-    Locator.check = check
-    Locator.uncheck = uncheck
-    Locator.drag_to = drag_to
-    Locator.select_option = select_option
+    # Each worded as Playwright words the Locator method (api_errors).
+    Locator.fill = api_errors("Locator.fill", fill)
+    Locator.click = api_errors("Locator.click", click)
+    Locator.type = api_errors("Locator.type", type_)
+    Locator.dblclick = api_errors("Locator.dblclick", dblclick)
+    Locator.hover = api_errors("Locator.hover", hover)
+    Locator.press = api_errors("Locator.press", press)
+    Locator.press_sequentially = api_errors("Locator.press_sequentially", press_sequentially)
+    Locator.clear = api_errors("Locator.clear", clear)
+    Locator.tap = api_errors("Locator.tap", tap)
+    Locator.check = api_errors("Locator.check", check)
+    Locator.uncheck = api_errors("Locator.uncheck", uncheck)
+    Locator.drag_to = api_errors("Locator.drag_to", drag_to)
+    Locator.select_option = api_errors("Locator.select_option", select_option)
     if o_set_checked is not None:
-        Locator.set_checked = set_checked
+        Locator.set_checked = api_errors("Locator.set_checked", set_checked)
 
 
 async def install_humanize_on_context(context, humanize=False, show_cursor=False, browser=None, seed=None):

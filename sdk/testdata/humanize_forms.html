@@ -86,6 +86,21 @@
   height:100%;pointer-events:none;background:rgba(0,0,0,.02)"></span></span>
   <button id="disbtn" disabled>Disabled</button>
   <iframe id="frb" style="width:170px;height:46px;border:0" srcdoc="<button id='fb' style='width:150px;height:30px'>In frame</button><script>for (const t of ['pointermove','pointerdown','pointerup','mousemove','mousedown','mouseup','click']) addEventListener(t, e => (parent.__fev = parent.__fev || []).push({ t, id: e.target.id || e.target.tagName, tr: e.isTrusted }), true);</script>"></iframe></div>
+<!-- SC 210 fix 2: a MUI-style button (an inset:0 ripple span that takes no pointer events), a
+     label-wrapped custom checkbox (the visible mark covers the hidden input; the label passes the press
+     on), a button with a decorative background span under its text, a button under a real overlay, and
+     input masks that re-punctuate what is typed and then stop taking keys. -->
+<div class="row"><button id="muibtn" style="position:relative;width:160px;height:40px;padding:0;border:0">Save<span
+  class="ripple" style="position:absolute;inset:0;pointer-events:none;overflow:hidden"></span></button>
+  <label id="swlab" style="position:relative;display:inline-block;width:60px;height:30px;vertical-align:middle"><input
+  id="swchk" type="checkbox" style="position:absolute;inset:0;margin:0;opacity:0"><span id="swmark"
+  style="position:absolute;inset:3px;background:#09f"></span></label>
+  <button id="bgbtn" style="position:relative;width:120px;height:40px;padding:0;border:0"><span id="bgspan"
+  style="position:absolute;inset:0;background:#eee"></span><span id="bgtext" style="position:relative">Go</span></button>
+  <span class="wrap"><button id="ovbtn" style="width:120px;height:40px">Behind</button><span id="ovlay"
+  style="position:absolute;inset:0;background:rgba(0,0,0,.02)"></span></span></div>
+<div class="row"><input id="exp" type="text" maxlength="5" placeholder="MM/YY"> <input id="telmask" type="tel"
+  maxlength="12" placeholder="555-123-4567"> <input id="pcmask" type="text" placeholder="1234 AB"></div>
 <div style="height:1600px"></div>
 <div class="row"><button id="far">Far away</button></div>
 
@@ -119,6 +134,15 @@
     phone.value = d.length > 6 ? `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`
                 : d.length > 3 ? `(${d.slice(0, 3)}) ${d.slice(3)}` : d;
   });
+  // SC 210 fix 2: masks that re-punctuate and then stop taking keys. MM/YY (maxlength 5: the slash
+  // takes the fifth place), a dashed phone (maxlength 12), and a postcode with no maxlength that the
+  // script cuts at six letters and digits.
+  const mask = (id, f) => { const e = document.getElementById(id); e.addEventListener('input', () => { e.value = f(e.value); }); };
+  mask('exp', v => { const d = v.replace(/\D/g, '').slice(0, 4); return d.length > 2 ? d.slice(0, 2) + '/' + d.slice(2) : d; });
+  mask('telmask', v => { const d = v.replace(/\D/g, '').slice(0, 10);
+    return [d.slice(0, 3), d.slice(3, 6), d.slice(6)].filter(Boolean).join('-'); });
+  mask('pcmask', v => { const d = v.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 6);
+    return d.length > 4 ? d.slice(0, 4) + ' ' + d.slice(4) : d; });
   // a password field inside an open shadow root (web components, embedded logins)
   customElements.define('shadow-pw', class extends HTMLElement {
     constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = "<input id='inner' type='password'>"; }
@@ -152,7 +176,8 @@
         shift: !!e.shiftKey, ctrl: !!e.ctrlKey, alt: !!e.altKey, meta: !!e.metaKey,
         ox: (typeof e.offsetX === 'number') ? e.offsetX : null, oy: (typeof e.offsetY === 'number') ? e.offsetY : null,
         value: el && typeof el.value === 'string' ? el.value : (el && el.isContentEditable ? TEXT.call(el) : null),
-        it: e.inputType || '', n: 1 });
+        it: e.inputType || '', n: 1, cx: (typeof e.clientX === 'number') ? e.clientX : null,
+        cy: (typeof e.clientY === 'number') ? e.clientY : null });
     }, true);
   }
 })();

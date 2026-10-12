@@ -25,7 +25,9 @@ Design notes:
     fat-finger-then-correct chance.
 """
 
+import functools
 import random
+import re
 import sys
 import time
 
@@ -48,7 +50,7 @@ from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     platform_from_navigator, rollover_rate, wheel_notches,
 )
-from ._pacing import trim_to as _trim_ambient, walk as _paced_walk
+from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk as _paced_walk
 
 # IIFE so it runs both as an add_init_script source AND when passed to page.evaluate().
 CURSOR_OVERLAY = """(() => {
@@ -70,6 +72,54 @@ CURSOR_OVERLAY = """(() => {
 
 # Kept for callers of the old name; the map itself lives in _forms (shared with async/Node/.NET).
 _NEARBY = NEARBY_LETTERS
+
+
+# --------------------------------------------------------------- Playwright's error wording
+# Playwright words every error after the API the caller used: "Page.click: Timeout 800ms exceeded.",
+# "Locator.check: Error: Not a checkbox or radio button". A humanized call raised the error of whatever
+# Playwright call it made inside (Locator.wait_for, Locator.is_checked; verifier B, SC 210) -- the
+# same type, but a message a caller matching on it would not recognise. Pre-existing in 0.48.0.
+_API_PREFIX = re.compile(r"^[A-Za-z_]+\.[A-Za-z_]+: ")
+
+
+def as_api_error(err, api):
+    """``err`` worded as Playwright words an error of ``api`` ("Page.click", "Locator.set_checked"):
+    the same class, the inner call's "Locator.wait_for: " prefix replaced (or, for an error the SDK
+    raised itself -- a trial that never passed, a checkbox that would not change --, added). Anything
+    that is not a Playwright error is returned as it is."""
+    try:
+        from playwright._impl._errors import Error as PlaywrightImplError
+    except Exception:  # noqa: BLE001
+        return err
+    if not isinstance(err, PlaywrightImplError):
+        return err
+    msg = err.message if isinstance(getattr(err, "message", None), str) else str(err)
+    m = _API_PREFIX.match(msg)
+    want = api + ": " + (msg[m.end():] if m else msg)
+    if want == msg:
+        return err
+    try:
+        new = type(err)(want)
+        for k in ("_name", "_stack", "_details", "_log"):
+            if hasattr(err, k):
+                setattr(new, k, getattr(err, k))
+    except Exception:  # noqa: BLE001
+        return err
+    return new
+
+
+def api_errors(api, fn):
+    """``fn``, with every Playwright error it raises worded as ``api``'s (as_api_error)."""
+    @functools.wraps(fn)
+    def call(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:  # noqa: BLE001
+            n = as_api_error(e, api)
+            if n is e:
+                raise
+            raise n.with_traceback(e.__traceback__) from None
+    return call
 
 
 def _rand(a, b):
@@ -247,13 +297,30 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         mouse.down() stays pressed across the whole path (drag).
 
         Paced against a WALL CLOCK (_pacing.walk): each sample goes out at its planned time, and
-        late samples are skipped (never the last, never a > 40 px jump). "Move, then sleep the
+        late samples are skipped (never the last, and no hop longer than a fast hand covers in the
+        time since the last dispatch: 3 px/ms of it, at least 40 px). "Move, then sleep the
         planned gap" added the ~27 ms mouse.move round trip to every 6-8 ms sample: a 1.05 s planned
         glide took 3.5-5.4 s on PRO r38 (SC 209), ambient_motion(1500) 5.7x as long."""
         def mv(sx, sy):
             native_move(sx, sy)
             st["placed"] = True
-        _paced_walk(steps, mv)
+        vp = _view_bounds()
+        _paced_walk(_keep_in_view(steps, *vp) if vp else steps, mv)
+
+    def _view_bounds():
+        """The viewport (innerWidth, innerHeight) a planned path is kept inside (_pacing.keep_in_view:
+        the planner's overshoot arcs left the window near its edges, verifier B), read in the isolated
+        world at most every 2 s; None when it cannot be read."""
+        now = time.monotonic()
+        c = st.get("vp")
+        if c is None or now - c[0] > 2.0:
+            try:
+                wh = world_for(page).evaluate(ISO_VIEWPORT)
+                vp = (float(wh[0]), float(wh[1])) if wh and wh[0] and wh[1] else None
+            except Exception:  # noqa: BLE001
+                vp = None
+            st["vp"] = c = (now, vp)
+        return c[1]
 
     def _glide(x, y, settle=False, target_w=24, held=False):
         """Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective
@@ -977,16 +1044,16 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         except Exception:  # noqa: BLE001
             return None
         box = _rect_box(r)
-        if box and not (_in_view(box) and _hit_ok(box)):
+        if box and not (_in_view(box) and _hit_ok(box, selector)):
             # scrollIntoViewIfNeeded also scrolls a scrolling container that clips it, and does
             # nothing when it already shows (then the cover is an overlay: the click's own check)
             box = _rect_box(w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": True}))
         return box
 
-    def _hit_ok(box):
+    def _hit_ok(box, sel=None):
         """Does the element filling ``box`` own its centre -- not clipped by a scrolling container,
         not covered? The browser's own hit test, read in the isolated world."""
-        return _hit_in_box(box, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2) is True
+        return _hit_in_box(box, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, sel) is True
 
     def _scroll_window_to(box):
         """Scroll the WINDOW so ``box`` sits centred where it was off-screen, the way Playwright's
@@ -1024,12 +1091,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         if box is not None:
             return box
         box = loc.bounding_box()
-        if box and not (_in_view(box) and _hit_ok(box)):
+        if box and not (_in_view(box) and _hit_ok(box, selector)):
             # Off-screen: scroll the window to it and prove it shows there (hit test), with no new
             # handle. Clipped by a scrolling container, covered, or the window scroll did not bring
             # it out: Playwright's scroll, which also scrolls containers, and a fresh box.
             moved = _scroll_window_to(box) if not _in_view(box) else None
-            if moved and _in_view(moved) and _hit_ok(moved):
+            if moved and _in_view(moved) and _hit_ok(moved, selector):
                 return moved
             loc.scroll_into_view_if_needed(timeout=timeout)
             box = loc.bounding_box()
@@ -1086,6 +1153,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         elif info.get("disabled"):
             return False
         pt = at if at is not None else click_point(box, st["pos"], persona)  # 2D gaussian toward centre
+        pt = (float(round(pt[0])), float(round(pt[1])))   # the pixel the hit test answered for
         _glide(pt[0], pt[1])
         _press_here(pt[0], pt[1])
         return True
@@ -1635,24 +1703,25 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         # One click did not change it (a page that cancels the click): Playwright's check raises here
         # rather than clicking again, and so does this.
         from playwright.sync_api import Error as PlaywrightError
-        raise PlaywrightError("Clicking the checkbox did not change its state")
+        raise PlaywrightError("Clicking the checkbox did not change its state")   # worded per API (api_errors)
 
-    page.type = htype
-    page.fill = hfill
-    page.dblclick = hdblclick
-    page.press = hpress
+    page.type = api_errors("Page.type", htype)
+    page.fill = api_errors("Page.fill", hfill)
+    page.dblclick = api_errors("Page.dblclick", hdblclick)
+    page.press = api_errors("Page.press", hpress)
     if native_page_select_option is not None:
-        page.select_option = hselect_option
+        page.select_option = api_errors("Page.select_option", hselect_option)
     for name, want in (("check", True), ("uncheck", False)):
         orig_c = getattr(page, name, None)
         if orig_c is not None:
-            setattr(page, name, (lambda o, w: lambda selector, **opts: _set_checked(o, selector, w, opts))(orig_c, want))
+            setattr(page, name, api_errors("Page." + name, (lambda o, w: lambda selector, **opts: _set_checked(
+                o, selector, w, opts))(orig_c, want)))
     orig_sc = getattr(page, "set_checked", None)
     if orig_sc is not None:
-        page.set_checked = lambda selector, checked, **opts: _set_checked(
-            lambda s, **o: orig_sc(s, checked, **o), selector, bool(checked), opts)
+        page.set_checked = api_errors("Page.set_checked", lambda selector, checked, **opts: _set_checked(
+            lambda s, **o: orig_sc(s, checked, **o), selector, bool(checked), opts))
 
-    def _hit_in_box(box, x, y):
+    def _hit_in_box(box, x, y, sel=None):
         """Does a press at viewport (x, y) reach the element filling ``box``? True / False, or None
         when it cannot be told here (CDP is unavailable). A point inside a child frame is answered
         by the <iframe> element that holds it (IsolatedWorld.node_at)."""
@@ -1660,11 +1729,13 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         nid = w.node_at(x, y)
         if nid is None:
             return None
-        res = w.call_on_node(nid, ISO_HIT_IN_BOX,
-                             {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]})
+        b = {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]}
+        if sel:
+            b["sel"] = sel   # a plain-CSS selector: whether the hit is THAT element (see HIT_IN_BOX)
+        res = w.call_on_node(nid, ISO_HIT_IN_BOX, b)
         return None if res is None else bool(res)
 
-    def _reaches_point(box, x, y):
+    def _reaches_point(box, x, y, sel=None):
         """The covered-point check, through the browser's own hit test read in the isolated world:
         nothing is dispatched and the pointer does not move. It replaced a Playwright TRIAL action,
         which moves the REAL pointer onto the element and back and performs a press with its events
@@ -1675,10 +1746,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         the <iframe> element that holds it (IsolatedWorld.node_at), so no Playwright trial runs for it
         either. False when covered; None when the hit test cannot run (no CDP): the caller goes native."""
         deadline = time.monotonic() + COVER_CHECK_MS / 1000.0
-        hit = _hit_in_box(box, x, y)
+        hit = _hit_in_box(box, x, y, sel)
         while hit is False and time.monotonic() < deadline:
             time.sleep(0.08)
-            hit = _hit_in_box(box, x, y)
+            hit = _hit_in_box(box, x, y, sel)
         return hit
 
     def _position_point(box, o):
@@ -1721,7 +1792,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                     else:
                         x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
                     time.sleep(0.05)   # stable: 50 ms on, the element still fills `box` (HIT_IN_BOX)
-                    if _hit_in_box(box, x, y) is not False:
+                    if _hit_in_box(box, x, y, selector) is not False:
                         return None    # reached (None: the hit test cannot run here -- nothing to add)
                     why = ("element is not stable, or another element would receive the pointer at "
                            "(%d, %d)" % (x, y))
@@ -1739,6 +1810,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         a trial clicked."""
         o = normalize_click_options(options, _platform())
 
+        aim = []   # where Playwright's own click lands, once the box is known (_native)
+
         def _native():
             if orig is None:
                 raise RuntimeError("humanized click could not run")
@@ -1749,6 +1822,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 # st["placed"] False afterwards made the next wheel anchor believe the pointer was
                 # still unplaced, so it glided away from the element the click had just left.
                 st["placed"] = True
+                # ... and away from where the engine walk left it: the engine path must not walk
+                # from its own stale point (_engine_in_sync; verifier A #6). The next SDK glide
+                # starts where Playwright pressed: `position`, else the centre of the box.
+                _eng["at"] = None
+                if aim:
+                    st["pos"] = aim[-1]
 
         if o["trial"]:
             return _trial(selector, options, no_click)
@@ -1760,18 +1839,24 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             box = _box_of(loc, timeout, o["force"], selector)
             if not box:
                 raise _Native()
+            aim.append((box["x"] + box["width"] / 2, box["y"] + box["height"] / 2))
             if not o["force"] and not loc.is_enabled():
                 raise _Native()
             if o["position"]:
                 x, y = _position_point(box, o)
+                aim.append((x, y))
             else:
                 x, y = click_point(box, st["pos"], persona)
+            # Whole pixels: the hit test below answers for the pixel DOM.getNodeForLocation rounds to,
+            # so the press goes to that pixel too. A press at 971.6 next to a badge ending at 972 was
+            # proven at 972 and landed on the badge, reported as a success (verifier B, SC 210).
+            x, y = float(round(x)), float(round(y))
             if not o["force"] and orig is not None:
                 # Stability, then covered-by: 50 ms on, the element must still fill `box` (an
                 # animation in flight does not) and own the click point -- no trusted press at a
                 # point some overlay owns. Either failing goes native: Playwright waits for it.
                 time.sleep(0.05)
-                if not _reaches_point(box, x, y):
+                if not _reaches_point(box, x, y, selector):
                     raise _Native()
             if o["modifiers"] and native_kb_down is None:
                 raise _Native()
@@ -1820,8 +1905,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return _targeted_click(orig, selector, options, no_click, None)
         return wrapped
 
-    page.click = _make_targeted(page.click, False)
-    page.hover = _make_targeted(page.hover, True)
+    page.click = api_errors("Page.click", _make_targeted(page.click, False))
+    page.hover = api_errors("Page.hover", _make_targeted(page.hover, True))
     # Locator.drag_to(trial=True) answers its checks here too (see the Locator patch).
     page._clearcote_trial = _trial
 
@@ -1832,6 +1917,15 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
 
 class _Native(Exception):
     """Internal: the humane route cannot apply here; run the native Playwright call instead."""
+
+
+def _no_touch(loc):
+    """Is ``loc``'s page in a context WITHOUT touch (no hasTouch), where Playwright's tap raises? A
+    page-like object whose context cannot be read counts as touch-capable (the tap is routed)."""
+    try:
+        return loc.page.context._impl_obj._options.get("hasTouch") is not True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _is_timeout(err):
@@ -1959,6 +2053,11 @@ def _patch_locator_class():
         return r if done else o_clear(self, **kw)
 
     def tap(self, **kw):
+        if _no_touch(self):
+            # Playwright's tap raises at once on a context without hasTouch ("The page does not
+            # support tap"); routed as a click it clicked instead, or waited out the timeout for a
+            # missing element and raised a TimeoutError (SC 210 error parity).
+            return o_tap(self, **kw)
         done, r = _route(self, kw, lambda: self.page.click(_sel(self), **_fwd(kw, _HOVER)))
         return r if done else o_tap(self, **kw)
 
@@ -2020,21 +2119,23 @@ def _patch_locator_class():
                 pass
         return o_drag_to(self, target, **kw)
 
-    Locator.fill = fill
-    Locator.click = click
-    Locator.type = type_
-    Locator.dblclick = dblclick
-    Locator.hover = hover
-    Locator.press = press
-    Locator.press_sequentially = press_sequentially
-    Locator.clear = clear
-    Locator.tap = tap
-    Locator.check = check
-    Locator.uncheck = uncheck
-    Locator.drag_to = drag_to
-    Locator.select_option = select_option
+    # Each worded as Playwright words the Locator method (api_errors): routed through page.*, an
+    # error read "Page.click: ..." or "Locator.wait_for: ...".
+    Locator.fill = api_errors("Locator.fill", fill)
+    Locator.click = api_errors("Locator.click", click)
+    Locator.type = api_errors("Locator.type", type_)
+    Locator.dblclick = api_errors("Locator.dblclick", dblclick)
+    Locator.hover = api_errors("Locator.hover", hover)
+    Locator.press = api_errors("Locator.press", press)
+    Locator.press_sequentially = api_errors("Locator.press_sequentially", press_sequentially)
+    Locator.clear = api_errors("Locator.clear", clear)
+    Locator.tap = api_errors("Locator.tap", tap)
+    Locator.check = api_errors("Locator.check", check)
+    Locator.uncheck = api_errors("Locator.uncheck", uncheck)
+    Locator.drag_to = api_errors("Locator.drag_to", drag_to)
+    Locator.select_option = api_errors("Locator.select_option", select_option)
     if o_set_checked is not None:
-        Locator.set_checked = set_checked
+        Locator.set_checked = api_errors("Locator.set_checked", set_checked)
 
 
 def install_humanize_on_context(context, humanize=False, show_cursor=False, browser=None, seed=None):

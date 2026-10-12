@@ -352,33 +352,47 @@ DESCRIBE = """function (a) {
   return o; }"""
 # The controls a locator can mean for the form routes.
 FORM_CONTROL = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']"
-# Does the element the browser's hit test found at a click point belong to the element whose box the
-# caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
-# that box -- with no OTHER element of that same box beside the hit's path inside it that the press
-# would miss? That twin is a wrapper's control under an overlay (<span class=wrap><input><span
-# overlay></span></span>: the wrap has the input's box, the press lands on the overlay). A twin the
-# press reaches anyway, or that no press could be meant for, does not count (SC 210 fix 2; counting
-# every twin made a MUI-style button "covered" and sent its click to Playwright): one that takes no
-# pointer events (pointer-events:none, not visibility:visible -- a ripple or focus-ring span, an icon
-# layer), a control whose <label> holds the hit (the label passes the press on: a custom checkbox),
-# and, inside an element that is itself a control, a decorative twin with no control in it (a
-# background span under a button's text). `this` = the hit node (DOM.getNodeForLocation,
-# pointer-events:none skipped, as for a real press; for a point inside a child frame, the <iframe>
-# element that holds it). The covered-point check without a Playwright trial: a trial MOVES the real
-# pointer onto the element and back and performs a press whose events Playwright blocks, so a page saw
-# a mousemove inside the target, a jump back and a pointerdown/click before every humanized click
-# (verifier B).
+# Does a press at a click point reach the element the caller holds? `this` = the node the browser's
+# hit test found there (DOM.getNodeForLocation, pointer-events:none skipped, as for a real press; for a
+# point inside a child frame, the <iframe> element that holds it); `b` = the element's box, plus `sel`
+# when the caller has a plain-CSS selector for it.
+#
+# With `sel` (its first match, which must still fill `b`), the answer is exact, as Playwright's own
+# hit-target check decides it: the hit is the element or inside it (across open shadow roots), or inside
+# a <label> whose control it is (the label passes the press on). Anything else on top -- an overlay
+# with exactly the element's box, a badge -- covers it.
+#
+# Without one, by the box: the hit element itself, or an ancestor that has exactly that box, with no
+# OTHER element of that same box beside the hit's path inside it that the press would miss. That twin
+# is a wrapper's control under an overlay (<span class=wrap><input><span overlay></span></span>: the
+# wrap has the input's box, the press lands on the overlay). A twin the press reaches anyway, or that no
+# press could be meant for, does not count (SC 210 fix 2; counting every twin made a MUI-style button
+# "covered" and sent its click to Playwright): one that takes no pointer events (pointer-events:none,
+# not visibility:visible -- a ripple or focus-ring span, an icon layer), a control whose <label> holds
+# the hit (a custom checkbox), and, inside an element that is itself a control, a decorative twin with
+# no control in it (a background span under a button's text).
+#
+# The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the element
+# and back and performs a press whose events Playwright blocks, so a page saw a mousemove inside the
+# target, a jump back and a pointerdown/click before every humanized click (verifier B).
 HIT_IN_BOX = """function (b) {
   const same = r => Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
     Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5;
+  const up = n => { const p = n.parentNode; return n.parentElement || (p && p.nodeType === 11 && p.host) || null; };
+  const h = this.nodeType === 1 ? this : this.parentElement;
+  let t = null;
+  if (b.sel) { try { t = document.querySelector(b.sel); } catch (x) { t = null; } }
+  if (t && same(t.getBoundingClientRect())) {
+    for (let e = h, n = 0; e && n < 128; e = up(e), n++)
+      if (e === t || (e.tagName === 'LABEL' && e.control === t)) return true;
+    return false;
+  }
   const CTL = 'a[href], area[href], button, input, select, textarea, label, summary, iframe, [contenteditable], ' +
     '[tabindex], [role=button], [role=link], [role=checkbox], [role=radio], [role=switch], [role=tab], ' +
     '[role=menuitem], [role=option], [role=combobox], [role=textbox]';
   const takes = d => { const s = getComputedStyle(d); return s.pointerEvents !== 'none' && s.visibility === 'visible'; };
-  const h = this.nodeType === 1 ? this : this.parentElement;
   const path = new Set();
-  let e = h;
-  for (let n = 0; e && n < 128; n++) {
+  for (let e = h, n = 0; e && n < 128; e = up(e), n++) {
     path.add(e);
     if (same(e.getBoundingClientRect())) {
       const all = e.getElementsByTagName('*'), ctl = e.matches(CTL);
@@ -391,8 +405,6 @@ HIT_IN_BOX = """function (b) {
         }
       return true;
     }
-    const p = e.parentNode;
-    e = e.parentElement || (p && p.nodeType === 11 && p.host) || null;
   }
   return false; }"""
 # A list box's scroll state and one row's box, from any node inside the <select> (`this`): where its

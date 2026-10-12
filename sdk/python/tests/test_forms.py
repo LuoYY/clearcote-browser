@@ -289,6 +289,11 @@ def test_segment_names_and_nodes_from_a_pierced_describe_tree():
 
 
 # ------------------------------------------------------------------- maxlength + pre-press pause
+@pytest.mark.parametrize("c", VEC["mask_kept"], ids=_ids(VEC["mask_kept"]))
+def test_mask_kept(c):
+    assert F.mask_kept(c["got"], c["want"], c["maxlength"], c["tag"], c["type"]) is c["result"]
+
+
 @pytest.mark.parametrize("c", VEC["fit_maxlength"], ids=_ids(VEC["fit_maxlength"]))
 def test_fit_maxlength(c):
     assert F.fit_maxlength(c["value"], c["maxlength"], c["tag"], c["type"]) == c["want"]

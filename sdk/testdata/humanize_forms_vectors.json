@@ -263,6 +263,23 @@
     {"value": "caf\u00e9s", "maxlength": 4, "tag": "input", "type": "", "want": "caf\u00e9"},
     {"value": "abc", "maxlength": 2, "tag": "INPUT", "type": "TEXT", "want": "ab"}
   ],
+  "mask_kept": [
+    {"got": "12/34", "want": "12345", "maxlength": 5, "tag": "input", "type": "text", "result": true},
+    {"got": "555-123-4567", "want": "555123456789", "maxlength": 12, "tag": "input", "type": "tel", "result": true},
+    {"got": "1234 AB", "want": "1234abx", "maxlength": -1, "tag": "input", "type": "text", "result": true},
+    {"got": "12345", "want": "123456", "maxlength": 8, "tag": "input", "type": "text", "result": false},
+    {"got": "12/35", "want": "12345", "maxlength": 5, "tag": "input", "type": "text", "result": false},
+    {"got": "", "want": "12345", "maxlength": 5, "tag": "input", "type": "text", "result": false},
+    {"got": null, "want": "12345", "maxlength": 5, "tag": "input", "type": "text", "result": false},
+    {"got": "12/34", "want": "1234", "maxlength": 5, "tag": "input", "type": "text", "result": false},
+    {"got": "1234 AB", "want": "1234ab", "maxlength": -1, "tag": "input", "type": "text", "result": false},
+    {"got": "12/3", "want": "12345", "maxlength": 5, "tag": "input", "type": "text", "result": true},
+    {"got": "1234", "want": "123456", "maxlength": 4, "tag": "input", "type": "number", "result": false},
+    {"got": "ab-cd", "want": "abcdef", "maxlength": 5, "tag": "textarea", "type": "", "result": true},
+    {"got": "\ud83d\ude001", "want": "\ud83d\ude0012", "maxlength": 3, "tag": "input", "type": "text", "result": true},
+    {"got": "--", "want": "12", "maxlength": -1, "tag": "input", "type": "text", "result": false},
+    {"got": "(555) 123-4567", "want": "55512345678", "maxlength": null, "tag": "input", "type": "tel", "result": true}
+  ],
   "pre_press_center": [
     {"seed": 0, "center": 114.802718742},
     {"seed": 1, "center": 92.970815435},

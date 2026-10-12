@@ -742,6 +742,7 @@ def test_controls_under_a_pointer_events_none_layer_are_humanized(page):
 def test_trial_moves_and_presses_nothing_a_window_listener_could_see(page):
     """trial=True runs the checks only: Playwright's own trial moved the pointer onto the target and
     dispatched pointerdown/pointerup/click that listeners registered before its blocker saw (SC 209)."""
+    from playwright.sync_api import Error as PWError
     page.locator("#trialbtn").scroll_into_view_if_needed()
     page.locator("#frb").scroll_into_view_if_needed()
     reset_w(page)
@@ -749,7 +750,8 @@ def test_trial_moves_and_presses_nothing_a_window_listener_could_see(page):
     page.locator("#trialbtn").click(trial=True)
     page.dblclick("#trialbtn", trial=True)
     page.hover("#trialbtn", trial=True)
-    page.locator("#trialbtn").tap(trial=True)
+    with pytest.raises(PWError, match="does not support tap"):   # no hasTouch here: Playwright's own error
+        page.locator("#trialbtn").tap(trial=True)
     page.click("#trialbtn", trial=True, position={"x": 5, "y": 5})
     page.check("#cb", trial=True)
     page.locator("#cb").set_checked(True, trial=True)
@@ -947,3 +949,143 @@ def test_select_open_click_is_held_as_planned(page, monkeypatch):
         assert d and u
         holds.append(u[0]["ts"] - d[0]["ts"])
     assert statistics.median(holds) <= 135, "held %s ms for a planned 120" % [round(h) for h in holds]
+
+
+# ------------------------------------------------- SC 210 fix 2: twins, masks, Playwright's error wording
+def _glided(page):
+    return sum(e["n"] for e in ev(page, "mousemove"))
+
+
+def test_a_mui_style_button_is_clicked_humanized_and_its_trial_passes(page):
+    """A ripple span with inset:0 and pointer-events:none fills the button: the old twin rule called
+    every such button covered, sent the click to stock Playwright and failed trial=True (verifier A)."""
+    page.locator("#muibtn").scroll_into_view_if_needed()
+    page.click("#muibtn", trial=True, timeout=1500)   # Playwright's own trial passes here
+    page.locator("#muibtn").click(trial=True, timeout=1500)
+    page.hover("#muibtn", trial=True, timeout=1500)
+    reset(page)
+    page.click("#muibtn")
+    assert _glided(page) >= 5, "the click glided (humanized), not a native jump"
+    downs = ev(page, "mousedown", "muibtn")
+    assert len(downs) == 1 and downs[0]["tr"]
+
+
+def test_a_label_wrapped_custom_checkbox_is_checked_humanized(page):
+    """The visible mark sits over the hidden input inside its <label>: the press lands on the mark and
+    the label passes it on, as Playwright's own check sees it. The old twin rule said "covered"."""
+    page.locator("#swlab").scroll_into_view_if_needed()
+    page.check("#swchk", trial=True, timeout=1500)
+    reset(page)
+    page.check("#swchk", position={"x": 20, "y": 15})   # on the mark, off the input's own 3 px rim
+    assert page.is_checked("#swchk")
+    assert _glided(page) >= 5, "humanized, not stock Playwright"
+    assert [e["tr"] for e in ev(page, "mousedown", "swmark")] == [True]
+    reset(page)
+    page.locator("#swchk").uncheck()
+    assert not page.is_checked("#swchk") and _glided(page) >= 5
+
+
+def test_a_decorative_span_under_a_buttons_text_is_not_an_overlay(page):
+    page.locator("#bgbtn").scroll_into_view_if_needed()
+    page.click("#bgbtn", trial=True, timeout=1500)   # the centre is the text, inside the button
+    reset(page)
+    page.click("#bgbtn", position={"x": 60, "y": 20})
+    assert _glided(page) >= 5 and ev(page, "click", "bgtext")[0]["tr"]
+
+
+def test_a_real_overlay_is_still_covered(page):
+    """A sibling layer that takes the press is still an overlay: trial fails like Playwright's, and
+    the click is Playwright's own (which waits for it, and times out)."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+    page.locator("#ovbtn").scroll_into_view_if_needed()
+    with pytest.raises(PWTimeout):
+        page.click("#ovbtn", trial=True, timeout=600)
+    reset(page)
+    with pytest.raises(PWTimeout):
+        page.click("#ovbtn", timeout=900)
+    assert not ev(page, "mousedown", "ovbtn"), "no press reached the covered button"
+
+
+@pytest.mark.parametrize("sel,value,want,keys", [
+    ("#exp", "123456", "12/34", "12345"),                     # MM/YY on maxlength 5 (verifier B)
+    ("#telmask", "5551234567890", "555-123-4567", "555123456789"),   # 3-3-4 dashes on maxlength 12
+    ("#pcmask", "1234abx", "1234 AB", "1234abx"),             # a script that formats and cuts, no maxlength
+], ids=["mmyy", "tel", "postcode"])
+def test_a_mask_that_stops_taking_keys_is_typed_once(page, typos, sel, value, want, keys):
+    typos(0)
+    reset(page)
+    page.fill(sel, value)
+    assert page.input_value(sel) == want
+    downs = ev(page, "keydown", sel[1:])
+    assert "".join(e["key"] for e in downs) == keys, [e["key"] for e in downs]
+    assert not [e for e in downs if e["ctrl"] or e["meta"] or e["key"] == "Backspace"], "wiped and retyped"
+    assert all(e["tr"] for e in downs)
+
+
+def _api_error(fn):
+    from playwright.sync_api import Error as PWError
+    with pytest.raises(PWError) as ei:
+        fn()
+    return type(ei.value).__name__, str(ei.value).split("\n")[0]
+
+
+def test_errors_name_the_api_the_caller_used(page):
+    """Playwright words an error after the method called ("Page.click: Timeout 600ms exceeded."); the
+    humanized calls raised the inner call's ("Locator.wait_for: ...", "Locator.is_checked: ...")."""
+    L = page.locator
+    calls = {
+        "Page.click": lambda: page.click("#missing", timeout=600),
+        "Page.dblclick": lambda: page.dblclick("#missing", timeout=600),
+        "Page.hover": lambda: page.hover("#missing", timeout=600),
+        "Page.fill": lambda: page.fill("#missing", "x", timeout=600),
+        "Page.type": lambda: page.type("#missing", "x", timeout=600),
+        "Page.press": lambda: page.press("#missing", "a", timeout=600),
+        "Page.check": lambda: page.check("#missing", timeout=600),
+        "Page.uncheck": lambda: page.uncheck("#missing", timeout=600),
+        "Page.set_checked": lambda: page.set_checked("#missing", True, timeout=600),
+        "Page.select_option": lambda: page.select_option("#missing", "a", timeout=600),
+        "Locator.click": lambda: L("#missing").click(timeout=600),
+        "Locator.dblclick": lambda: L("#missing").dblclick(timeout=600),
+        "Locator.hover": lambda: L("#missing").hover(timeout=600),
+        "Locator.fill": lambda: L("#missing").fill("x", timeout=600),
+        "Locator.clear": lambda: L("#missing").clear(timeout=600),
+        "Locator.press": lambda: L("#missing").press("a", timeout=600),
+        "Locator.type": lambda: L("#missing").type("x", timeout=600),
+        "Locator.press_sequentially": lambda: L("#missing").press_sequentially("x", timeout=600),
+        "Locator.check": lambda: L("#missing").check(timeout=600),
+        "Locator.uncheck": lambda: L("#missing").uncheck(timeout=600),
+        "Locator.set_checked": lambda: L("#missing").set_checked(True, timeout=600),
+        "Locator.select_option": lambda: L("#missing").select_option("a", timeout=600),
+        "Locator.click(trial)": lambda: L("#disbtn").click(trial=True, timeout=600),
+    }
+    got = {api: _api_error(fn) for api, fn in calls.items()}
+    want = {api: ("TimeoutError", api.split("(")[0] + ": Timeout 600ms exceeded.") for api in calls}
+    assert got == want
+
+
+def test_check_on_a_non_checkbox_raises_playwrights_own_error(page):
+    from playwright.sync_api import Page as PWPage
+    native = _api_error(lambda: PWPage.check(page, "#btn", timeout=600))   # the class method: stock Playwright
+    assert native == ("Error", "Page.check: Error: Not a checkbox or radio button")
+    assert _api_error(lambda: page.check("#btn", timeout=600)) == native
+    assert _api_error(lambda: page.uncheck("#btn", timeout=600)) == ("Error", native[1].replace("check", "uncheck", 1))
+    assert _api_error(lambda: page.locator("#btn").check(timeout=600)) == ("Error", "Locator" + native[1][4:])
+    assert _api_error(lambda: page.locator("#btn").set_checked(True, timeout=600)) == (
+        "Error", "Locator.set_checked" + native[1][len("Page.check"):])
+
+
+def test_tap_without_touch_raises_like_playwright(page):
+    """No hasTouch in this context: Playwright's tap raises at once; routed as a click it clicked."""
+    kind, msg = _api_error(lambda: page.locator("#btn").tap(timeout=600))
+    assert kind == "Error" and msg.startswith("Locator.tap: The page does not support tap"), msg
+
+
+def test_a_click_presses_the_whole_pixel_its_hit_test_proved(page):
+    """DOM.getNodeForLocation answers for a whole pixel; a press at 971.6 next to a badge ending at 972
+    was proven at 972 and landed on the badge, reported as a success (verifier B). Pointer events carry
+    the fractional point the press went to."""
+    for _ in range(5):
+        reset(page)
+        page.click("#btn")
+        d = ev(page, "pointerdown", "btn")[0]
+        assert d["cx"] == int(d["cx"]) and d["cy"] == int(d["cy"]), (d["cx"], d["cy"])
