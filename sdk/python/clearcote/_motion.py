@@ -163,28 +163,77 @@ def _log2(x: float) -> float:
     return math.log(x) / math.log(2.0)
 
 
-def _sample_submove(out, a, b, dur_ms, p: Persona, rng: Rng, t0, drift, jit, tremor_phase, land):
-    """Sample ONE min-jerk submovement a→b along a slightly bowed path with colored noise. Appends
-    (x, y, sleep_ms) tuples to ``out``. Returns the absolute clock (ms) at the end."""
+# Salt for the path-shape stream. Like the rollover salt, a separate mulberry32(seed ^ salt) stream
+# keeps make_persona's draw ORDER (and so every existing seed's motor identity) unchanged.
+_SHAPE_SALT = 0x85EBCA6B
+
+
+@dataclass(frozen=True)
+class ShapeTraits:
+    """Per-identity path-shape traits, stable per seed (see shape_traits)."""
+
+    overshoot_rate: float   # share of aimed moves that pass the target and come back, 0.15..0.38
+    curve: float            # scale on the primary submovement's bow, 0.75..1.3
+    drag_tempo: float       # scale on held-drag duration, 0.85..1.2
+
+
+def shape_traits(p: Persona) -> ShapeTraits:
+    """The persona's path-shape traits, drawn from a salted stream of its seed.
+
+    Measured on r38 / SDK 0.48.0 (SC 209): 1 of 36 planned approaches passed the target, against
+    15-40 % for real reaches and 14/36 for the engine's recorded trajectories, because the primary
+    submovement always aimed at 84-94 % of the distance. Same values in motion.ts shapeTraits and
+    Motion.ShapeTraitsOf."""
+    r = mulberry32((p.seed ^ _SHAPE_SALT) & _MASK)
+    overshoot_rate = _lerp(0.15, 0.38, r())
+    curve = _lerp(0.75, 1.3, r())
+    drag_tempo = _lerp(0.85, 1.2, r())
+    return ShapeTraits(overshoot_rate=overshoot_rate, curve=curve, drag_tempo=drag_tempo)
+
+
+# Sub-pixel noise scale. The colored noise (OU drift + 8-12 Hz tremor + AR(1) jitter) stays, but
+# smaller and carried mostly while the hand is moving: a mouse resting on the pad reports no counts,
+# so a slow tail full of +-0.5 px wobble is what a quantizing page turns into 1 px zigzags.
+_NOISE = 0.6
+
+
+def _skewed(tau: float, skew: float) -> float:
+    """Time warp 1-(1-tau)^skew: skew > 1 moves the min-jerk speed peak before the midpoint."""
+    t = _clamp(tau, 0.0, 1.0)
+    return 1.0 - math.pow(1.0 - t, skew) if skew != 1.0 else t
+
+
+def _sample_submove(out, a, b, dur_ms, p: Persona, rng: Rng, t0, drift, jit, tremor_phase, land,
+                    bow_frac, skew):
+    """Sample ONE min-jerk submovement a->b along a bowed path with colored noise. Appends
+    (x, y, sleep_ms) tuples to ``out``. Returns the absolute clock (ms) at the end.
+
+    ``bow_frac``: signed peak sideways deviation as a share of the submovement's length.
+    ``skew``: time warp of the min-jerk profile (1 = symmetric)."""
     ax, ay = a
     bx, by = b
     dx, dy = bx - ax, by - ay
     dist = math.hypot(dx, dy) or 1e-6
     step_ms = 1000.0 / p.device_hz
     # Cap the sample count so a very long move can't emit thousands of steps (defends the Fitts cap).
-    n = int(min(180, max(4, round(dur_ms / step_ms))))
+    n = int(min(180, max(4, _js_round(dur_ms / step_ms))))
     nx, ny = -dy / dist, dx / dist
-    bow_sign = 1 if p.approach_bias >= 0 else -1
-    bow = bow_sign * (0.04 + abs(gauss_from(rng)) * 0.05) * min(dist, 260) * (0.5 + abs(p.approach_bias))
-    c1x, c1y = ax + dx * 0.33 + nx * bow, ay + dy * 0.33 + ny * bow
-    c2x, c2y = ax + dx * 0.66 + nx * bow, ay + dy * 0.66 + ny * bow
+    # A cubic with both control points offset by c peaks at 0.75 c; the first control point carries
+    # more of it, so the widest point of the arc comes before the middle, as in a reach.
+    c = bow_frac * dist / 0.75
+    c1x, c1y = ax + dx * 0.3 + nx * c * 1.15, ay + dy * 0.3 + ny * c * 1.15
+    c2x, c2y = ax + dx * 0.7 + nx * c * 0.85, ay + dy * 0.7 + ny * c * 0.85
     t = t0
     for i in range(1, n + 1):
-        e = min_jerk(i / n)
+        tau = i / n
+        e = min_jerk(_skewed(tau, skew))
         px = _bez(ax, c1x, c2x, bx, e)
         py = _bez(ay, c1y, c2y, by, e)
         last = i == n
         if not (last and land):
+            # noise follows the speed envelope (min-jerk speed 30 tau^2 (1-tau)^2 peaks at 1.875)
+            v = 30.0 * tau * tau * (1 - tau) * (1 - tau) / 1.875
+            g = _NOISE * (0.35 + 0.65 * v)
             k = step_ms / p.drift_tau
             drift[0] += -k * drift[0] + math.sqrt(2 * k) * p.drift_amp * gauss_from(rng)
             drift[1] += -k * drift[1] + math.sqrt(2 * k) * p.drift_amp * gauss_from(rng)
@@ -197,8 +246,8 @@ def _sample_submove(out, a, b, dur_ms, p: Persona, rng: Rng, t0, drift, jit, tre
             # fresh speed reversal every sample -> spurious "submovements" + flat noise spectrum).
             jit[0] = 0.7 * jit[0] + gauss_from(rng) * p.jitter * 0.22
             jit[1] = 0.7 * jit[1] + gauss_from(rng) * p.jitter * 0.22
-            px += drift[0] + tr_x + jit[0]
-            py += drift[1] + tr_y + jit[1]
+            px += (drift[0] + tr_x + jit[0]) * g
+            py += (drift[1] + tr_y + jit[1]) * g
         else:
             px, py = bx, by
         sleep_ms = step_ms * _lerp(0.88, 1.12, rng())
@@ -207,9 +256,21 @@ def _sample_submove(out, a, b, dur_ms, p: Persona, rng: Rng, t0, drift, jit, tre
     return t
 
 
-def plan_move(frm, to, p: Persona, target_w: float = 24.0, settle: bool = False, rng: Optional[Rng] = None):
-    """Plan a free cursor move frm→to as a sum of minimum-jerk submovements (primary + corrections),
-    Fitts-scaled duration and colored noise. Returns a list of (x, y, sleep_ms) tuples."""
+def plan_move(frm, to, p: Persona, target_w: float = 24.0, settle: bool = False, rng: Optional[Rng] = None,
+              held: bool = False):
+    """Plan a free cursor move frm->to as a sum of minimum-jerk submovements (primary + corrections),
+    Fitts-scaled duration and colored noise. Returns a list of (x, y, sleep_ms) tuples.
+
+    A move with a button held (``held``) or one that seats a handle (``settle``) is a drag, planned
+    by :func:`plan_drag`.
+
+    Shape (SC 209/210): the primary submovement arcs (peak sideways deviation ~6-18 % of the
+    distance, per-persona curvature and handedness), reaches its speed peak before the middle of the
+    move, and either stops short of the target (a short corrective submovement closes the gap) or,
+    in ``shape_traits(p).overshoot_rate`` of moves, passes it by 3-28 px and comes back. Straightness
+    (distance / path length) of the planned points lands around 0.85-0.95, the band of real reaches."""
+    if settle or held:
+        return plan_drag(frm, to, p, settle=settle, rng=rng)
     if rng is None:
         rng = random.random
     fx, fy = frm
@@ -225,21 +286,24 @@ def plan_move(frm, to, p: Persona, target_w: float = 24.0, settle: bool = False,
     # floor capped at the 1700ms ceiling so a very long move can't invert the clamp (lo > hi).
     mt_lo = min(1700.0, max(70.0, 40.0 + d * 0.6))
     mt = _clamp((p.fitts_a + p.fitts_b * idv) * (0.85 + 0.3 * rng()), mt_lo, 1700.0)
+    tr = shape_traits(p)
+    ux, uy = (tx - fx) / d, (ty - fy) / d
 
     targets = []
+    over = False
     if d >= 40:
-        f = p.primary_frac
-        spread = min(16.0, d * p.overshoot)
-        targets.append((fx + (tx - fx) * f + gauss_from(rng) * spread,
-                        fy + (ty - fy) * f + gauss_from(rng) * spread))
-        n_corr = 2 if rng() < 0.08 * p.max_corrections else 1
-        cur = targets[0]
-        for _ in range(n_corr):
+        over = rng() < tr.overshoot_rate
+        if over:
+            along = d + _clamp(d * _lerp(0.03, 0.08, rng()), 3.0, 28.0)
+        else:
+            along = d * _clamp(p.primary_frac + 0.05 + gauss_from(rng) * 0.015, 0.88, 0.985)
+        lat = gauss_from(rng) * min(6.0, d * 0.02)
+        targets.append((fx + ux * along - uy * lat, fy + uy * along + ux * lat))
+        if rng() < 0.08 * p.max_corrections:
+            cur = targets[0]
             close = _lerp(0.55, 0.8, rng())
-            nxt = (cur[0] + (tx - cur[0]) * close + gauss_from(rng) * 1.2,
-                   cur[1] + (ty - cur[1]) * close + gauss_from(rng) * 1.2)
-            targets.append(nxt)
-            cur = nxt
+            targets.append((cur[0] + (tx - cur[0]) * close + gauss_from(rng) * 1.0,
+                            cur[1] + (ty - cur[1]) * close + gauss_from(rng) * 1.0))
     targets.append((tx, ty))
 
     seg_dur = []
@@ -252,6 +316,15 @@ def plan_move(frm, to, p: Persona, target_w: float = 24.0, settle: bool = False,
         for _ in range(nc):
             seg_dur.append((rest / nc) * _lerp(0.8, 1.2, rng()))
 
+    # The primary's arc: handedness sign from the persona (1 move in 5 bends the other way), size
+    # from the persona's curvature trait. Corrections are short and nearly straight.
+    sign = 1.0 if p.approach_bias >= 0 else -1.0
+    if rng() < 0.2:
+        sign = -sign
+    bow = sign * min(0.25, (0.08 + abs(gauss_from(rng)) * 0.11) * tr.curve * (0.75 + abs(p.approach_bias)))
+    if d * abs(bow) > 110.0:
+        bow = math.copysign(110.0 / d, bow)
+
     drift = [0.0, 0.0]
     jit = [0.0, 0.0]
     tremor_phase = rng() * 2 * math.pi
@@ -260,17 +333,86 @@ def plan_move(frm, to, p: Persona, target_w: float = 24.0, settle: bool = False,
     for s in range(len(targets)):
         b = targets[s]
         last = s == len(targets) - 1
-        t = _sample_submove(out, a, b, max(20.0, seg_dur[s]), p, rng, t, drift, jit, tremor_phase, last and not settle)
+        first = s == 0
+        t = _sample_submove(out, a, b, max(20.0, seg_dur[s]), p, rng, t, drift, jit, tremor_phase, last,
+                            bow if first else bow * 0.15, 1.25 if first else 1.0)
         if not last and out:
             x, y, sl = out[-1]
-            out[-1] = (x, y, sl + _lerp(40, 120, rng()))  # motor re-planning gap
+            # motor re-planning gap; a reversal after passing the target comes back quicker
+            out[-1] = (x, y, sl + (_lerp(25, 90, rng()) if (over and first) else _lerp(40, 120, rng())))
         a = b
+    return out
+
+
+def plan_drag(frm, to, p: Persona, settle: bool = False, rng: Optional[Rng] = None):
+    """Plan a held-button drag frm->to (slider handle, drag-and-drop, range thumb).
+
+    Measured on r38 / SDK 0.48.0 (SC 209): the held leg reused the aimed-move planner, whose arc
+    put the hand up to 47 px off the line between grab and drop -- off a 40 px slider track. A drag
+    is a slower, flatter movement: one skewed min-jerk leg along the line with at most ~4 px of arc
+    and +-6 px of total sideways error, 0.5-2 s for 300-400 px (``shape_traits(p).drag_tempo``),
+    and now and then (about 0.6 x the persona's overshoot rate) a 2.5-10 px overshoot and pull-back.
+    ``settle`` adds a couple of sub-pixel seating jiggles before landing exactly on ``to``."""
+    if rng is None:
+        rng = random.random
+    fx, fy = frm
+    tx, ty = to
+    d = math.hypot(tx - fx, ty - fy)
+    out: list = []
+    step_ms = 1000.0 / p.device_hz
+    if d < 1.5:
+        out.append((tx, ty, step_ms))
+        return out
+    tr = shape_traits(p)
+    ux, uy = (tx - fx) / d, (ty - fy) / d
+    mt = _clamp((260.0 + 1.7 * d) * tr.drag_tempo * _lerp(0.9, 1.1, rng()), min(500.0, 150.0 + 1.5 * d), 2000.0)
+    over = d >= 60 and rng() < tr.overshoot_rate * 0.6
+    o = _clamp(d * _lerp(0.01, 0.03, rng()), 2.5, 10.0) if over else 0.0
+    sign = 1.0 if p.approach_bias >= 0 else -1.0
+    h = sign * min(5.0, d * 0.015) * _lerp(0.3, 1.0, rng())
+    tremor_phase = rng() * 2 * math.pi
+
+    legs = [(0.0, d + o, mt * (0.86 if over else 1.0), h)]
+    if over:
+        legs.append((d + o, d, mt * 0.14, 0.0))
+    drift = 0.0
+    jit = 0.0
+    t = 0.0
+    for li, (s0, s1, dur, hh) in enumerate(legs):
+        n = int(min(360, max(4, _js_round(dur / step_ms))))
+        dt = dur / n
+        last_leg = li == len(legs) - 1
+        for i in range(1, n + 1):
+            tau = i / n
+            e = min_jerk(_skewed(tau, 1.2))
+            along = s0 + (s1 - s0) * e
+            v = 30.0 * tau * tau * (1 - tau) * (1 - tau) / 1.875
+            k = dt / p.drift_tau
+            drift += -k * drift + math.sqrt(2 * k) * p.drift_amp * 0.8 * gauss_from(rng)
+            jit = 0.7 * jit + gauss_from(rng) * p.jitter * 0.12
+            t_amp = p.tremor_amp * (0.7 + 0.3 * math.sin((2 * math.pi * t) / 850.0 + tremor_phase))
+            tremor = t_amp * math.sin(tremor_phase + (2 * math.pi * p.tremor_hz * t) / 1000.0)
+            along += t_amp * 0.6 * math.sin(tremor_phase + 1.0 + (2 * math.pi * (p.tremor_hz * 0.93) * t) / 1000.0) * v
+            side = hh * math.sin(math.pi * e) + (drift + tremor + jit) * (0.6 + 0.4 * v)
+            side = _clamp(side, -6.0, 6.0)
+            if last_leg and i == n and not settle:
+                px, py = tx, ty
+            else:
+                px, py = fx + ux * along - uy * side, fy + uy * along + ux * side
+            sl = dt * _lerp(0.88, 1.12, rng())
+            out.append((px, py, sl))
+            t += sl
+        if not last_leg and out:
+            x, y, sl = out[-1]
+            out[-1] = (x, y, sl + _lerp(30, 80, rng()))   # the hand notices, stops, pulls back
 
     if settle:
+        # A couple of tiny sub-pixel seating jiggles, then land exactly (handle "clunk" into place).
         jig = 1 + int(rng() * 2)
         for _ in range(jig):
-            out.append((tx + gauss_from(rng) * 1.4, ty + gauss_from(rng) * 1.4, _lerp(30, 90, rng())))
-        out.append((tx, ty, 1000.0 / p.device_hz))
+            out.append((tx + _clamp(gauss_from(rng) * 0.8, -1.5, 1.5), ty + _clamp(gauss_from(rng) * 0.8, -1.5, 1.5),
+                        _lerp(30, 90, rng())))
+        out.append((tx, ty, step_ms))
     return out
 
 

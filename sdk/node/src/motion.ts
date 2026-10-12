@@ -198,8 +198,10 @@ export interface PlanOpts {
   /** Target width/height (px) for the Fitts duration + click-point spread. Defaults ~24. */
   targetW?: number;
   targetH?: number;
-  /** Append a tiny 1–2 px settling jiggle at the end (used for slider/drag seating). */
+  /** A drag that seats a handle: planned by planDrag, ending in a couple of sub-pixel seating jiggles. */
   settle?: boolean;
+  /** The button is held (a drag leg): planned by planDrag, landing exactly on `to`. */
+  held?: boolean;
   /** RNG for live micro-variation. Defaults to Math.random (non-reproducible). Pass a seeded Rng in tests. */
   rng?: Rng;
 }
@@ -219,31 +221,79 @@ export function minJerk(tau: number): number {
   return t * t * t * (10 + t * (-15 + 6 * t));
 }
 
-/** Sample ONE min-jerk submovement a→b along a slightly bowed path, adding colored noise. Appends to
- * `out`. `t0` is the absolute clock (ms) at the start (for tremor phase continuity). Returns the
- * absolute clock at the end. `land` = put the final sample exactly on b with no noise. */
+// Salt for the path-shape stream. Like the rollover salt, a separate mulberry32(seed ^ salt) stream
+// keeps makePersona's draw ORDER (and so every existing seed's motor identity) unchanged.
+const SHAPE_SALT = 0x85ebca6b;
+
+/** Per-identity path-shape traits, stable per seed (see shapeTraits). */
+export interface ShapeTraits {
+  /** Share of aimed moves that pass the target and come back, 0.15–0.38. */
+  overshootRate: number;
+  /** Scale on the primary submovement's bow, 0.75–1.3. */
+  curve: number;
+  /** Scale on held-drag duration, 0.85–1.2. */
+  dragTempo: number;
+}
+
+/** The persona's path-shape traits, drawn from a salted stream of its seed.
+ *
+ * Measured on r38 / SDK 0.48.0 (SC 209): 1 of 36 planned approaches passed the target, against 15–40 %
+ * for real reaches and 14/36 for the engine's recorded trajectories, because the primary submovement
+ * always aimed at 84–94 % of the distance. Same values as Python `_motion.shape_traits` and .NET
+ * `Motion.ShapeTraitsOf`. */
+export function shapeTraits(p: Persona): ShapeTraits {
+  const r = mulberry32((p.seed ^ SHAPE_SALT) >>> 0);
+  const overshootRate = lerp(0.15, 0.38, r());
+  const curve = lerp(0.75, 1.3, r());
+  const dragTempo = lerp(0.85, 1.2, r());
+  return { overshootRate, curve, dragTempo };
+}
+
+// Sub-pixel noise scale. The colored noise (OU drift + 8–12 Hz tremor + AR(1) jitter) stays, but smaller
+// and carried mostly while the hand is moving: a mouse resting on the pad reports no counts, so a slow
+// tail full of ±0.5 px wobble is what a quantizing page turns into 1 px zigzags.
+const NOISE = 0.6;
+
+/** floor(x + 0.5): the same rounding as Python `_js_round` and .NET `JsRound`. */
+const jsRound = (x: number) => Math.floor(x + 0.5);
+
+/** Time warp 1−(1−τ)^skew: skew > 1 moves the min-jerk speed peak before the midpoint. */
+function skewed(tau: number, skew: number): number {
+  const t = clamp(tau, 0, 1);
+  return skew !== 1 ? 1 - Math.pow(1 - t, skew) : t;
+}
+
+/** Sample ONE min-jerk submovement a→b along a bowed path, adding colored noise. Appends to `out`.
+ * `t0` is the absolute clock (ms) at the start (for tremor phase continuity). Returns the absolute
+ * clock at the end. `land` = put the final sample exactly on b with no noise. `bowFrac` = signed peak
+ * sideways deviation as a share of the submovement's length; `skew` = time warp (1 = symmetric). */
 function sampleSubmove(
   out: Step[], a: Point, b: Point, durMs: number, p: Persona, rng: Rng,
-  t0: number, drift: { x: number; y: number }, jit: { x: number; y: number }, tremorPhase: number, land: boolean
+  t0: number, drift: { x: number; y: number }, jit: { x: number; y: number }, tremorPhase: number, land: boolean,
+  bowFrac: number, skew: number
 ): number {
   const dx = b.x - a.x, dy = b.y - a.y;
   const dist = Math.hypot(dx, dy) || 1e-6;
   const stepMs = 1000 / p.deviceHz;
   // Cap the sample count so a very long move can't emit thousands of steps (defends the Fitts cap).
-  const n = Math.min(180, Math.max(4, Math.round(durMs / stepMs)));
-  // perpendicular unit for the path bow; sign follows the persona's handedness bias
+  const n = Math.min(180, Math.max(4, jsRound(durMs / stepMs)));
   const nx = -dy / dist, ny = dx / dist;
-  const bowSign = p.approachBias >= 0 ? 1 : -1;
-  const bow = bowSign * (0.04 + Math.abs(gaussFrom(rng)) * 0.05) * Math.min(dist, 260) * (0.5 + Math.abs(p.approachBias));
-  const c1x = a.x + dx * 0.33 + nx * bow, c1y = a.y + dy * 0.33 + ny * bow;
-  const c2x = a.x + dx * 0.66 + nx * bow, c2y = a.y + dy * 0.66 + ny * bow;
+  // A cubic with both control points offset by c peaks at 0.75 c; the first control point carries more
+  // of it, so the widest point of the arc comes before the middle, as in a reach.
+  const c = bowFrac * dist / 0.75;
+  const c1x = a.x + dx * 0.3 + nx * c * 1.15, c1y = a.y + dy * 0.3 + ny * c * 1.15;
+  const c2x = a.x + dx * 0.7 + nx * c * 0.85, c2y = a.y + dy * 0.7 + ny * c * 0.85;
   let t = t0;
   for (let i = 1; i <= n; i++) {
-    const e = minJerk(i / n);
+    const tau = i / n;
+    const e = minJerk(skewed(tau, skew));
     let px = bez(a.x, c1x, c2x, b.x, e);
     let py = bez(a.y, c1y, c2y, b.y, e);
     const last = i === n;
     if (!(last && land)) {
+      // noise follows the speed envelope (min-jerk speed 30τ²(1−τ)² peaks at 1.875)
+      const v = 30 * tau * tau * (1 - tau) * (1 - tau) / 1.875;
+      const g = NOISE * (0.35 + 0.65 * v);
       // Ornstein–Uhlenbeck drift (colored, low-frequency)
       const k = stepMs / p.driftTau;
       drift.x += -k * drift.x + Math.sqrt(2 * k) * p.driftAmp * gaussFrom(rng);
@@ -258,8 +308,8 @@ function sampleSubmove(
       // speed reversal every sample, manufacturing spurious "submovements" and a flat noise spectrum.
       jit.x = 0.7 * jit.x + gaussFrom(rng) * p.jitter * 0.22;
       jit.y = 0.7 * jit.y + gaussFrom(rng) * p.jitter * 0.22;
-      px += drift.x + trX + jit.x;
-      py += drift.y + trY + jit.y;
+      px += (drift.x + trX + jit.x) * g;
+      py += (drift.y + trY + jit.y) * g;
     } else {
       px = b.x; py = b.y;
     }
@@ -275,8 +325,18 @@ function sampleSubmove(
 /**
  * Plan a free cursor move `from`→`to` as a sum of minimum-jerk submovements (primary + corrections)
  * with Fitts-scaled duration and colored noise. Returns the samples to dispatch.
+ *
+ * A move with a button held (`held`) or one that seats a handle (`settle`) is a drag, planned by
+ * {@link planDrag}.
+ *
+ * Shape (SC 209/210): the primary submovement arcs (peak sideways deviation ~6–18 % of the distance,
+ * per-persona curvature and handedness), reaches its speed peak before the middle of the move, and
+ * either stops short of the target (a short corrective submovement closes the gap) or, in
+ * `shapeTraits(p).overshootRate` of moves, passes it by 3–28 px and comes back. Straightness (distance /
+ * path length) of the planned points lands around 0.85–0.95, the band of real reaches.
  */
 export function planMove(from: Point, to: Point, p: Persona, opts: PlanOpts = {}): Step[] {
+  if (opts.settle || opts.held) return planDrag(from, to, p, { settle: opts.settle, rng: opts.rng });
   const rng = opts.rng ?? Math.random;
   const W = Math.max(6, opts.targetW ?? 24);
   const D = Math.hypot(to.x - from.x, to.y - from.y);
@@ -289,43 +349,48 @@ export function planMove(from: Point, to: Point, p: Persona, opts: PlanOpts = {}
   const id = log2(D / W + 1);
   const mtLo = Math.min(1700, Math.max(70, 40 + D * 0.6));
   const mt = clamp((p.fittsA + p.fittsB * id) * (0.85 + 0.3 * rng()), mtLo, 1700);
+  const tr = shapeTraits(p);
+  const ux = (to.x - from.x) / D, uy = (to.y - from.y) / D;
 
-  // Submovement targets: primary lands near `to` with a small over/undershoot; corrections close the
-  // residual error, each covering ~55–80% of what's left.
+  // Submovement targets: the primary stops a little short of `to` or, in the persona's overshoot rate,
+  // passes it; one correction closes the residual (occasionally an intermediate one first).
   const targets: Point[] = [];
+  let over = false;
   if (D >= 40) {
-    const f = p.primaryFrac;
-    const spread = Math.min(16, D * p.overshoot);
-    targets.push({
-      x: from.x + (to.x - from.x) * f + gaussFrom(rng) * spread,
-      y: from.y + (to.y - from.y) * f + gaussFrom(rng) * spread,
-    });
-    // 1 correction usually, occasionally 2 (a 3rd is rare) — keeps the corrective-submovement count
-    // in the human 1–3 band rather than over-generating homing bumps.
-    const nCorr = rng() < 0.08 * p.maxCorrections ? 2 : 1;
-    let cur = targets[0];
-    for (let i = 0; i < nCorr; i++) {
+    over = rng() < tr.overshootRate;
+    const along = over
+      ? D + clamp(D * lerp(0.03, 0.08, rng()), 3, 28)
+      : D * clamp(p.primaryFrac + 0.05 + gaussFrom(rng) * 0.015, 0.88, 0.985);
+    const lat = gaussFrom(rng) * Math.min(6, D * 0.02);
+    targets.push({ x: from.x + ux * along - uy * lat, y: from.y + uy * along + ux * lat });
+    if (rng() < 0.08 * p.maxCorrections) {
+      const cur = targets[0];
       const close = lerp(0.55, 0.8, rng());
-      const nx = { x: cur.x + (to.x - cur.x) * close, y: cur.y + (to.y - cur.y) * close };
-      // tiny lateral error so corrections aren't perfectly collinear
-      nx.x += gaussFrom(rng) * 1.2; nx.y += gaussFrom(rng) * 1.2;
-      targets.push(nx); cur = nx;
+      const mx = cur.x + (to.x - cur.x) * close + gaussFrom(rng) * 1.0;
+      const my = cur.y + (to.y - cur.y) * close + gaussFrom(rng) * 1.0;
+      targets.push({ x: mx, y: my });
     }
   }
   targets.push({ x: to.x, y: to.y });
 
-  // Allocate MT: primary ~62%, remaining split across corrections (each shorter).
   const segDur: number[] = [];
   if (targets.length === 1) {
     segDur.push(mt);
   } else {
-    // Primary gets ~78% of the time (min-jerk peaks at its own mid-point ⇒ global peak lands ~0.35–0.4,
-    // the human sweet spot slightly before the whole-gesture midpoint), corrections share the rest.
+    // Primary gets ~78% of the time; with its skewed min-jerk profile the global speed peak lands
+    // ~0.3 of the way through the move, before the midpoint as in a reach. Corrections share the rest.
     segDur.push(mt * 0.78);
     const rest = mt * 0.22;
     const nc = targets.length - 1;
     for (let i = 0; i < nc; i++) segDur.push((rest / nc) * lerp(0.8, 1.2, rng()));
   }
+
+  // The primary's arc: handedness sign from the persona (1 move in 5 bends the other way), size from
+  // the persona's curvature trait. Corrections are short and nearly straight.
+  let sign = p.approachBias >= 0 ? 1 : -1;
+  if (rng() < 0.2) sign = -sign;
+  let bow = sign * Math.min(0.25, (0.08 + Math.abs(gaussFrom(rng)) * 0.11) * tr.curve * (0.75 + Math.abs(p.approachBias)));
+  if (D * Math.abs(bow) > 110) bow = bow < 0 ? -110 / D : 110 / D;
 
   const drift = { x: 0, y: 0 };
   const jit = { x: 0, y: 0 };
@@ -334,18 +399,82 @@ export function planMove(from: Point, to: Point, p: Persona, opts: PlanOpts = {}
   for (let s = 0; s < targets.length; s++) {
     const b = targets[s];
     const last = s === targets.length - 1;
-    t = sampleSubmove(out, a, b, Math.max(20, segDur[s]), p, rng, t, drift, jit, tremorPhase, last && !opts.settle);
-    if (!last && out.length) out[out.length - 1].sleepMs += lerp(40, 120, rng()); // motor re-planning gap
+    const first = s === 0;
+    t = sampleSubmove(out, a, b, Math.max(20, segDur[s]), p, rng, t, drift, jit, tremorPhase, last,
+      first ? bow : bow * 0.15, first ? 1.25 : 1.0);
+    // motor re-planning gap; a reversal after passing the target comes back quicker
+    if (!last && out.length) out[out.length - 1].sleepMs += over && first ? lerp(25, 90, rng()) : lerp(40, 120, rng());
     a = b;
   }
+  return out;
+}
 
-  if (opts.settle) {
+/**
+ * Plan a held-button drag `from`→`to` (slider handle, drag-and-drop, range thumb).
+ *
+ * Measured on r38 / SDK 0.48.0 (SC 209): the held leg reused the aimed-move planner, whose arc put the
+ * hand up to 47 px off the line between grab and drop — off a 40 px slider track. A drag is a slower,
+ * flatter movement: one skewed min-jerk leg along the line with at most ~5 px of arc and ±6 px of total
+ * sideways error, 0.5–2 s for 300–400 px (`shapeTraits(p).dragTempo`), and now and then (about 0.6× the
+ * persona's overshoot rate) a 2.5–10 px overshoot and pull-back. `settle` adds a couple of sub-pixel
+ * seating jiggles before landing exactly on `to`.
+ */
+export function planDrag(from: Point, to: Point, p: Persona, opts: { settle?: boolean; rng?: Rng } = {}): Step[] {
+  const rng = opts.rng ?? Math.random;
+  const settle = !!opts.settle;
+  const D = Math.hypot(to.x - from.x, to.y - from.y);
+  const out: Step[] = [];
+  const stepMs = 1000 / p.deviceHz;
+  if (D < 1.5) { out.push({ x: to.x, y: to.y, sleepMs: stepMs }); return out; }
+  const tr = shapeTraits(p);
+  const ux = (to.x - from.x) / D, uy = (to.y - from.y) / D;
+  const mt = clamp((260 + 1.7 * D) * tr.dragTempo * lerp(0.9, 1.1, rng()), Math.min(500, 150 + 1.5 * D), 2000);
+  const over = D >= 60 && rng() < tr.overshootRate * 0.6;
+  const o = over ? clamp(D * lerp(0.01, 0.03, rng()), 2.5, 10) : 0;
+  const sign = p.approachBias >= 0 ? 1 : -1;
+  const h = sign * Math.min(5, D * 0.015) * lerp(0.3, 1.0, rng());
+  const tremorPhase = rng() * 2 * Math.PI;
+
+  const legs: Array<[number, number, number, number]> = [[0, D + o, mt * (over ? 0.86 : 1.0), h]];
+  if (over) legs.push([D + o, D, mt * 0.14, 0]);
+  let drift = 0, jit = 0, t = 0;
+  for (let li = 0; li < legs.length; li++) {
+    const [s0, s1, dur, hh] = legs[li];
+    const n = Math.min(360, Math.max(4, jsRound(dur / stepMs)));
+    const dt = dur / n;
+    const lastLeg = li === legs.length - 1;
+    for (let i = 1; i <= n; i++) {
+      const tau = i / n;
+      const e = minJerk(skewed(tau, 1.2));
+      let along = s0 + (s1 - s0) * e;
+      const v = 30 * tau * tau * (1 - tau) * (1 - tau) / 1.875;
+      const k = dt / p.driftTau;
+      drift += -k * drift + Math.sqrt(2 * k) * p.driftAmp * 0.8 * gaussFrom(rng);
+      jit = 0.7 * jit + gaussFrom(rng) * p.jitter * 0.12;
+      const tAmp = p.tremorAmp * (0.7 + 0.3 * Math.sin((2 * Math.PI * t) / 850 + tremorPhase));
+      const tremor = tAmp * Math.sin(tremorPhase + (2 * Math.PI * p.tremorHz * t) / 1000);
+      along += tAmp * 0.6 * Math.sin(tremorPhase + 1.0 + (2 * Math.PI * (p.tremorHz * 0.93) * t) / 1000) * v;
+      let side = hh * Math.sin(Math.PI * e) + (drift + tremor + jit) * (0.6 + 0.4 * v);
+      side = clamp(side, -6, 6);
+      let px: number, py: number;
+      if (lastLeg && i === n && !settle) { px = to.x; py = to.y; }
+      else { px = from.x + ux * along - uy * side; py = from.y + uy * along + ux * side; }
+      const sl = dt * lerp(0.88, 1.12, rng());
+      out.push({ x: px, y: py, sleepMs: sl });
+      t += sl;
+    }
+    if (!lastLeg && out.length) out[out.length - 1].sleepMs += lerp(30, 80, rng()); // notices, stops, pulls back
+  }
+
+  if (settle) {
     // A couple of tiny sub-pixel seating jiggles, then land exactly (slider handle "clunk" into place).
     const jig = 1 + Math.floor(rng() * 2);
     for (let i = 0; i < jig; i++) {
-      out.push({ x: to.x + gaussFrom(rng) * 1.4, y: to.y + gaussFrom(rng) * 1.4, sleepMs: lerp(30, 90, rng()) });
+      const jx = to.x + clamp(gaussFrom(rng) * 0.8, -1.5, 1.5);
+      const jy = to.y + clamp(gaussFrom(rng) * 0.8, -1.5, 1.5);
+      out.push({ x: jx, y: jy, sleepMs: lerp(30, 90, rng()) });
     }
-    out.push({ x: to.x, y: to.y, sleepMs: 1000 / p.deviceHz });
+    out.push({ x: to.x, y: to.y, sleepMs: stepMs });
   }
   return out;
 }
