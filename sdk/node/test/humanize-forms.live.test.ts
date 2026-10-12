@@ -23,7 +23,7 @@ const T = 90_000;
 type E = {
   t: string; id: string; tr: boolean; ts: number; key: string; code: string; button: number | null;
   buttons: number | null; detail: number; shift: boolean; ctrl: boolean; alt: boolean; meta: boolean;
-  ox: number | null; oy: number | null; value: string | null; it: string; n: number;
+  ox: number | null; oy: number | null; value: string | null; it: string; n: number; te?: number;
 };
 
 describe.runIf(LIVE)("live humanized form input", () => {
@@ -809,4 +809,125 @@ describe.runIf(LIVE)("live humanized form input", () => {
     expect(await moves(), "the click glided (humanized)").toBeGreaterThanOrEqual(5);
     expect(main.filter((e) => ["pointerdown", "mousedown", "click"].includes(e.t))).toEqual([]);
   }, T);
+
+  // ------------------------------------------------- SC 210 lane F: maxlength, pre-press, bulk, date timing
+  const LONG_VALUE = "A long note pasted into a text area: it runs well past the two hundred character limit so the "
+    + "SDK inserts it in one go instead of typing it key by key, but a person still has to click into "
+    + "the field before pasting anything into it, which is what this checks. The end.";
+
+  /** ms from the last mousemove (end of its collapsed run) to each pointerdown on `id`. */
+  const pressGaps = (events: E[], id: string): (number | null)[] => {
+    let last: number | null = null;
+    const out: (number | null)[] = [];
+    for (const e of events) {
+      if (e.t === "mousemove") last = e.te ?? e.ts;
+      else if (e.t === "pointerdown" && e.id === id) out.push(last === null ? null : e.ts - last);
+    }
+    return out;
+  };
+
+  it("maxlength: only what fits is typed, no wipe and retype, no insertText", async () => {
+    typos(0);
+    await reset();
+    await page.fill("#zip", "1234567");
+    expect(await page.inputValue("#zip")).toBe("12345");
+    expect((await ev("keydown", "zip")).map((e) => e.key)).toEqual(["1", "2", "3", "4", "5"]);
+    const inputs = await ev("input", "zip");
+    expect(inputs.map((e) => e.value)).toEqual(["1", "12", "123", "1234", "12345"]);
+    expect(inputs.every((e) => e.tr)).toBe(true);
+  }, T);
+
+  it.each(["fill_text", "type", "slider_drag", "range_fill", "select", "listbox", "date", "check", "click"])(
+    "every SDK press waits after the pointer arrives (%s)", async (act) => {
+      await reset();
+      const target = ({ fill_text: "name", type: "city", slider_drag: "rng", range_fill: "rng2", select: "country",
+        listbox: "OPTION", date: "d", check: "cb", click: "btn" } as Record<string, string>)[act];
+      if (act === "fill_text") await page.fill("#name", "Ada Lovelace");
+      else if (act === "type") await page.type("#city", "Leiden");
+      else if (act === "slider_drag") {
+        const b = (await page.locator("#rng").boundingBox())!;
+        const y = b.y + b.height / 2;
+        await page.mouse.move(b.x + 30, y);
+        await page.mouse.down();
+        await page.mouse.move(b.x + 200, y);
+        await page.mouse.up();
+      } else if (act === "range_fill") await page.fill("#rng2", "15");
+      else if (act === "select") await page.selectOption("#country", { label: "Iceland" });
+      else if (act === "listbox") await page.selectOption("#lb", "opt3");
+      else if (act === "date") await page.fill("#d", "1990-04-12");
+      else if (act === "check") await page.check("#cb");
+      else await page.click("#btn");
+      const gaps = pressGaps(await ev(), target);
+      expect(gaps.length, `a press reached #${target}`).toBeGreaterThan(0);
+      expect(gaps.filter((g) => g === null || g < 40), "pressed too soon after the pointer arrived").toEqual([]);
+    }, T);
+
+  it("a bulk fill clicks into the field before inserting", async () => {
+    expect(LONG_VALUE.length).toBeGreaterThan(200);
+    await reset();
+    await page.fill("#bio", LONG_VALUE);
+    expect(await page.inputValue("#bio")).toBe(LONG_VALUE);
+    const events = await ev();
+    const downs = events.filter((e) => e.t === "pointerdown" && e.id === "bio");
+    const inputs = events.filter((e) => e.t === "input" && e.id === "bio");
+    expect(downs.length, "a press into the field").toBeGreaterThan(0);
+    expect(downs[0].tr).toBe(true);
+    expect(inputs.length).toBe(1);
+    expect(inputs[0].it).toBe("insertText");
+    expect(downs[0].ts).toBeLessThan(inputs[0].ts);
+  }, T);
+
+  it("the select open click is held as planned, not plus the popup's opening", async () => {
+    // Node's motion binding cannot be stubbed, so the persona's own 60-150 ms plan is the reference:
+    // the median page hold must stay inside it (it was ~206 ms in the SC 209 lab).
+    const holds: number[] = [];
+    for (const label of ["Iceland", "Norway", "Chile", "Kenya", "Malta", "Spain", "Japan", "Ghana"]) {
+      await reset();
+      await page.selectOption("#country", { label });
+      const d = await ev("mousedown", "country"), u = await ev("mouseup", "country");
+      expect(d.length && u.length).toBeTruthy();
+      holds.push(u[0].ts - d[0].ts);
+    }
+    holds.sort((a, b) => a - b);
+    expect(holds[holds.length >> 1], `holds ${holds.map(Math.round)}`).toBeLessThanOrEqual(160);
+  }, 180_000);
+
+  it("date segments use the typing model across identities, values exact", async () => {
+    const VALUES: Record<string, string[]> = {
+      "#d": ["1990-04-12", "2031-11-03"], "#t": ["14:35", "07:58"], "#m": ["2026-10", "1999-03"],
+      "#w": ["2026-W41", "2019-W07"], "#dtl": ["2026-01-15T09:30", "1987-06-24T21:12"],
+    };
+    const gaps: number[] = [];
+    let rolls = 0;
+    for (const ident of ["dt-id-1", "dt-id-2", "dt-id-3"]) {
+      const b = await launch({ executablePath: LIVE, headless: true, humanize: true, fingerprint: ident, quiet: true,
+        args: ["--no-sandbox"] });
+      try {
+        const p = await b.newPage();
+        await p.goto(FIXTURE);
+        for (const [sel, values] of Object.entries(VALUES)) {
+          for (const value of values) {
+            await p.evaluate("window.__ev.length = 0");
+            await p.fill(sel, value);
+            expect(await p.inputValue(sel), `${ident} ${sel}`).toBe(value);
+            const evs = (await p.evaluate("window.__ev")) as E[];
+            const kd = evs.filter((e) => e.t === "keydown" && e.id === sel.slice(1));
+            const ku = evs.filter((e) => e.t === "keyup" && e.id === sel.slice(1));
+            for (let i = 1; i < kd.length; i++) if (kd[i].ts - kd[i - 1].ts < 2000) gaps.push(kd[i].ts - kd[i - 1].ts);
+            kd.slice(0, -1).forEach((d, i) => {
+              const up = ku.find((u) => u.code === d.code && u.ts >= d.ts);
+              if (up && kd[i + 1].ts < up.ts) rolls++;
+            });
+          }
+        }
+      } finally {
+        await b.close();
+      }
+    }
+    const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+    const sd = Math.sqrt(gaps.reduce((a, b) => a + (b - mean) ** 2, 0) / gaps.length);
+    const cv = sd / mean;
+    expect(cv, `CV ${cv.toFixed(2)} over ${gaps.length} gaps (rollover ${rolls})`).toBeGreaterThanOrEqual(0.3);
+    expect(cv).toBeLessThanOrEqual(1.0);
+  }, 600_000);
 });

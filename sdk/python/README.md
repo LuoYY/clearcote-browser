@@ -288,8 +288,10 @@ concerned); no Playwright `trial` runs at all. With a CSS selector the element i
 scrolled into view there, so the page's own scripts see no read at all; a `get_by_role` / `get_by_label` /
 text locator costs one Playwright `bounding_box`, which reads the element's `textContent` in the page. Typing goes key-by-key with **gaussian inter-key timing** + word-boundary pauses, the
 occasional fat-finger correction and **key rollover** (on some fast pairs the next key goes down
-before the previous one comes up, at a rate fixed per identity); `page.fill` over 200 chars stays
-atomic (skips per-key typing) to avoid crawling. Scrolling moves in **whole wheel notches** (100 px on
+before the previous one comes up, at a rate fixed per identity); `page.fill` over 200 chars glides to
+the field and clicks into it like any fill, then inserts the value in one go (no per-key typing, which
+would crawl). Every button press the SDK makes comes after a short pause once the pointer has arrived
+(40-250 ms, right-skewed, typical length fixed per identity), the way a hand confirms its target. Scrolling moves in **whole wheel notches** (100 px on
 a Windows identity, 120 on Linux, 40 on macOS), because a browser reports every wheel event as one
 full notch: the requested distance is rounded to the nearest notch (at least one). Notches come in
 short flicks with the occasional reading pause.
@@ -303,10 +305,11 @@ or pressing (Playwright's own trial does both, and listeners a page registered e
 
 **`fill` follows the field.** Text is typed (cleared with held keys only when it has a value, then
 checked through Playwright; a field whose value cannot be confirmed, or one the click could not reach, is
-filled by Playwright instead). A range slider is dragged (or its track clicked) and nudged with the arrow
+filled by Playwright instead). A field with a `maxlength` gets only the characters it can hold, the same
+value Playwright's own `fill` leaves there. A range slider is dragged (or its track clicked) and nudged with the arrow
 keys to the exact value; a value the slider cannot hold (off its step, out of range, not a number) raises
 Playwright's own "Malformed value", as before. A date / time / month / week / datetime-local field is typed
-segment by segment, in the order the browser shows them. Colour pickers, non-text inputs and fields inside
+segment by segment, in the order the browser shows them, with the same key timing as text. Colour pickers, non-text inputs and fields inside
 frames keep Playwright's own behaviour.
 
 **Waits and errors are Playwright's.** Humanized actions wait with your timeout (or the page's default),

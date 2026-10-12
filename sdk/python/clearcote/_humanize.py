@@ -32,8 +32,9 @@ import time
 import os
 
 from ._forms import (
-    DEFAULT_TYPO_RATE, NEARBY_LETTERS, classify_field, datetime_equal, engine_path_ok, formatted_equal,
-    match_option, normalize_click_options, numeric_equal, plan_datetime, plan_select, plan_typo, range_attrs,
+    DEFAULT_TYPO_RATE, NEARBY_LETTERS, classify_field, datetime_equal, engine_path_ok, fit_maxlength,
+    formatted_equal, match_option, normalize_click_options, numeric_equal, plan_datetime, plan_select,
+    plan_typo, pre_press_ms, range_attrs,
     range_fraction, range_nudge, range_point, range_sanitize, range_value_ok, segment_nodes_from_tree,
     typo_eligible, typos_allowed,
 )
@@ -403,6 +404,11 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 native_move(*st["pos"])
             except Exception:  # noqa: BLE001 - best effort: keep the press on target
                 pass
+            # The hand has arrived; it confirms the target before the button goes down. The pin
+            # above is itself a pointermove, so the pause comes after it: pressed straight after
+            # the move, a drag grab came ~21 ms after the last pointermove (measured on r38). A
+            # down() with no move before it (never placed) stays instant: nothing arrived.
+            _pre_press()
         # try/finally semantics so a raising press cannot strand held=True and turn every later
         # move into a phantom drag leg. hup already guarded this; hdown did not.
         try:
@@ -429,6 +435,36 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             st["platform"] = plat or _host_platform()
         return st["platform"]
 
+    def _pre_press():
+        """The pause between the pointer coming to rest and the button going down (_forms.pre_press_ms:
+        40-250 ms, right-skewed, centred per identity)."""
+        time.sleep(pre_press_ms(persona.seed) / 1000.0)
+
+    def _press_here(x, y, hold=None):
+        """Press and release the left button where the last glide left the pointer, after the
+        pre-press pause. Native down/up, so nothing moves: Playwright's mouse.click(x, y) sends one more
+        mouseMoved first, and that move -- not the glide -- was the last pointermove the page saw, ~4 ms
+        before the press (the typing focus click, measured on r38)."""
+        hold = click_hold(persona) if hold is None else hold
+        if native_down is None or native_up is None:
+            _pre_press()
+            native_click(x, y, delay=hold)
+            return
+        _pre_press()
+        t0 = time.monotonic()
+        native_down()
+        try:
+            time.sleep(_hold_rest(hold, t0))
+        finally:
+            native_up()   # never leave the button down
+
+    def _hold_rest(hold_ms, t0):
+        """What is left of a button hold once mouse.down() has returned. The hold runs from when the press
+        was SENT: mouse.down() returns only after the page has handled the press, and a <select> opens
+        its popup inside that handling, so a hold slept after it reached the page ~30-80 ms longer than
+        planned (206 ms median for the open click in the SC 209 lab, planned 60-150 ms)."""
+        return max(0.0, hold_ms / 1000.0 - (time.monotonic() - t0))
+
     def _press_at(x, y, o):
         """Press at (x, y) -- where the last glide ended -- the way the options ask: the button,
         the click count (a double click is two presses with a human gap, not one event), the
@@ -441,13 +477,14 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 native_kb_down(m)
                 held.append(m)
                 time.sleep(_rand(40, 110) / 1000.0)
-            time.sleep(_rand(40, 130) / 1000.0)    # brief dwell before pressing, like a human
+            _pre_press()    # the hand confirms the target before it presses
             n = o["click_count"]
             for i in range(1, n + 1):
                 hold = o["delay"] if o["delay"] is not None else click_hold(persona)
+                t0 = time.monotonic()
                 native_down(button=o["button"], click_count=i)
                 try:
-                    time.sleep(hold / 1000.0)
+                    time.sleep(_hold_rest(hold, t0))
                 finally:
                     native_up(button=o["button"], click_count=i)   # never leave the button down
                 if i < n:
@@ -470,7 +507,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         _glide(x, y)
         try:
             if native_down is None or native_up is None or (o["modifiers"] and native_kb_down is None):
-                time.sleep(_rand(40, 130) / 1000.0)
+                _pre_press()
                 native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                              **_sel_kw(kw, "button", "click_count"))
                 return
@@ -629,6 +666,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # ----------------------------------------------------------------- keyboard
     kb = page.keyboard
     native_kb_type, native_kb_press = kb.type, kb.press
+    native_kb_insert = getattr(kb, "insert_text", None)   # a bulk fill's paste (Input.insertText)
     # getattr: a page-like keyboard without down/up still gets every other humanization; it just
     # types capitals without the Shift key, as before.
     native_kb_down, native_kb_up = getattr(kb, "down", None), getattr(kb, "up", None)
@@ -1049,8 +1087,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return False
         pt = at if at is not None else click_point(box, st["pos"], persona)  # 2D gaussian toward centre
         _glide(pt[0], pt[1])
-        time.sleep(_rand(40, 130) / 1000.0)
-        native_click(pt[0], pt[1], delay=click_hold(persona))
+        _press_here(pt[0], pt[1])
         return True
 
     def _key(k, n=1, gap=(60, 150)):
@@ -1133,9 +1170,21 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         focus is, and the page cannot observe it. A field whose value cannot be read, or a click that
         did not put the caret in it (an overlay took it), is left to Playwright -- "could not check"
         is never treated as success."""
-        if len(value) > 200:
-            return False   # bulk values: keep fill fast/atomic (humanizing 1000s of chars would crawl)
         is_ce = bool(info and info.get("ce")) or info is None and (loc.get_attribute("contenteditable") or "false") != "false"
+        # What the field can hold: a maxlength keeps the first N characters (what Playwright's
+        # insertText leaves too), and a person types only those -- the field stops taking keys.
+        if is_ce:
+            want = value
+        elif info is not None:
+            want = fit_maxlength(value, info.get("maxlength"), info.get("tag"), info.get("type"))
+        else:
+            want = fit_maxlength(value, loc.get_attribute("maxlength"), _classify_tag(loc),
+                                 loc.get_attribute("type") or "")
+        # Bulk values (over 200 characters) are still inserted at once -- typing thousands of keys
+        # would crawl -- but the way a person pastes: glide to the field, click into it, then insert.
+        bulk = len(value) > 200
+        if bulk and native_kb_insert is None:
+            return False
         if not _focus_click(box, _proven_point(box, info) if box else None, loc, selector):
             return False
         time.sleep(_rand(40, 120) / 1000.0)
@@ -1148,29 +1197,38 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             except Exception:  # noqa: BLE001
                 return None
 
+        def put(text, typos=True):
+            if bulk:
+                time.sleep(_rand(120, 320) / 1000.0)   # the paste shortcut, after the click
+                native_kb_insert(text)
+            else:
+                _human_type_text(text, field=info, typos=typos)
+
         if is_ce:
             cur = info.get("value") if info else None
             if cur:
                 _clear_focused()
-            _human_type_text(value, field=info)
+            put(want)
             return True   # contenteditable: Playwright's fill sets text the same way; no value to read
         cur = read()
         if cur is None:
             return False
         if cur:  # a person does not select-all an empty field
             _clear_focused(read)
-        _human_type_text(value, field=info)
+        put(want)
         got = read()
         if got is None:
             return False
-        if got == value or formatted_equal(got, value):
+        if got == want or formatted_equal(got, want):
             return True   # exact, or a mask that only re-punctuated what was typed (a phone format)
+        if bulk:
+            return False   # an inserted value that did not land: Playwright's fill, not a second paste
         # Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips,
         # then give the field to Playwright -- a correct value beats pretty input.
         _clear_focused(read)
-        _human_type_text(value, field=info, typos=False)
+        put(want, typos=False)
         got = read()
-        return got is not None and (got == value or formatted_equal(got, value))
+        return got is not None and (got == want or formatted_equal(got, want))
 
     def _fill_range(loc, box, info, value):
         """A range input: drag the thumb (or click the track) to the value, then arrow-nudge to it
@@ -1205,7 +1263,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             cx, cy = range_point(box, range_fraction(cur, lo, hi), rtl)
             cy += random.gauss(0, box["height"] * 0.08)
             _glide(cx, cy, target_w=16)
-            time.sleep(_rand(60, 160) / 1000.0)
+            _pre_press()
             grab_ms, release_ms = drag_dwell(persona)
             native_down()
             st["held"] = True
@@ -1218,8 +1276,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 st["held"] = False
         else:
             _glide(tx, ty, target_w=16)
-            time.sleep(_rand(40, 130) / 1000.0)
-            native_click(tx, ty, delay=click_hold(persona))
+            _press_here(tx, ty)
         for _ in range(3):
             v = now()
             if v is None:
@@ -1265,19 +1322,27 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             px = box["x"] + min(14.0, box["width"] * 0.12)
             py = box["y"] + box["height"] / 2
         _glide(px, py, target_w=fw)
-        time.sleep(_rand(40, 130) / 1000.0)
-        native_click(px, py, delay=click_hold(persona))
+        _press_here(px, py)
         time.sleep(_rand(150, 350) / 1000.0)
         for a in plan:
             if a[0] == "type":
-                for j, ch in enumerate(a[1]):
-                    native_kb_press(ch, delay=key_dwell(persona))
-                    if j < len(a[1]) - 1:
-                        time.sleep(max(0.03, random.gauss(0.11, 0.04)))
+                # The same typing model as text (persona dwell, gaussian gaps, thinking pauses,
+                # rollover): the old flat 60-150 ms gap had a CV of 0.24 and no rollover at all. A
+                # segment moves on by itself after its last digit, and keys go down in order, so a
+                # rolled-over digit still lands in the right field (checked on r38, all five types).
+                # No typos: a slip in a date is a wrong date.
+                _human_type_text(a[1], typos=False)
             else:
                 _key(a[1], a[2] if len(a) > 2 else 1, gap=(70, 170))
             time.sleep(_rand(60, 220) / 1000.0)   # between fields: the eye checks what it typed
         return datetime_equal(kind, loc.input_value(), value)
+
+    def _classify_tag(loc):
+        """'textarea' | 'input' | None, through Playwright's utility-world queries."""
+        for tag in ("textarea", "input"):
+            if loc.locator("xpath=self::%s" % tag).count():
+                return tag
+        return None
 
     def _classify_fallback(loc):
         """Classify through Playwright's utility-world queries when the hit test could not prove the
@@ -1471,8 +1536,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 # ControlOrMeta: Playwright sends the add-to-selection key the ENGINE honours
                 _press_at(px, py, normalize_click_options({"modifiers": ["ControlOrMeta"]}))
             else:
-                time.sleep(_rand(40, 130) / 1000.0)
-                native_click(px, py, delay=click_hold(persona))
+                _press_here(px, py)
             time.sleep(_rand(150, 350) / 1000.0)
         final = _listbox_row(info, want[0])
         if not final:
@@ -1734,7 +1798,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             _glide(x, y)
             if not no_click:
                 if native_down is None or native_up is None:
-                    time.sleep(_rand(40, 130) / 1000.0)
+                    _pre_press()
                     native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                                  button=o["button"], click_count=o["click_count"])
                 else:
@@ -1939,8 +2003,7 @@ def _patch_locator_class():
                     persona = getattr(page, "_clearcote_persona", None)
                     grab_ms, release_ms = drag_dwell(persona) if persona else (_rand(130, 360), _rand(90, 230))
                     page.mouse.move(sx, sy)
-                    time.sleep(_rand(100, 200) / 1000.0)
-                    page.mouse.down()                     # native -> button held across the glide
+                    page.mouse.down()                     # pre-press pause, then held across the glide
                     time.sleep(grab_ms / 1000.0)          # grab hesitation
                     held_glide = getattr(page, "_clearcote_held_glide", None)
                     if held_glide:

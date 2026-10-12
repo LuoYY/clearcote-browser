@@ -15,8 +15,9 @@ import random
 import time
 
 from ._forms import (
-    classify_field, datetime_equal, engine_path_ok, formatted_equal, match_option, normalize_click_options,
-    numeric_equal, plan_datetime, plan_select, plan_typo, range_attrs, range_fraction, range_nudge, range_point,
+    classify_field, datetime_equal, engine_path_ok, fit_maxlength, formatted_equal, match_option,
+    normalize_click_options, numeric_equal, plan_datetime, plan_select, plan_typo, pre_press_ms, range_attrs,
+    range_fraction, range_nudge, range_point,
     range_sanitize, range_value_ok, segment_nodes_from_tree, typo_eligible, typos_allowed,
 )
 from ._humanize import (
@@ -103,6 +104,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # helpers below hold modifiers with them.
     kb = page.keyboard
     native_kb_type, native_kb_press = kb.type, kb.press
+    native_kb_insert = getattr(kb, "insert_text", None)   # a bulk fill's paste (Input.insertText)
     # getattr: a page-like keyboard without down/up still gets every other humanization; it just
     # types capitals without the Shift key, as before.
     native_kb_down, native_kb_up = getattr(kb, "down", None), getattr(kb, "up", None)
@@ -235,6 +237,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 await native_move(*st["pos"])
             except Exception:  # noqa: BLE001 - best effort: keep the press on target
                 pass
+            # The pre-press pause, after the pin (itself a pointermove): see _humanize.hdown. A
+            # down() with no move before it (never placed) stays instant.
+            await _pre_press()
         # try/finally so a raising press cannot strand held=True and make every later move a
         # phantom drag leg (hup already had this; hdown did not).
         try:
@@ -261,6 +266,31 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             st["platform"] = plat or _host_platform()
         return st["platform"]
 
+    async def _pre_press():
+        """The pause between the pointer coming to rest and the button going down (_forms.pre_press_ms:
+        40-250 ms, right-skewed, centred per identity)."""
+        await asyncio.sleep(pre_press_ms(persona.seed) / 1000.0)
+
+    async def _press_here(x, y, hold=None):
+        """Press and release the left button where the last glide left the pointer, after the
+        pre-press pause. Native down/up, so nothing moves (see _humanize._press_here)."""
+        hold = click_hold(persona) if hold is None else hold
+        await _pre_press()
+        if native_down is None or native_up is None:
+            await native_click(x, y, delay=hold)
+            return
+        t0 = time.monotonic()
+        try:
+            await native_down()   # inside the try: a press in flight when cancelled was still sent
+            await asyncio.sleep(_hold_rest(hold, t0))
+        finally:
+            await _release(native_up())   # never leave the button down, not even when cancelled
+
+    def _hold_rest(hold_ms, t0):
+        """What is left of a button hold once mouse.down() has returned (see _humanize._hold_rest): the
+        hold runs from when the press was sent, not from when the page finished handling it."""
+        return max(0.0, hold_ms / 1000.0 - (time.monotonic() - t0))
+
     async def _press_at(x, y, o):
         """Press at (x, y) -- where the last glide ended -- the way the options ask: the button, the
         click count (a double click is two presses with a human gap), the caller's hold (`delay`) or
@@ -273,14 +303,15 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 held.append(m)   # before the await: a keydown in flight when cancelled was still sent
                 await native_kb_down(m)
                 await asyncio.sleep(_rand(40, 110) / 1000.0)
-            await asyncio.sleep(_rand(40, 130) / 1000.0)    # brief dwell before pressing, like a human
+            await _pre_press()    # the hand confirms the target before it presses
             n = o["click_count"]
             for i in range(1, n + 1):
                 hold = o["delay"] if o["delay"] is not None else click_hold(persona)
+                t0 = time.monotonic()
                 try:
                     # inside the try: a press in flight when the task is cancelled was still sent
                     await native_down(button=o["button"], click_count=i)
-                    await asyncio.sleep(hold / 1000.0)
+                    await asyncio.sleep(_hold_rest(hold, t0))
                 finally:
                     # never leave the button down -- not on an error, and not when this task is
                     # cancelled mid-hold (the next move would be a drag)
@@ -307,7 +338,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         await _glide(x, y)
         try:
             if native_down is None or native_up is None or (o["modifiers"] and native_kb_down is None):
-                await asyncio.sleep(_rand(40, 130) / 1000.0)
+                await _pre_press()
                 await native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                                    **_sel_kw(kw, "button", "click_count"))
                 return
@@ -872,8 +903,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             return False
         pt = at if at is not None else click_point(box, st["pos"], persona)  # 2D gaussian toward centre
         await _glide(pt[0], pt[1])
-        await asyncio.sleep(_rand(40, 130) / 1000.0)
-        await native_click(pt[0], pt[1], delay=click_hold(persona))
+        await _press_here(pt[0], pt[1])
         return True
 
     async def _key(k, n=1, gap=(60, 150)):
@@ -960,10 +990,20 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         focus is, and the page cannot observe it. A field whose value cannot be read, or a click that
         did not put the caret in it (an overlay took it), is left to Playwright -- "could not check"
         is never treated as success."""
-        if len(value) > 200:
-            return False   # bulk values: keep fill fast/atomic (humanizing 1000s of chars would crawl)
         is_ce = bool(info and info.get("ce")) or (
             info is None and ((await loc.get_attribute("contenteditable")) or "false") != "false")
+        # What the field can hold (maxlength), and bulk values inserted after the click: see
+        # _humanize._fill_text.
+        if is_ce:
+            want = value
+        elif info is not None:
+            want = fit_maxlength(value, info.get("maxlength"), info.get("tag"), info.get("type"))
+        else:
+            want = fit_maxlength(value, await loc.get_attribute("maxlength"), await _classify_tag(loc),
+                                 (await loc.get_attribute("type")) or "")
+        bulk = len(value) > 200
+        if bulk and native_kb_insert is None:
+            return False
         if not await _focus_click(box, _proven_point(box, info) if box else None, loc, selector):
             return False
         await asyncio.sleep(_rand(40, 120) / 1000.0)
@@ -976,29 +1016,38 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             except Exception:  # noqa: BLE001
                 return None
 
+        async def put(text, typos=True):
+            if bulk:
+                await asyncio.sleep(_rand(120, 320) / 1000.0)   # the paste shortcut, after the click
+                await native_kb_insert(text)
+            else:
+                await _human_type_text(text, field=info, typos=typos)
+
         if is_ce:
             cur = info.get("value") if info else None
             if cur:
                 await _clear_focused()
-            await _human_type_text(value, field=info)
+            await put(want)
             return True   # contenteditable: Playwright's fill sets text the same way; no value to read
         cur = await read()
         if cur is None:
             return False
         if cur:  # a person does not select-all an empty field
             await _clear_focused(read)
-        await _human_type_text(value, field=info)
+        await put(want)
         got = await read()
         if got is None:
             return False
-        if got == value or formatted_equal(got, value):
+        if got == want or formatted_equal(got, want):
             return True   # exact, or a mask that only re-punctuated what was typed (a phone format)
+        if bulk:
+            return False   # an inserted value that did not land: Playwright's fill, not a second paste
         # Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips,
         # then give the field to Playwright -- a correct value beats pretty input.
         await _clear_focused(read)
-        await _human_type_text(value, field=info, typos=False)
+        await put(want, typos=False)
         got = await read()
-        return got is not None and (got == value or formatted_equal(got, value))
+        return got is not None and (got == want or formatted_equal(got, want))
 
     async def _fill_range(loc, box, info, value):
         """A range input: drag the thumb (or click the track) to the value, then arrow-nudge to it
@@ -1033,7 +1082,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             cx, cy = range_point(box, range_fraction(cur, lo, hi), rtl)
             cy += random.gauss(0, box["height"] * 0.08)
             await _glide(cx, cy, target_w=16)
-            await asyncio.sleep(_rand(60, 160) / 1000.0)
+            await _pre_press()
             grab_ms, release_ms = drag_dwell(persona)
             st["held"] = True
             try:
@@ -1046,8 +1095,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 await _release(native_up())   # the thumb is let go even when cancelled mid-drag
         else:
             await _glide(tx, ty, target_w=16)
-            await asyncio.sleep(_rand(40, 130) / 1000.0)
-            await native_click(tx, ty, delay=click_hold(persona))
+            await _press_here(tx, ty)
         for _ in range(3):
             v = await now()
             if v is None:
@@ -1093,19 +1141,23 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             px = box["x"] + min(14.0, box["width"] * 0.12)
             py = box["y"] + box["height"] / 2
         await _glide(px, py, target_w=fw)
-        await asyncio.sleep(_rand(40, 130) / 1000.0)
-        await native_click(px, py, delay=click_hold(persona))
+        await _press_here(px, py)
         await asyncio.sleep(_rand(150, 350) / 1000.0)
         for a in plan:
             if a[0] == "type":
-                for j, ch in enumerate(a[1]):
-                    await native_kb_press(ch, delay=key_dwell(persona))
-                    if j < len(a[1]) - 1:
-                        await asyncio.sleep(max(0.03, random.gauss(0.11, 0.04)))
+                # the text typing model, rollover included, no typos (see _humanize._fill_datetime)
+                await _human_type_text(a[1], typos=False)
             else:
                 await _key(a[1], a[2] if len(a) > 2 else 1, gap=(70, 170))
             await asyncio.sleep(_rand(60, 220) / 1000.0)   # between fields: the eye checks what it typed
         return datetime_equal(kind, await loc.input_value(), value)
+
+    async def _classify_tag(loc):
+        """'textarea' | 'input' | None, through Playwright's utility-world queries."""
+        for tag in ("textarea", "input"):
+            if await loc.locator("xpath=self::%s" % tag).count():
+                return tag
+        return None
 
     async def _classify_fallback(loc):
         """Classify through Playwright's utility-world queries when the hit test could not prove the
@@ -1295,8 +1347,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 # ControlOrMeta: Playwright sends the add-to-selection key the ENGINE honours
                 await _press_at(px, py, normalize_click_options({"modifiers": ["ControlOrMeta"]}))
             else:
-                await asyncio.sleep(_rand(40, 130) / 1000.0)
-                await native_click(px, py, delay=click_hold(persona))
+                await _press_here(px, py)
             await asyncio.sleep(_rand(150, 350) / 1000.0)
         final = await _listbox_row(info, want[0])
         if not final:
@@ -1523,7 +1574,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             await _glide(x, y)
             if not no_click:
                 if native_down is None or native_up is None:
-                    await asyncio.sleep(_rand(40, 130) / 1000.0)
+                    await _pre_press()
                     await native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                                        button=o["button"], click_count=o["click_count"])
                 else:
@@ -1743,9 +1794,8 @@ def _patch_locator_class():
                     persona = getattr(page, "_clearcote_persona", None)
                     grab_ms, release_ms = drag_dwell(persona) if persona else (_rand(130, 360), _rand(90, 230))
                     await page.mouse.move(sx, sy)
-                    await asyncio.sleep(_rand(100, 200) / 1000.0)
                     try:
-                        await page.mouse.down()                 # native -> button held across the glide
+                        await page.mouse.down()                 # pre-press pause, then held across the glide
                         await asyncio.sleep(grab_ms / 1000.0)   # grab hesitation
                         held_glide = getattr(page, "_clearcote_held_glide", None)
                         if held_glide:

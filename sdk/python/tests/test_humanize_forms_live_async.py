@@ -323,7 +323,8 @@ async def test_filter_and_first_locators_are_humanized(page):
     await assert_human_keys(page, "name")
 
 
-async def test_field_under_a_floating_label(page):
+async def test_field_under_a_floating_label(page, typos):
+    typos(0)   # the exact key list below: no slip (2 % per key otherwise; flaky)
     # The label covers every probe point of the field: a person clicks the label (it passes the focus on)
     # and types; the fill must not fall back to Playwright's insertText.
     await reset(page)
@@ -887,3 +888,124 @@ async def test_a_click_on_a_frame_is_humanized_without_a_trial(page):
     assert len(downs) == 1 and downs[0]["tr"], inner
     assert sum(e["n"] for e in await ev(page, "mousemove")) >= 5, "the click glided (humanized)"
     assert not [e for e in main if e["t"] in ("pointerdown", "mousedown", "click")]
+
+
+# ------------------------------------------------- SC 210 lane F: maxlength, pre-press, bulk, date timing
+LONG_VALUE = ("A long note pasted into a text area: it runs well past the two hundred character limit so the "
+              "SDK inserts it in one go instead of typing it key by key, but a person still has to click into "
+              "the field before pasting anything into it, which is what this checks. The end.")
+
+
+def press_gaps(events, id=None):
+    """ms from the last mousemove (end of its collapsed run) to each pointerdown on ``id``."""
+    last, out = None, []
+    for e in events:
+        if e["t"] == "mousemove":
+            last = e.get("te", e["ts"])
+        elif e["t"] == "pointerdown" and (id is None or e["id"] == id):
+            out.append(None if last is None else e["ts"] - last)
+    return out
+
+
+async def test_maxlength_types_only_what_fits(page, typos):
+    typos(0)
+    await reset(page)
+    await page.fill("#zip", "1234567")
+    assert await page.input_value("#zip") == "12345", "Playwright's fill leaves the same five digits"
+    keys = [e["key"] for e in await ev(page, "keydown", "zip")]
+    assert keys == list("12345"), "only what fits is typed, no wipe and retype: %s" % keys
+    inputs = await ev(page, "input", "zip")
+    assert [e["value"] for e in inputs] == ["1", "12", "123", "1234", "12345"], "one key each, no insertText"
+    assert all(e["tr"] for e in inputs)
+
+
+@pytest.mark.parametrize("act", ["fill_text", "type", "slider_drag", "range_fill", "select", "listbox",
+                                 "date", "check", "click"])
+async def test_every_sdk_press_waits_after_the_pointer_arrives(page, act):
+    await reset(page)
+    target = {"fill_text": "name", "type": "city", "slider_drag": "rng", "range_fill": "rng2",
+              "select": "country", "listbox": "OPTION", "date": "d", "check": "cb", "click": "btn"}[act]
+    if act == "fill_text":
+        await page.fill("#name", "Ada Lovelace")
+    elif act == "type":
+        await page.type("#city", "Leiden")
+    elif act == "slider_drag":
+        b = await page.locator("#rng").bounding_box()
+        y = b["y"] + b["height"] / 2
+        await page.mouse.move(b["x"] + 30, y)
+        await page.mouse.down()
+        await page.mouse.move(b["x"] + 200, y)
+        await page.mouse.up()
+    elif act == "range_fill":
+        await page.fill("#rng2", "15")
+    elif act == "select":
+        await page.select_option("#country", label="Iceland")
+    elif act == "listbox":
+        await page.select_option("#lb", "opt3")
+    elif act == "date":
+        await page.fill("#d", "1990-04-12")
+    elif act == "check":
+        await page.check("#cb")
+    else:
+        await page.click("#btn")
+    gaps = press_gaps(await ev(page), target)
+    assert gaps, "a press reached #%s" % target
+    short = [g if g is None else round(g, 1) for g in gaps if g is None or g < 40]
+    assert not short, "pressed too soon after the pointer arrived: %s ms" % short
+
+
+async def test_a_bulk_fill_clicks_into_the_field_before_inserting(page):
+    assert len(LONG_VALUE) > 200
+    await reset(page)
+    await page.fill("#bio", LONG_VALUE)
+    assert await page.input_value("#bio") == LONG_VALUE
+    events = await ev(page)
+    downs = [e for e in events if e["t"] == "pointerdown" and e["id"] == "bio"]
+    inputs = [e for e in events if e["t"] == "input" and e["id"] == "bio"]
+    assert downs and downs[0]["tr"], "a trusted press into the field"
+    assert inputs and downs[0]["ts"] < inputs[0]["ts"], "the press comes before the insert"
+    assert len(inputs) == 1 and inputs[0]["it"] == "insertText", "one insert, not typed key by key"
+
+
+DATE_VALUES = {"#d": ["1990-04-12", "2031-11-03"], "#t": ["14:35", "07:58"], "#m": ["2026-10", "1999-03"],
+               "#w": ["2026-W41", "2019-W07"], "#dtl": ["2026-01-15T09:30", "1987-06-24T21:12"]}
+
+
+async def test_date_segments_use_the_typing_model_and_survive_rollover(page, monkeypatch):
+    import statistics
+    from clearcote import _humanize_async
+    gaps, rolls = [], 0
+    for forced in (False, True):
+        if forced:   # every eligible digit pair rolled over: auto-advancing segments still get their digits
+            monkeypatch.setattr(_humanize_async, "rollover_rate", lambda p: 1.0)
+        for sel, values in DATE_VALUES.items():
+            for value in values:
+                await reset(page)
+                await page.fill(sel, value)
+                assert await page.input_value(sel) == value, (sel, value, forced)
+                events = await ev(page)
+                kd = [e for e in events if e["t"] == "keydown" and e["id"] == sel[1:]]
+                ku = [e for e in events if e["t"] == "keyup" and e["id"] == sel[1:]]
+                if not forced:
+                    gaps += [b["ts"] - a["ts"] for a, b in zip(kd, kd[1:]) if b["ts"] - a["ts"] < 2000]
+                for i, d in enumerate(kd[:-1]):
+                    up = next((u for u in ku if u["code"] == d["code"] and u["ts"] >= d["ts"]), None)
+                    if forced and up is not None and kd[i + 1]["ts"] < up["ts"]:
+                        rolls += 1
+    cv = statistics.pstdev(gaps) / statistics.mean(gaps)
+    assert 0.3 <= cv <= 1.0, "inter-key variation %.2f over %d gaps" % (cv, len(gaps))
+    assert rolls, "rollover happened"
+
+
+async def test_select_open_click_is_held_as_planned(page, monkeypatch):
+    import statistics
+    from clearcote import _humanize_async
+    monkeypatch.setattr(_humanize_async, "click_hold", lambda p, rng=None: 120.0)
+    holds = []
+    for label in ("Iceland", "Norway", "Chile", "Kenya", "Malta", "Spain"):
+        await reset(page)
+        await page.select_option("#country", label=label)
+        d, u = await ev(page, "mousedown", "country"), await ev(page, "mouseup", "country")
+        assert d and u
+        holds.append(u[0]["ts"] - d[0]["ts"])
+    assert statistics.median(holds) <= 135, "held %s ms for a planned 120" % [round(h) for h in holds]

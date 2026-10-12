@@ -144,7 +144,7 @@
     document.addEventListener(t, e => {
       const el = e.target && e.target.nodeType === 1 ? e.target : null;
       if (t === 'mousemove' && __ev.length && __ev[__ev.length - 1].t === 'mousemove') {
-        __ev[__ev.length - 1].n++; return;   // collapse move runs: count only
+        const m = __ev[__ev.length - 1]; m.n++; m.te = e.timeStamp; return;   // collapse move runs: count + last ts
       }
       __ev.push({ t, id: el ? (el.id || el.className || el.tagName) : '', tr: e.isTrusted, ts: e.timeStamp,
         key: e.key || '', code: e.code || '', button: (typeof e.button === 'number') ? e.button : null,
