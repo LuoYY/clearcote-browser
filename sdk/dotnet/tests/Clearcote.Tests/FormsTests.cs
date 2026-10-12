@@ -79,7 +79,7 @@ public class FormsTests
     {
         "classify_field", "typos_allowed", "typo_eligible", "formatted_equal", "nearby_digits", "typeahead_simulate",
         "plan_select", "match_option", "range_sanitize", "range_value_ok", "range_point", "range_nudge", "plan_datetime",
-        "datetime_equal", "normalize_click_options", "engine_path_ok",
+        "datetime_equal", "normalize_click_options", "engine_path_ok", "fit_maxlength", "pre_press_center", "pre_press_ms",
     };
 
     [Fact]
@@ -655,5 +655,68 @@ public class FormsTests
         foreach (var src in new[] { IsolatedWorld.ActiveValue, IsolatedWorld.ActiveField, IsolatedWorld.Describe, IsolatedWorld.FormControl,
                                     IsolatedWorld.HitInBox, IsolatedWorld.ListboxRow, IsolatedWorld.CssBox, IsolatedWorld.ScrollBy })
             Assert.Contains(src.Replace("\r\n", "\n"), py);
+    }
+
+    // ------------------------------------------------------------ maxlength + pre-press pause (SC 210)
+    [Theory, MemberData(nameof(Cases), "fit_maxlength")]
+    public void Fit_maxlength(int i)
+    {
+        var c = Case("fit_maxlength", i);
+        var ml = c.GetProperty("maxlength");
+        int? n = ml.ValueKind == JsonValueKind.Number ? ml.GetInt32() : null;
+        Assert.Equal(Str(c, "want"), Forms.FitMaxlength(Str(c, "value")!, n, Str(c, "tag"), Str(c, "type")));
+    }
+
+    [Theory, MemberData(nameof(Cases), "pre_press_center")]
+    public void Pre_press_center(int i)
+    {
+        var c = Case("pre_press_center", i);
+        Assert.Equal(c.GetProperty("center").GetDouble(), Forms.PrePressCenter(c.GetProperty("seed").GetUInt32()), 6);
+    }
+
+    [Theory, MemberData(nameof(Cases), "pre_press_ms")]
+    public void Pre_press_ms(int i)
+    {
+        var c = Case("pre_press_ms", i);
+        var r = Motion.Mulberry32(c.GetProperty("rng_seed").GetUInt32());
+        uint seed = c.GetProperty("seed").GetUInt32();
+        foreach (var want in c.GetProperty("ms").EnumerateArray())
+            Assert.Equal(want.GetDouble(), Forms.PrePressMs(seed, r), 6);
+    }
+
+    [Fact]
+    public void Pre_press_pause_is_40_to_250_ms_right_skewed_and_per_identity()
+    {
+        var centres = new HashSet<double>();
+        foreach (var name in new[] { "ha-1", "ha-2", "ha-3", "ha-4", "ha-5", "ha-6" })
+        {
+            uint seed = Motion.HashSeed(name);
+            var r = Motion.Mulberry32(seed);
+            var xs = Enumerable.Range(0, 4000).Select(_ => Forms.PrePressMs(seed, r)).OrderBy(x => x).ToList();
+            Assert.True(xs[0] >= 40 && xs[^1] <= 250);
+            Assert.True(xs.Average() > xs[xs.Count / 2], "right-skewed");
+            Assert.True(xs.Count(x => x == 40 || x == 250) <= 4, "no pile-up at the bounds");
+            var c = Forms.PrePressCenter(seed);
+            Assert.InRange(c, 70, 135);
+            centres.Add(Math.Round(c, 3));
+        }
+        Assert.Equal(6, centres.Count);
+    }
+
+    [Fact]
+    public void Fit_maxlength_is_the_longest_prefix_that_fits_in_utf16_units()
+    {
+        var rng = new Random(5);
+        var pool = new[] { "a", "b", "1", char.ConvertFromUtf32(0x1F600) };
+        for (int k = 0; k < 500; k++)
+        {
+            int n = rng.Next(-1, 13);
+            var v = string.Concat(Enumerable.Range(0, rng.Next(0, 11)).Select(_ => pool[rng.Next(pool.Length)]));
+            var got = Forms.FitMaxlength(v, n, "input", "text");
+            Assert.StartsWith(got, v, StringComparison.Ordinal);
+            if (n < 0) { Assert.Equal(v, got); continue; }
+            Assert.True(got.Length <= n);
+            if (got != v) Assert.True(got.Length + (char.IsHighSurrogate(v[got.Length]) ? 2 : 1) > n);
+        }
     }
 }

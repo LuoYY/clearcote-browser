@@ -192,6 +192,68 @@ internal static class Forms
     // Python's str.isalnum() for one code point: a letter or a digit of any script.
     private static bool IsAlnum(string ch) => Rune.TryGetRuneAt(ch, 0, out var r) && (Rune.IsLetterOrDigit(r) || Rune.IsNumber(r));
 
+    // ------------------------------------------------------------------------------- maxlength
+    /// <summary>The input types whose maxlength the browser enforces on what is typed or inserted (plus textarea).</summary>
+    public static readonly IReadOnlySet<string> MaxlengthTypes = new HashSet<string> { "", "text", "search", "url", "tel", "email", "password" };
+
+    /// <summary>
+    /// The part of <paramref name="value"/> an EMPTY control with <paramref name="maxlength"/> ends up holding:
+    /// what Playwright's fill (Input.insertText) leaves there, and what a person types before the field stops
+    /// taking keys. maxlength counts UTF-16 code units, as Blink does; a character that would be cut in half
+    /// (beyond the BMP) is dropped whole. A negative or missing maxlength, a contenteditable and a type that
+    /// ignores maxlength keep the whole value. Port of _forms.fit_maxlength (r38: fill("1234567") on
+    /// maxlength=5 typed seven digits, wiped the field, typed seven again, then fell back to Playwright).
+    /// </summary>
+    public static string FitMaxlength(string value, int? maxlength, string? tag = "input", string? inputType = "")
+    {
+        int n = maxlength ?? -1;
+        var t = (tag ?? "").ToLowerInvariant();
+        if (n < 0 || (t != "input" && t != "textarea")) return value;
+        if (t == "input" && !MaxlengthTypes.Contains((inputType ?? "").ToLowerInvariant())) return value;
+        int units = 0;
+        var sb = new StringBuilder();
+        foreach (var r in value.EnumerateRunes())
+        {
+            units += r.Utf16SequenceLength;
+            if (units > n) return sb.ToString();
+            sb.Append(r.ToString());
+        }
+        return value;
+    }
+
+    // ------------------------------------------------------------------------------ pre-press pause
+    /// <summary>Lower bound of the pause between the pointer coming to rest and the button going down (ms).</summary>
+    public const double PrePressMinMs = 40;
+    /// <summary>Upper bound of the pre-press pause (ms).</summary>
+    public const double PrePressMaxMs = 250;
+    // Salt for the per-identity centre (same value in _forms.py and forms.ts).
+    private const uint PrePressSalt = 0x5BD1E995;
+
+    /// <summary>The identity's typical pre-press pause (ms), 70..135, stable per persona seed.</summary>
+    public static double PrePressCenter(uint seed)
+    {
+        double r = Motion.Mulberry32(seed ^ PrePressSalt)();
+        return 70 + (135 - 70) * r;
+    }
+
+    /// <summary>
+    /// One pre-press pause (ms): a log-normal above the 40 ms floor with its median at the identity's centre
+    /// (sigma 0.55, right-skewed); a draw past 250 ms is drawn again (up to four times, then capped). Port of
+    /// _forms.pre_press_ms. Measured on r38 before it: the focus click before typing pressed ~4 ms after the
+    /// last pointermove, a drag grab ~21 ms.
+    /// </summary>
+    public static double PrePressMs(uint seed, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double c = PrePressCenter(seed) - PrePressMinMs;
+        for (int k = 0; k < 4; k++)
+        {
+            double ms = PrePressMinMs + c * Math.Exp(0.55 * Motion.GaussFrom(rng));
+            if (ms <= PrePressMaxMs) return ms;
+        }
+        return PrePressMaxMs;
+    }
+
     // ------------------------------------------------------------------------------ select-all
     /// <summary>The select-all chord a person on <paramref name="platform"/> uses: Cmd+A on a Mac, Ctrl+A elsewhere.</summary>
     public static string SelectAllCombo(string? platform)

@@ -1018,4 +1018,166 @@ public class HumanizeFormsLiveTests : IClassFixture<FormsLiveBrowser>
         Assert.True(await page.EvaluateAsync<double>("document.getElementById('scroller').scrollTop") > 0);
         Assert.NotEmpty(await Ev(page, "mousemove"));   // the pointer travelled to it
     });
+
+    // ------------------------------------------------- SC 210 lane F: maxlength, pre-press, bulk, date timing
+    private const string LongValue = "A long note pasted into a text area: it runs well past the two hundred character limit so the "
+        + "SDK inserts it in one go instead of typing it key by key, but a person still has to click into "
+        + "the field before pasting anything into it, which is what this checks. The end.";
+
+    /// ms from the last mousemove (end of its collapsed run) to each pointerdown on <paramref name="id"/>.
+    private static List<double?> PressGaps(List<JsonElement> events, string id)
+    {
+        double? last = null;
+        var gaps = new List<double?>();
+        foreach (var e in events)
+        {
+            var t = S(e, "t");
+            if (t == "mousemove") last = double.IsNaN(D(e, "te")) ? D(e, "ts") : D(e, "te");
+            else if (t == "pointerdown" && S(e, "id") == id) gaps.Add(last is double l ? D(e, "ts") - l : null);
+        }
+        return gaps;
+    }
+
+    [Fact]
+    public Task Maxlength_types_only_what_fits() => WithTypoRate(0, () => Live(async page =>
+    {
+        await Reset(page);
+        await page.HumanFillAsync("#zip", "1234567");
+        Assert.Equal("12345", await page.InputValueAsync("#zip"));
+        Assert.Equal(new[] { "1", "2", "3", "4", "5" }, (await Ev(page, "keydown", "zip")).Select(e => S(e, "key")).ToArray());
+        var inputs = await Ev(page, "input", "zip");
+        Assert.Equal(new[] { "1", "12", "123", "1234", "12345" }, inputs.Select(e => S(e, "value")).ToArray());
+        Assert.All(inputs, e => Assert.True(Tr(e)));
+        Assert.Empty(Fallbacks);
+    }));
+
+    [Theory]
+    [InlineData("fill_text")]
+    [InlineData("type")]
+    [InlineData("drag")]
+    [InlineData("range_fill")]
+    [InlineData("select")]
+    [InlineData("listbox")]
+    [InlineData("date")]
+    [InlineData("check")]
+    [InlineData("click")]
+    public Task Every_sdk_press_waits_after_the_pointer_arrives(string act) => Live(async page =>
+    {
+        await Reset(page);
+        var target = act switch
+        {
+            "fill_text" => "name", "type" => "city", "drag" => "rng", "range_fill" => "rng2", "select" => "country",
+            "listbox" => "OPTION", "date" => "d", "check" => "cb", _ => "btn",
+        };
+        switch (act)
+        {
+            case "fill_text": await page.HumanFillAsync("#name", "Ada Lovelace"); break;
+            case "type": await page.Locator("#city").HumanTypeAsync("Leiden"); break;
+            case "drag":
+                var b = (await page.Locator("#rng").BoundingBoxAsync())!;
+                await page.Locator("#rng").HumanDragToAsync(b.X + 250, b.Y + b.Height / 2);
+                break;
+            case "range_fill": await page.HumanFillAsync("#rng2", "15"); break;
+            case "select": await page.HumanSelectOptionAsync("#country", new SelectOptionValue { Label = "Iceland" }); break;
+            case "listbox": await page.HumanSelectOptionAsync("#lb", "opt3"); break;
+            case "date": await page.HumanFillAsync("#d", "1990-04-12"); break;
+            case "check": await page.HumanCheckAsync("#cb"); break;
+            default: await page.HumanClickAsync("#btn"); break;
+        }
+        var gaps = PressGaps(await Ev(page), target);
+        Assert.True(gaps.Count > 0, $"a press reached #{target}{Why}");
+        var shortGaps = gaps.Where(g => g is null || g < 40).ToList();
+        Assert.True(shortGaps.Count == 0, $"pressed too soon after the pointer arrived: {string.Join(", ", shortGaps)} ms");
+    });
+
+    [Fact]
+    public Task A_bulk_fill_clicks_into_the_field_before_inserting() => Live(async page =>
+    {
+        Assert.True(LongValue.Length > 200);
+        await Reset(page);
+        await page.HumanFillAsync("#bio", LongValue);
+        Assert.Equal(LongValue, await page.InputValueAsync("#bio"));
+        var events = await Ev(page);
+        var downs = events.Where(e => S(e, "t") == "pointerdown" && S(e, "id") == "bio").ToList();
+        var inputs = events.Where(e => S(e, "t") == "input" && S(e, "id") == "bio").ToList();
+        Assert.True(downs.Count > 0 && Tr(downs[0]), "a trusted press into the field" + Why);
+        Assert.Single(inputs);
+        Assert.Equal("insertText", S(inputs[0], "it"));
+        Assert.True(D(downs[0], "ts") < D(inputs[0], "ts"), "the press comes before the insert");
+        Assert.Empty(Fallbacks);
+    });
+
+    [Fact]
+    public Task The_select_open_click_is_held_as_planned() => Live(async page =>
+    {
+        // The open click's page hold was the click-hold model PLUS the popup's opening (~206 ms in the SC 209
+        // lab for a 60-150 ms plan). The persona's own plan is the reference here: the median stays inside it.
+        var holds = new List<double>();
+        foreach (var label in new[] { "Iceland", "Norway", "Chile", "Kenya", "Malta", "Spain", "Japan", "Ghana" })
+        {
+            await Reset(page);
+            await page.HumanSelectOptionAsync("#country", new SelectOptionValue { Label = label });
+            var d = await Ev(page, "mousedown", "country");
+            var u = await Ev(page, "mouseup", "country");
+            Assert.True(d.Count > 0 && u.Count > 0);
+            holds.Add(D(u[0], "ts") - D(d[0], "ts"));
+        }
+        holds.Sort();
+        Assert.True(holds[holds.Count / 2] <= 160, "holds " + string.Join(", ", holds.Select(h => Math.Round(h))));
+    });
+
+    private static readonly (string Sel, string[] Values)[] DateValues =
+    {
+        ("#d", new[] { "1990-04-12", "2031-11-03" }), ("#t", new[] { "14:35", "07:58" }), ("#m", new[] { "2026-10", "1999-03" }),
+        ("#w", new[] { "2026-W41", "2019-W07" }), ("#dtl", new[] { "2026-01-15T09:30", "1987-06-24T21:12" }),
+    };
+
+    [Fact]
+    public async Task Date_segments_use_the_typing_model_across_identities_and_survive_rollover()
+    {
+        if (_b.Context is null) return;
+        var gaps = new List<double>();
+        int rolls = 0;
+        foreach (var (ident, forced) in new[] { ("dt-id-1", false), ("dt-id-2", false), ("dt-id-3", false), ("dt-id-4", true) })
+        {
+            var page = await _b.Context.NewPageAsync();
+            try
+            {
+                Humanize.Attach(page, ident);
+                if (forced) Humanize.RolloverOverride.AddOrUpdate(page, new System.Runtime.CompilerServices.StrongBox<double>(1.0));
+                await page.GotoAsync(Fixture);
+                foreach (var (sel, values) in DateValues)
+                {
+                    foreach (var value in values)
+                    {
+                        await Reset(page);
+                        await page.HumanFillAsync(sel, value);
+                        Assert.Equal(value, await page.InputValueAsync(sel));
+                        var evs = await Ev(page);
+                        var kd = evs.Where(e => S(e, "t") == "keydown" && S(e, "id") == sel[1..]).ToList();
+                        var ku = evs.Where(e => S(e, "t") == "keyup" && S(e, "id") == sel[1..]).ToList();
+                        for (int i = 1; i < kd.Count; i++)
+                        {
+                            var g = D(kd[i], "ts") - D(kd[i - 1], "ts");
+                            if (!forced && g < 2000) gaps.Add(g);
+                        }
+                        for (int i = 0; i + 1 < kd.Count; i++)
+                        {
+                            var up = ku.FirstOrDefault(u => S(u, "code") == S(kd[i], "code") && D(u, "ts") >= D(kd[i], "ts"));
+                            if (forced && up.ValueKind == JsonValueKind.Object && D(kd[i + 1], "ts") < D(up, "ts")) rolls++;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                await page.CloseAsync();
+            }
+        }
+        double mean = gaps.Average();
+        double sd = Math.Sqrt(gaps.Sum(g => (g - mean) * (g - mean)) / gaps.Count);
+        double cv = sd / mean;
+        Assert.True(cv >= 0.3 && cv <= 1.0, $"inter-key variation {cv:F2} over {gaps.Count} gaps");
+        Assert.True(rolls > 0, "rollover happened");
+    }
 }

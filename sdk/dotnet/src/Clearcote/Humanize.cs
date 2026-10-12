@@ -777,16 +777,17 @@ public static class Humanize
                 held.Add(m);
                 await Task.Delay((int)Rand(40, 110)).ConfigureAwait(false);
             }
-            await Task.Delay((int)Rand(40, 130)).ConfigureAwait(false);   // brief dwell before pressing
+            await PrePressAsync(p).ConfigureAwait(false);   // the hand confirms the target before it presses
             var button = o.Button switch { "right" => MouseButton.Right, "middle" => MouseButton.Middle, _ => MouseButton.Left };
             for (int i = 1; i <= o.ClickCount; i++)
             {
                 // Delay <= 0 or non-finite was normalised to null: the persona's hold (Task.Delay(-1) is forever).
                 double hold = o.Delay is double d && d > 0 && double.IsFinite(d) ? d : Motion.ClickHold(p);
+                var sent = System.Diagnostics.Stopwatch.StartNew();
                 await page.Mouse.DownAsync(new MouseDownOptions { Button = button, ClickCount = i }).ConfigureAwait(false);
                 try
                 {
-                    await Task.Delay((int)Math.Min(int.MaxValue, Math.Round(hold))).ConfigureAwait(false);
+                    await Task.Delay(HoldRest(hold, sent)).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -807,14 +808,39 @@ public static class Humanize
         }
     }
 
-    /// <summary>A plain left click at (x, y) with the persona's hold, after a brief settle (the glide
-    /// there has already happened).</summary>
+    /// <summary>
+    /// A plain left click where the last glide left the pointer (x, y), with the persona's hold, after the
+    /// pre-press pause. Down/up, so nothing moves: Mouse.ClickAsync(x, y) sends one more mouseMoved first,
+    /// and THAT was the last pointermove the page saw, ~4 ms before the press (the typing focus click,
+    /// measured on r38). (x, y) only document the point the glide ended at.
+    /// </summary>
     private static async Task ClickAtAsync(IPage page, Persona p, double x, double y)
     {
-        await Task.Delay((int)Rand(40, 130)).ConfigureAwait(false);
-        await page.Mouse.ClickAsync((float)x, (float)y, new MouseClickOptions { Delay = (float)Motion.ClickHold(p) })
-            .ConfigureAwait(false);
+        _ = x; _ = y;
+        await PrePressAsync(p).ConfigureAwait(false);
+        double hold = Motion.ClickHold(p);
+        var sent = System.Diagnostics.Stopwatch.StartNew();
+        await page.Mouse.DownAsync().ConfigureAwait(false);
+        try
+        {
+            await Task.Delay(HoldRest(hold, sent)).ConfigureAwait(false);
+        }
+        finally
+        {
+            await page.Mouse.UpAsync().ConfigureAwait(false);   // never leave the button down
+        }
     }
+
+    /// <summary>The pause between the pointer coming to rest and the button going down
+    /// (<see cref="Forms.PrePressMs"/>: 40-250 ms, right-skewed, centred per identity).</summary>
+    private static Task PrePressAsync(Persona p) => Task.Delay((int)Math.Round(Forms.PrePressMs(p.Seed)));
+
+    /// <summary>What is left of a button hold once Mouse.DownAsync has returned. The hold runs from when the
+    /// press was SENT: DownAsync returns only after the page has handled the press, and a &lt;select&gt; opens
+    /// its popup inside that handling, so a hold slept afterwards reached the page ~30-80 ms longer than
+    /// planned (206 ms median for the open click in the SC 209 lab, planned 60-150 ms).</summary>
+    private static int HoldRest(double holdMs, System.Diagnostics.Stopwatch sent)
+        => (int)Math.Max(0, Math.Min(int.MaxValue, Math.Round(holdMs - sent.Elapsed.TotalMilliseconds)));
 
     /// <summary>One key (or chord) pressed <paramref name="n"/> times, each HELD for the persona's dwell.</summary>
     private static async Task KeyAsync(IPage page, Persona p, string key, int n = 1, double gapLo = 60, double gapHi = 150)
@@ -865,8 +891,8 @@ public static class Humanize
         }
 
         var (grabMs, releaseMs) = Motion.DragDwell(p);
-        await Task.Delay((int)Rand(100, 200)).ConfigureAwait(false);   // hand arrives before the button goes down
         await EnsurePointerAsync(page, p, st).ConfigureAwait(false);
+        await PrePressAsync(p).ConfigureAwait(false);   // the hand arrives, then the button goes down
         await page.Mouse.DownAsync().ConfigureAwait(false);
         try
         {
@@ -2174,11 +2200,36 @@ public static class Humanize
     /// </summary>
     private static async Task<bool> FillTextAsync(ILocator loc, LocatorBoundingBoxResult? box, string value, FieldInfo? info)
     {
-        if (value.EnumerateRunes().Count() > 200) return false;   // bulk values: keep fill fast and atomic
         var page = loc.Page;
         var p = PersonaFor(page);
         var ceAttr = info is null ? await loc.GetAttributeAsync("contenteditable").ConfigureAwait(false) : null;
         bool isCe = info?.Ce == true || (info is null && (string.IsNullOrEmpty(ceAttr) ? "false" : ceAttr) != "false");
+        // What the field can hold: a maxlength keeps the first N characters (what Playwright's insertText
+        // leaves too), and a person types only those -- the field stops taking keys.
+        var want = value;
+        if (!isCe)
+        {
+            if (info is not null) want = Forms.FitMaxlength(value, info.Maxlength, info.Tag, info.Type);
+            else
+            {
+                var mlAttr = await loc.GetAttributeAsync("maxlength").ConfigureAwait(false);
+                int? ml = int.TryParse(mlAttr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var mlv) ? mlv : null;
+                var tag = await loc.Locator("xpath=self::textarea").CountAsync().ConfigureAwait(false) > 0 ? "textarea" : "input";
+                want = Forms.FitMaxlength(value, ml, tag, await loc.GetAttributeAsync("type").ConfigureAwait(false) ?? "");
+            }
+        }
+        // Bulk values (over 200 characters) are still inserted at once -- typing thousands of keys would
+        // crawl -- but the way a person pastes: glide to the field, click into it, then insert.
+        bool bulk = value.EnumerateRunes().Count() > 200;
+        async Task Put(string text, bool typos)
+        {
+            if (bulk)
+            {
+                await Task.Delay((int)Rand(120, 320)).ConfigureAwait(false);   // the paste shortcut, after the click
+                await page.Keyboard.InsertTextAsync(text).ConfigureAwait(false);
+            }
+            else await TypeTextAsync(page, p, text, info?.Traits, typos).ConfigureAwait(false);
+        }
         // the box BoxOfAsync resolved (no second BoundingBoxAsync handle the page could see)
         if (!await FocusClickAsync(page, box, box is null ? null : ProvenPoint(box, info), loc).ConfigureAwait(false)) return false;
         await Task.Delay((int)Rand(40, 120)).ConfigureAwait(false);
@@ -2200,22 +2251,23 @@ public static class Humanize
         {
             // contenteditable: Playwright's fill sets text the same way; there is no value to read back
             if (!string.IsNullOrEmpty(info?.Value)) await ClearFocusedAsync(page, p, () => ActiveValueAsync(page)).ConfigureAwait(false);
-            await TypeTextAsync(page, p, value, info?.Traits, typos: true).ConfigureAwait(false);
+            await Put(want, typos: true).ConfigureAwait(false);
             return true;
         }
         var cur = await Read().ConfigureAwait(false);
         if (cur is null) return false;
         if (cur.Length > 0) await ClearFocusedAsync(page, p, Read).ConfigureAwait(false);   // a person does not select-all an empty field
-        await TypeTextAsync(page, p, value, info?.Traits, typos: true).ConfigureAwait(false);
+        await Put(want, typos: true).ConfigureAwait(false);
         var got = await Read().ConfigureAwait(false);
         if (got is null) return false;
-        if (got == value || Forms.FormattedEqual(got, value)) return true;   // exact, or a mask that only re-punctuated it
+        if (got == want || Forms.FormattedEqual(got, want)) return true;   // exact, or a mask that only re-punctuated it
+        if (bulk) return false;   // an inserted value that did not land: Playwright's fill, not a second paste
         // Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips, then
         // give the field to Playwright -- a correct value beats pretty input.
         await ClearFocusedAsync(page, p, Read).ConfigureAwait(false);
-        await TypeTextAsync(page, p, value, info?.Traits, typos: false).ConfigureAwait(false);
+        await Put(want, typos: false).ConfigureAwait(false);
         got = await Read().ConfigureAwait(false);
-        return got is not null && (got == value || Forms.FormattedEqual(got, value));
+        return got is not null && (got == want || Forms.FormattedEqual(got, want));
     }
 
     private static async Task<double?> InputNumberAsync(ILocator loc)
@@ -2263,7 +2315,7 @@ public static class Humanize
             var (cx, cy) = Forms.RangePoint(box, Forms.RangeFraction(c, lo, hi), rtl);
             cy += Gauss(0, box.Height * 0.08);
             await GlideAsync(page, p, st, cx, cy, 16).ConfigureAwait(false);
-            await Task.Delay((int)Rand(60, 160)).ConfigureAwait(false);
+            await PrePressAsync(p).ConfigureAwait(false);
             var (grabMs, releaseMs) = Motion.DragDwell(p);
             await page.Mouse.DownAsync().ConfigureAwait(false);
             try
@@ -2349,12 +2401,11 @@ public static class Humanize
         {
             if (a.Op == "type")
             {
-                for (int j = 0; j < a.Arg.Length; j++)
-                {
-                    await page.Keyboard.PressAsync(a.Arg[j].ToString(), new KeyboardPressOptions { Delay = (float)Motion.KeyDwell(p) })
-                        .ConfigureAwait(false);
-                    if (j < a.Arg.Length - 1) await Task.Delay((int)Math.Max(30, Gauss(110, 40))).ConfigureAwait(false);
-                }
+                // The same typing model as text (persona dwell, gaussian gaps, thinking pauses, rollover):
+                // the old flat 60-150 ms gap had a CV of 0.24 and no rollover. A segment moves on by itself
+                // after its last digit and keys go down in order, so a rolled-over digit still lands in the
+                // right field (checked on r38, all five types). No typos: a slip in a date is a wrong date.
+                await TypeTextAsync(page, p, a.Arg, null, typos: false).ConfigureAwait(false);
             }
             else await KeyAsync(page, p, a.Arg, a.Count ?? 1, 70, 170).ConfigureAwait(false);
             await Task.Delay((int)Rand(60, 220)).ConfigureAwait(false);   // between fields: the eye checks what it typed
@@ -2512,7 +2563,7 @@ public static class Humanize
         public double[] Rect = Array.Empty<double>();
         public string? Value, Min, Max, Step, InputMode, Autocomplete, Dir, Wm;
         public double Bl, Bt, ProbeX = 0.5, ProbeY = 0.5;
-        public int Size, SelectedIndex = -1, Node;
+        public int Size, SelectedIndex = -1, Node, Maxlength = -1;
         public List<OptionInfo> Options = new();
         public List<double[]?>? OptRects;
 
@@ -2542,6 +2593,7 @@ public static class Humanize
                 Bl = D(e, "bl"), Bt = D(e, "bt"), Multiple = B(e, "multiple"), Size = (int)D(e, "size"),
                 SelectedIndex = e.TryGetProperty("selectedIndex", out var si) && si.ValueKind == JsonValueKind.Number ? si.GetInt32() : -1,
                 Node = node,
+                Maxlength = e.TryGetProperty("maxlength", out var ml) && ml.ValueKind == JsonValueKind.Number ? ml.GetInt32() : -1,
             };
             if (e.TryGetProperty("options", out var opts) && opts.ValueKind == JsonValueKind.Array)
                 foreach (var o in opts.EnumerateArray())
