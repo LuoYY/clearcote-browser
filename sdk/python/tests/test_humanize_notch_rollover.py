@@ -311,6 +311,59 @@ def test_engine_click_falls_back_once_on_an_older_engine(monkeypatch, fast):
         "Browser.dispatchPointerPath", "Browser.humanizedClick", "Browser.humanizedClick"]
 
 
+class _Browser:
+    """One browser connection: every page's engine call goes through its one session."""
+
+    def __init__(self, session):
+        self.session = session
+
+    def new_browser_cdp_session(self):
+        return self.session
+
+
+def _engine_pages(monkeypatch, session, n=2):
+    monkeypatch.setattr(_humanize, "world_for", lambda page: _World("Windows"))
+    browser = _Browser(session)
+    pages = []
+    for _ in range(n):
+        page = _Page()
+        ctx = type("Ctx", (), {})()
+        ctx.new_cdp_session = lambda p: session
+        ctx.browser = browser
+        page.context = ctx
+        _humanize.attach_humanize(None, page, humanize=True, seed="t")
+        pages.append(page)
+    return pages
+
+
+def test_a_missing_new_name_is_remembered_for_the_whole_browser(monkeypatch, fast):
+    # The engine is one per browser connection: a new page must not pay the failed probe again.
+    s = _Session(missing={"Browser.dispatchPointerPath"})
+    a, b = _engine_pages(monkeypatch, s)
+    a.mouse.click(300, 200)
+    b.mouse.click(320, 260)
+    assert _browser_calls(s) == [
+        "Browser.dispatchPointerPath", "Browser.humanizedClick", "Browser.humanizedClick"]
+
+
+def test_an_engine_without_either_name_is_asked_once_per_browser(monkeypatch, fast):
+    s = _Session(missing={"Browser.dispatchPointerPath", "Browser.humanizedClick"})
+    a, b = _engine_pages(monkeypatch, s)
+    a.mouse.click(300, 200)
+    b.mouse.click(320, 260)
+    assert _browser_calls(s) == ["Browser.dispatchPointerPath", "Browser.humanizedClick"]
+
+
+def test_the_engine_answer_is_kept_per_browser_not_shared_across_browsers(monkeypatch, fast):
+    old, new = _Session(missing={"Browser.dispatchPointerPath"}), _Session()
+    (a,) = _engine_pages(monkeypatch, old, 1)
+    (b,) = _engine_pages(monkeypatch, new, 1)
+    a.mouse.click(300, 200)
+    b.mouse.click(320, 260)
+    assert _browser_calls(old) == ["Browser.dispatchPointerPath", "Browser.humanizedClick"]
+    assert _browser_calls(new) == ["Browser.dispatchPointerPath"]
+
+
 def test_engine_click_does_not_fall_back_on_other_errors(monkeypatch, fast):
     s = _Session(fail="No target with given id found")
     page = _engine_page(monkeypatch, s)

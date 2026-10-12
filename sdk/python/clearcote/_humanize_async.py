@@ -20,7 +20,8 @@ from ._forms import (
 )
 from ._humanize import (
     CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _host_platform, _is_timeout,
-    _needs_shift, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, typo_rate,
+    _needs_shift, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, default_timeout_ms, engine_path_memo,
+    trial_timeout_error, typo_rate,
 )
 from ._isolated import (
     ACTIVE_FIELD as ISO_ACTIVE_FIELD, ACTIVE_VALUE as ISO_ACTIVE_VALUE, COVER_CHECK_MS, COVER_RETRY_MS,
@@ -129,6 +130,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     async def _engine_glide(x, y, no_click):
         if not _eng["ok"]:
             return False
+        memo = engine_path_memo(page)
+        if memo.get("method") is False:   # this browser's engine has neither name: no probe again
+            _eng["ok"] = False
+            return False
         try:
             if _eng["session"] is None:
                 tsession = await page.context.new_cdp_session(page)
@@ -142,19 +147,28 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             dur = min(1.10, max(0.28, 0.30 + dist / 1700.0)) * (0.85 + 0.30 * random.random())
             params = {"targetId": _eng["tid"], "x": float(x), "y": float(y),
                       "duration": dur, "noClick": bool(no_click)}
-            if _eng.get("method"):
-                await _eng["session"].send(_eng["method"], params)
+            method = _eng.get("method") or memo.get("method")
+            if method:
+                await _eng["session"].send(method, params)
             else:
                 # New name first; an engine older than r34 answers "wasn't found" (-32601)
-                # and gets the old one. Any other error is a real failure (below).
+                # and gets the old one. Any other error is a real failure (below). The answer is
+                # remembered for the whole browser (engine_path_memo), not just this page.
                 try:
                     await _eng["session"].send(ENGINE_POINTER_PATH[0], params)
-                    _eng["method"] = ENGINE_POINTER_PATH[0]
+                    method = ENGINE_POINTER_PATH[0]
                 except Exception as e:  # noqa: BLE001
                     if not _cdp_method_missing(e):
                         raise
-                    await _eng["session"].send(ENGINE_POINTER_PATH[1], params)
-                    _eng["method"] = ENGINE_POINTER_PATH[1]
+                    try:
+                        await _eng["session"].send(ENGINE_POINTER_PATH[1], params)
+                    except Exception as e2:  # noqa: BLE001
+                        if _cdp_method_missing(e2):
+                            memo["method"] = False
+                        raise
+                    method = ENGINE_POINTER_PATH[1]
+                memo["method"] = method
+            _eng["method"] = method
             # The engine walks the trajectory in the BROWSER process and answers before it has
             # finished. Without waiting, a following mouse.down() fires at the cursor's stale
             # position -- measured on the sync path: a move to (110,58) then a press landed at
@@ -723,7 +737,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
 
     async def _hit_in_box(box, x, y):
         """Does a press at viewport (x, y) reach the element filling ``box``? True / False, or None
-        when it cannot be told here: the point lies in a child frame, or CDP is unavailable."""
+        when it cannot be told here (CDP is unavailable). A point inside a child frame is answered
+        by the <iframe> element that holds it."""
         w = async_world_for(page)
         nid = await w.node_at(x, y)
         if nid is None:
@@ -1336,10 +1351,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
 
     async def _set_checked(orig, selector, checked, options):
         """check / uncheck / set_checked: a humanized click when the state must change, then the
-        state verified. `trial` performs no action: Playwright's own trial runs."""
-        if options.get("trial"):
-            return await orig(selector, **options)
+        state verified. `trial` performs no action: the state is read (a non-checkbox raises, as in
+        Playwright) and, when a click would be needed, its checks run here (_trial)."""
         loc = page.locator(selector).first
+        if options.get("trial"):
+            if await loc.is_checked(timeout=options.get("timeout")) == checked:
+                return None
+            return await _trial(selector, options, no_click=False)
         # Errors propagate as Playwright's own (not a checkbox, timed out): the click below owns its
         # native fallback, so nothing here may click a second time.
         if await loc.is_checked(timeout=options.get("timeout")) == checked:
@@ -1352,43 +1370,70 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         from playwright.async_api import Error as PlaywrightError
         raise PlaywrightError("Clicking the checkbox did not change its state")
 
-    async def _reaches_point(orig, selector, box, x, y):
+    async def _reaches_point(box, x, y):
         """The covered-point check, through the browser's own hit test read in the isolated world:
         nothing is dispatched and the pointer does not move. It replaced a Playwright TRIAL action,
         which moves the REAL pointer onto the element and back and performs a press with its events
         blocked (verifier B: a mousemove inside the target, a 450-500 px jump back, then the glide,
         and a pointerdown window capture listeners could see). A covered point is looked at again
-        for COVER_CHECK_MS (an overlay fading out). See _humanize._reaches_point."""
+        for COVER_CHECK_MS (an overlay fading out); a point inside a child frame is answered by its
+        <iframe> element. None when the hit test cannot run. See _humanize._reaches_point."""
         deadline = asyncio.get_running_loop().time() + COVER_CHECK_MS / 1000.0
         hit = await _hit_in_box(box, x, y)
         while hit is False and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.08)
             hit = await _hit_in_box(box, x, y)
-        if hit is not None:
-            return hit
-        # Only Playwright's trial can look inside a child frame. It moves the pointer: the cost of a
-        # point the isolated world cannot see, never of an ordinary click.
-        at = {"x": x - box["x"], "y": y - box["y"]}
-        try:
-            await orig(selector, trial=True, timeout=COVER_CHECK_MS, position=at)
-            return True
-        except Exception as e:  # noqa: BLE001
-            if not _is_timeout(e) or "intercepts pointer events" in str(e):
-                return False
-        try:
-            # Not covered, just not "stable" yet (slow first frames on a fresh headless browser):
-            # one longer look.
-            await orig(selector, trial=True, timeout=COVER_RETRY_MS, position=at)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        return hit
+
+    async def _position_point(box, o):
+        """The viewport point of Playwright's `position` (relative to the PADDING box)."""
+        info = await _describe(box, None)
+        bl, bt = (info.get("bl", 0), info.get("bt", 0)) if info else (0, 0)
+        return box["x"] + bl + o["position"]["x"], box["y"] + bt + o["position"]["y"]
+
+    async def _trial(selector, options, no_click):
+        """`trial=True`, answered by the SDK: Playwright's actionability checks (visible, enabled
+        unless hover, stable, the click point receives the press) retried until the timeout, then a
+        Playwright TimeoutError; no pointer move and no press. See _humanize._trial."""
+        o = normalize_click_options(options, await _platform())
+        timeout = options.get("timeout")
+        ms = float(timeout) if timeout is not None else default_timeout_ms(page)
+        clock = asyncio.get_running_loop().time
+        end = clock() + ms / 1000.0 if ms > 0 else None
+        loc = page.locator(selector).first
+
+        def left():   # what is left of the timeout for a Playwright wait (0 there: no limit)
+            return 0 if end is None else max(1, int((end - clock()) * 1000.0))
+
+        if o["force"]:
+            await loc.wait_for(state="attached", timeout=left())
+            return None
+        while True:
+            why = "element is not visible"
+            box = await _box_of(loc, left(), selector=selector)   # waits for visible; raises Playwright's timeout
+            if box:
+                if not no_click and not await loc.is_enabled():
+                    why = "element is not enabled"
+                else:
+                    if o["position"]:
+                        x, y = await _position_point(box, o)
+                    else:
+                        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+                    await asyncio.sleep(0.05)   # stable: 50 ms on, the element still fills `box`
+                    if await _hit_in_box(box, x, y) is not False:
+                        return None
+                    why = ("element is not stable, or another element would receive the pointer at "
+                           "(%d, %d)" % (x, y))
+            if end is not None and clock() >= end:
+                raise trial_timeout_error(selector, ms, why)
+            await asyncio.sleep(0.1 if end is None else max(0.0, min(0.1, end - clock())))
 
     async def _targeted_click(orig, selector, options, no_click, native_opts):
         """The humanized form of page.click / dblclick / hover (and the click inside check/uncheck).
 
         Every Playwright option is honoured: `button`, `click_count`, `delay` (the hold) and
         `modifiers` shape the press; `position` (relative to the PADDING box) replaces the persona's
-        point; `force` skips the hit test; `trial` performs NO action (it runs Playwright's own trial).
+        point; `force` skips the hit test; `trial` performs NO action: its checks run here (_trial).
         A Playwright TimeoutError propagates: falling back would wait the full timeout again."""
         o = normalize_click_options(options, await _platform())
 
@@ -1403,7 +1448,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 st["placed"] = True
 
         if o["trial"]:
-            return await _native()
+            return await _trial(selector, options, no_click)
         try:
             timeout = options.get("timeout")   # None: the page's default, as Playwright would use
             loc = page.locator(selector).first
@@ -1415,10 +1460,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             if not o["force"] and not await loc.is_enabled():
                 raise _Native()
             if o["position"]:
-                # Playwright's position is relative to the PADDING box: add the border widths.
-                info = await _describe(box, None)
-                bl, bt = (info.get("bl", 0), info.get("bt", 0)) if info else (0, 0)
-                x, y = box["x"] + bl + o["position"]["x"], box["y"] + bt + o["position"]["y"]
+                x, y = await _position_point(box, o)
             else:
                 x, y = click_point(box, st["pos"], persona)
             if not o["force"] and orig is not None:
@@ -1426,7 +1468,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 # animation in flight does not) and own the click point -- no trusted press at a
                 # point some overlay owns. Either failing goes native: Playwright waits for it.
                 await asyncio.sleep(0.05)
-                if not await _reaches_point(orig, selector, box, x, y):
+                if not await _reaches_point(box, x, y):
                     raise _Native()
             if o["modifiers"] and native_kb_down is None:
                 raise _Native()
@@ -1500,6 +1542,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         page.click = _serial(_make_targeted(native_page_click, False))
     if native_page_hover is not None:
         page.hover = _serial(_make_targeted(native_page_hover, True))
+    # Locator.drag_to(trial=True) answers its checks here too (see the Locator patch).
+    page._clearcote_trial = _serial(_trial)
 
     # Marker the Locator-class patch keys off: humanize is active for THIS page.
     page._clearcote_humanized = True
@@ -1647,7 +1691,18 @@ def _patch_locator_class():
         return r if done else await o_select_option(self, value, **kw)
 
     async def drag_to(self, target, **kw):
-        if _on(self):
+        if kw.get("trial") and _on(self) and _on(target) and await _strict(self) and await _strict(target):
+            # Playwright's drag trial moves the pointer onto the source and presses there (SC 209);
+            # the SDK runs the checks of both ends instead: visible, stable, receives the pointer.
+            trial = getattr(self.page, "_clearcote_trial", None)
+            if trial is not None:
+                for loc, pos in ((self, kw.get("source_position")), (target, kw.get("target_position"))):
+                    opts = {k: kw[k] for k in ("force", "timeout") if kw.get(k) is not None}
+                    if pos:
+                        opts["position"] = pos
+                    await trial(_sel(loc), opts, True)
+                return None
+        if _on(self) and not kw.get("trial"):
             try:
                 page = self.page
                 sb = await self.bounding_box()

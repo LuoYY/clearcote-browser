@@ -78,6 +78,14 @@
 <div class="row"><select id="long"></select> <select id="same"></select> <select id="lbmid" size="6"></select></div>
 <div class="row"><div id="scroller" style="height:60px;width:260px;overflow:auto;border:1px solid #999">
   <div style="height:220px">scrolled content</div><button id="innerbtn">Inner one</button><div style="height:120px"></div></div></div>
+<!-- SC 210 lane H: controls under a pointer-events:none layer (a real press passes through it), a
+     disabled button, and a frame whose own window records what a trial dispatches inside it. -->
+<div class="row"><span class="wrap"><input id="pen" type="text" style="width:180px"> <select id="pensel">
+  <option value="a">Alpha</option><option value="c">Charlie</option><option value="e">Echo</option></select>
+  <button id="penbtn">Under glass</button><span id="penlay" style="position:absolute;left:0;top:0;width:100%;
+  height:100%;pointer-events:none;background:rgba(0,0,0,.02)"></span></span>
+  <button id="disbtn" disabled>Disabled</button>
+  <iframe id="frb" style="width:170px;height:46px;border:0" srcdoc="<button id='fb' style='width:150px;height:30px'>In frame</button><script>for (const t of ['pointermove','pointerdown','pointerup','mousemove','mousedown','mouseup','click']) addEventListener(t, e => (parent.__fev = parent.__fev || []).push({ t, id: e.target.id || e.target.tagName, tr: e.isTrusted }), true);</script>"></iframe></div>
 <div style="height:1600px"></div>
 <div class="row"><button id="far">Far away</button></div>
 
@@ -119,6 +127,17 @@
   // Node.prototype.textContent (to count the reads humanize causes in the page's world) counts none of its own.
   const TEXT = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent').get;
   window.__ev = [];
+  // Pointer and mouse events seen by WINDOW capture listeners registered at load: they run before
+  // anything Playwright installs during an action (its trial's event blocker included), as a page's
+  // own early listeners do. window.__fev holds the same from inside #frb.
+  window.__wev = [];
+  window.__fev = window.__fev || [];
+  for (const t of ['pointermove','pointerdown','pointerup','mousemove','mousedown','mouseup','click']) {
+    window.addEventListener(t, e => {
+      const el = e.target && e.target.nodeType === 1 ? e.target : null;
+      __wev.push({ t, id: el ? (el.id || el.tagName) : '', tr: e.isTrusted });
+    }, true);
+  }
   const T = ['keydown','keyup','input','change','beforeinput','mousedown','mouseup','click','dblclick','auxclick',
              'contextmenu','pointerdown','pointerup','focus','wheel','scroll','mousemove'];
   for (const t of T) {

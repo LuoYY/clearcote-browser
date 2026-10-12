@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   IsolatedWorld, worldFor, nodeAtParams, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_DESCRIBE, ISO_FORM_CONTROL, ISO_PLATFORM,
-  ISO_SCROLL, ISO_VIEWPORT, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_CSS_BOX, ISO_SCROLL_BY,
+  ISO_SCROLL, ISO_VIEWPORT, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_CSS_BOX, ISO_SCROLL_BY, topChildFrame,
 } from "../src/isolated.js";
 
 // A read that takes an argument (the CSS-only ISO_IS_FOCUSED this used went with the hit-test port).
@@ -98,7 +98,41 @@ describe("IsolatedWorld hit test and node calls", () => {
     const w = new IsolatedWorld(fakePage(cdp));
     expect(await w.nodeAt(10.6, 20.4)).toBe(42);
     const hit = cdp.calls.find(([m]) => m === "DOM.getNodeForLocation")![1];
-    expect(hit).toEqual({ x: 11, y: 20, includeUserAgentShadowDOM: false, ignorePointerEventsNone: true });
+    expect(hit).toEqual({ x: 11, y: 20, includeUserAgentShadowDOM: false });
+  });
+
+  it("nodeAt skips pointer-events:none layers, as a real press does (no ignorePointerEventsNone)", async () => {
+    // `true` makes CDP hit-test pointer-events:none elements TOO: a decorative layer over a control
+    // answered instead of the control and every form route fell back to stock Playwright (SC 209).
+    expect(nodeAtParams(5, 5).ignorePointerEventsNone ?? false).toBe(false);
+  });
+
+  it("nodeAt answers a point inside a child frame with the main document's <iframe> element", async () => {
+    const tree = { frameTree: { frame: { id: "MAIN" }, childFrames: [
+      { frame: { id: "C1", parentId: "MAIN" }, childFrames: [{ frame: { id: "C2", parentId: "C1" } }] }] } };
+    class FrameCdp extends HitCdp {
+      constructor(hitFrame: string, private owners: Record<string, number> = { C1: 501, C2: 777 }) {
+        super({ backendNodeId: 42, frameId: hitFrame });
+      }
+      async send(method: string, params?: any): Promise<any> {
+        if (method === "Page.getFrameTree") { this.calls.push([method, params]); return tree; }
+        if (method === "DOM.getFrameOwner") {
+          this.calls.push([method, params]);
+          if (!(params.frameId in this.owners)) throw new Error("Frame with the given id was not found.");
+          return { backendNodeId: this.owners[params.frameId] };
+        }
+        return super.send(method, params);
+      }
+    }
+    const direct = new FrameCdp("C1");
+    expect(await new IsolatedWorld(fakePage(direct)).nodeAt(1, 1)).toBe(501);
+    const nested = new FrameCdp("C2");
+    expect(await new IsolatedWorld(fakePage(nested)).nodeAt(1, 1)).toBe(501);   // C1's <iframe>, not C2's
+    expect(nested.calls.filter(([m]) => m === "DOM.getFrameOwner").map(([, p]) => p)).toEqual([{ frameId: "C1" }]);
+    expect(await new IsolatedWorld(fakePage(new FrameCdp("C1", {}))).nodeAt(1, 1)).toBeUndefined();
+    expect(await new IsolatedWorld(fakePage(new FrameCdp("GONE"))).nodeAt(1, 1)).toBeUndefined();
+    expect(topChildFrame(tree.frameTree, "C2", "MAIN")).toBe("C1");
+    expect(topChildFrame(tree.frameTree, "MAIN", "MAIN")).toBeNull();
   });
 
   it("nodeAt hit-tests in DOCUMENT coordinates: the viewport point plus the scroll offset", async () => {
@@ -118,7 +152,7 @@ describe("IsolatedWorld hit test and node calls", () => {
     expect(nodeAtParams(60.5, 61.5)).toMatchObject({ x: 60, y: 62 });
   });
 
-  it("nodeAt refuses a node inside another frame, and is undefined when nothing is there", async () => {
+  it("nodeAt is undefined for a frame it cannot place, and when nothing is there", async () => {
     expect(await new IsolatedWorld(fakePage(new HitCdp({ backendNodeId: 42, frameId: "IFRAME-7" }))).nodeAt(1, 1)).toBeUndefined();
     expect(await new IsolatedWorld(fakePage(new HitCdp({}))).nodeAt(1, 1)).toBeUndefined();
     expect(await new IsolatedWorld(fakePage(new HitCdp(null))).nodeAt(1, 1)).toBeUndefined();

@@ -438,12 +438,36 @@ describe("mouse.click / dblclick options", () => {
 
 // ------------------------------------------------------------------------------- page.click
 describe("page.click / hover / dblclick", () => {
-  it("trial performs no action: Playwright's own trial runs", async () => {
+  it("trial performs no action and runs no Playwright trial (it moves the pointer and presses)", async () => {
     const f = await attached();
     await f.page.click("#btn", { trial: true });
     await f.page.hover("#btn", { trial: true });
-    expect(f.natives.map((n) => [n.m, n.args[1].trial])).toEqual([["click", true], ["hover", true]]);
+    await f.page.dblclick("#btn", { trial: true });
+    await f.page.click("#btn", { trial: true, position: { x: 5, y: 5 } });
+    expect(f.natives).toEqual([]);
     expect(f.of("down")).toEqual([]);
+    expect(f.of("move")).toEqual([]);
+  }, SLOW);
+
+  it("a trial whose checks never pass raises Playwright's TimeoutError, still with no action", async () => {
+    const covered = await attached({ covered: true });
+    await expect(covered.page.click("#btn", { trial: true, timeout: 300 })).rejects.toMatchObject({ name: "TimeoutError" });
+    const disabled = await attached({ enabled: false });
+    const err = await disabled.page.click("#btn", { trial: true, timeout: 300 }).catch((e: any) => e);
+    expect(err).toMatchObject({ name: "TimeoutError" });
+    expect(String(err.message)).toMatch(/300ms[\s\S]*not enabled/);
+    await disabled.page.hover("#btn", { trial: true, timeout: 300 });   // hover does not need enabled
+    for (const f of [covered, disabled]) {
+      expect(f.natives).toEqual([]);
+      expect(f.of("down")).toEqual([]);
+      expect(f.of("move")).toEqual([]);
+    }
+  }, SLOW);
+
+  it("a forced trial only needs the element", async () => {
+    const f = await attached({ covered: true });
+    await f.page.click("#btn", { trial: true, force: true, timeout: 300 });
+    expect(f.natives).toEqual([]);
     expect(f.of("move")).toEqual([]);
   }, SLOW);
 
@@ -499,11 +523,12 @@ describe("page.click / hover / dblclick", () => {
     expect(covered.of("down")).toEqual([]);
   }, SLOW);
 
-  it("a point the hit test cannot see (a child frame) still falls back to Playwright's trial", async () => {
+  it("a point the hit test cannot answer goes native, with no Playwright trial first", async () => {
+    // (a point inside a child frame is answered by its <iframe> element: IsolatedWorld.nodeAt)
     const f = await attached({ hitTestBlind: true });
     await f.page.click("#btn");
-    expect(f.natives.map((n) => n.args[1]?.trial)).toEqual([true]);
-    expect(f.of("down").length).toBe(1);
+    expect(f.natives).toEqual([{ m: "click", args: ["#btn", {}] }]);
+    expect(f.of("down")).toEqual([]);
   }, SLOW);
 
   it("a CSS selector in view needs no main-world handle; any other selector one boundingBox", async () => {
@@ -1019,13 +1044,15 @@ describe("check / uncheck / setChecked", () => {
     expect(protoCalls).toEqual([]);
   }, SLOW);
 
-  it("trial runs Playwright's own trial and changes nothing", async () => {
+  it("trial changes nothing and runs no Playwright trial", async () => {
     const f = await attached({ field: { type: "checkbox", checked: false } });
     await f.page.check("#cb", { trial: true });
     await f.page.setChecked("#cb", true, { trial: true });
+    await f.page.locator("#cb").check({ trial: true });
     expect(f.field.checked).toBe(false);
-    expect(f.natives.map((n) => n.m)).toEqual(["check", "setChecked"]);
-    expect(f.natives[1].args).toEqual(["#cb", true, { trial: true }]);
+    expect(f.natives).toEqual([]);
+    expect(f.of("down")).toEqual([]);
+    expect(f.of("move")).toEqual([]);
   }, SLOW);
 });
 
@@ -1063,9 +1090,9 @@ describe("Locator patch", () => {
   }, SLOW);
 
   it("forwards every option the page method understands (and only those)", async () => {
-    const f = await attached();
-    await f.page.locator("#btn").click({ button: "right", clickCount: 1, trial: true, timeout: 1234, bogus: 1 });
-    expect(f.natives).toEqual([{ m: "click", args: ["#btn", { button: "right", clickCount: 1, trial: true, timeout: 1234 }] }]);
+    const f = await attached({ enabled: false });   // a disabled target: the native click gets the options
+    await f.page.locator("#btn").click({ button: "right", clickCount: 1, noWaitAfter: true, timeout: 1234, bogus: 1 });
+    expect(f.natives).toEqual([{ m: "click", args: ["#btn", { button: "right", clickCount: 1, noWaitAfter: true, timeout: 1234 }] }]);
     expect(pickOptions({ delay: 5, timeout: null, noWaitAfter: true }, ["delay", "timeout", "noWaitAfter"]))
       .toEqual({ delay: 5, noWaitAfter: true });
   }, SLOW);

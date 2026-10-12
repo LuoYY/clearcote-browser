@@ -215,10 +215,11 @@ public static class Humanize
     private static double TypoRateFor(IPage page)
         => TypoRateOverride.TryGetValue(page, out var forced) ? forced.Value : TypoRate();
 
-    // How long a trial action may look for a covered click point before the native path takes over.
+    // How long a covered click point is re-checked (an overlay fading out) before the native path takes over.
     internal const float CoverCheckMs = 400;
-    // The one longer look when that trial timed out only because the element was not "stable" yet (no
-    // "intercepts pointer events" in Playwright's call log): slow first frames, not an overlay.
+    // The timeout of the utility-world value reads that prove a fill landed. (It was also the one longer look
+    // of the Playwright trial that checked a point inside a child frame; no Playwright trial runs in humanized
+    // mode any more: such a point is answered by its <iframe> element, see IsolatedWorld.NodeAtAsync.)
     internal const float CoverRetryMs = 2000;
 
     // Points tried when resolving a control through the browser's hit test: a floating label or an icon
@@ -472,12 +473,8 @@ public static class Humanize
             await native().ConfigureAwait(false);
             return;
         }
-        await TargetedClickAsync(locator, options, options.Normalize(), noClick: false, native, ClickProbe(locator))
-            .ConfigureAwait(false);
+        await TargetedClickAsync(locator, options, options.Normalize(), noClick: false, native).ConfigureAwait(false);
     }
-
-    private static Func<Position, float, Task> ClickProbe(ILocator l)
-        => (pos, ms) => l.ClickAsync(new LocatorClickOptions { Trial = true, Timeout = ms, Position = pos });
 
     /// <summary>The first element matching <paramref name="selector"/>, clicked as
     /// <see cref="HumanClickAsync(ILocator,LocatorClickOptions)"/> does (page actions are not strict).</summary>
@@ -511,8 +508,7 @@ public static class Humanize
             await Native().ConfigureAwait(false);
             return;
         }
-        await TargetedClickAsync(locator, options, options.Normalize(defaultCount: 2), noClick: false, Native,
-            (pos, ms) => locator.DblClickAsync(new LocatorDblClickOptions { Trial = true, Timeout = ms, Position = pos })).ConfigureAwait(false);
+        await TargetedClickAsync(locator, options, options.Normalize(defaultCount: 2), noClick: false, Native).ConfigureAwait(false);
     }
 
     /// <inheritdoc cref="HumanDblClickAsync(ILocator,HumanClickOptions)"/>
@@ -544,8 +540,7 @@ public static class Humanize
             await Native().ConfigureAwait(false);
             return;
         }
-        await TargetedClickAsync(locator, options, options.Normalize(), noClick: true, Native,
-            (pos, ms) => locator.HoverAsync(new LocatorHoverOptions { Trial = true, Timeout = ms, Position = pos })).ConfigureAwait(false);
+        await TargetedClickAsync(locator, options, options.Normalize(), noClick: true, Native).ConfigureAwait(false);
     }
 
     /// <inheritdoc cref="HumanHoverAsync(ILocator,HumanClickOptions)"/>
@@ -600,15 +595,14 @@ public static class Humanize
     /// or the persona's), wait 50 ms and prove with the browser's own hit test that the point still reaches
     /// the element (stability and covered-by in one: nothing dispatched, the pointer does not move), glide
     /// there and press as asked. Anything the route cannot prove goes to <paramref name="native"/>; a timeout
-    /// propagates. <paramref name="trialProbe"/> (Playwright's trial) is used only for a point the isolated
-    /// world cannot see: inside a child frame, or with no CDP.
+    /// propagates. No Playwright trial runs at any point: <c>Trial</c> is answered by <see cref="TrialAsync"/>.
     /// </summary>
     private static async Task TargetedClickAsync(ILocator loc, HumanClickOptions options, NormalizedClick o, bool noClick,
-        Func<Task> native, Func<Position, float, Task> trialProbe)
+        Func<Task> native)
     {
         if (o.Trial)
         {
-            await native().ConfigureAwait(false);   // documented to perform NO action: Playwright's trial
+            await TrialAsync(loc, options.Timeout, o, noClick).ConfigureAwait(false);   // performs NO action
             return;
         }
         var page = loc.Page;
@@ -627,10 +621,7 @@ public static class Humanize
                 double x, y;
                 if (o.Position is { } pos)
                 {
-                    // Playwright's position is relative to the PADDING box: add the border widths.
-                    var info = await DescribeAsync(page, bb, null).ConfigureAwait(false);
-                    x = bb.X + (info?.Bl ?? 0) + pos.X;
-                    y = bb.Y + (info?.Bt ?? 0) + pos.Y;
+                    (x, y) = await PositionPointAsync(page, bb, pos).ConfigureAwait(false);
                 }
                 else
                 {
@@ -645,7 +636,7 @@ public static class Humanize
                     // flight does not) and own the click point -- no trusted press at a point some overlay
                     // owns. Either failing goes native: Playwright waits for it.
                     await Task.Delay(50).ConfigureAwait(false);
-                    if (!await ReachesPointAsync(page, bb, x, y, trialProbe).ConfigureAwait(false))
+                    if (await ReachesPointAsync(page, bb, x, y).ConfigureAwait(false) != true)
                         goNative = Fallback("click: the point does not reach the element (covered, moving or clipped)");
                 }
                 if (!goNative)
@@ -701,7 +692,8 @@ public static class Humanize
 
     /// <summary>
     /// Does a press at viewport (x, y) reach the element filling <paramref name="box"/>? True / false, or
-    /// null when it cannot be told here: the point lies in a child frame, or CDP is unavailable.
+    /// null when it cannot be told here (CDP is unavailable). A point inside a child frame is answered by the
+    /// &lt;iframe&gt; element that holds it (IsolatedWorld.NodeAtAsync).
     /// </summary>
     private static async Task<bool?> HitInBoxAsync(IPage page, LocatorBoundingBoxResult box, double x, double y)
     {
@@ -720,12 +712,11 @@ public static class Humanize
     /// pointer onto the element and back and performs a press with its events blocked: verifier B saw, before
     /// every humanized click, a mousemove inside the target, a 450-500 px jump back, then the glide, and a
     /// pointerdown/pointerup/click (left, even for a right click) that window capture listeners could see.
-    /// A covered point is looked at again for <see cref="CoverCheckMs"/> (an overlay fading out). Only a
-    /// point the isolated world cannot see (a child frame, no CDP) falls back to <paramref name="trialProbe"/>,
-    /// with its one longer <see cref="CoverRetryMs"/> look.
+    /// A covered point is looked at again for <see cref="CoverCheckMs"/> (an overlay fading out). A point
+    /// inside a child frame is answered by the &lt;iframe&gt; element that holds it, so no Playwright trial runs
+    /// for it either. False when covered; null when the hit test cannot run (no CDP): the caller goes native.
     /// </summary>
-    private static async Task<bool> ReachesPointAsync(IPage page, LocatorBoundingBoxResult box, double x, double y,
-        Func<Position, float, Task> trialProbe)
+    private static async Task<bool?> ReachesPointAsync(IPage page, LocatorBoundingBoxResult box, double x, double y)
     {
         var deadline = Environment.TickCount64 + (long)CoverCheckMs;
         var hit = await HitInBoxAsync(page, box, x, y).ConfigureAwait(false);
@@ -734,30 +725,88 @@ public static class Humanize
             await Task.Delay(80).ConfigureAwait(false);
             hit = await HitInBoxAsync(page, box, x, y).ConfigureAwait(false);
         }
-        if (hit is bool h) return h;
-        // Only Playwright's trial can look inside a child frame. It moves the pointer: the cost of a point the
-        // isolated world cannot see, never of an ordinary click.
-        FallbackTrace?.Invoke("click: the hit test cannot see the point; Playwright's trial is used");
-        var at = new Position { X = (float)(x - box.X), Y = (float)(y - box.Y) };
+        if (hit is null) FallbackTrace?.Invoke("click: the hit test cannot run here");
+        return hit;
+    }
+
+    /// The viewport point of Playwright's <c>Position</c> (relative to the PADDING box: the border widths are added).
+    private static async Task<(double X, double Y)> PositionPointAsync(IPage page, LocatorBoundingBoxResult bb, (double X, double Y) pos)
+    {
+        var info = await DescribeAsync(page, bb, null).ConfigureAwait(false);
+        return (bb.X + (info?.Bl ?? 0) + pos.X, bb.Y + (info?.Bt ?? 0) + pos.Y);
+    }
+
+    /// <summary>
+    /// The page's default action timeout (SetDefaultTimeout, else the context's, else Playwright's 30 s). Playwright
+    /// .NET has no public getter: read through its TimeoutSettings, 30 s when that shape is not there.
+    /// </summary>
+    internal static float DefaultTimeoutMs(IPage page)
+    {
         try
         {
-            await trialProbe(at, CoverCheckMs).ConfigureAwait(false);
-            return true;
-        }
-        catch (Exception e)
-        {
-            if (!IsTimeoutError(e) || e.Message.Contains("intercepts pointer events", StringComparison.Ordinal)) return false;
-        }
-        try
-        {
-            // Not covered, just not "stable" yet: on the first page of a fresh headless browser Playwright's
-            // animation-frame wait can outlast the first look (measured on r37: 1 in 6). One longer look.
-            await trialProbe(at, CoverRetryMs).ConfigureAwait(false);
-            return true;
+            const System.Reflection.BindingFlags F = System.Reflection.BindingFlags.Instance
+                | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public;
+            for (var t = page.GetType(); t is not null; t = t.BaseType)
+            {
+                if (t.GetField("_timeoutSettings", F)?.GetValue(page) is not { } ts) continue;
+                foreach (var m in ts.GetType().GetMethods(F))
+                    if (m.Name == "Timeout" && m.GetParameters().Length == 1
+                        && m.Invoke(ts, new object?[] { null }) is float f && float.IsFinite(f))
+                        return f;
+            }
         }
         catch (Exception)
         {
-            return false;
+            // not this Playwright's shape
+        }
+        return 30_000;
+    }
+
+    /// <summary>
+    /// <c>Trial = true</c>, answered by the SDK: Playwright's actionability checks -- visible, enabled (not for
+    /// hover), stable, and the click point receives the press (the browser's own hit test, read in the isolated
+    /// world) -- retried until the caller's timeout (or the page default), then a TimeoutException (what Playwright .NET throws on a timeout).
+    /// NO pointer move and NO press: Playwright's own trial moves the real pointer onto the target and dispatches
+    /// pointerdown/pointerup/click that page listeners registered before its blocker see (SC 209: 6/6). The
+    /// point checked is Playwright's: Position, else the centre. Scrolling the element into view is part of the
+    /// checks, as in Playwright. With Force only the element must exist.
+    /// </summary>
+    private static async Task TrialAsync(ILocator loc, float? timeout, NormalizedClick o, bool noClick)
+    {
+        var page = loc.Page;
+        float ms = timeout ?? DefaultTimeoutMs(page);
+        long? end = ms > 0 ? Environment.TickCount64 + (long)ms : null;
+        float Left() => end is long e ? Math.Max(1, e - Environment.TickCount64) : 0;
+        if (o.Force)
+        {
+            await loc.WaitForAsync(new LocatorWaitForOptions { State = WaitForSelectorState.Attached, Timeout = Left() })
+                .ConfigureAwait(false);
+            return;
+        }
+        while (true)
+        {
+            string why = "element is not visible";
+            var bb = await BoxOfAsync(loc, Left(), force: false).ConfigureAwait(false);   // waits for visible; throws Playwright's timeout
+            if (bb is not null)
+            {
+                if (!noClick && !await loc.IsEnabledAsync().ConfigureAwait(false))
+                {
+                    why = "element is not enabled";
+                }
+                else
+                {
+                    var (x, y) = o.Position is { } pos
+                        ? await PositionPointAsync(page, bb, pos).ConfigureAwait(false)
+                        : (bb.X + bb.Width / 2.0, bb.Y + bb.Height / 2.0);
+                    await Task.Delay(50).ConfigureAwait(false);   // stable: 50 ms on, the element still fills `bb`
+                    if (await HitInBoxAsync(page, bb, x, y).ConfigureAwait(false) != false) return;   // null: cannot tell -- nothing to add
+                    why = $"element is not stable, or another element would receive the pointer at ({x:0}, {y:0})";
+                }
+            }
+            if (end is long done && Environment.TickCount64 >= done)
+                throw new System.TimeoutException(
+                    $"Timeout {ms:0}ms exceeded.\nCall log:\n  - waiting for {loc}\n  - {why}");
+            await Task.Delay(end is long e2 ? (int)Math.Clamp(e2 - Environment.TickCount64, 0, 100) : 100).ConfigureAwait(false);
         }
     }
 
@@ -1608,7 +1657,7 @@ public static class Humanize
         var page = loc.Page;
         var p = PersonaFor(page);
         var o = new HumanClickOptions { Position = at };
-        await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()), ClickProbe(loc))
+        await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()))
             .ConfigureAwait(false);
         await Task.Delay((int)Rand(220, 480)).ConfigureAwait(false);   // the list opens; the eye finds the option
         foreach (var ch in plan.Keys)
@@ -2450,20 +2499,27 @@ public static class Humanize
     /// own native fallback), then the state verified. When the click did not change it -- a page that
     /// cancels the click -- this raises Playwright's own error ("Clicking the checkbox did not change its
     /// state") without clicking again, as Playwright's CheckAsync does. Errors propagate as Playwright's:
-    /// nothing here may click a second time. Trial performs no action (Playwright's own trial runs).
+    /// nothing here may click a second time. Trial performs no action: the state is read (a non-checkbox
+    /// raises, as in Playwright) and, when a click would be needed, its checks run (<see cref="TrialAsync"/>) --
+    /// not Playwright's trial, which moves the pointer and presses.
     /// </summary>
     private static Task SetCheckedAsync(ILocator loc, bool want, float? timeout, bool force, Position? position,
         bool trial, bool strict, Func<Task> native)
         => SerialAsync(loc.Page, async () =>
         {
-            if (trial || !await RoutableAsync(loc, strict).ConfigureAwait(false))
+            if (!await RoutableAsync(loc, strict).ConfigureAwait(false))
             {
-                await native().ConfigureAwait(false);   // a trial performs NO action; strict and frame cases are Playwright's
+                await native().ConfigureAwait(false);   // strict and frame cases are Playwright's
                 return;
             }
             if (await loc.IsCheckedAsync(new LocatorIsCheckedOptions { Timeout = timeout }).ConfigureAwait(false) == want) return;
-            var o = new HumanClickOptions { Force = force, Position = position, Timeout = timeout };
-            await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()), ClickProbe(loc))
+            var o = new HumanClickOptions { Force = force, Position = position, Timeout = timeout, Trial = trial };
+            if (trial)
+            {
+                await TrialAsync(loc, timeout, o.Normalize(), noClick: false).ConfigureAwait(false);
+                return;
+            }
+            await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()))
                 .ConfigureAwait(false);
             if (await loc.IsCheckedAsync().ConfigureAwait(false) == want) return;
             throw new PlaywrightException("Clicking the checkbox did not change its state");

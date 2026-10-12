@@ -34,9 +34,40 @@ def _node_at_params(x, y, scroll):
     # offset); Playwright's boxes, CDP's box model and the mouse are all VIEWPORT coordinates.
     # Measured on r37: a field scrolled 547 px down answered "No node found" at its viewport centre
     # and the input itself at centre + scroll.
+    #
+    # No ignorePointerEventsNone: in CDP `true` means "hit-test pointer-events:none elements TOO", so a
+    # decorative layer with pointer-events:none over a control was returned instead of the control
+    # and every form route fell back to stock Playwright (SC 209: 6/6 untrusted change events). The
+    # default (false) skips such layers, exactly as a real press does.
     sx, sy = scroll or (0, 0)
-    return {"x": int(round(x + sx)), "y": int(round(y + sy)), "includeUserAgentShadowDOM": False,
-            "ignorePointerEventsNone": True}
+    return {"x": int(round(x + sx)), "y": int(round(y + sy)), "includeUserAgentShadowDOM": False}
+
+
+def _parents(tree, out=None, parent=None):
+    """{frameId: parentFrameId} for a Page.getFrameTree answer."""
+    out = {} if out is None else out
+    if not isinstance(tree, dict):
+        return out
+    fid = (tree.get("frame") or {}).get("id")
+    if fid:
+        out[fid] = parent
+    for child in tree.get("childFrames") or ():
+        _parents(child, out, fid)
+    return out
+
+
+def _top_child(frame_id, parents, main):
+    """The frame directly under ``main`` that contains ``frame_id`` (itself for a direct child), or
+    None when ``frame_id`` is not below the main frame."""
+    fid = frame_id
+    for _ in range(64):
+        up = parents.get(fid)
+        if up is None:
+            return None
+        if up == main:
+            return fid
+        fid = up
+    return None
 
 
 SCROLL = "() => [scrollX, scrollY]"
@@ -91,7 +122,8 @@ class IsolatedWorld:
         return (float(s[0]), float(s[1])) if isinstance(s, list) and len(s) == 2 else (0.0, 0.0)
 
     def node_at(self, x, y, scroll=None):
-        """backendNodeId of the MAIN-FRAME element at viewport point (x, y), or None. ``scroll``:
+        """backendNodeId of the MAIN-FRAME element at viewport point (x, y) -- for a point inside a
+        child frame, the <iframe> element that holds it --, or None. ``scroll``:
         the page's (scrollX, scrollY) if the caller already has it (read here otherwise).
 
         CDP's hit test (DOM.getNodeForLocation) runs in the renderer with no script at all, so this
@@ -108,8 +140,19 @@ class IsolatedWorld:
         if not hit or "backendNodeId" not in hit:
             return None
         if hit.get("frameId") and self._frame and hit["frameId"] != self._frame:
-            return None   # inside an iframe: not this world's document
+            return self._owner_in_main(hit["frameId"])
         return hit["backendNodeId"]
+
+    def _owner_in_main(self, frame_id):
+        """A point inside a child frame: the <iframe> element in the MAIN document that holds it
+        (through every nesting level), or None. To the main document a press there lands on that
+        element: a control the iframe covers is covered, a target that is (or contains) the iframe
+        is reached. This replaced the only Playwright trial humanize still ran (it moved the pointer
+        and pressed, and page listeners registered first saw it)."""
+        tree = self.send("Page.getFrameTree")
+        top = _top_child(frame_id, _parents((tree or {}).get("frameTree")), self._frame)
+        own = self.send("DOM.getFrameOwner", {"frameId": top}) if top else None
+        return own.get("backendNodeId") if isinstance(own, dict) else None
 
     def call_on_node(self, backend_node_id, fn_source, arg=None):
         """Run ``fn_source`` -- a ``function (arg) { ... }`` whose ``this`` is the node -- in the
@@ -200,8 +243,15 @@ class AsyncIsolatedWorld:
         if not hit or "backendNodeId" not in hit:
             return None
         if hit.get("frameId") and self._frame and hit["frameId"] != self._frame:
-            return None
+            return await self._owner_in_main(hit["frameId"])
         return hit["backendNodeId"]
+
+    async def _owner_in_main(self, frame_id):
+        """See IsolatedWorld._owner_in_main."""
+        tree = await self.send("Page.getFrameTree")
+        top = _top_child(frame_id, _parents((tree or {}).get("frameTree")), self._frame)
+        own = await self.send("DOM.getFrameOwner", {"frameId": top}) if top else None
+        return own.get("backendNodeId") if isinstance(own, dict) else None
 
     async def call_on_node(self, backend_node_id, fn_source, arg=None):
         for _ in range(2):
@@ -248,10 +298,9 @@ def async_world_for(page):
 
 # How long a covered click point is re-checked (an overlay fading out) before the native path takes over.
 COVER_CHECK_MS = 400
-# The one longer look when Playwright's trial -- now only the fallback for a point inside a child
-# frame -- timed out only because the element was not "stable" yet (no "intercepts pointer events"
-# in its call log): slow first frames, not an overlay. Also the timeout of the utility-world value
-# reads that prove a fill landed.
+# The timeout of the utility-world value reads that prove a fill landed. (It was also the one longer
+# look of the Playwright trial that checked a point inside a child frame; no Playwright trial runs in
+# humanized mode any more: such a point is answered by its <iframe> element, see node_at.)
 COVER_RETRY_MS = 2000
 
 # The reads humanize makes, as functions of one JSON argument (run by IsolatedWorld.evaluate).
@@ -305,16 +354,25 @@ DESCRIBE = """function (a) {
 FORM_CONTROL = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']"
 # Does the element the browser's hit test found at a click point belong to the element whose box the
 # caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
-# that box? `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
-# press). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
+# that box -- with no OTHER element of that same box beside the hit's path inside it? That twin is a
+# wrapper's control under an overlay (<span class=wrap><input><span overlay></span></span>: the wrap
+# has the input's box, the press lands on the overlay): the old check called it reached. `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
+# press; for a point inside a child frame, the <iframe> element that holds it). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
 # element and back and performs a press whose events Playwright blocks, so a page saw a mousemove
 # inside the target, a jump back and a pointerdown/click before every humanized click (verifier B).
 HIT_IN_BOX = """function (b) {
+  const same = r => Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
+    Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5;
+  const path = new Set();
   let e = this.nodeType === 1 ? this : this.parentElement;
   for (let n = 0; e && n < 128; n++) {
-    const r = e.getBoundingClientRect();
-    if (Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
-        Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5) return true;
+    path.add(e);
+    if (same(e.getBoundingClientRect())) {
+      const all = e.getElementsByTagName('*');
+      if (all.length <= 4000)
+        for (const d of all) if (!path.has(d) && same(d.getBoundingClientRect())) return false;
+      return true;
+    }
     const p = e.parentNode;
     e = e.parentElement || (p && p.nodeType === 11 && p.host) || null;
   }

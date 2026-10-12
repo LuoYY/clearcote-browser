@@ -275,8 +275,10 @@ one symmetric bell. Because they use native input, the button held by `mouse.dow
 across the move, so `down → move → up` is a real drag (slider captchas work). Clicks get an
 actionability pre-flight (visible + enabled + stable + not covered) and fall back to the native click
 if it fails. The "not covered" check is the browser's own hit test, read in an isolated world: the
-pointer does not move before the glide and nothing is pressed (only a click point inside a child frame
-still uses Playwright's `trial`, which does both). With a CSS selector the element is also found and
+pointer does not move before the glide and nothing is pressed. A layer with `pointer-events: none` over
+the target is skipped, as a real press skips it, and a click point inside a child frame is checked
+against the `<iframe>` element that holds it (where a press there lands as far as the page is
+concerned); no Playwright `trial` runs at all. With a CSS selector the element is also found and
 scrolled into view there, so the page's own scripts see no read at all; a `get_by_role` / `get_by_label` /
 text locator costs one Playwright `bounding_box`, which reads the element's `textContent` in the page. Typing goes key-by-key with **gaussian inter-key timing** + word-boundary pauses, the
 occasional fat-finger correction and **key rollover** (on some fast pairs the next key goes down
@@ -287,8 +289,10 @@ full notch: the requested distance is rounded to the nearest notch (at least one
 short flicks with the occasional reading pause.
 
 **Click options** are honoured with humanize on: `button`, `click_count`, `delay` (the hold),
-`modifiers` (held around the press), `position` and `force`; `trial=True` performs no action, exactly as
-in Playwright. Locator actions stay strict, and every Playwright locator works (`get_by_role`,
+`modifiers` (held around the press), `position` and `force`; `trial=True` performs no action: the SDK
+runs Playwright's checks itself (visible, enabled, stable, the click point receives the press) and
+raises Playwright's `TimeoutError` when they never pass within the timeout, without moving the pointer
+or pressing (Playwright's own trial does both, and listeners a page registered early see it). Locator actions stay strict, and every Playwright locator works (`get_by_role`,
 `get_by_label`, `.filter()`, `.nth()`).
 
 **`fill` follows the field.** Text is typed (cleared with held keys only when it has a value, then

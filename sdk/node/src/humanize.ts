@@ -28,6 +28,7 @@
 // page.evaluate / locator.evaluate.
 
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
+import { errors as pwErrors } from "playwright-core";
 import {
   makePersona, planMove, dragDwell, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Step, type WheelPlatform,
@@ -93,8 +94,10 @@ export const POINTER_PATH = "Browser.dispatchPointerPath";
 /** @internal exported for tests */
 export const POINTER_PATH_LEGACY = "Browser.humanizedClick";
 
-// Which name each browser answered to, so only its first call can pay for a miss.
+// Which name each browser answered to, so only its first call can pay for a miss. NO_ENGINE_PATH: the
+// engine knew neither name -- remembered too, so a new page of that browser does not probe both again.
 const engineMethodNames = new WeakMap<object, Map<string, string>>();
+const NO_ENGINE_PATH = "";
 
 // A CDP method-not-found: the engine predates the name. A raw CDP client sees code -32601;
 // Playwright's CDPSession keeps only the message ("Protocol error (X): 'X' wasn't found").
@@ -102,9 +105,9 @@ const isMethodNotFound = (e: any): boolean =>
   e?.code === -32601 || /-32601|wasn't found|method not found/i.test(String(e?.message ?? e));
 
 /** @internal exported for tests. Send `method`, or `legacy` when the engine predates the rename, and
- * remember per `cacheKey` (a Browser, or the context when there is none) which one answered. Any
- * error other than method-not-found propagates as-is: retrying a real failure under the old name
- * would only replay it. */
+ * remember per `cacheKey` (a Browser, or the context when there is none) which one answered -- or that
+ * neither did, after which every call fails at once without a round trip. Any error other than
+ * method-not-found propagates as-is: retrying a real failure under the old name would only replay it. */
 export async function sendEngineCommand(
   session: { send(method: string, params?: any): Promise<any> }, cacheKey: object,
   method: string, legacy: string, params: Record<string, unknown>
@@ -112,6 +115,7 @@ export async function sendEngineCommand(
   let names = engineMethodNames.get(cacheKey);
   if (!names) { names = new Map(); engineMethodNames.set(cacheKey, names); }
   const known = names.get(method);
+  if (known === NO_ENGINE_PATH) throw Object.assign(new Error(`'${method}' wasn't found`), { code: -32601 });
   if (known) return session.send(known, params);
   try {
     const r = await session.send(method, params);
@@ -120,9 +124,39 @@ export async function sendEngineCommand(
   } catch (e) {
     if (!isMethodNotFound(e)) throw e;
   }
-  const r = await session.send(legacy, params);
+  let r: any;
+  try {
+    r = await session.send(legacy, params);
+  } catch (e) {
+    if (isMethodNotFound(e)) names.set(method, NO_ENGINE_PATH);
+    throw e;
+  }
   names.set(method, legacy);
   return r;
+}
+
+/** @internal exported for tests. Did this browser's engine already say it has no pointer-path command? */
+export function engineHasNoPointerPath(cacheKey: object | null): boolean {
+  return !!cacheKey && engineMethodNames.get(cacheKey)?.get(POINTER_PATH) === NO_ENGINE_PATH;
+}
+
+/** @internal exported for tests. The page's default action timeout (setDefaultTimeout, else the
+ * context's, else Playwright's 30 s). */
+export function defaultTimeoutMs(page: any): number {
+  try {
+    const t = page?._timeoutSettings?.timeout({});
+    if (typeof t === "number" && Number.isFinite(t)) return t;
+  } catch { /* not this Playwright's shape */ }
+  return 30_000;
+}
+
+/** @internal exported for tests. A Playwright TimeoutError for a trial whose checks never passed,
+ * worded like Playwright's. */
+export function trialTimeoutError(selector: string, ms: number, why: string): Error {
+  const msg = `Timeout ${Math.round(ms)}ms exceeded.\nCall log:\n  - waiting for locator('${selector}')\n  - ${why}`;
+  const E: any = (pwErrors as any)?.TimeoutError;
+  if (typeof E === "function") return new E(msg);
+  return Object.assign(new Error(msg), { name: "TimeoutError" });
 }
 
 // The characters a US-layout keyboard (Playwright's, and the engine's keyboard.getLayoutMap())
@@ -260,6 +294,9 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   const engineGlide = async (x: number, y: number, noClick: boolean): Promise<boolean> => {
     if (!eng.ok) return false;
     try {
+      // This browser's engine already said it has neither command: no sessions, no probe.
+      const ctx0: any = page.context();
+      if (engineHasNoPointerPath((ctx0.browser ? ctx0.browser() : null) ?? ctx0)) { eng.ok = false; return false; }
       if (eng.session === null) {
         const ctx: any = page.context();
         const tsession = await ctx.newCDPSession(page);
@@ -826,7 +863,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   };
 
   // Does a press at viewport (x, y) reach the element filling `box`? true / false, or null when it
-  // cannot be told here: the point lies in a child frame, or CDP is unavailable.
+  // cannot be told here (CDP is unavailable). A point inside a child frame is answered by the <iframe>
+  // element that holds it (IsolatedWorld.nodeAt).
   const hitInBox = async (box: Rect, x: number, y: number): Promise<boolean | null> => {
     const w = worldFor(page);
     const nid = await w.nodeAt(x, y);
@@ -1453,14 +1491,18 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
 
   // ------------------------------------------------------------------ check / uncheck / setChecked
   // A humanized click when the state must change, then the state verified. `trial` performs no action:
-  // Playwright's own trial runs. Errors propagate as Playwright's own (not a checkbox, timed out): the
+  // the state is read (a non-checkbox raises, as in Playwright) and, when a click would be needed, its
+  // checks run here (trial) -- not Playwright's trial, which moves the pointer and presses. Errors propagate as Playwright's own (not a checkbox, timed out): the
   // click owns its native fallback, so nothing here may click a second time -- and when one click did
   // not change the state (a page that cancels it), this raises like Playwright's check instead of
   // clicking again.
   const setChecked = async (orig: NativeFn, selector: string, checked: boolean, options: any): Promise<any> => {
     const opts = options ?? {};
-    if (opts.trial) return orig(selector, opts);
     const loc = page.locator(selector).first();
+    if (opts.trial) {
+      if ((await loc.isChecked({ timeout: opts.timeout })) === checked) return;
+      return trial(selector, opts, false);
+    }
     if ((await loc.isChecked({ timeout: opts.timeout })) === checked) return;
     await targetedClick(nativePageClick, selector, { ...opts }, false, null);
     if ((await loc.isChecked()) === checked) return;
@@ -1485,31 +1527,57 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // saw, before every humanized click since 0.46.0, a mousemove inside the target, a 450-500 px jump
   // back, then the glide, and a pointerdown/pointerup/click (left, even for a right click) that window
   // capture listeners could see. A covered point is looked at again for COVER_CHECK_MS (an overlay
-  // fading out).
-  const reachesPoint = async (orig: NativeFn, selector: string, box: Rect, x: number, y: number): Promise<boolean> => {
+  // fading out). A point inside a child frame is answered by the <iframe> element that holds it
+  // (IsolatedWorld.nodeAt), so no Playwright trial runs for it either. false when covered; null when
+  // the hit test cannot run (no CDP): the caller goes native.
+  const reachesPoint = async (box: Rect, x: number, y: number): Promise<boolean | null> => {
     const deadline = Date.now() + COVER_CHECK_MS;
     let hit = await hitInBox(box, x, y);
     while (hit === false && Date.now() < deadline) {
       await sleep(80);
       hit = await hitInBox(box, x, y);
     }
-    if (hit !== null) return hit;
-    // Only Playwright's trial can look inside a child frame. It moves the pointer: the cost of a point
-    // the isolated world cannot see, never of an ordinary click.
-    const at = { x: x - box.x, y: y - box.y };
-    try {
-      await orig(selector, { trial: true, timeout: COVER_CHECK_MS, position: at });
-      return true;
-    } catch (e) {
-      if (!isTimeout(e) || String((e as Error)?.message ?? e).includes("intercepts pointer events")) return false;
-    }
-    try {
-      // Not covered, just not "stable" yet: on the first page of a fresh headless browser Playwright's
-      // animation-frame wait can outlast the first look. One longer look.
-      await orig(selector, { trial: true, timeout: COVER_RETRY_MS, position: at });
-      return true;
-    } catch {
-      return false;
+    return hit;
+  };
+
+  // The viewport point of Playwright's `position` (relative to the PADDING box: the border widths are added).
+  const positionPoint = async (box: Rect, pos: { x: number; y: number }): Promise<{ x: number; y: number }> => {
+    const info = await describe(box, null);
+    const bl = info ? info.bl || 0 : 0, bt = info ? info.bt || 0 : 0;
+    return { x: box.x + bl + pos.x, y: box.y + bt + pos.y };
+  };
+
+  // `trial: true`, answered by the SDK: Playwright's actionability checks -- visible, enabled (not for
+  // hover), stable, and the click point receives the press (the browser's own hit test, read in the
+  // isolated world) -- retried until the caller's timeout (or the page default), then a Playwright
+  // TimeoutError. NO pointer move and NO press: Playwright's own trial moves the real pointer onto the
+  // target and dispatches pointerdown/pointerup/click that page listeners registered before its blocker
+  // see (SC 209: 6/6). The point checked is Playwright's: `position`, else the centre. Scrolling the
+  // element into view is part of the checks, as in Playwright. With `force` only the element must exist.
+  const trial = async (selector: string, options: any, noClick: boolean): Promise<void> => {
+    const opts = options ?? {};
+    const o = normalizeClickOptions(opts);
+    const ms = typeof opts.timeout === "number" ? opts.timeout : defaultTimeoutMs(page);
+    const end = ms > 0 ? Date.now() + ms : null;
+    const left = () => (end === null ? 0 : Math.max(1, Math.round(end - Date.now())));
+    const loc = page.locator(selector).first();
+    if (o.force) { await loc.waitFor({ state: "attached", timeout: left() }); return; }
+    for (;;) {
+      let why = "element is not visible";
+      const box = await boxOf(loc, left(), false, selector); // waits for visible; throws Playwright's timeout
+      if (box) {
+        if (!noClick && !(await loc.isEnabled())) {
+          why = "element is not enabled";
+        } else {
+          const { x, y } = o.position ? await positionPoint(box, o.position)
+            : { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+          await sleep(50); // stable: 50 ms on, the element still fills `box` (ISO_HIT_IN_BOX)
+          if ((await hitInBox(box, x, y)) !== false) return; // null: the hit test cannot run -- nothing to add
+          why = `element is not stable, or another element would receive the pointer at (${Math.round(x)}, ${Math.round(y)})`;
+        }
+      }
+      if (end !== null && Date.now() >= end) throw trialTimeoutError(selector, ms, why);
+      await sleep(end === null ? 100 : Math.max(0, Math.min(100, end - Date.now())));
     }
   };
 
@@ -1518,9 +1586,9 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   //
   // Every Playwright option is honoured: `button`, `clickCount`, `delay` (the hold) and `modifiers`
   // shape the press; `position` replaces the persona's point; `force` skips the covered-point check
-  // (and, as in Playwright, every wait); `trial` performs NO action (it runs Playwright's own trial, as
-  // documented). The caller's `timeout` is passed through unchanged. No Playwright trial runs before a
-  // humanized press (reachesPoint): only a point inside a child frame still needs one.
+  // (and, as in Playwright, every wait); `trial` performs NO action: its checks run here (trial), with
+  // no pointer move and no press. The caller's `timeout` is passed through unchanged. No Playwright
+  // trial runs before a humanized press either (reachesPoint).
   const targetedClick = async (orig: NativeFn | null, selector: string, options: any, noClick: boolean,
     nativeOpts: any | null): Promise<any> => {
     const opts = options ?? {};
@@ -1535,7 +1603,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
         st.placed = true;
       }
     };
-    if (o.trial) return native();
+    if (o.trial) return trial(selector, opts, noClick);
     try {
       const timeout = opts.timeout; // undefined: the page's default, as Playwright would use
       const loc = page.locator(selector).first();
@@ -1546,11 +1614,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       if (!o.force && !(await loc.isEnabled())) throw new NativeSignal();
       let x: number, y: number;
       if (o.position) {
-        // Playwright's position is relative to the PADDING box: add the border widths.
-        const info = await describe(box, null);
-        const bl = info ? info.bl || 0 : 0, bt = info ? info.bt || 0 : 0;
-        x = box.x + bl + o.position.x;
-        y = box.y + bt + o.position.y;
+        ({ x, y } = await positionPoint(box, o.position));
       } else {
         ({ x, y } = clickPoint(box, st, persona));
       }
@@ -1559,7 +1623,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
         // flight does not) and own the click point -- no trusted press at a point some overlay owns.
         // Either failing goes native: Playwright waits for it.
         await sleep(50);
-        if (!(await reachesPoint(orig, selector, box, x, y))) throw new NativeSignal();
+        if (!(await reachesPoint(box, x, y))) throw new NativeSignal();
       }
       if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) throw new NativeSignal();
       if (noClick && o.modifiers.length) {
@@ -1594,6 +1658,9 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     locked(() => targetedClick(nativePageClick, selector, options, false, null));
   (page as any).hover = (selector: string, options: any = {}) =>
     locked(() => targetedClick(nativePageHover, selector, options, true, null));
+  // Locator.dragTo({ trial: true }) answers its checks here too (see the Locator patch).
+  (page as any)._clearcoteTrial = (selector: string, options: any, noClick: boolean) =>
+    locked(() => trial(selector, options, noClick));
 
   // Marker the Locator-class patch keys off: humanize is active for THIS page.
   (page as any)._clearcoteHumanized = true;
@@ -1767,7 +1834,20 @@ function patchLocatorClass(sample: Locator): void {
   }
 
   proto.dragTo = async function (this: any, target: any, kw: any = {}) {
-    if (on(this)) {
+    if (kw?.trial && on(this) && on(target) && await strict(this) && await strict(target)) {
+      // Playwright's drag trial moves the pointer onto the source and presses there (SC 209); the SDK
+      // runs the checks of both ends instead: visible, stable, receives the pointer.
+      const t = this.page()._clearcoteTrial;
+      if (typeof t === "function") {
+        for (const [loc, pos] of [[this, kw.sourcePosition], [target, kw.targetPosition]] as const) {
+          const o: any = pickOptions(kw, ["force", "timeout"]);
+          if (pos) o.position = pos;
+          await t(sel(loc), o, true);
+        }
+        return;
+      }
+    }
+    if (on(this) && !kw?.trial) {
       try {
         const pg: any = this.page();
         const sb = await this.boundingBox();

@@ -227,8 +227,11 @@ e-mail, number, phone, URL or one-time-code fields, nor in a field inside an ifr
   calls on one page take turns instead of interleaving their keys.
 - **Humanized clicks no longer run a Playwright `trial`** before pressing: the covered-point check is the
   browser's own hit test, read where the page cannot see it, so the pointer is not moved onto the target
-  and back and no blocked press reaches the page. Only a click point inside a child frame still uses a
-  trial. A plain-CSS target (`"#id"`, `page.Locator(".cls")`) is located without any Playwright element
+  and back and no blocked press reaches the page. A click point inside a child frame is checked against the
+  `<iframe>` element that holds it, and a layer with `pointer-events: none` over the target is skipped, as
+  a real press skips it. `Trial = true` runs Playwright's checks in the SDK (visible, enabled, stable, the
+  point receives the press) and throws a `TimeoutException` when they never pass, without moving the
+  pointer or pressing. A plain-CSS target (`"#id"`, `page.Locator(".cls")`) is located without any Playwright element
   handle; a long drop-down list is crossed with a held arrow key and type-ahead that includes spaces.
 
 `Attach` is optional — the first humanized call creates a random persona. Pass the same seed you pass

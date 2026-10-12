@@ -545,14 +545,46 @@ def test_modifiers_are_held_around_the_whole_press(fast):
 
 
 def test_trial_performs_no_action(fast):
+    # The SDK answers trial itself: Playwright's trial moves the real pointer onto the target and
+    # dispatches pointerdown/pointerup/click that page listeners registered first see (SC 209).
     async def go():
         p = await attached(_btn())
         await p.click("#b", trial=True)
         await p.hover("#b", trial=True)
         await p.dblclick("#b", trial=True)
         assert not kinds(p, "down", "up", "click", "move")
-        assert [(n[0], n[-1].get("trial")) for n in p.native] == [("click", True), ("hover", True),
-                                                                   ("dblclick", True)]
+        assert p.native == [], "no Playwright trial: it moves the pointer and presses"
+    run(go())
+
+
+def test_a_trial_on_a_covered_target_times_out_like_playwright(fast):
+    async def go():
+        b = Field(tag="button", type="", rect=(100.0, 100.0, 160.0, 40.0), covered=True)
+        p = await attached(("#b", b))
+        with pytest.raises(Exception) as err:
+            await p.click("#b", trial=True, timeout=200)
+        assert type(err.value).__name__ == "TimeoutError" and "200ms" in str(err.value)
+        assert p.native == [] and not kinds(p, "down", "up", "click", "move")
+    run(go())
+
+
+def test_a_trial_on_a_hidden_target_raises_playwrights_timeout(fast):
+    async def go():
+        b = Field(tag="button", type="", rect=(100.0, 100.0, 160.0, 40.0))
+        b.visible = False
+        p = await attached(("#b", b))
+        with pytest.raises(PWTimeout):
+            await p.click("#b", trial=True, timeout=200)
+        assert p.native == [] and not kinds(p, "down", "move")
+    run(go())
+
+
+def test_a_forced_trial_only_needs_the_element(fast):
+    async def go():
+        b = Field(tag="button", type="", rect=(100.0, 100.0, 160.0, 40.0), covered=True)
+        p = await attached(("#b", b))
+        await p.click("#b", trial=True, force=True, timeout=200)
+        assert p.native == [] and not kinds(p, "down", "move")
     run(go())
 
 
@@ -1073,7 +1105,7 @@ def test_check_with_trial_performs_no_action(fast):
         await p.check("#cb", trial=True)
         await p.set_checked("#cb", True, trial=True)
         assert not cb.checked and not kinds(p, "down", "click", "move")
-        assert [(n[0], n[-1].get("trial")) for n in p.native] == [("check", True), ("set_checked", True)]
+        assert p.native == [], "no Playwright trial: it moves the pointer and presses"
     run(go())
 
 
@@ -1414,14 +1446,16 @@ def test_a_covered_click_point_goes_native_without_a_trial(fast):
     run(go())
 
 
-def test_a_click_point_in_a_child_frame_still_uses_the_trial(fast):
-    # Only Playwright's trial can see inside a child frame: that one case keeps it.
+def test_a_click_point_the_hit_test_cannot_answer_runs_no_playwright_trial(fast):
+    # A point inside a child frame is answered by its <iframe> element (IsolatedWorld.node_at); when
+    # the hit test cannot answer at all, the click is Playwright's own -- never a trial first (it
+    # moved the pointer onto the target and pressed there).
     async def go():
         b = Field(tag="button", type="", rect=(100.0, 100.0, 160.0, 40.0), in_frame=True)
         p = await attached(("#b", b))
         await p.click("#b")
-        assert [(n[0], n[-1].get("trial")) for n in p.native] == [("click", True)]
-        assert kinds(p, "down"), "the trial passed: the humanized press follows"
+        assert [(n[0], n[-1].get("trial")) for n in p.native] == [("click", None)]
+        assert not kinds(p, "down"), "no humanized press at a point nothing proved"
     run(go())
 
 

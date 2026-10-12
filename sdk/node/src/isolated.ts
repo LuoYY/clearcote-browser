@@ -26,10 +26,36 @@ const resultValue = <T>(r: any): T | undefined => {
 /** @internal exported for tests. DOM.getNodeForLocation hit-tests in DOCUMENT coordinates (the
  * viewport point plus the scroll offset); Playwright's boxes, CDP's box model and the mouse are all
  * VIEWPORT coordinates. Measured on r37: a field scrolled 547 px down answered "No node found" at its
- * viewport centre and the input itself at centre + scroll. */
+ * viewport centre and the input itself at centre + scroll.
+ *
+ * No ignorePointerEventsNone: in CDP `true` means "hit-test pointer-events:none elements TOO", so a
+ * decorative layer with pointer-events:none over a control was returned instead of the control and
+ * every form route fell back to stock Playwright (SC 209: 6/6 untrusted change events). The default
+ * (false) skips such layers, exactly as a real press does. */
 export function nodeAtParams(x: number, y: number, scroll?: readonly [number, number] | null): Record<string, unknown> {
   const [sx, sy] = scroll ?? [0, 0];
-  return { x: roundHalfEven(x + sx), y: roundHalfEven(y + sy), includeUserAgentShadowDOM: false, ignorePointerEventsNone: true };
+  return { x: roundHalfEven(x + sx), y: roundHalfEven(y + sy), includeUserAgentShadowDOM: false };
+}
+
+/** @internal exported for tests. The frame directly under `main` that contains `frameId` (itself for a
+ * direct child), from a Page.getFrameTree answer; null when it is not below the main frame. */
+export function topChildFrame(tree: any, frameId: string, main: string): string | null {
+  const parents = new Map<string, string | null>();
+  const walk = (t: any, parent: string | null) => {
+    const id = t?.frame?.id;
+    if (!id) return;
+    parents.set(id, parent);
+    for (const c of t.childFrames ?? []) walk(c, id);
+  };
+  walk(tree, null);
+  let fid = frameId;
+  for (let n = 0; n < 64; n++) {
+    const up = parents.get(fid);
+    if (up === undefined || up === null) return null;
+    if (up === main) return fid;
+    fid = up;
+  }
+  return null;
 }
 
 /** Python's round(): half to even (60.5 -> 60), so the hit test picks the same pixel in every SDK. */
@@ -118,8 +144,9 @@ export class IsolatedWorld {
     return Array.isArray(s) && s.length === 2 ? [Number(s[0]), Number(s[1])] : [0, 0];
   }
 
-  /** backendNodeId of the MAIN-FRAME element at viewport point (x, y), or undefined. `scroll`: the
-   * page's [scrollX, scrollY] if the caller already has it (read here otherwise).
+  /** backendNodeId of the MAIN-FRAME element at viewport point (x, y) -- for a point inside a child
+   * frame, the <iframe> element that holds it --, or undefined. `scroll`: the page's [scrollX, scrollY]
+   * if the caller already has it (read here otherwise).
    *
    * CDP's hit test (DOM.getNodeForLocation) runs in the renderer with no script at all, so this is how
    * humanize finds the element a Playwright locator means -- getByRole, getByLabel, `>> nth=`,
@@ -133,8 +160,21 @@ export class IsolatedWorld {
     }
     const hit = await this.send("DOM.getNodeForLocation", nodeAtParams(x, y, scroll ?? await this.scroll()));
     if (!hit || hit.backendNodeId === undefined || hit.backendNodeId === null) return undefined;
-    if (hit.frameId && this.frame && hit.frameId !== this.frame) return undefined; // inside an iframe
+    if (hit.frameId && this.frame && hit.frameId !== this.frame) return this.ownerInMain(hit.frameId);
     return hit.backendNodeId as number;
+  }
+
+  /** A point inside a child frame: the <iframe> element in the MAIN document that holds it (through
+   * every nesting level), or undefined. To the main document a press there lands on that element: a
+   * control the iframe covers is covered, a target that is (or contains) the iframe is reached. This
+   * replaced the only Playwright trial humanize still ran (it moved the pointer and pressed, and page
+   * listeners registered first saw it). */
+  private async ownerInMain(frameId: string): Promise<number | undefined> {
+    const tree = await this.send("Page.getFrameTree");
+    const top = this.frame ? topChildFrame(tree?.frameTree, frameId, this.frame) : null;
+    if (!top) return undefined;
+    const own = await this.send("DOM.getFrameOwner", { frameId: top });
+    return own && typeof own.backendNodeId === "number" ? own.backendNodeId : undefined;
   }
 
   /** Run `fnSource` -- a `function (arg) { ... }` whose `this` is the node -- in the isolated world and
@@ -174,10 +214,11 @@ export function worldFor(page: object): IsolatedWorld {
   return w;
 }
 
-/** How long a trial action may look for a covered click point before the native path takes over. */
+/** How long a covered click point is re-checked (an overlay fading out) before the native path takes over. */
 export const COVER_CHECK_MS = 400;
-/** The one longer look when that trial timed out only because the element was not "stable" yet (no
- *  "intercepts pointer events" in Playwright's call log): slow first frames, not an overlay. */
+/** The timeout of the utility-world value reads that prove a fill landed. (It was also the one longer
+ *  look of the Playwright trial that checked a point inside a child frame; no Playwright trial runs in
+ *  humanized mode any more: such a point is answered by its <iframe> element, see nodeAt.) */
 export const COVER_RETRY_MS = 2000;
 
 // The reads humanize makes, as functions of one JSON argument (run by IsolatedWorld.evaluate).
@@ -233,16 +274,25 @@ export const ISO_DESCRIBE = `function (a) {
 export const ISO_FORM_CONTROL = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']";
 // Does the element the browser's hit test found at a click point belong to the element whose box the
 // caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
-// that box? `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
+// that box -- with no OTHER element of that same box beside the hit's path inside it (a wrapper's
+// control under an overlay: the wrap has the input's box, the press lands on the overlay)?
+// `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
 // press). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
 // element and back and performs a press whose events Playwright blocks, so a page saw a mousemove
 // inside the target, a jump back and a pointerdown/click before every humanized click (verifier B).
 export const ISO_HIT_IN_BOX = `function (b) {
+  const same = r => Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
+    Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5;
+  const path = new Set();
   let e = this.nodeType === 1 ? this : this.parentElement;
   for (let n = 0; e && n < 128; n++) {
-    const r = e.getBoundingClientRect();
-    if (Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
-        Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5) return true;
+    path.add(e);
+    if (same(e.getBoundingClientRect())) {
+      const all = e.getElementsByTagName('*');
+      if (all.length <= 4000)
+        for (const d of all) if (!path.has(d) && same(d.getBoundingClientRect())) return false;
+      return true;
+    }
     const p = e.parentNode;
     e = e.parentElement || (p && p.nodeType === 11 && p.host) || null;
   }

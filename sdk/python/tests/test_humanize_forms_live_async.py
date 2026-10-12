@@ -813,3 +813,77 @@ async def test_click_a_button_clipped_by_a_scrolling_container(page, how):
     assert [e["tr"] for e in await ev(page, "click", "innerbtn")] == [True]
     assert await page.evaluate("document.getElementById('scroller').scrollTop") > 0
     assert await ev(page, "mousemove"), "the pointer travelled to it"
+
+
+# --------------------------------------------------------------- SC 210: pointer-events:none, trial
+async def wev(page):
+    return await page.evaluate("[window.__wev, window.__fev || []]")
+
+
+async def reset_w(page):
+    await page.evaluate("window.__wev.length = 0; (window.__fev || []).length = 0")
+
+
+async def test_controls_under_a_pointer_events_none_layer_are_humanized(page):
+    """See test_humanize_forms_live.py: a pointer-events:none layer must not answer the hit test."""
+    await reset(page)
+    await page.fill("#pen", "glass")
+    assert await page.input_value("#pen") == "glass"
+    await assert_human_keys(page, "pen")
+    await reset(page)
+    await page.select_option("#pensel", "c")
+    assert await page.input_value("#pensel") == "c"
+    changes = await ev(page, "change", "pensel")
+    assert len(changes) == 1 and changes[0]["tr"], "one trusted change, not Playwright's synthetic one"
+    await reset(page)
+    await page.click("#penbtn")
+    assert sum(e["n"] for e in await ev(page, "mousemove")) >= 5, "the click glided (humanized)"
+    assert (await ev(page, "mousedown", "penbtn"))[0]["tr"]
+
+
+async def test_trial_moves_and_presses_nothing_a_window_listener_could_see(page):
+    await page.locator("#trialbtn").scroll_into_view_if_needed()
+    await page.locator("#frb").scroll_into_view_if_needed()
+    await reset_w(page)
+    await page.click("#trialbtn", trial=True)
+    await page.locator("#trialbtn").click(trial=True)
+    await page.dblclick("#trialbtn", trial=True)
+    await page.hover("#trialbtn", trial=True)
+    await page.locator("#trialbtn").tap(trial=True)
+    await page.click("#trialbtn", trial=True, position={"x": 5, "y": 5})
+    await page.check("#cb", trial=True)
+    await page.locator("#cb").set_checked(True, trial=True)
+    await page.locator("#btn").drag_to(page.locator("#trialbtn"), trial=True)
+    await page.click("#frb", trial=True)
+    assert await wev(page) == [[], []], "a trial dispatched pointer events"
+    assert not await page.is_checked("#cb")
+
+
+async def test_trial_fails_like_playwright_when_a_check_never_passes(page):
+    from playwright.async_api import TimeoutError as PWTimeout
+    await page.locator("#disbtn").scroll_into_view_if_needed()
+    await reset_w(page)
+    for sel in ("#disbtn", "#hiddenbtn", "#cov"):
+        t0 = time.time()
+        with pytest.raises(PWTimeout):
+            await page.click(sel, trial=True, timeout=600)
+        assert time.time() - t0 < 3, sel
+    page.set_default_timeout(700)   # no timeout given: the page default, as in Playwright
+    t0 = time.time()
+    with pytest.raises(PWTimeout):
+        await page.click("#disbtn", trial=True)
+    assert time.time() - t0 < 3, "the page default timeout"
+    await page.hover("#disbtn", trial=True, timeout=600)
+    assert await wev(page) == [[], []]
+
+
+async def test_a_click_on_a_frame_is_humanized_without_a_trial(page):
+    await page.locator("#frb").scroll_into_view_if_needed()
+    await reset(page)
+    await reset_w(page)
+    await page.click("#frb")
+    main, inner = await wev(page)
+    downs = [e for e in inner if e["t"] == "pointerdown"]
+    assert len(downs) == 1 and downs[0]["tr"], inner
+    assert sum(e["n"] for e in await ev(page, "mousemove")) >= 5, "the click glided (humanized)"
+    assert not [e for e in main if e["t"] in ("pointerdown", "mousedown", "click")]
