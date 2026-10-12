@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import * as F from "../src/forms.js";
-import { mulberry32 } from "../src/motion.js";
+import { hashSeed, mulberry32 } from "../src/motion.js";
 
 const VEC = JSON.parse(readFileSync(fileURLToPath(new URL("../../testdata/humanize_forms_vectors.json", import.meta.url)), "utf8"));
 
@@ -89,7 +89,8 @@ describe("shared vectors", () => {
   it("every vector group is exercised", () => {
     const tested = ["classify_field", "typos_allowed", "typo_eligible", "nearby_digits", "typeahead_simulate",
       "plan_select", "match_option", "range_sanitize", "range_value_ok", "range_point", "range_nudge",
-      "plan_datetime", "datetime_equal", "formatted_equal", "normalize_click_options", "engine_path_ok"];
+      "plan_datetime", "datetime_equal", "formatted_equal", "normalize_click_options", "engine_path_ok",
+      "fit_maxlength", "pre_press_center", "pre_press_ms"];
     expect(Object.keys(VEC).filter((k) => !k.startsWith("_")).sort()).toEqual([...tested].sort());
   });
 });
@@ -346,5 +347,54 @@ describe("properties", () => {
     expect(F.selectAllCombo("macOS")).toBe("Meta+a");
     expect(F.selectAllCombo("windows")).toBe("Control+a");
     expect(F.normalizeClickOptions({ clickCount: "2", delay: "80" })).toMatchObject({ clickCount: 2, delay: 80 });
+  });
+});
+
+describe("maxlength + pre-press pause (SC 210)", () => {
+  it.each(cases("fit_maxlength"))("fitMaxlength #%i", (_, c) => {
+    expect(F.fitMaxlength(c.value, c.maxlength, c.tag, c.type)).toBe(c.want);
+  });
+
+  it.each(cases("pre_press_center"))("prePressCenter #%i", (_, c) => {
+    expect(F.prePressCenter(c.seed)).toBeCloseTo(c.center, 6);
+  });
+
+  it.each(cases("pre_press_ms"))("prePressMs #%i", (_, c) => {
+    const r = mulberry32(c.rng_seed);
+    const got = (c.ms as number[]).map(() => F.prePressMs(c.seed, r));
+    got.forEach((g, i) => expect(g).toBeCloseTo(c.ms[i], 6));
+  });
+
+  it("the pause is 40-250 ms, right-skewed, with its own centre per identity", () => {
+    const centres = new Set<number>();
+    for (const name of ["ha-1", "ha-2", "ha-3", "ha-4", "ha-5", "ha-6"]) {
+      const seed = hashSeed(name);
+      const r = mulberry32(seed);
+      const xs = Array.from({ length: 4000 }, () => F.prePressMs(seed, r)).sort((a, b) => a - b);
+      expect(xs[0]).toBeGreaterThanOrEqual(40);
+      expect(xs[xs.length - 1]).toBeLessThanOrEqual(250);
+      const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+      expect(mean).toBeGreaterThan(xs[xs.length >> 1]);
+      expect(xs.filter((x) => x === 40 || x === 250).length).toBeLessThanOrEqual(4);
+      const c = F.prePressCenter(seed);
+      expect(c).toBeGreaterThanOrEqual(70);
+      expect(c).toBeLessThanOrEqual(135);
+      centres.add(Math.round(c * 1000));
+    }
+    expect(centres.size).toBe(6);
+  });
+
+  it("fitMaxlength is the longest prefix that fits, in UTF-16 units", () => {
+    const r = mulberry32(5);
+    const pool = ["a", "b", "1", "\u{1F600}"];
+    for (let k = 0; k < 500; k++) {
+      const n = Math.floor(r() * 14) - 1;
+      const v = Array.from({ length: Math.floor(r() * 11) }, () => pool[Math.floor(r() * pool.length)]).join("");
+      const got = F.fitMaxlength(v, n, "input", "text");
+      expect(v.startsWith(got)).toBe(true);
+      if (n < 0) { expect(got).toBe(v); continue; }
+      expect(got.length).toBeLessThanOrEqual(n);
+      if (got !== v) expect(got.length + Array.from(v.slice(got.length))[0].length).toBeGreaterThan(n);
+    }
   });
 });

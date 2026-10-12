@@ -217,7 +217,14 @@ function makeFake(opts: FakeOpts = {}) {
       if (["Shift", "Control", "Meta", "Alt", "ControlOrMeta"].includes(k)) mods.add(k); else applyKey(k);
     },
     up: async (k: string) => { rec("kup", k); mods.delete(k); },
-    insertText: async () => undefined,
+    insertText: async (t: string) => {
+      rec("insert", t);
+      const fo = focus;
+      if (!fo) return;
+      if (selAll) { fo.value = ""; selAll = false; }
+      const room = fo.maxlength === undefined ? Infinity : Math.max(0, fo.maxlength - Array.from(fo.value).length);
+      fo.value += Array.from(t).slice(0, room).join("");
+    },
   };
 
   const describeInfo = (f: Field, want: string | null) => {
@@ -682,10 +689,74 @@ describe("fill: text", () => {
     expect(cb.of("press")).toEqual([]);
   }, SLOW);
 
-  it("a value over 200 characters is filled atomically by Playwright", async () => {
-    const f = await attached();
+  it("a value over 200 characters is clicked into, then inserted at once (no Playwright fill)", async () => {
+    const f = await attached({ field: { value: "old" } });
     await f.page.fill("#f", "x".repeat(201));
-    expect(f.natives.map((n) => n.m)).toEqual(["fill"]);
+    expect(f.natives).toEqual([]);
+    expect(f.field.value).toBe("x".repeat(201));
+    const seq = f.events.map((e) => e.t).filter((t) => ["move", "down", "up", "insert"].includes(t));
+    expect(seq.indexOf("down")).toBeGreaterThan(seq.indexOf("move"));
+    expect(seq.indexOf("down")).toBeLessThan(seq.indexOf("insert"));
+    expect(f.of("insert").map((e) => e.a)).toEqual(["x".repeat(201)]);
+    expect(f.of("press").filter((e) => e.a.k === "x")).toEqual([]);
+  }, SLOW);
+
+  it("a bulk value respects maxlength and never falls back", async () => {
+    const f = await attached({ field: { maxlength: 250 } });
+    await f.page.fill("#f", "q".repeat(300));
+    expect(f.natives).toEqual([]);
+    expect(f.field.value).toBe("q".repeat(250));
+    expect(f.of("insert").map((e) => e.a)).toEqual(["q".repeat(250)]);
+  }, SLOW);
+
+  it("maxlength: only what fits is typed, no wipe and retype, no Playwright fill", async () => {
+    // r38: fill('1234567') on maxlength=5 typed seven, saw 12345, wiped it, typed seven again and then
+    // handed the field to Playwright. Playwright's own fill leaves 12345 too.
+    process.env[ENV] = "0";
+    const f = await attached({ field: { maxlength: 5 } });
+    await f.page.fill("#zip", "1234567");
+    expect(f.field.value).toBe("12345");
+    expect(f.natives).toEqual([]);
+    const typed = [...f.of("press").map((e) => e.a.k), ...f.of("kdown").map((e) => e.a)].filter((k) => /^[0-9]$/.test(k));
+    expect(typed.sort()).toEqual(["1", "2", "3", "4", "5"]);
+    expect(f.of("press").filter((e) => e.a.k === "Backspace")).toEqual([]);
+    expect(f.of("insert")).toEqual([]);
+  }, SLOW);
+
+  it("every SDK press waits 40+ ms after the last pointer move (focus click, click, drag grab)", async () => {
+    // r38: the focus click before typing pressed ~4 ms after the last pointermove, a drag grab ~21 ms.
+    process.env[ENV] = "0";
+    const gapBeforeDown = (f: Fake) => {
+      const out: number[] = [];
+      let last: number | null = null;
+      for (const e of f.events) {
+        if (e.t === "move") last = e.ts;
+        else if (e.t === "down" && last !== null) out.push(e.ts - last);
+      }
+      return out;
+    };
+    const a = await attached();
+    await a.page.fill("#f", "abc");
+    const b = await attached({ field: { tag: "button", type: "" } });
+    await b.page.click("#btn");
+    const c = await attached();
+    await c.page.mouse.move(150, 220);
+    await c.page.mouse.down();
+    await c.page.mouse.up();
+    for (const [name, f] of [["fill", a], ["click", b], ["drag", c]] as const) {
+      const gaps = gapBeforeDown(f);
+      expect(gaps.length, name).toBeGreaterThan(0);
+      for (const g of gaps) expect(g, name).toBeGreaterThanOrEqual(38);   // timer granularity
+      expect(f.of("click"), name).toEqual([]);
+    }
+  }, SLOW);
+
+  it("a bare mouse.down with no move before it stays instant", async () => {
+    const f = await attached();
+    const t0 = performance.now();
+    await f.page.mouse.down();
+    await f.page.mouse.up();
+    expect(performance.now() - t0).toBeLessThan(30);
   }, SLOW);
 
   it("a range value Playwright would reject goes to Playwright (which raises), never a snapped one", async () => {
@@ -829,11 +900,11 @@ describe("type / press", () => {
   it("an unfocused text field is clicked first; the caller's press delay wins, 0 gets the persona's", async () => {
     const f = await attached();
     await f.page.press("#f", "x", { delay: 222 });
-    expect(f.of("click").length).toBe(1);
+    expect(f.of("down").length).toBe(1);
     expect(f.of("press").at(-1)!.a).toEqual({ k: "x", delay: 222 });
     await f.page.press("#f", "y", { delay: 0 });
     expect(f.of("press").at(-1)!.a.delay).toBeGreaterThanOrEqual(45);
-    expect(f.of("click").length).toBe(1);   // already focused: no second click
+    expect(f.of("down").length).toBe(1);   // already focused: no second click
   }, SLOW);
 
   it("a press on a button is Playwright's: no click first, so it activates once", async () => {
@@ -956,7 +1027,8 @@ describe("selectOption", () => {
     });
     expect(await f.page.selectOption("#ms", ["b", "d", "e"])).toEqual(["b", "d", "e"]);
     expect(f.field.options!.filter((o) => o.selected).map((o) => o.value)).toEqual(["b", "d", "e"]);
-    expect(f.of("click").length).toBe(1);
+    expect(f.of("click")).toEqual([]);   // a press, not mouse.click (which moves again right before it)
+    expect(f.of("down").length).toBe(3);
     expect(f.of("kdown").map((e) => e.a)).toEqual(["ControlOrMeta", "ControlOrMeta"]);
     expect(f.of("wheel")).toEqual([]);
     expect(f.natives).toEqual([]);

@@ -38,8 +38,9 @@ import {
   worldFor, type DescribedElement,
 } from "./isolated.js";
 import {
-  DEFAULT_TYPO_RATE, NEARBY_LETTERS, classifyField, datetimeEqual, enginePathOk, formattedEqual, matchOption,
-  normalizeClickOptions, numericEqual, planDatetime, planSelect, planTypo, pyFloat, rangeAttrs, rangeFraction,
+  DEFAULT_TYPO_RATE, NEARBY_LETTERS, classifyField, datetimeEqual, enginePathOk, fitMaxlength, formattedEqual,
+  matchOption, normalizeClickOptions, numericEqual, planDatetime, planSelect, planTypo, prePressMs, pyFloat,
+  rangeAttrs, rangeFraction,
   rangeNudge, rangePoint, rangeSanitize, rangeValueOk, segmentNodesFromTree, typoEligible, typosAllowed,
   type ClickPlan, type FieldClass, type OptionInfo, type SelectPlan, type TypoField, type TypoPlan,
 } from "./forms.js";
@@ -357,6 +358,24 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // enough: measured on Node, a move to (110,58) was still mid-flight at (416,504) when the press
   // fired, landing on <body>. Re-issuing a native move to the tracked target immediately before
   // the press pins the cursor to where the caller asked, whatever the trajectory is doing.
+  // The pause between the pointer coming to rest and the button going down (forms.prePressMs: 40-250
+  // ms, right-skewed, centred per identity). Measured on r38 before it: the focus click before typing
+  // pressed ~4 ms after the last pointermove, a drag grab ~21 ms.
+  const prePress = async (): Promise<void> => { await sleep(prePressMs(persona.seed)); };
+  // What is left of a button hold once mouse.down() has returned: the hold runs from when the press was
+  // SENT. mouse.down() returns only after the page handled the press, and a <select> opens its popup
+  // inside that, so a hold slept afterwards reached the page ~30-80 ms longer than planned.
+  const holdRest = (holdMs: number, t0: number): number => Math.max(0, holdMs - (Date.now() - t0));
+  // Press and release the left button where the last glide left the pointer, after the pre-press
+  // pause. Native down/up, so nothing moves: Playwright's mouse.click(x, y) sends one more mouseMoved
+  // first, and THAT was the last pointermove the page saw, ~4 ms before the press.
+  const pressHere = async (x: number, y: number, holdMs?: number): Promise<void> => {
+    const hold = holdMs ?? clickHold(persona);
+    await prePress();
+    const t0 = Date.now();
+    await nativeDown();
+    try { await sleep(holdRest(hold, t0)); } finally { await nativeUp(); } // never leave the button down
+  };
   mouse.down = async (...a: any[]) => {
     // DELIBERATELY NO PLACEMENT WHEN THE POINTER HAS NEVER MOVED.
     //
@@ -372,6 +391,9 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       // where the engine's cursor actually is. The engine answers its pointer path before its
       // trajectory has finished, so without this the press can fire at a stale position.
       try { await nativeMove(st.x, st.y); } catch { /* best effort: keep the press on target */ }
+      // The hand has arrived; it confirms the target before the button goes down. The pin is itself
+      // a pointermove, so the pause comes after it. A down() with no move before it stays instant.
+      await prePress();
     }
     st.held = true;
     try {
@@ -391,7 +413,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     await glide(x, y);
     try {
       if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) {
-        await sleep(rand(40, 130)); // brief dwell before pressing, like a human
+        await prePress(); // the hand confirms the target before it presses
         // delay = the mousedown→mouseup HOLD (human ~60–150 ms); without it Playwright releases in ~2 ms.
         await nativeClick(x, y, { delay: o.delay ?? clickHold(persona), button: o.button, clickCount: o.clickCount });
         return;
@@ -502,6 +524,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   const keyboard: any = page.keyboard;
   const nativeKbType = keyboard.type.bind(keyboard);
   const nativeKbPress = keyboard.press.bind(keyboard);
+  // A bulk fill's paste (Input.insertText).
+  const nativeKbInsert = typeof keyboard.insertText === "function" ? keyboard.insertText.bind(keyboard) : undefined;
   // A page-like keyboard without down/up still gets every other humanization; it just types
   // capitals without the Shift key, as before.
   const nativeKbDown = typeof keyboard.down === "function" ? keyboard.down.bind(keyboard) : undefined;
@@ -536,13 +560,14 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
         held.push(m);
         await sleep(rand(40, 110));
       }
-      await sleep(rand(40, 130)); // brief dwell before pressing, like a human
+      await prePress(); // the hand confirms the target before it presses
       const n = o.clickCount;
       for (let i = 1; i <= n; i++) {
         const hold = o.delay ?? clickHold(persona);
+        const t0 = Date.now();
         await nativeDown({ button: o.button, clickCount: i });
         try {
-          await sleep(hold);
+          await sleep(holdRest(hold, t0));
         } finally {
           await nativeUp({ button: o.button, clickCount: i }); // never leave the button down
         }
@@ -959,8 +984,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     }
     const pt = at ? { x: at[0], y: at[1] } : clickPoint(box, st, persona); // 2D gaussian toward the centre
     await glide(pt.x, pt.y);
-    await sleep(rand(40, 130));
-    await nativeClick(pt.x, pt.y, { delay: clickHold(persona) });
+    await pressHere(pt.x, pt.y);
     return true;
   };
 
@@ -1043,34 +1067,55 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // (an overlay took it), is left to Playwright -- "could not check" is never treated as success.
   const fillText = async (loc: Locator, box: Rect | null, value: string, info: DescribedElement | null,
     selector: string | null = null): Promise<boolean> => {
-    if (Array.from(value).length > 200) return false; // bulk values: keep fill fast/atomic
     const isCe = Boolean(info && info.ce)
       || (info === null && ((await loc.getAttribute("contenteditable")) || "false") !== "false");
+    // What the field can hold: a maxlength keeps the first N characters (what Playwright's insertText
+    // leaves too), and a person types only those -- the field stops taking keys.
+    let want = value;
+    if (!isCe) {
+      want = info
+        ? fitMaxlength(value, info.maxlength, info.tag, info.type)
+        : fitMaxlength(value, await loc.getAttribute("maxlength"),
+          (await loc.locator("xpath=self::textarea").count()) ? "textarea" : "input", (await loc.getAttribute("type")) || "");
+    }
+    // Bulk values (over 200 characters) are still inserted at once -- typing thousands of keys would
+    // crawl -- but the way a person pastes: glide to the field, click into it, then insert.
+    const bulk = Array.from(value).length > 200;
+    if (bulk && !nativeKbInsert) return false;
     if (!(await focusClick(box, box ? provenPoint(box, info) : null, loc, selector))) return false;
     await sleep(rand(40, 120));
     if (!(await focused(loc))) return false;
     const read = async (): Promise<string | null> => {
       try { return await loc.inputValue({ timeout: COVER_RETRY_MS }); } catch { return null; }
     };
+    const put = async (text: string, typos = true): Promise<void> => {
+      if (bulk) {
+        await sleep(rand(120, 320)); // the paste shortcut, after the click
+        await nativeKbInsert!(text);
+      } else {
+        await humanTypeText(text, info, typos);
+      }
+    };
     if (isCe) {
       const cur = info ? info.value : null;
       if (cur) await clearFocused();
-      await humanTypeText(value, info);
+      await put(want);
       return true; // contenteditable: Playwright's fill sets text the same way; no value to read
     }
     const cur = await read();
     if (cur === null) return false;
     if (cur) await clearFocused(read); // a person does not select-all an empty field
-    await humanTypeText(value, info);
+    await put(want);
     let got = await read();
     if (got === null) return false;
-    if (got === value || formattedEqual(got, value)) return true; // exact, or a mask that only re-punctuated it
+    if (got === want || formattedEqual(got, want)) return true; // exact, or a mask that only re-punctuated it
+    if (bulk) return false; // an inserted value that did not land: Playwright's fill, not a second paste
     // Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips, then
     // give the field to Playwright -- a correct value beats pretty input.
     await clearFocused(read);
-    await humanTypeText(value, info, false);
+    await put(want, false);
     got = await read();
-    return got !== null && (got === value || formattedEqual(got, value));
+    return got !== null && (got === want || formattedEqual(got, want));
   };
 
   // A range input: drag the thumb (or click the track) to the value, then arrow-nudge to it exactly.
@@ -1101,7 +1146,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       let [cx, cy] = rangePoint(box, rangeFraction(cur, lo, hi), rtl);
       cy += gauss() * box.height * 0.08;
       await glide(cx, cy, { targetW: 16 });
-      await sleep(rand(60, 160));
+      await prePress();
       const { grabMs, releaseMs } = dragDwell(persona);
       await nativeDown();
       st.held = true;
@@ -1115,8 +1160,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       }
     } else {
       await glide(tx, ty, { targetW: 16 });
-      await sleep(rand(40, 130));
-      await nativeClick(tx, ty, { delay: clickHold(persona) });
+      await pressHere(tx, ty);
     }
     for (let round = 0; round < 3; round++) {
       const v = await now();
@@ -1163,16 +1207,15 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       py = box.y + box.height / 2;
     }
     await glide(px, py, { targetW: fw });
-    await sleep(rand(40, 130));
-    await nativeClick(px, py, { delay: clickHold(persona) });
+    await pressHere(px, py);
     await sleep(rand(150, 350));
     for (const a of plan) {
       if (a[0] === "type") {
-        const digits = Array.from(a[1]);
-        for (let j = 0; j < digits.length; j++) {
-          await nativeKbPress(digits[j], { delay: keyDwell(persona) });
-          if (j < digits.length - 1) await sleep(Math.max(30, 110 + gauss() * 40));
-        }
+        // The same typing model as text (persona dwell, gaussian gaps, thinking pauses, rollover): the
+        // old flat 60-150 ms gap had a CV of 0.24 and no rollover. A segment moves on by itself after
+        // its last digit and keys go down in order, so a rolled-over digit still lands in the right
+        // field (checked on r38, all five types). No typos: a slip in a date is a wrong date.
+        await humanTypeText(a[1], null, false);
       } else {
         await key(a[1], a.length > 2 ? (a as [string, string, number])[2] : 1, [70, 170]);
       }
@@ -1386,8 +1429,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
         // ControlOrMeta: Playwright sends the add-to-selection key the ENGINE honours
         await pressAt(normalizeClickOptions({ modifiers: ["ControlOrMeta"] }));
       } else {
-        await sleep(rand(40, 130));
-        await nativeClick(px, py, { delay: clickHold(persona) });
+        await pressHere(px, py);
       }
       await sleep(rand(150, 350));
     }
@@ -1779,8 +1821,8 @@ function patchLocatorClass(sample: Locator): void {
           // a settle dwell BEFORE releasing, drawn from the page's motor persona.
           const persona: Persona | undefined = pg._clearcotePersona;
           const { grabMs, releaseMs } = persona ? dragDwell(persona) : { grabMs: rand(130, 360), releaseMs: rand(90, 230) };
-          await pg.mouse.move(sx, sy); await sleep(rand(100, 200));
-          await pg.mouse.down(); await sleep(grabMs);   // grab hesitation (native -> button held across glide)
+          await pg.mouse.move(sx, sy);
+          await pg.mouse.down(); await sleep(grabMs);   // pre-press pause inside down(); then the grab hesitation
           const heldGlide = pg._clearcoteHeldGlide;     // humanized held-button drag + seating jiggle (settle)
           if (heldGlide) await heldGlide(tx, ty); else await pg.mouse.move(tx, ty);
           await sleep(releaseMs);                       // pre-release settle before letting go

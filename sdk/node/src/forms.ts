@@ -21,6 +21,8 @@
  *     (type=month) ignores digits and steps on arrows; the ampm field takes A / P.
  */
 
+import { gaussFrom, mulberry32 } from "./motion.js";
+
 /** A source of uniform [0, 1) numbers (Math.random, or a seeded generator in tests). */
 export type FormsRng = () => number;
 
@@ -158,6 +160,65 @@ export function formattedEqual(got: string | null | undefined, want: string | nu
   const a = Array.from(got).filter(isAlnum).map(casefold);
   const b = Array.from(want).filter(isAlnum).map(casefold);
   return b.length > 0 && a.length === b.length && a.every((c, i) => c === b[i]);
+}
+
+// ------------------------------------------------------------------------------- maxlength
+/** The input types whose maxlength the browser enforces on what is typed or inserted, plus textarea. */
+export const MAXLENGTH_TYPES: ReadonlySet<string> = new Set(["", "text", "search", "url", "tel", "email", "password"]);
+
+/**
+ * The part of `value` an EMPTY control with `maxlength` ends up holding: what Playwright's fill
+ * (Input.insertText) leaves there, and what a person types before the field stops taking keys.
+ * maxlength counts UTF-16 code units, as Blink does; a character that would be cut in half (beyond the
+ * BMP) is dropped whole. Negative / missing maxlength, a contenteditable and a type that ignores
+ * maxlength keep the whole value. Port of _forms.fit_maxlength (r38: fill('1234567') on maxlength=5
+ * typed seven digits, wiped the field, typed seven again, then fell back to Playwright).
+ */
+export function fitMaxlength(value: string, maxlength: number | string | null | undefined,
+  tag: string | null | undefined = "input", inputType: string | null | undefined = ""): string {
+  let n = -1;
+  if (maxlength !== null && maxlength !== undefined && maxlength !== "") {
+    const v = typeof maxlength === "number" ? maxlength : Number(maxlength);
+    n = Number.isFinite(v) ? Math.trunc(v) : -1;
+  }
+  const t = (tag || "").toLowerCase();
+  if (n < 0 || (t !== "input" && t !== "textarea")) return value;
+  if (t === "input" && !MAXLENGTH_TYPES.has((inputType || "").toLowerCase())) return value;
+  let units = 0, out = "";
+  for (const ch of value) {          // code points, like Python's str
+    units += ch.length;               // 2 for a surrogate pair
+    if (units > n) return out;
+    out += ch;
+  }
+  return value;
+}
+
+// ------------------------------------------------------------------------------ pre-press pause
+/** Bounds of the pause between the pointer coming to rest and the button going down (ms). */
+export const PRE_PRESS_MIN_MS = 40;
+export const PRE_PRESS_MAX_MS = 250;
+// Salt for the per-identity centre (same value in _forms.py and Forms.cs).
+const PRE_PRESS_SALT = 0x5bd1e995;
+
+/** The identity's typical pre-press pause (ms), 70..135, stable per persona seed. */
+export function prePressCenter(seedInt: number): number {
+  const r = mulberry32((seedInt ^ PRE_PRESS_SALT) >>> 0)();
+  return 70 + (135 - 70) * r;
+}
+
+/**
+ * One pre-press pause (ms): a log-normal above the 40 ms floor with its median at the identity's
+ * centre (sigma 0.55, right-skewed); a draw past 250 ms is drawn again (up to four times, then capped).
+ * Port of _forms.pre_press_ms. Measured on r38 before it existed: the focus click before typing pressed
+ * ~4 ms after the last pointermove, a drag grab ~21 ms.
+ */
+export function prePressMs(seedInt: number, rng: FormsRng = Math.random): number {
+  const c = prePressCenter(seedInt) - PRE_PRESS_MIN_MS;
+  for (let k = 0; k < 4; k++) {
+    const ms = PRE_PRESS_MIN_MS + c * Math.exp(0.55 * gaussFrom(rng));
+    if (ms <= PRE_PRESS_MAX_MS) return ms;
+  }
+  return PRE_PRESS_MAX_MS;
 }
 
 // ------------------------------------------------------------------------------ select-all
