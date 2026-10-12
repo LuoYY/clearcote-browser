@@ -290,9 +290,24 @@ def test_pacer_stops_at_a_failing_move():
 def test_trim_to_cuts_near_the_budget_at_a_slow_sample():
     from clearcote._motion import make_persona, plan_ambient
     p = make_persona("trim")
-    for ms in (300, 1200, 1500, 4000):
+    for ms in (600, 1200, 1500, 4000):
         plan = plan_ambient((300, 300), {"width": 1280, "height": 800}, p, ms)
         cut = _pacing.trim_to(plan, ms)
         total = sum(s[2] for s in cut)
         assert 0.85 * ms <= total <= 1.1 * ms, (ms, total)
         assert cut == plan[:len(cut)], "trim only drops a tail; it never changes a sample"
+
+
+def test_trim_to_a_short_ask_does_not_stop_the_pointer_mid_flight():
+    # ~300 ms against a first excursion of 0.5-1 s: every sample in the window is mid-glide. The cut
+    # moves to where the glide has slowed down, within 2x the ask.
+    from clearcote._motion import make_persona, plan_ambient
+    for seed in range(60):
+        plan = plan_ambient((300, 300), {"width": 1280, "height": 800}, make_persona(seed), 300)
+        cut = _pacing.trim_to(plan, 300)
+        peak = max(_pacing._speed(plan, k) for k in range(len(plan)))
+        total = sum(s[2] for s in cut)
+        assert cut == plan[:len(cut)]
+        assert total <= 600 + 1e-6, (seed, total)
+        if total > 1.1 * 300:   # moved forward: only ever to a slow point
+            assert _pacing._speed(plan, len(cut) - 1) <= 0.1 * peak, seed

@@ -24,7 +24,7 @@ vi.mock("../src/motion.js", async (importOriginal) => {
 
 import { attachHumanize } from "../src/humanize.js";
 import { ISO_PLATFORM, ISO_VIEWPORT } from "../src/isolated.js";
-import { walk, trimTo, schedule } from "../src/pacing.js";
+import { walk, trimTo, schedule, speedAt } from "../src/pacing.js";
 import { makePersona, planAmbient } from "../src/motion.js";
 
 type Ev = { op: string; t: number; x?: number; y?: number };
@@ -205,13 +205,26 @@ describe("pacing.walk", () => {
 
   it("trimTo cuts an ambient plan near the budget, dropping only a tail", () => {
     const p = makePersona("trim");
-    for (const ms of [300, 1200, 1500, 4000]) {
+    for (const ms of [600, 1200, 1500, 4000]) {
       const plan = planAmbient({ x: 300, y: 300 }, { width: 1280, height: 800 }, p, ms);
       const cut = trimTo(plan, ms);
       const { total } = schedule(cut);
       expect(total).toBeGreaterThanOrEqual(0.85 * ms);
       expect(total).toBeLessThanOrEqual(1.1 * ms);
       expect(cut).toEqual(plan.slice(0, cut.length));
+    }
+  });
+
+  it("trimTo on a short ask does not stop the pointer mid-flight", () => {
+    for (let seed = 0; seed < 60; seed++) {
+      const plan = planAmbient({ x: 300, y: 300 }, { width: 1280, height: 800 }, makePersona(seed), 300);
+      const cut = trimTo(plan, 300);
+      let peak = 0;
+      for (let k = 0; k < plan.length; k++) peak = Math.max(peak, speedAt(plan, k));
+      const { total } = schedule(cut);
+      expect(cut).toEqual(plan.slice(0, cut.length));
+      expect(total).toBeLessThanOrEqual(600 + 1e-6);
+      if (total > 1.1 * 300) expect(speedAt(plan, cut.length - 1)).toBeLessThanOrEqual(0.1 * peak);
     }
   });
 });

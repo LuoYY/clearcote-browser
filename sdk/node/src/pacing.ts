@@ -84,29 +84,47 @@ export async function walk<S extends PacedStep>(
   return sent;
 }
 
+/** px/ms arriving at sample k (0 for the first). */
+export function speedAt(steps: readonly PacedStep[], k: number): number {
+  if (k === 0) return 0;
+  const a = steps[k - 1], b = steps[k];
+  return Math.hypot(b.x - a.x, b.y - a.y) / Math.max(1e-3, a.sleepMs);
+}
+
 /**
  * Cut an ambient plan so it lasts about `ms`. planAmbient keeps adding whole excursions + rests until
  * its budget is spent and draws each rest sample's gap from 0.9-1.4x the frame time it counts, so its
  * plan runs well past what was asked. Of the samples whose end falls in [lo*ms, hi*ms], keep up to the
- * slowest one (inside a rest or the tail of a move, so the cursor is not frozen mid-flight). Only a
- * tail is dropped; no sample is changed.
+ * slowest one (inside a rest or the tail of a move). Only a tail is dropped; no sample is changed.
+ *
+ * The one exception to "about ms": when the whole window lies inside the first excursion (a short ask,
+ * ~300 ms, against a ~0.5-1 s glide) every candidate is mid-flight, and a pointer that stops dead at
+ * speed is a kinematic no hand produces. Then the cut moves forward to where that move has slowed down
+ * (<= 10 % of the plan's peak speed), as long as that is within `stretch` x ms.
  */
-export function trimTo<S extends PacedStep>(steps: S[], ms: number, lo = 0.85, hi = 1.10): S[] {
+export function trimTo<S extends PacedStep>(steps: S[], ms: number, lo = 0.85, hi = 1.10, stretch = 2): S[] {
   if (!steps.length || ms <= 0) return steps;
   const { due, total } = schedule(steps);
   if (total <= hi * ms) return steps;
+  const end = steps.map((s, k) => due[k] + Math.max(0, s.sleepMs));
   let best = -1, bestV = Infinity;
   for (let k = 0; k < steps.length; k++) {
-    const end = due[k] + Math.max(0, steps[k].sleepMs);
-    if (end < lo * ms) continue;
-    if (end > hi * ms) break;
-    const v = k === 0 ? 0
-      : Math.hypot(steps[k].x - steps[k - 1].x, steps[k].y - steps[k - 1].y) / Math.max(1e-3, steps[k - 1].sleepMs);
+    if (end[k] < lo * ms) continue;
+    if (end[k] > hi * ms) break;
+    const v = speedAt(steps, k);
     if (v < bestV) { best = k; bestV = v; }
   }
   if (best < 0) {
     best = 0;
-    for (let k = 0; k < steps.length; k++) if (due[k] + Math.max(0, steps[k].sleepMs) <= hi * ms) best = k;
+    for (let k = 0; k < steps.length; k++) if (end[k] <= hi * ms) best = k;
+  }
+  let peak = 0;
+  for (let k = 0; k < steps.length; k++) peak = Math.max(peak, speedAt(steps, k));
+  if (peak > 0 && speedAt(steps, best) > 0.3 * peak) {
+    for (let k = best + 1; k < steps.length; k++) {
+      if (end[k] > stretch * ms) break;
+      if (speedAt(steps, k) <= 0.1 * peak) { best = k; break; }
+    }
   }
   return steps.slice(0, best + 1);
 }

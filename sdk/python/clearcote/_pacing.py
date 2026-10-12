@@ -124,35 +124,52 @@ async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, 
     return sent
 
 
-def trim_to(steps, ms, lo=0.85, hi=1.10):
+def _speed(steps, k):
+    """px/ms arriving at sample k (0 for the first)."""
+    if k == 0:
+        return 0.0
+    a, b = steps[k - 1], steps[k]
+    return math.hypot(b[0] - a[0], b[1] - a[1]) / max(1e-3, float(a[2]))
+
+
+def trim_to(steps, ms, lo=0.85, hi=1.10, stretch=2.0):
     """Cut an ambient plan so it lasts about ``ms``.
 
     ``plan_ambient`` keeps adding whole excursions + rests until its budget is spent and draws each
     rest sample's gap from 0.9-1.4x the frame time it counts, so its plan runs well past what the
     caller asked for (ambient_motion(1500) planned up to ~2.5 s). Of the samples whose end falls in
-    [lo*ms, hi*ms], keep up to the slowest one -- a point inside a rest or the tail of a move, so
-    the cursor is not frozen mid-flight. A plan already shorter than lo*ms is returned whole."""
+    [lo*ms, hi*ms], keep up to the slowest one -- a point inside a rest or the tail of a move. Only a
+    tail is dropped; no sample is changed. A plan already no longer than hi*ms is returned whole.
+
+    The one exception to "about ms": when the whole window lies inside the first excursion (a short
+    ask, ~300 ms, against a ~0.5-1 s glide) every candidate is mid-flight, and a pointer that stops dead
+    at speed is a kinematic no hand produces. Then the cut moves forward to where that move has slowed
+    down (<= 10 % of the plan's peak speed), as long as that is within ``stretch`` x ms."""
     if not steps or ms <= 0:
         return steps
     due, total = schedule(steps)
     if total <= hi * ms:
         return steps
+    end = [due[k] + max(0.0, float(steps[k][2])) for k in range(len(steps))]
     best, best_v = None, None
-    for k, s in enumerate(steps):
-        end = due[k] + max(0.0, float(s[2]))
-        if end < lo * ms:
+    for k in range(len(steps)):
+        if end[k] < lo * ms:
             continue
-        if end > hi * ms:
+        if end[k] > hi * ms:
             break
-        if k == 0:
-            v = 0.0
-        else:
-            p = steps[k - 1]
-            v = math.hypot(s[0] - p[0], s[1] - p[1]) / max(1e-3, float(p[2]))
+        v = _speed(steps, k)
         if best_v is None or v < best_v:
             best, best_v = k, v
     if best is None:
         # One sample spans the whole window (a long settle dwell): cut at the last one before it.
-        ends = [k for k in range(len(steps)) if due[k] + max(0.0, float(steps[k][2])) <= hi * ms]
+        ends = [k for k in range(len(steps)) if end[k] <= hi * ms]
         best = ends[-1] if ends else 0
+    peak = max(_speed(steps, k) for k in range(len(steps)))
+    if peak > 0 and _speed(steps, best) > 0.3 * peak:
+        for k in range(best + 1, len(steps)):
+            if end[k] > stretch * ms:
+                break
+            if _speed(steps, k) <= 0.1 * peak:
+                best = k
+                break
     return steps[:best + 1]
