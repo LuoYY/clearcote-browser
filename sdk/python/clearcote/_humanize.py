@@ -198,11 +198,11 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             st["placed"] = True
             time.sleep(sl / 1000.0)
 
-    def _glide(x, y, settle=False, target_w=24):
+    def _glide(x, y, settle=False, target_w=24, held=False):
         """Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective
         homing) with colored sub-pixel noise and Fitts-scaled duration (see _motion.plan_move).
         Continuous (starts at the tracked position, lands exactly on target)."""
-        _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle))
+        _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle, held=held))
         st["pos"] = (x, y)
 
     # --- Engine real-trajectory routing (PRO) --------------------------------
@@ -289,7 +289,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         # Fitts-scaled duration); only the engine's recorded-trajectory SOURCING is given up for
         # bare moves. hclick keeps it, because it performs the whole move+click engine-side where
         # nothing races the trajectory.
-        _glide(x, y)
+        # A move while the button is held is a DRAG leg: plan_drag keeps it on the line between grab
+        # and drop (an aimed reach's arc took a slider handle 47 px off a 40 px track, SC 209).
+        _glide(x, y, held=st["held"])
 
     def hdown(**kw):
         # A press needs a POSITION behind it. mouse.down() with nothing having moved the pointer

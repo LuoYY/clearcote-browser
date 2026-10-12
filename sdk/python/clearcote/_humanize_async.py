@@ -115,9 +115,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             st["placed"] = True
             await asyncio.sleep(sl / 1000.0)
 
-    async def _glide(x, y, settle=False, target_w=24):
+    async def _glide(x, y, settle=False, target_w=24, held=False):
         # minimum-jerk sum-of-submovements path with colored noise + Fitts duration (_motion.plan_move)
-        await _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle))
+        await _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle, held=held))
         st["pos"] = (x, y)
 
     # Engine real-trajectory routing (PRO): send point-to-point moves/clicks through
@@ -182,7 +182,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         #     pressed on HTML at (856,213) instead of the INPUT, and the slider stayed at 0.
         # hclick keeps engine routing: it does move+click entirely engine-side, where nothing
         # races the trajectory. Kept identical to the sync file and to Node.
-        await _glide(x, y)
+        # A move while the button is held is a DRAG leg: plan_drag keeps it on the line between grab
+        # and drop (an aimed reach's arc took a slider handle 47 px off a 40 px track, SC 209).
+        await _glide(x, y, held=st["held"])
 
     async def hdown(**kw):
         # DELIBERATELY NO PLACEMENT WHEN THE POINTER HAS NEVER MOVED.
