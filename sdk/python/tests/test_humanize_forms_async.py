@@ -845,6 +845,38 @@ def test_a_value_cut_short_with_room_left_is_still_typed_again(fast):
     run(go())
 
 
+def _alnum_only(v):   # a field that strips separators as they are typed
+    return "".join(c for c in v if c.isalnum())
+
+
+@pytest.mark.parametrize("fmt,value,want,lost", [
+    (str.lower, "ABC126", "abc126", "6"),                  # a field that lower-cases: "abc12" is not a mask
+    (_alnum_only, "555-123-4567", "5551234567", "7"),      # one that strips separators: "555123456" is not either
+    (None, "123456", "123456", "6"),                       # a plain field: as before
+], ids=["lowercase", "strip-punct", "plain"])
+def test_a_lost_key_in_a_field_that_normalizes_is_typed_again(fast, fmt, value, want, lost):
+    """Round 3: mask_kept read a change of case or a stripped separator as a mask that cuts, and accepted
+    a value missing its last key ("abc12" for "ABC126"). Only punctuation the page ADDED marks such a
+    mask; here the lost key is noticed and the value gets its one clean retry."""
+    async def go():
+        f = Field(type="tel" if fmt is _alnum_only else "text", fmt=fmt)
+        p = await attached(("#f", f))
+        orig = f.key
+        dropped = {"n": 0}
+
+        def key(k):   # the first press of the last key never lands
+            if k == lost and not dropped["n"]:
+                dropped["n"] = 1
+                return None
+            return orig(k)
+        f.key = key
+        await p.fill("#f", value)
+        assert dropped["n"] == 1
+        assert f.value == want and p.native == [], (f.value, p.native)
+        assert [e for e in p.log if e[0] in ("press", "kdown") and e[1] in SELECT_ALL_OR_ERASE[:2]], "retyped once"
+    run(go())
+
+
 def test_a_covered_field_goes_to_playwright_and_no_keys_go_astray(fast):
     async def go():
         f = Field(value="old", covered=True)

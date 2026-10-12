@@ -1078,6 +1078,24 @@ async def test_a_mask_that_stops_taking_keys_is_typed_once(page, typos, sel, val
     assert all(e["tr"] for e in downs)
 
 
+@pytest.mark.parametrize("sel,value,want,lost", [
+    ("#lcdrop", "ABC126", "abc126", "6"),          # lower-cases: "abc12" is not a mask that cut
+    ("#npdrop", "555-123-4567", "5551234567", "7"),   # strips separators: "555123456" is not either
+    ("#plaindrop", "123456", "123456", "6"),       # a plain field: as before
+], ids=["lowercase", "strip-punct", "plain"])
+async def test_a_lost_key_in_a_field_that_normalizes_is_typed_again(page, typos, sel, value, want, lost):
+    typos(0)
+    await page.evaluate("([s, k]) => { document.querySelector(s).dataset.drop = k; }", [sel, lost])
+    await reset(page)
+    await page.fill(sel, value)
+    assert await page.evaluate("s => !('drop' in document.querySelector(s).dataset)", sel), "the key was never lost"
+    assert await page.input_value(sel) == want
+    downs = await ev(page, "keydown", sel[1:])
+    assert [e for e in downs if e["key"] == "Backspace" or e["ctrl"] or e["meta"]], "the lost key went unnoticed"
+    assert [e["key"] for e in downs].count(lost) == 2, [e["key"] for e in downs]
+    assert all(e["tr"] for e in downs)
+
+
 async def _api_error(coro_fn):
     from playwright.async_api import Error as PWError
     with pytest.raises(PWError) as ei:

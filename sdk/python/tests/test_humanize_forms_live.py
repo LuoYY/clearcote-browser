@@ -1022,6 +1022,26 @@ def test_a_mask_that_stops_taking_keys_is_typed_once(page, typos, sel, value, wa
     assert all(e["tr"] for e in downs)
 
 
+@pytest.mark.parametrize("sel,value,want,lost", [
+    ("#lcdrop", "ABC126", "abc126", "6"),          # lower-cases: "abc12" is not a mask that cut
+    ("#npdrop", "555-123-4567", "5551234567", "7"),   # strips separators: "555123456" is not either
+    ("#plaindrop", "123456", "123456", "6"),       # a plain field: as before
+], ids=["lowercase", "strip-punct", "plain"])
+def test_a_lost_key_in_a_field_that_normalizes_is_typed_again(page, typos, sel, value, want, lost):
+    """SC 210 round 3: the field loses the first press of its last key. A change of case or a stripped
+    separator is no mask that cuts, so the lost key is noticed: wiped and typed once more, by keys."""
+    typos(0)
+    page.evaluate("([s, k]) => { document.querySelector(s).dataset.drop = k; }", [sel, lost])
+    reset(page)
+    page.fill(sel, value)
+    assert page.evaluate("s => !('drop' in document.querySelector(s).dataset)", sel), "the key was never lost"
+    assert page.input_value(sel) == want
+    downs = ev(page, "keydown", sel[1:])
+    assert [e for e in downs if e["key"] == "Backspace" or e["ctrl"] or e["meta"]], "the lost key went unnoticed"
+    assert [e["key"] for e in downs].count(lost) == 2, [e["key"] for e in downs]   # lost once, typed again
+    assert all(e["tr"] for e in downs)
+
+
 def _api_error(fn):
     from playwright.sync_api import Error as PWError
     with pytest.raises(PWError) as ei:

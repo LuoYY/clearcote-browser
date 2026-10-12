@@ -202,10 +202,12 @@ def mask_kept(got, want, maxlength=None, tag="input", input_type=""):
 
     - the field is full: it holds ``maxlength`` UTF-16 units (an expiry field MM/YY with maxlength 5
       takes "12/34" of "12345": the slash the mask adds uses the fifth place), or
-    - the page re-punctuated what was typed (``got`` is not just the first characters of ``want``): a
-      mask that formats AND cuts ("1234 AB" of "1234abx", a postcode).
+    - the page ADDED punctuation that was not typed there: a mask that formats AND cuts ("1234 AB" of
+      "1234abx", a postcode). Only an added separator counts. A field that just changes case ("abc12"
+      of "ABC123") or strips separators ("555123456" of "555-123-4567") shows no mask that cuts, so a
+      missing last letter or digit there is a lost key (round 3: both used to be accepted silently).
 
-    A value cut short with nothing re-punctuated and room left is a lost key, not a mask: False, and
+    A value cut short with no punctuation added and room left is a lost key, not a mask: False, and
     the caller types it again. Verifier B (SC 210): MM/YY and a 12-place phone mask were typed, wiped
     with Ctrl+A Backspace and typed again, then handed to Playwright, for the same visible result."""
     if not got or want is None:
@@ -222,7 +224,22 @@ def mask_kept(got, want, maxlength=None, tag="input", input_type=""):
     if n >= 0 and (t == "textarea" or t == "input" and (input_type or "").lower() in MAXLENGTH_TYPES):
         if sum(2 if ord(ch) > 0xFFFF else 1 for ch in got) >= n:
             return True
-    return got != want[:len(got)]
+    g, w = _sep_runs(got), _sep_runs(want)
+    return any(c not in w[i] for i in range(len(g)) for c in g[i])
+
+
+def _sep_runs(s):
+    """The separators of ``s`` by place: run i is what stands before its i-th letter or digit, and the
+    last run is what trails the last one ("12/3" -> ["", "", "/", ""])."""
+    runs, cur = [], []
+    for c in s:
+        if c.isalnum():
+            runs.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+    runs.append("".join(cur))
+    return runs
 
 
 # ------------------------------------------------------------------------------ pre-press pause

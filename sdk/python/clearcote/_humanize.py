@@ -150,9 +150,10 @@ def _needs_shift(ch):
     return "A" <= ch <= "Z" or ch in _SHIFTED_SYMBOLS
 
 
-# The engine's trajectory command, new name first. r34 renamed it and dropped both names from the
-# served /json/protocol: "humanizedClick" was listed there, and it is a known tool's vocabulary. The
-# old name still works on r34 and is the only one r33 and older know.
+# The engine's trajectory command, new name first. r34 renamed it to a neutral name ("humanizedClick" is
+# a known tool's vocabulary). The served /json/protocol still lists "humanizedClick" (measured on r38,
+# SC 210); r40 keeps "dispatchPointerPath" out of it. The old name still works and is the only one r33
+# and older know.
 ENGINE_POINTER_PATH = ("Browser.dispatchPointerPath", "Browser.humanizedClick")
 
 
@@ -297,8 +298,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         mouse.down() stays pressed across the whole path (drag).
 
         Paced against a WALL CLOCK (_pacing.walk): each sample goes out at its planned time, and
-        late samples are skipped (never the last, and no hop longer than a fast hand covers in the
-        time since the last dispatch: 3 px/ms of it, at least 40 px). "Move, then sleep the
+        late samples are skipped (never the last, and no skip hops more than 40 px, or 20 px once
+        nothing has been dispatched for 40 ms: _pacing.MAX_JUMP_PX / IDLE_HOP_PX). "Move, then sleep the
         planned gap" added the ~27 ms mouse.move round trip to every 6-8 ms sample: a 1.05 s planned
         glide took 3.5-5.4 s on PRO r38 (SC 209), ambient_motion(1500) 5.7x as long."""
         def mv(sx, sy):

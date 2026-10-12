@@ -101,6 +101,8 @@
   style="position:absolute;inset:0;background:rgba(0,0,0,.02)"></span></span></div>
 <div class="row"><input id="exp" type="text" maxlength="5" placeholder="MM/YY"> <input id="telmask" type="tel"
   maxlength="12" placeholder="555-123-4567"> <input id="pcmask" type="text" placeholder="1234 AB"></div>
+<div class="row"><input id="lcdrop" type="text" placeholder="lower case"> <input id="npdrop" type="tel"
+  placeholder="digits only"> <input id="plaindrop" type="text" placeholder="plain"></div>
 <div style="height:1600px"></div>
 <div class="row"><button id="far">Far away</button></div>
 
@@ -143,6 +145,12 @@
     return [d.slice(0, 3), d.slice(3, 6), d.slice(6)].filter(Boolean).join('-'); });
   mask('pcmask', v => { const d = v.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 6);
     return d.length > 4 ? d.slice(0, 4) + ' ' + d.slice(4) : d; });
+  // SC 210 round 3: fields that normalize without cutting (lower case; punctuation stripped) and a plain
+  // one. A test sets data-drop to a key, and the field loses that key's first press (a lost key).
+  mask('lcdrop', v => v.toLowerCase());
+  mask('npdrop', v => v.replace(/[^0-9A-Za-z]/g, ''));
+  ['lcdrop', 'npdrop', 'plaindrop'].forEach(id => { const e = document.getElementById(id);
+    e.addEventListener('keydown', k => { if (e.dataset.drop && k.key === e.dataset.drop) { delete e.dataset.drop; k.preventDefault(); } }); });
   // a password field inside an open shadow root (web components, embedded logins)
   customElements.define('shadow-pw', class extends HTMLElement {
     constructor() { super(); this.attachShadow({ mode: 'open' }).innerHTML = "<input id='inner' type='password'>"; }

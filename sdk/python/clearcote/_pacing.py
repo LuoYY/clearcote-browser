@@ -36,7 +36,8 @@ MAX_JUMP_PX = 40.0
 # A single dispatch slower than this is a STALL (the page or the box was busy), not latency: nothing
 # reached the page while it lasted, so the plan pauses with it instead of skipping ahead afterwards.
 STALL_MS = 60.0
-# A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s).
+# A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s). No longer a dispatch cap (the
+# hop cap is MAX_JUMP_PX / IDLE_HOP_PX since SC 210 round 2): kept as the speed bound the tests check.
 FAST_PX_PER_MS = 3.0
 # After this long with nothing dispatched, a skip may hop at most IDLE_HOP_PX: what a hand moving at a
 # moderate 2.5 px/ms covers in one 125 Hz report (8 ms), and below the 24 px an r40 engine walks.

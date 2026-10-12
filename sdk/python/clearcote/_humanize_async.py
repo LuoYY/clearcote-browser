@@ -129,8 +129,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         """Walk a planned trajectory (list of (x, y, sleep_ms)) via native trusted mouse.move +
         off-protocol asyncio.sleep. Native input carries button state (held-button drag works).
         Paced against a wall clock (_pacing.walk_async): samples go out at their planned time, late
-        ones are skipped (never the last; no hop longer than 3 px/ms of the time since the last
-        dispatch, at least 40 px), so the dispatch round trip no
+        ones are skipped (never the last; no skip hops more than 40 px, or 20 px once nothing has been
+        dispatched for 40 ms: _pacing.MAX_JUMP_PX / IDLE_HOP_PX), so the dispatch round trip no
         longer stretches every glide 3-5x (SC 209)."""
         async def mv(sx, sy):
             await native_move(sx, sy)
