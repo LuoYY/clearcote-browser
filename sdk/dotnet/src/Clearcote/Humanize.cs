@@ -327,13 +327,14 @@ public static class Humanize
     {
         await SeedPointerAsync(page, st).ConfigureAwait(false);
         var steps = Motion.PlanMove(new Point(st.X, st.Y), new Point(toX, toY), p, targetW, settle);
-        foreach (var s in steps)
-        {
-            // Native moves carry button state, so a button held via Mouse.DownAsync stays pressed
-            // across the whole path — that is what makes a drag a drag rather than a teleport.
-            await page.Mouse.MoveAsync((float)s.X, (float)s.Y).ConfigureAwait(false);
-            if (s.SleepMs > 0) await Task.Delay((int)Math.Round(s.SleepMs)).ConfigureAwait(false);
-        }
+        // Native moves carry button state, so a button held via Mouse.DownAsync stays pressed
+        // across the whole path — that is what makes a drag a drag rather than a teleport.
+        //
+        // Paced against a WALL CLOCK (Pacing): each sample goes out at its planned time and late ones
+        // are skipped (never the last, never a > 40 px jump). "Move, then sleep the planned gap" added
+        // the ~27 ms move round trip to every 6-8 ms sample: a 1.05 s planned glide took 3.5-5.4 s on
+        // PRO r38 (SC 209).
+        await Pacing.WalkAsync(steps, (x, y) => page.Mouse.MoveAsync((float)x, (float)y)).ConfigureAwait(false);
         st.X = toX;
         st.Y = toY;
     }

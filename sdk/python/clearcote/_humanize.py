@@ -47,6 +47,7 @@ from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     platform_from_navigator, rollover_rate, wheel_notches,
 )
+from ._pacing import trim_to as _trim_ambient, walk as _paced_walk
 
 # IIFE so it runs both as an add_init_script source AND when passed to page.evaluate().
 CURSOR_OVERLAY = """(() => {
@@ -225,14 +226,16 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     def _dispatch(steps):
         """Walk a planned trajectory (list of (x, y, sleep_ms)) via native trusted mouse.move +
         off-protocol time.sleep. Native input carries button state, so a button held via
-        mouse.down() stays pressed across the whole path (drag)."""
-        for sx, sy, sl in steps:
-            try:
-                native_move(sx, sy)
-            except Exception:  # noqa: BLE001
-                break
+        mouse.down() stays pressed across the whole path (drag).
+
+        Paced against a WALL CLOCK (_pacing.walk): each sample goes out at its planned time, and
+        late samples are skipped (never the last, never a > 40 px jump). "Move, then sleep the
+        planned gap" added the ~27 ms mouse.move round trip to every 6-8 ms sample: a 1.05 s planned
+        glide took 3.5-5.4 s on PRO r38 (SC 209), ambient_motion(1500) 5.7x as long."""
+        def mv(sx, sy):
+            native_move(sx, sy)
             st["placed"] = True
-            time.sleep(sl / 1000.0)
+        _paced_walk(steps, mv)
 
     def _glide(x, y, settle=False, target_w=24):
         """Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective
@@ -455,7 +458,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         behavioral collector sees pointer entropy BEFORE the first goal action. page.ambient_motion(ms)."""
         try:
             vp = page.viewport_size or {"width": 1280, "height": 800}
-            steps = plan_ambient(st["pos"], {"width": vp["width"], "height": vp["height"]}, persona, ms)
+            # plan_ambient overruns its budget (whole excursions, rests drawn at 0.9-1.4x a frame):
+            # cut the plan at a slow sample near ms so ambient_motion(ms) lasts about ms.
+            steps = _trim_ambient(plan_ambient(st["pos"], {"width": vp["width"], "height": vp["height"]},
+                                               persona, ms), ms)
             _dispatch(steps)
             if steps:
                 st["pos"] = (steps[-1][0], steps[-1][1])
