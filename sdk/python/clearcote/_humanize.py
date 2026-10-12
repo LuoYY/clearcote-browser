@@ -110,6 +110,23 @@ def _cdp_method_missing(err):
     return "wasn't found" in m or "-32601" in m or "method not found" in m.lower()
 
 
+def _engine_clicks_mode():
+    """Which clicks the engine pointer path (Browser.dispatchPointerPath) may walk, from
+    CLEARCOTE_HUMANIZE_ENGINE_CLICKS: "off" (also 0/false/no) never; "all" (also "selector") coordinate
+    clicks AND targeted page.click(selector) / locator.click() clicks; anything else (the default)
+    coordinate clicks only, as before.
+
+    Targeted clicks stay on the SDK planner by default (SC 210 lane S, measured on r38): the engine
+    presses 9 ms after its last move (the planner's press waits 40-130 ms), and it walks from its own
+    last position, which an SDK glide does not update."""
+    v = (os.environ.get("CLEARCOTE_HUMANIZE_ENGINE_CLICKS") or "").strip().lower()
+    if v in ("0", "off", "false", "no", "none"):
+        return "off"
+    if v in ("all", "selector", "selectors"):
+        return "all"
+    return "coords"
+
+
 # Keys a person rolls over: unshifted, one physical key each. Shifted characters, Enter/Backspace and
 # the typo path keep the plain one-press-at-a-time path.
 _ROLL_KEYS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789 ,.;'/-=")
@@ -216,10 +233,20 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # button across the path -- sliders depend on it); wheel/typing unchanged.
     # Falls back to the SDK bezier (plan_move) permanently if the method is
     # unavailable (older engine, or a persistent context with no Browser handle).
-    _eng = {"session": None, "tid": None, "ok": True, "method": None}
+    _eng = {"session": None, "tid": None, "ok": True, "method": None, "at": None}
+
+    def _engine_in_sync():
+        """The engine walks from ITS OWN last position on this page, not from where an SDK glide left
+        the pointer. Measured on r38 (SC 210): an engine click at (300,300), an SDK glide to (800,550),
+        then mouse.click(400,200) through the engine -- its first sample was at (300,300), a 559 px
+        teleport from where the pointer was. So the engine walks only while nothing else has moved
+        the pointer since its own last walk (before its first walk: while nothing has moved it)."""
+        if _eng["at"] is None:
+            return not st["placed"]
+        return st["pos"] == _eng["at"]
 
     def _engine_glide(x, y, no_click):
-        if not _eng["ok"]:
+        if not _eng["ok"] or not _engine_in_sync():
             return False
         try:
             if _eng["session"] is None:
@@ -234,6 +261,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             dur = min(1.10, max(0.28, 0.30 + dist / 1700.0)) * (0.85 + 0.30 * random.random())
             params = {"targetId": _eng["tid"], "x": float(x), "y": float(y),
                       "duration": dur, "noClick": bool(no_click)}
+            t_send = time.monotonic()
             if _eng.get("method"):
                 _eng["session"].send(_eng["method"], params)
             else:
@@ -252,7 +280,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             # at the cursor's stale position -- measured: a move to (110,58) then a press landed
             # at (981,629), on <body> instead of the slider, so every move-then-press sequence
             # (drag, press-and-hold, drag-and-drop) acted on the wrong element.
-            time.sleep(dur)
+            # r38 answers only after the walk AND the click (send returned 772 ms after a 600 ms
+            # walk, 2 ms after the release, SC 210): wait only for what is left of `dur`, so an
+            # engine that answers late does not add a second, idle `dur` after every click.
+            time.sleep(max(0.0, dur - (time.monotonic() - t_send)))
             # Keep Playwright's own cursor position in sync so a following
             # mouse.down()/drag presses where the engine left the cursor.
             try:
@@ -261,6 +292,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 pass
             st["pos"] = (x, y)
             st["placed"] = True
+            _eng["at"] = st["pos"]
             return True
         except Exception:  # noqa: BLE001 - method missing / no browser session: stop trying
             _eng["ok"] = False
@@ -381,7 +413,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         # double click, a caller-chosen hold -- glides SDK-side and presses as asked; the old
         # wrapper dropped those options and always left-clicked once.
         o = normalize_click_options(kw, _platform())
-        if engine_path_ok(o) and _engine_glide(x, y, no_click=False):
+        if engine_path_ok(o) and _engine_clicks_mode() != "off" and _engine_glide(x, y, no_click=False):
             return
         _glide(x, y)
         try:
@@ -1586,6 +1618,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                     raise _Native()
             if o["modifiers"] and native_kb_down is None:
                 raise _Native()
+            if (not no_click and not o["force"] and orig is not None and _engine_clicks_mode() == "all"
+                    and engine_path_ok(o) and _engine_glide(x, y, no_click=False)):
+                # Opt-in (CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and
+                # clicks the point the hit test above proved; plain left single clicks only, and only
+                # while the engine knows where the pointer is (_engine_in_sync). Otherwise: planner.
+                return None
             if no_click and o["modifiers"]:
                 # hover with modifiers: Playwright holds them across the move
                 held = []

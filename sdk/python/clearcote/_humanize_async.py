@@ -12,6 +12,7 @@ the rationale and the measurements behind each step; comments here note what is 
 
 import asyncio
 import random
+import time
 
 from ._forms import (
     classify_field, datetime_equal, engine_path_ok, formatted_equal, match_option, normalize_click_options,
@@ -19,8 +20,8 @@ from ._forms import (
     range_sanitize, range_value_ok, segment_nodes_from_tree, typo_eligible, typos_allowed,
 )
 from ._humanize import (
-    CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _host_platform, _is_timeout,
-    _needs_shift, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, typo_rate,
+    CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _engine_clicks_mode, _host_platform,
+    _is_timeout, _needs_shift, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, typo_rate,
 )
 from ._isolated import (
     ACTIVE_FIELD as ISO_ACTIVE_FIELD, ACTIVE_VALUE as ISO_ACTIVE_VALUE, COVER_CHECK_MS, COVER_RETRY_MS,
@@ -124,10 +125,20 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # Browser.dispatchPointerPath, humanizedClick before r34 (real recorded human paths for PRO, engine bezier for free,
     # tiered by the engine license gate). Drags stay native (held button); fall back to
     # the SDK bezier if the method is unavailable.
-    _eng = {"session": None, "tid": None, "ok": True, "method": None}
+    _eng = {"session": None, "tid": None, "ok": True, "method": None, "at": None}
+
+    def _engine_in_sync():
+        """The engine walks from ITS OWN last position on this page, not from where an SDK glide left
+        the pointer. Measured on r38 (SC 210): an engine click at (300,300), an SDK glide to (800,550),
+        then mouse.click(400,200) through the engine -- its first sample was at (300,300), a 559 px
+        teleport from where the pointer was. So the engine walks only while nothing else has moved
+        the pointer since its own last walk (before its first walk: while nothing has moved it)."""
+        if _eng["at"] is None:
+            return not st["placed"]
+        return st["pos"] == _eng["at"]
 
     async def _engine_glide(x, y, no_click):
-        if not _eng["ok"]:
+        if not _eng["ok"] or not _engine_in_sync():
             return False
         try:
             if _eng["session"] is None:
@@ -142,6 +153,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             dur = min(1.10, max(0.28, 0.30 + dist / 1700.0)) * (0.85 + 0.30 * random.random())
             params = {"targetId": _eng["tid"], "x": float(x), "y": float(y),
                       "duration": dur, "noClick": bool(no_click)}
+            t_send = time.monotonic()
             if _eng.get("method"):
                 await _eng["session"].send(_eng["method"], params)
             else:
@@ -160,13 +172,17 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             # position -- measured on the sync path: a move to (110,58) then a press landed at
             # (981,629), on <body> instead of the target, breaking every move-then-press
             # sequence (drag, press-and-hold, drag-and-drop). See _humanize.py.
-            await asyncio.sleep(dur)
+            # r38 answers only after the walk AND the click (send returned 772 ms after a 600 ms
+            # walk, 2 ms after the release, SC 210): wait only for what is left of `dur`, so an
+            # engine that answers late does not add a second, idle `dur` after every click.
+            await asyncio.sleep(max(0.0, dur - (time.monotonic() - t_send)))
             try:
                 await native_move(x, y)
             except Exception:  # noqa: BLE001
                 pass
             st["pos"] = (x, y)
             st["placed"] = True
+            _eng["at"] = st["pos"]
             return True
         except Exception:  # noqa: BLE001
             _eng["ok"] = False
@@ -271,7 +287,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # The engine path performs ONE plain left click. Anything else -- right/middle button, a
         # double click, a caller-chosen hold, modifiers -- glides SDK-side and presses as asked.
         o = normalize_click_options(kw, await _platform())
-        if engine_path_ok(o) and await _engine_glide(x, y, no_click=False):
+        if engine_path_ok(o) and _engine_clicks_mode() != "off" and await _engine_glide(x, y, no_click=False):
             return
         await _glide(x, y)
         try:
@@ -1432,6 +1448,12 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                     raise _Native()
             if o["modifiers"] and native_kb_down is None:
                 raise _Native()
+            if (not no_click and not o["force"] and orig is not None and _engine_clicks_mode() == "all"
+                    and engine_path_ok(o) and await _engine_glide(x, y, no_click=False)):
+                # Opt-in (CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and
+                # clicks the point the hit test above proved; plain left single clicks only, and only
+                # while the engine knows where the pointer is (_engine_in_sync). Otherwise: planner.
+                return None
             if no_click and o["modifiers"]:
                 # hover with modifiers: Playwright holds them across the move
                 held = []
