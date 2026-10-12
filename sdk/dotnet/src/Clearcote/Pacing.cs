@@ -35,7 +35,9 @@ internal static class Pacing
     /// nothing reached the page while it lasted, so the plan pauses with it instead of skipping ahead.</summary>
     public const double StallMs = 60;
 
-    /// <summary>A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s).</summary>
+    /// <summary>A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s). No longer a dispatch cap
+    /// (the hop cap is <see cref="MaxJumpPx"/> / <see cref="IdleHopPx"/> since SC 210 round 2): kept as the
+    /// speed bound the tests check.</summary>
     public const double FastPxPerMs = 3;
 
     /// <summary>After this long with nothing dispatched, a skip may hop at most <see cref="IdleHopPx"/>.</summary>

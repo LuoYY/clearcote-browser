@@ -1341,6 +1341,26 @@ public class HumanizeFormsLiveTests : IClassFixture<FormsLiveBrowser>
             Assert.All(downs, e => Assert.True(Tr(e)));
         }));
 
+    // SC 210 round 3: the field loses the first press of its last key. A change of case or a stripped
+    // separator is no mask that cuts, so the lost key is noticed: wiped and typed once more, by keys.
+    [Theory]
+    [InlineData("#lcdrop", "ABC126", "abc126", "6")]
+    [InlineData("#npdrop", "555-123-4567", "5551234567", "7")]
+    [InlineData("#plaindrop", "123456", "123456", "6")]
+    public Task A_lost_key_in_a_field_that_normalizes_is_typed_again(string sel, string value, string want, string lost) =>
+        WithTypoRate(0, () => Live(async page =>
+        {
+            await page.EvaluateAsync("([s, k]) => { document.querySelector(s).dataset.drop = k; }", new[] { sel, lost });
+            await Reset(page);
+            await page.HumanFillAsync(sel, value);
+            Assert.True(await page.EvaluateAsync<bool>("s => !('drop' in document.querySelector(s).dataset)", sel), "the key was never lost");
+            Assert.Equal(want, await page.InputValueAsync(sel));
+            var downs = await Ev(page, "keydown", sel[1..]);
+            Assert.NotEmpty(downs.Where(e => e.GetProperty("ctrl").GetBoolean() || e.GetProperty("meta").GetBoolean() || S(e, "key") == "Backspace"));
+            Assert.Equal(2, downs.Count(e => S(e, "key") == lost));
+            Assert.All(downs, e => Assert.True(Tr(e)));
+        }));
+
     private static async Task<(string Type, string Line)> Error(Func<Task> call)
     {
         try { await call(); }

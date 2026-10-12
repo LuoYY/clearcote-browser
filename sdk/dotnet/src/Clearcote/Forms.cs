@@ -227,9 +227,10 @@ internal static class Forms
     /// Playwright's fill, which the same mask cuts the same way) changes nothing? Its letters and digits are a
     /// shorter prefix of <paramref name="want"/>'s (<see cref="FormattedEqual"/> covers the whole value) AND
     /// either the field is full (<paramref name="maxlength"/> UTF-16 units: MM/YY on maxlength 5 holds "12/34"
-    /// of "12345") or the page re-punctuated what was typed (<paramref name="got"/> is not just the first
-    /// characters of <paramref name="want"/>: "1234 AB" of "1234abx"). A value cut short with nothing
-    /// re-punctuated and room left is a lost key: false, and the caller types it again. Port of
+    /// of "12345") or the page ADDED punctuation that was not typed there ("1234 AB" of "1234abx"). A field
+    /// that only changes case ("abc12" of "ABC123") or strips separators ("555123456" of "555-123-4567") shows
+    /// no mask that cuts, so a missing last letter or digit there is a lost key. A value cut short with no
+    /// punctuation added and room left is a lost key: false, and the caller types it again. Port of
     /// _forms.mask_kept (verifier B, SC 210: MM/YY and a 12-place phone mask were typed, wiped with Ctrl+A
     /// Backspace and typed again).
     /// </summary>
@@ -243,8 +244,23 @@ internal static class Forms
         var t = (tag ?? "").ToLowerInvariant();
         if (n >= 0 && (t == "textarea" || (t == "input" && MaxlengthTypes.Contains((inputType ?? "").ToLowerInvariant())))
             && got.Length >= n) return true;   // string length is UTF-16 units, as maxlength counts
-        var cps = Chars(got).Count();
-        return got != string.Concat(Chars(want).Take(cps));
+        var g = SepRuns(got);
+        var w = SepRuns(want);
+        return g.Select((run, i) => Chars(run).Any(c => !w[i].Contains(c, StringComparison.Ordinal))).Any(x => x);
+    }
+
+    // The separators of s by place: run i stands before its i-th letter or digit, the last trails ("12/3" -> "", "", "/", "").
+    private static List<string> SepRuns(string s)
+    {
+        var runs = new List<string>();
+        var cur = new StringBuilder();
+        foreach (var c in Chars(s))
+        {
+            if (IsAlnum(c)) { runs.Add(cur.ToString()); cur.Clear(); }
+            else cur.Append(c);
+        }
+        runs.Add(cur.ToString());
+        return runs;
     }
 
     // ------------------------------------------------------------------------------ pre-press pause
