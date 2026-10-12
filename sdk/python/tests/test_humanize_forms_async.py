@@ -728,7 +728,7 @@ def test_fill_an_empty_field_types_and_presses_no_clear_keys(fast):
         p = await attached(("#f", f))
         await p.fill("#f", "hello")
         assert f.value == "hello"
-        assert not [e for e in kinds(p, "press") if e[1] in ("ControlOrMeta+a", "Backspace")]
+        assert not [e for e in kinds(p, "press") if e[1] in ("ControlOrMeta", "ControlOrMeta+a", "Backspace")]
         assert not [e for e in kinds(p, "kdown") if e[1] == "ControlOrMeta"]
         assert len(kinds(p, "down")) == 1 and len(kinds(p, "up")) == 1, "focused with ONE trusted press"
         assert not kinds(p, "click"), "no mouse.click: it moves the pointer again right before the press"
@@ -784,6 +784,61 @@ def test_a_reformatting_mask_is_typed_once(fast):
         assert f.value == "(555) 123-4567" and p.native == []
         digits = [e for e in p.log if e[0] in ("press", "kdown") and e[1].isdigit()]
         assert len(digits) == 10, "a person does not type their number twice"
+    run(go())
+
+
+def _expiry(v):   # MM/YY: the slash comes in with the third digit
+    d = "".join(c for c in v if c.isdigit())[:4]
+    return d[:2] + "/" + d[2:] if len(d) > 2 else d
+
+
+def _tel_dashes(v):   # 555-123-4567
+    d = "".join(c for c in v if c.isdigit())[:10]
+    return "-".join(x for x in (d[:3], d[3:6], d[6:]) if x)
+
+
+def _postcode(v):   # 1234 AB: upper case, a space after the digits, six places at most
+    d = "".join(c for c in v.upper() if c.isalnum())[:6]
+    return d[:4] + " " + d[4:] if len(d) > 4 else d
+
+
+@pytest.mark.parametrize("fmt,maxlength,value,want,keys", [
+    (_expiry, 5, "123456", "12/34", "12345"),                 # verifier B: typed, Ctrl+A, Backspace, retyped
+    (_tel_dashes, 12, "5551234567890", "555-123-4567", "555123456789"),
+    (_postcode, -1, "1234abx", "1234 AB", "1234abx"),         # a JS mask with no maxlength cuts it too
+], ids=["mmyy-maxlength5", "tel-maxlength12", "postcode-js"])
+def test_a_mask_that_stops_taking_keys_is_typed_once(fast, fmt, maxlength, value, want, keys):
+    """A mask that re-punctuates what is typed and then stops taking keys leaves what a person typing
+    the value gets (and what Playwright's fill leaves): no wipe, no retype, no Playwright fill."""
+    async def go():
+        f = Field(type="tel" if fmt is _tel_dashes else "text", fmt=fmt, maxlength=maxlength)
+        p = await attached(("#f", f))
+        await p.fill("#f", value)
+        assert f.value == want and p.native == [], (f.value, p.native)
+        typed = [e[1] for e in p.log if e[0] in ("press", "kdown") and len(e[1]) == 1]
+        assert "".join(typed) == keys, typed
+        assert not [e for e in p.log if e[0] in ("press", "kdown") and e[1] in ("ControlOrMeta", "ControlOrMeta+a", "Backspace")]
+    run(go())
+
+
+def test_a_value_cut_short_with_room_left_is_still_typed_again(fast):
+    """mask_kept is for masks: a plain field that came out short (a lost key), with room left and
+    nothing re-punctuated, still gets the one clean retry."""
+    async def go():
+        f = Field(maxlength=8)
+        p = await attached(("#f", f))
+        orig = f.key
+        lost = {"n": 0}
+
+        def key(k, *a, **kw):   # the last key of the first pass never lands: "12345", a prefix
+            if k == "6" and not lost["n"]:
+                lost["n"] = 1
+                return None
+            return orig(k, *a, **kw)
+        f.key = key
+        await p.fill("#f", "123456")
+        assert f.value == "123456" and p.native == []
+        assert [e for e in p.log if e[0] in ("press", "kdown") and e[1] in ("ControlOrMeta", "ControlOrMeta+a")], "retyped once"
     run(go())
 
 

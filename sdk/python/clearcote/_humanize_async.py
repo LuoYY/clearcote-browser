@@ -15,7 +15,7 @@ import random
 import time
 
 from ._forms import (
-    classify_field, datetime_equal, engine_path_ok, fit_maxlength, formatted_equal, match_option,
+    classify_field, datetime_equal, engine_path_ok, fit_maxlength, formatted_equal, mask_kept, match_option,
     normalize_click_options, numeric_equal, plan_datetime, plan_select, plan_typo, pre_press_ms, range_attrs,
     range_fraction, range_nudge, range_point,
     range_sanitize, range_value_ok, segment_nodes_from_tree, typo_eligible, typos_allowed,
@@ -995,13 +995,15 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # What the field can hold (maxlength), and bulk values inserted after the click: see
         # _humanize._fill_text.
         if is_ce:
-            want = value
+            want, limit = value, (None, None, None)
         elif info is not None:
-            want = fit_maxlength(value, info.get("maxlength"), info.get("tag"), info.get("type"))
+            limit = (info.get("maxlength"), info.get("tag"), info.get("type"))
+            want = fit_maxlength(value, *limit)
         else:
-            want = fit_maxlength(value, await loc.get_attribute("maxlength"), await _classify_tag(loc),
-                                 (await loc.get_attribute("type")) or "")
-        bulk = len(value) > 200
+            limit = (await loc.get_attribute("maxlength"), await _classify_tag(loc),
+                     (await loc.get_attribute("type")) or "")
+            want = fit_maxlength(value, *limit)
+        bulk = len(want) > 200
         if bulk and native_kb_insert is None:
             return False
         if not await _focus_click(box, _proven_point(box, info) if box else None, loc, selector):
@@ -1038,8 +1040,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         got = await read()
         if got is None:
             return False
-        if got == want or formatted_equal(got, want):
-            return True   # exact, or a mask that only re-punctuated what was typed (a phone format)
+        if got == want or formatted_equal(got, want) or mask_kept(got, want, *limit):
+            return True   # exact, re-punctuated, or re-punctuated and full (see _humanize._fill_text)
         if bulk:
             return False   # an inserted value that did not land: Playwright's fill, not a second paste
         # Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips,
@@ -1047,7 +1049,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         await _clear_focused(read)
         await put(want, typos=False)
         got = await read()
-        return got is not None and (got == want or formatted_equal(got, want))
+        return got is not None and (got == want or formatted_equal(got, want) or mask_kept(got, want, *limit))
 
     async def _fill_range(loc, box, info, value):
         """A range input: drag the thumb (or click the track) to the value, then arrow-nudge to it

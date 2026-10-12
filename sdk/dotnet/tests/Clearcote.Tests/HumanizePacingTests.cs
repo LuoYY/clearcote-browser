@@ -32,8 +32,12 @@ public class HumanizePacingTests
 
         private async Task Ev(string op, float x, float y)
         {
+            // The SEND time: the pacer's hop cap counts from when it sent the previous sample. Stamped after
+            // the latency, Task.Delay's own jitter (a 25 ms delay answering in 25-40 ms) shrank the measured
+            // gap below the pacer's and failed the hop check on a hop the pacer was allowed (97.9 px in 32 ms).
+            double t = Clock.Elapsed.TotalMilliseconds;
             if (LatencyMs > 0) await Task.Delay(LatencyMs);
-            lock (Log) Log.Add((op, Clock.Elapsed.TotalMilliseconds, x, y));
+            lock (Log) Log.Add((op, t, x, y));
         }
     }
 

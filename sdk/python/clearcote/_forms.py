@@ -194,6 +194,37 @@ def fit_maxlength(value, maxlength, tag="input", input_type=""):
     return value
 
 
+def mask_kept(got, want, maxlength=None, tag="input", input_type=""):
+    """Is ``got`` what a formatting mask leaves of ``want`` once the field stops taking keys -- a value a
+    person typing ``want`` ends up with too, so typing it again (or handing it to Playwright, whose
+    insert the same mask cuts the same way) changes nothing? Its letters and digits are a shorter prefix
+    of ``want``'s (formatted_equal covers the whole value) AND either
+
+    - the field is full: it holds ``maxlength`` UTF-16 units (an expiry field MM/YY with maxlength 5
+      takes "12/34" of "12345": the slash the mask adds uses the fifth place), or
+    - the page re-punctuated what was typed (``got`` is not just the first characters of ``want``): a
+      mask that formats AND cuts ("1234 AB" of "1234abx", a postcode).
+
+    A value cut short with nothing re-punctuated and room left is a lost key, not a mask: False, and
+    the caller types it again. Verifier B (SC 210): MM/YY and a 12-place phone mask were typed, wiped
+    with Ctrl+A Backspace and typed again, then handed to Playwright, for the same visible result."""
+    if not got or want is None:
+        return False
+    a = [c.casefold() for c in got if c.isalnum()]
+    b = [c.casefold() for c in want if c.isalnum()]
+    if not a or len(a) >= len(b) or b[:len(a)] != a:
+        return False
+    try:
+        n = int(maxlength) if maxlength is not None else -1
+    except (TypeError, ValueError):
+        n = -1
+    t = (tag or "").lower()
+    if n >= 0 and (t == "textarea" or t == "input" and (input_type or "").lower() in MAXLENGTH_TYPES):
+        if sum(2 if ord(ch) > 0xFFFF else 1 for ch in got) >= n:
+            return True
+    return got != want[:len(got)]
+
+
 # ------------------------------------------------------------------------------ pre-press pause
 # The pause between the pointer coming to rest and the button going down. A hand that has arrived
 # confirms the target before it presses: 40-250 ms, right-skewed (most presses come quickly, a few

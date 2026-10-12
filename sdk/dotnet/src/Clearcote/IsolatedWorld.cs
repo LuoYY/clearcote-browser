@@ -299,23 +299,41 @@ public sealed class IsolatedWorld
     internal const string FormControl = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']";
     // Does the element the browser's hit test found at a click point belong to the element whose box the
     // caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
-    // that box -- with no OTHER element of that same box beside the hit's path inside it (a wrapper's
-    // control under an overlay: the wrap has the input's box, the press lands on the overlay)?
-    // `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
-    // press). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
-    // element and back and performs a press whose events Playwright blocks, so a page saw a mousemove
-    // inside the target, a jump back and a pointerdown/click before every humanized click (verifier B).
+    // that box -- with no OTHER element of that same box beside the hit's path inside it that the press
+    // would miss? That twin is a wrapper's control under an overlay (<span class=wrap><input><span
+    // overlay></span></span>: the wrap has the input's box, the press lands on the overlay). A twin the
+    // press reaches anyway, or that no press could be meant for, does not count (SC 210 fix 2; counting
+    // every twin made a MUI-style button "covered" and sent its click to Playwright): one that takes no
+    // pointer events (pointer-events:none, not visibility:visible -- a ripple or focus-ring span, an icon
+    // layer), a control whose <label> holds the hit (the label passes the press on: a custom checkbox),
+    // and, inside an element that is itself a control, a decorative twin with no control in it (a
+    // background span under a button's text). `this` = the hit node (DOM.getNodeForLocation,
+    // pointer-events:none skipped, as for a real press; for a point inside a child frame, the <iframe>
+    // element that holds it). The covered-point check without a Playwright trial: a trial MOVES the real
+    // pointer onto the element and back and performs a press whose events Playwright blocks, so a page saw
+    // a mousemove inside the target, a jump back and a pointerdown/click before every humanized click
+    // (verifier B).
     internal const string HitInBox = @"function (b) {
   const same = r => Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
     Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5;
+  const CTL = 'a[href], area[href], button, input, select, textarea, label, summary, iframe, [contenteditable], ' +
+    '[tabindex], [role=button], [role=link], [role=checkbox], [role=radio], [role=switch], [role=tab], ' +
+    '[role=menuitem], [role=option], [role=combobox], [role=textbox]';
+  const takes = d => { const s = getComputedStyle(d); return s.pointerEvents !== 'none' && s.visibility === 'visible'; };
+  const h = this.nodeType === 1 ? this : this.parentElement;
   const path = new Set();
-  let e = this.nodeType === 1 ? this : this.parentElement;
+  let e = h;
   for (let n = 0; e && n < 128; n++) {
     path.add(e);
     if (same(e.getBoundingClientRect())) {
-      const all = e.getElementsByTagName('*');
+      const all = e.getElementsByTagName('*'), ctl = e.matches(CTL);
       if (all.length <= 4000)
-        for (const d of all) if (!path.has(d) && same(d.getBoundingClientRect())) return false;
+        for (const d of all) {
+          if (path.has(d) || !same(d.getBoundingClientRect()) || !takes(d)) continue;
+          if (d.labels && Array.prototype.some.call(d.labels, l => l.contains(h))) continue;
+          if (ctl && !d.matches(CTL) && !d.querySelector(CTL)) continue;
+          return false;
+        }
       return true;
     }
     const p = e.parentNode;

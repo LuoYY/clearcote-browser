@@ -33,7 +33,7 @@ import os
 
 from ._forms import (
     DEFAULT_TYPO_RATE, NEARBY_LETTERS, classify_field, datetime_equal, engine_path_ok, fit_maxlength,
-    formatted_equal, match_option, normalize_click_options, numeric_equal, plan_datetime, plan_select,
+    formatted_equal, mask_kept, match_option, normalize_click_options, numeric_equal, plan_datetime, plan_select,
     plan_typo, pre_press_ms, range_attrs,
     range_fraction, range_nudge, range_point, range_sanitize, range_value_ok, segment_nodes_from_tree,
     typo_eligible, typos_allowed,
@@ -1174,15 +1174,16 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         # What the field can hold: a maxlength keeps the first N characters (what Playwright's
         # insertText leaves too), and a person types only those -- the field stops taking keys.
         if is_ce:
-            want = value
+            want, limit = value, (None, None, None)
         elif info is not None:
-            want = fit_maxlength(value, info.get("maxlength"), info.get("tag"), info.get("type"))
+            limit = (info.get("maxlength"), info.get("tag"), info.get("type"))
+            want = fit_maxlength(value, *limit)
         else:
-            want = fit_maxlength(value, loc.get_attribute("maxlength"), _classify_tag(loc),
-                                 loc.get_attribute("type") or "")
+            limit = (loc.get_attribute("maxlength"), _classify_tag(loc), loc.get_attribute("type") or "")
+            want = fit_maxlength(value, *limit)
         # Bulk values (over 200 characters) are still inserted at once -- typing thousands of keys
         # would crawl -- but the way a person pastes: glide to the field, click into it, then insert.
-        bulk = len(value) > 200
+        bulk = len(want) > 200   # what the field can hold: a 300-character value cut to 5 is typed
         if bulk and native_kb_insert is None:
             return False
         if not _focus_click(box, _proven_point(box, info) if box else None, loc, selector):
@@ -1219,8 +1220,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         got = read()
         if got is None:
             return False
-        if got == want or formatted_equal(got, want):
-            return True   # exact, or a mask that only re-punctuated what was typed (a phone format)
+        if got == want or formatted_equal(got, want) or mask_kept(got, want, *limit):
+            # exact; a mask that only re-punctuated what was typed (a phone format); or one that
+            # re-punctuated it and then stopped taking keys (MM/YY on maxlength 5): no wipe and retype
+            return True
         if bulk:
             return False   # an inserted value that did not land: Playwright's fill, not a second paste
         # Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips,
@@ -1228,7 +1231,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         _clear_focused(read)
         put(want, typos=False)
         got = read()
-        return got is not None and (got == want or formatted_equal(got, want))
+        return got is not None and (got == want or formatted_equal(got, want) or mask_kept(got, want, *limit))
 
     def _fill_range(loc, box, info, value):
         """A range input: drag the thumb (or click the track) to the value, then arrow-nudge to it
