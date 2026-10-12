@@ -1,0 +1,217 @@
+import { describe, it, expect, vi, afterEach } from "vitest";
+
+// Wall-clock pacing of planned pointer paths (SC 210 lane P; mirrors tests/test_humanize_pacing.py).
+//
+// The planner returns ~130 samples ~6.6 ms apart for a ~1 s glide. The old dispatch loop awaited
+// mouse.move for each sample and THEN slept the planned gap, so the dispatch round trip (27 ms median
+// on PRO r38) was added to every sample: glides ran 3.5-5.4 s, ambientMotion(1500) 5.7x as long
+// (SC 209). These tests drive the real attachHumanize wrappers with a fake mouse whose move costs 0 or
+// 25 ms of FAKE time (vitest fake timers + performance), so they are exact and fast. On 0.48.0 the
+// 25 ms duration checks and the ambient checks fail.
+
+const spy = vi.hoisted(() => ({ plans: [] as { from: { x: number; y: number }; plan: any[] }[] }));
+vi.mock("../src/motion.js", async (importOriginal) => {
+  const m: any = await importOriginal();
+  return {
+    ...m,
+    planMove: (from: any, to: any, p: any, o: any) => {
+      const plan = m.planMove(from, to, p, o);
+      spy.plans.push({ from: { x: from.x, y: from.y }, plan });
+      return plan;
+    },
+  };
+});
+
+import { attachHumanize } from "../src/humanize.js";
+import { ISO_PLATFORM, ISO_VIEWPORT } from "../src/isolated.js";
+import { walk, trimTo, schedule } from "../src/pacing.js";
+import { makePersona, planAmbient } from "../src/motion.js";
+
+type Ev = { op: string; t: number; x?: number; y?: number };
+
+const fakePage = (latMs: number) => {
+  const log: Ev[] = [];
+  const ev = async (op: string, x?: number, y?: number) => {
+    await new Promise((r) => setTimeout(r, latMs));
+    log.push({ op, t: performance.now(), x, y });
+  };
+  const noop = async () => undefined;
+  const cdp = {
+    send: async (method: string, params?: any): Promise<any> => {
+      if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "MAIN" } } };
+      if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
+      if (method === "Runtime.evaluate") {
+        if (params.expression.startsWith(`(${ISO_PLATFORM})`)) return { result: { value: "Win32" } };
+        if (params.expression.startsWith(`(${ISO_VIEWPORT})`)) return { result: { value: [1280, 800] } };
+        return { result: { value: null } };
+      }
+      throw new Error(method);
+    },
+  };
+  const locatorProto = {
+    fill: noop, click: noop, type: noop, dblclick: noop, hover: noop, press: noop,
+    pressSequentially: noop, clear: noop, tap: noop, check: noop, uncheck: noop,
+    dragTo: noop, page: () => null,
+  };
+  const page = {
+    mouse: {
+      move: (x: number, y: number) => ev("move", x, y),
+      down: () => ev("down"), up: () => ev("up"),
+      click: noop, wheel: noop, dblclick: noop,
+    },
+    keyboard: { type: noop, press: noop, down: noop, up: noop, insertText: noop },
+    click: noop, hover: noop, dblclick: noop, fill: noop, press: noop, type: noop,
+    focus: noop, on: () => undefined, mainFrame: () => ({}), waitForTimeout: noop,
+    viewportSize: () => ({ width: 1280, height: 800 }),
+    evaluate: () => { throw new Error("humanize must not evaluate in the page's world"); },
+    context: () => ({ newCDPSession: async () => cdp }),
+    locator: () => Object.create(locatorProto),
+  };
+  return { page: page as any, log };
+};
+
+// Run an async action to completion under fake timers, 1 ms of fake time per tick.
+const drive = async <T>(p: Promise<T>): Promise<T> => {
+  let done = false;
+  const q = p.finally(() => { done = true; });
+  for (let i = 0; !done && i < 120_000; i++) await vi.advanceTimersByTimeAsync(1);
+  return q;
+};
+
+const maxGap = (pts: { x: number; y: number }[]) => {
+  let m = 0;
+  for (let i = 1; i < pts.length; i++) m = Math.max(m, Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y));
+  return m;
+};
+
+const checkWalk = (from: { x: number; y: number }, plan: any[], moves: Ev[], dur: number) => {
+  const planned = plan.reduce((a, s) => a + s.sleepMs, 0);
+  expect(dur, `glide took ${dur.toFixed(0)} ms, planned ${planned.toFixed(0)} ms`).toBeGreaterThanOrEqual(0.8 * planned - 1);
+  expect(dur, `glide took ${dur.toFixed(0)} ms, planned ${planned.toFixed(0)} ms`).toBeLessThanOrEqual(1.2 * planned + 1);
+  const lastM = moves[moves.length - 1], lastP = plan[plan.length - 1];
+  expect([lastM.x, lastM.y]).toEqual([lastP.x, lastP.y]);
+  const own = maxGap([from, ...plan]);
+  expect(maxGap([from, ...moves.map((m) => ({ x: m.x!, y: m.y! }))])).toBeLessThanOrEqual(Math.max(40, own) + 1e-6);
+};
+
+const setup = async (lat: number, seed: string) => {
+  const f = fakePage(lat);
+  await attachHumanize({} as never, f.page, { humanize: true, seed });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "performance", "Date"] });
+  return f;
+};
+
+afterEach(() => { vi.useRealTimers(); });
+
+describe("humanize pacing: planned paths keep their planned duration", () => {
+  for (const lat of [0, 25]) {
+    it(`bare glides at ${lat} ms dispatch latency`, async () => {
+      const f = await setup(lat, "pace-1");
+      for (const [x, y] of [[900, 600], [150, 150], [640, 420], [1100, 120]]) {
+        const n0 = spy.plans.length;
+        const t0 = performance.now();
+        await drive(f.page.mouse.move(x, y));
+        const t1 = performance.now();
+        expect(spy.plans.length).toBe(n0 + 1);
+        const { from, plan } = spy.plans[spy.plans.length - 1];
+        const mv = f.log.filter((e) => e.op === "move" && e.t > t0 && e.t <= t1);
+        checkWalk(from, plan, mv, t1 - t0);
+        expect([mv[mv.length - 1].x, mv[mv.length - 1].y]).toEqual([x, y]);
+      }
+    }, 60_000);
+
+    it(`held drag at ${lat} ms: button order kept, lands on target, planned duration`, async () => {
+      const f = await setup(lat, "pace-2");
+      await drive(f.page.mouse.move(200, 300));
+      await drive(f.page.mouse.down());
+      const t0 = performance.now();
+      await drive(f.page.mouse.move(560, 310));
+      const t1 = performance.now();
+      await drive(f.page.mouse.up());
+      const ops = f.log.map((e) => e.op);
+      expect(ops.filter((o) => o === "down").length).toBe(1);
+      expect(ops.filter((o) => o === "up").length).toBe(1);
+      const d = ops.indexOf("down"), u = ops.indexOf("up");
+      const leg = f.log.slice(d + 1, u);
+      expect(leg.length).toBeGreaterThan(0);
+      expect(leg.every((e) => e.op === "move")).toBe(true);
+      expect([leg[leg.length - 1].x, leg[leg.length - 1].y]).toEqual([560, 310]);
+      const { from, plan } = spy.plans[spy.plans.length - 1];
+      checkWalk(from, plan, leg, t1 - t0);
+    }, 60_000);
+
+    for (const ms of [600, 1500, 3000]) {
+      it(`ambientMotion(${ms}) at ${lat} ms lasts ${ms} ms +-20 %`, async () => {
+        const f = await setup(lat, "pace-3");
+        const t0 = performance.now();
+        await drive(f.page.ambientMotion(ms));
+        const took = performance.now() - t0;
+        const mv = f.log.filter((e) => e.op === "move");
+        expect(mv.length).toBeGreaterThan(0);
+        expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeGreaterThanOrEqual(0.8 * ms);
+        expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeLessThanOrEqual(1.2 * ms);
+        expect(maxGap(mv.map((m) => ({ x: m.x!, y: m.y! })))).toBeLessThanOrEqual(40 + 1e-6);
+      }, 60_000);
+    }
+  }
+});
+
+describe("pacing.walk", () => {
+  const fake = (lat: number) => {
+    let t = 0;
+    const sent: { x: number; y: number; t: number }[] = [];
+    return {
+      now: () => t,
+      sleep: async (ms: number) => { t += Math.max(0, ms); },
+      move: async (x: number, y: number) => { t += lat; sent.push({ x, y, t }); },
+      sent, get t() { return t; },
+    };
+  };
+
+  it("never drops a pinned (button-state) step or the last one", async () => {
+    const steps = Array.from({ length: 200 }, (_, i) => ({ x: i, y: 0, sleepMs: 2, btn: [37, 38, 120].includes(i) }));
+    const c = fake(25);
+    await walk(steps, c.move, { now: c.now, sleep: c.sleep, pinned: (s) => s.btn });
+    const xs = c.sent.map((s) => s.x);
+    expect(xs.length).toBeLessThan(100);
+    for (const k of [37, 38, 120, 199]) expect(xs).toContain(k);
+    expect([...xs].sort((a, b) => a - b)).toEqual(xs);
+  });
+
+  it("on time: every sample at its planned time", async () => {
+    const steps = Array.from({ length: 50 }, (_, i) => ({ x: i * 3, y: 0, sleepMs: 7 }));
+    const c = fake(0);
+    expect(await walk(steps, c.move, { now: c.now, sleep: c.sleep })).toBe(50);
+    c.sent.forEach((s, k) => expect(s.t).toBeCloseTo(7 * k, 6));
+    expect(c.t).toBeCloseTo(350, 6);
+  });
+
+  it("dispatches the in-between point instead of a long jump", async () => {
+    const steps = Array.from({ length: 40 }, (_, i) => ({ x: i * 30, y: 0, sleepMs: 1 }));
+    const c = fake(25);
+    await walk(steps, c.move, { now: c.now, sleep: c.sleep });
+    expect(maxGap([{ x: 0, y: 0 }, ...c.sent])).toBeLessThanOrEqual(40);
+    expect(c.sent[c.sent.length - 1].x).toBe(39 * 30);
+  });
+
+  it("stops at a failing move", async () => {
+    let calls = 0;
+    const c = fake(0);
+    const n = await walk(Array.from({ length: 10 }, (_, i) => ({ x: i, y: 0, sleepMs: 5 })),
+      async () => { if (++calls === 3) throw new Error("Target closed"); }, { now: c.now, sleep: c.sleep });
+    expect(n).toBe(2);
+    expect(calls).toBe(3);
+  });
+
+  it("trimTo cuts an ambient plan near the budget, dropping only a tail", () => {
+    const p = makePersona("trim");
+    for (const ms of [300, 1200, 1500, 4000]) {
+      const plan = planAmbient({ x: 300, y: 300 }, { width: 1280, height: 800 }, p, ms);
+      const cut = trimTo(plan, ms);
+      const { total } = schedule(cut);
+      expect(total).toBeGreaterThanOrEqual(0.85 * ms);
+      expect(total).toBeLessThanOrEqual(1.1 * ms);
+      expect(cut).toEqual(plan.slice(0, cut.length));
+    }
+  });
+});

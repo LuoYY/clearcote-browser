@@ -32,6 +32,7 @@ import {
   makePersona, planMove, dragDwell, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Step, type WheelPlatform,
 } from "./motion.js";
+import { trimTo, walk } from "./pacing.js";
 import {
   COVER_CHECK_MS, COVER_RETRY_MS, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_FORM_CONTROL,
   ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
@@ -235,12 +236,13 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // Walk a planned trajectory (motion.ts) with native (trusted) mouse.move + off-protocol sleeps.
   // Native input carries the button state, so a button pressed via mouse.down() stays held across
   // the whole path — the same code powers a free move AND a held-button drag.
+  //
+  // Paced against a WALL CLOCK (pacing.ts): each sample goes out at its planned time and late ones
+  // are skipped (never the last, never a > 40 px jump). "Move, then sleep the planned gap" added the
+  // ~27 ms mouse.move round trip to every 6-8 ms sample: a 1.05 s planned glide took 3.5-5.4 s on
+  // PRO r38 (SC 209), ambient motion 5.7x as long.
   const dispatch = async (steps: Step[]): Promise<void> => {
-    for (const s of steps) {
-      try { await nativeMove(s.x, s.y); } catch { break; }
-      st.placed = true;
-      await sleep(s.sleepMs);
-    }
+    await walk(steps, async (x, y) => { await nativeMove(x, y); st.placed = true; });
   };
 
   // Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective homing)
@@ -311,7 +313,9 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // an action needs one but names no coordinates.
   const ambient = async (ms: number): Promise<void> => {
     try {
-      const steps = planAmbient(st, await viewport(), persona, ms);
+      // planAmbient overruns its budget (whole excursions, rests drawn at 0.9-1.4x a frame): cut the
+      // plan at a slow sample near ms so ambientMotion(ms) lasts about ms.
+      const steps = trimTo(planAmbient(st, await viewport(), persona, ms), ms);
       await dispatch(steps);
       if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
     } catch { /* best-effort ambient */ }
