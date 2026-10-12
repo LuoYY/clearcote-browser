@@ -549,8 +549,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
 
   // Press at the point the last glide ended, the way the options ask: the button, the click count (a
   // double click is two presses with a human gap, not one event), the caller's hold (`delay`) or the
-  // persona's, and modifiers held around the whole press with a lead before it (80-240 ms: 40-110 ms
-  // per modifier plus the 40-130 ms pre-press dwell) and a 20-80 ms lag after, as fingers do. Native
+  // persona's, and modifiers held around the whole press with a lead before it (80-360 ms: 40-110 ms
+  // per modifier plus the 40-250 ms pre-press pause) and a 20-80 ms lag after, as fingers do. Native
   // down/up, so nothing moves.
   const pressAt = async (o: ClickPlan): Promise<void> => {
     const held: string[] = [];

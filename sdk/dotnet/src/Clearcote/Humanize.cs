@@ -30,8 +30,8 @@ public sealed record HumanClickOptions
     /// <summary>How long each press is held, in ms. Default: the persona's click hold.</summary>
     public float? Delay { get; init; }
 
-    /// <summary>Keys held around the whole press: down 80-240 ms before it (the modifier's own 40-110 ms lead plus
-    /// the 40-130 ms dwell before any press; measured 102-223 ms), up 20-80 ms after it.
+    /// <summary>Keys held around the whole press: down 80-360 ms before it (the modifier's own 40-110 ms lead plus
+    /// the 40-250 ms pre-press pause before any press), up 20-80 ms after it.
     /// <see cref="KeyboardModifier.ControlOrMeta"/> is passed through for Playwright to resolve to the key
     /// the engine's platform uses.</summary>
     public IEnumerable<KeyboardModifier>? Modifiers { get; init; }
@@ -1886,7 +1886,8 @@ public static class Humanize
     /// contenteditable): click into it, clear it only if it holds something (Ctrl/Cmd+A then Backspace,
     /// each held for the persona's dwell; then End and Backspaces if anything is left), type with the
     /// persona's cadence and the occasional corrected slip (see <see cref="HumanTypeAsync(IPage,string)"/>),
-    /// then check the value; one clean retry without slips, else Playwright's FillAsync.</item>
+    /// then check the value; one clean retry without slips, else Playwright's FillAsync. A maxlength field
+    /// gets only what it can hold (the value Playwright's FillAsync leaves there).</item>
     /// <item>range: drag the thumb (or click the track) to the value, then nudge with held arrow keys
     /// until it is exact. Vertical sliders go native.</item>
     /// <item>date, time, month, week, datetime-local: click into the first segment of the browser's own
@@ -1894,8 +1895,9 @@ public static class Humanize
     /// <item>color: native (the OS colour dialog is no route). Checkbox, radio, file and the other
     /// unfillable types: native, which raises exactly as Playwright does.</item>
     /// </list>
-    /// Values over 200 characters go native (humanizing thousands of keys would crawl). Strict like
-    /// Playwright's locator actions; a timeout propagates.
+    /// Values over 200 characters are not typed (thousands of keys would crawl): the field is glided to and
+    /// clicked into as above, then the value is inserted in one go (Keyboard.InsertTextAsync) and checked.
+    /// Strict like Playwright's locator actions; a timeout propagates.
     /// </summary>
     public static async Task HumanFillAsync(this ILocator locator, string value, LocatorFillOptions? options = null)
     {

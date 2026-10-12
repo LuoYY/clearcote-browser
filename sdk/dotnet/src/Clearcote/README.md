@@ -197,10 +197,12 @@ await page.HumanPressAsync("Enter");
 
 Forms (`HumanFillAsync`, `HumanSelectOptionAsync`, `HumanCheckAsync` / `HumanUncheckAsync` /
 `HumanSetCheckedAsync`) are handled the way a person handles them: a text field is clicked, emptied
-only if it holds something (held Ctrl/Cmd+A, Backspace) and typed; a drop-down is opened with a click,
+only if it holds something (held Ctrl/Cmd+A, Backspace) and typed (a `maxlength` field gets only the
+characters it can hold; a value over 200 characters is inserted in one go after the click); a drop-down is opened with a click,
 moved by type-ahead and committed with Enter, so it fires **one** trusted change; list boxes get row
 clicks with Ctrl/Cmd held for more rows; a range thumb is dragged; date and time editors are typed
-segment by segment in the order the browser shows them. Each result is verified, and anything the
+segment by segment in the order the browser shows them, with the same key timing as text. Every press
+comes after a short pause once the pointer has arrived (40-250 ms, typical length fixed per identity). Each result is verified, and anything the
 humane route cannot prove goes to Playwright's own method. The click family (`HumanClickAsync`,
 `HumanDblClickAsync`, `HumanHoverAsync`) honours every Playwright click option — button, click count,
 hold, modifiers, a padding-box position, force and trial — through `HumanClickOptions` or
