@@ -683,6 +683,29 @@ describe("fill: text", () => {
     }, SLOW);
   }
 
+  // SC 210 round 3: maskKept read a change of case or a stripped separator as a mask that cuts, and
+  // accepted a value missing its last key ("abc12" for "ABC126"). Only punctuation the page ADDED marks
+  // such a mask; here the lost key is noticed and the value gets its one clean retry.
+  const alnumOnly = (v: string) => v.replace(/[^0-9A-Za-z]/g, "");
+  for (const [name, format, value, want, lost] of [
+    ["a field that lower-cases", (v: string) => v.toLowerCase(), "ABC126", "abc126", "6"],
+    ["a field that strips separators", alnumOnly, "555-123-4567", "5551234567", "7"],
+    ["a plain field (as before)", undefined, "123456", "123456", "6"],
+  ] as const) {
+    it(`a lost key is typed again: ${name}`, async () => {
+      process.env[ENV] = "0";
+      let dropped = 0;
+      const accept = (ch: string) => { if (ch === lost && !dropped) { dropped = 1; return false; } return true; };
+      const f = await attached({ field: { format, accept } });
+      await f.page.fill("#m", value);
+      expect(dropped).toBe(1);
+      expect(f.field.value).toBe(want);
+      expect(f.natives).toEqual([]);
+      const typed: string[] = f.events.filter((e) => e.t === "press" || e.t === "kdown").map((e) => (e.t === "press" ? e.a.k : e.a));
+      expect(typed.filter((k) => ["ControlOrMeta", "ControlOrMeta+a"].includes(k)).length, "retyped once").toBeGreaterThan(0);
+    }, SLOW);
+  }
+
   it("a covered field is clicked where a person clicks; when the overlay keeps the caret, Playwright fills it", async () => {
     process.env[ENV] = "0";
     const f = await attached({ field: { value: "old" }, covered: true });

@@ -88,8 +88,8 @@ const hostWheelPlatform = (): WheelPlatform =>
   process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux";
 
 // The engine's pointer-path command. r34 renamed Browser.humanizedClick to Browser.dispatchPointerPath:
-// the old name was listed in /json/protocol for anyone who asked, and "humanizedClick" is known
-// vocabulary, so the method list alone said what the build was for. r33 and older only know the old
+// "humanizedClick" is known vocabulary. The served /json/protocol still lists the old name (measured on
+// r38, SC 210); r40 keeps the new one out of it. r33 and older only know the old
 // name, so the new one goes first and the old one is the fallback for a method-not-found only.
 /** @internal exported for tests */
 export const POINTER_PATH = "Browser.dispatchPointerPath";
@@ -332,8 +332,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // the whole path — the same code powers a free move AND a held-button drag.
   //
   // Paced against a WALL CLOCK (pacing.ts): each sample goes out at its planned time and late ones
-  // are skipped (never the last, and no hop longer than a fast hand covers in the time since the last
-  // dispatch: 3 px/ms of it, at least 40 px). "Move, then sleep the planned gap" added the
+  // are skipped (never the last, and no skip hops more than 40 px, or 20 px once nothing has been
+  // dispatched for 40 ms: MAX_JUMP_PX / IDLE_HOP_PX). "Move, then sleep the planned gap" added the
   // ~27 ms mouse.move round trip to every 6-8 ms sample: a 1.05 s planned glide took 3.5-5.4 s on
   // PRO r38 (SC 209), ambient motion 5.7x as long.
   const dispatch = async (steps: Step[]): Promise<void> => {

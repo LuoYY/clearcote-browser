@@ -198,9 +198,10 @@ export function fitMaxlength(value: string, maxlength: number | string | null | 
  * typing `want` ends up with too, so typing it again (or Playwright's fill, which the same mask cuts the
  * same way) changes nothing? Its letters and digits are a shorter prefix of `want`'s (formattedEqual
  * covers the whole value) AND either the field is full (`maxlength` UTF-16 units: MM/YY on maxlength 5
- * holds "12/34" of "12345") or the page re-punctuated what was typed (`got` is not just the first
- * characters of `want`: "1234 AB" of "1234abx"). A value cut short with nothing re-punctuated and room
- * left is a lost key: false, and the caller types it again. Port of _forms.mask_kept (verifier B, SC 210:
+ * holds "12/34" of "12345") or the page ADDED punctuation that was not typed there ("1234 AB" of
+ * "1234abx"). A field that only changes case ("abc12" of "ABC123") or strips separators ("555123456" of
+ * "555-123-4567") shows no mask that cuts, so a missing last letter or digit there is a lost key. A value
+ * cut short with no punctuation added and room left is a lost key: false, and the caller types it again. Port of _forms.mask_kept (verifier B, SC 210:
  * MM/YY and a 12-place phone mask were typed, wiped with Ctrl+A Backspace and typed again).
  */
 export function maskKept(got: string | null | undefined, want: string | null | undefined,
@@ -219,8 +220,19 @@ export function maskKept(got: string | null | undefined, want: string | null | u
   if (n >= 0 && (t === "textarea" || (t === "input" && MAXLENGTH_TYPES.has((inputType || "").toLowerCase())))) {
     if (got.length >= n) return true;   // String length is UTF-16 units, as maxlength counts
   }
-  const cps = Array.from(got).length;
-  return got !== Array.from(want).slice(0, cps).join("");
+  const g = sepRuns(got), w = sepRuns(want);
+  return g.some((run, i) => Array.from(run).some((c) => !w[i].includes(c)));
+}
+
+/** The separators of `s` by place: run i stands before its i-th letter or digit, the last trails ("12/3" -> ["", "", "/", ""]). */
+function sepRuns(s: string): string[] {
+  const runs: string[] = [];
+  let cur = "";
+  for (const c of Array.from(s)) {
+    if (isAlnum(c)) { runs.push(cur); cur = ""; } else cur += c;
+  }
+  runs.push(cur);
+  return runs;
 }
 
 // ------------------------------------------------------------------------------ pre-press pause

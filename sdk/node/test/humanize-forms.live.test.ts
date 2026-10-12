@@ -994,6 +994,27 @@ describe.runIf(LIVE)("live humanized form input", () => {
     }, T);
   }
 
+  // SC 210 round 3: the field loses the first press of its last key. A change of case or a stripped
+  // separator is no mask that cuts, so the lost key is noticed: wiped and typed once more, by keys.
+  for (const [sel, value, want, lost] of [
+    ["#lcdrop", "ABC126", "abc126", "6"],
+    ["#npdrop", "555-123-4567", "5551234567", "7"],
+    ["#plaindrop", "123456", "123456", "6"],
+  ] as const) {
+    it(`a lost key in a field that normalizes is typed again (${sel})`, async () => {
+      typos(0);
+      await page.evaluate(([s, k]) => { (document.querySelector(s) as HTMLElement).dataset.drop = k; }, [sel, lost]);
+      await reset();
+      await page.fill(sel, value);
+      expect(await page.evaluate((s) => !("drop" in (document.querySelector(s) as HTMLElement).dataset), sel), "the key was never lost").toBe(true);
+      expect(await page.inputValue(sel)).toBe(want);
+      const downs = await ev("keydown", sel.slice(1));
+      expect(downs.filter((e) => e.key === "Backspace" || e.ctrl || e.meta).length, "the lost key went unnoticed").toBeGreaterThan(0);
+      expect(downs.filter((e) => e.key === lost).length).toBe(2);
+      expect(downs.every((e) => e.tr)).toBe(true);
+    }, T);
+  }
+
   const apiError = async (p: Promise<unknown>): Promise<[string, string]> => {
     try { await p; } catch (e: any) { return [e instanceof errors.TimeoutError ? "TimeoutError" : e?.name, String(e?.message).split("\n")[0]]; }
     return ["no error", ""];
