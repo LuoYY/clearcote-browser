@@ -193,6 +193,36 @@ export function fitMaxlength(value: string, maxlength: number | string | null | 
   return value;
 }
 
+/**
+ * Is `got` what a formatting mask leaves of `want` once the field stops taking keys -- what a person
+ * typing `want` ends up with too, so typing it again (or Playwright's fill, which the same mask cuts the
+ * same way) changes nothing? Its letters and digits are a shorter prefix of `want`'s (formattedEqual
+ * covers the whole value) AND either the field is full (`maxlength` UTF-16 units: MM/YY on maxlength 5
+ * holds "12/34" of "12345") or the page re-punctuated what was typed (`got` is not just the first
+ * characters of `want`: "1234 AB" of "1234abx"). A value cut short with nothing re-punctuated and room
+ * left is a lost key: false, and the caller types it again. Port of _forms.mask_kept (verifier B, SC 210:
+ * MM/YY and a 12-place phone mask were typed, wiped with Ctrl+A Backspace and typed again).
+ */
+export function maskKept(got: string | null | undefined, want: string | null | undefined,
+  maxlength: number | string | null | undefined = null, tag: string | null | undefined = "input",
+  inputType: string | null | undefined = ""): boolean {
+  if (!got || want === null || want === undefined) return false;
+  const a = Array.from(got).filter(isAlnum).map(casefold);
+  const b = Array.from(want).filter(isAlnum).map(casefold);
+  if (a.length === 0 || a.length >= b.length || !a.every((c, i) => c === b[i])) return false;
+  let n = -1;
+  if (maxlength !== null && maxlength !== undefined && maxlength !== "") {
+    const v = typeof maxlength === "number" ? maxlength : Number(maxlength);
+    n = Number.isFinite(v) ? Math.trunc(v) : -1;
+  }
+  const t = (tag || "").toLowerCase();
+  if (n >= 0 && (t === "textarea" || (t === "input" && MAXLENGTH_TYPES.has((inputType || "").toLowerCase())))) {
+    if (got.length >= n) return true;   // String length is UTF-16 units, as maxlength counts
+  }
+  const cps = Array.from(got).length;
+  return got !== Array.from(want).slice(0, cps).join("");
+}
+
 // ------------------------------------------------------------------------------ pre-press pause
 /** Bounds of the pause between the pointer coming to rest and the button going down (ms). */
 export const PRE_PRESS_MIN_MS = 40;

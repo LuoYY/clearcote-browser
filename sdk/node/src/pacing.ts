@@ -12,9 +12,12 @@
 //              path keeps the plan's shape and the move keeps the plan's duration;
 //   never skipped: the final sample (the move lands exactly where it was aimed) and a sample marked
 //              as changing button state (`pinned`);
-//   never a teleport: a skip may not put more between two dispatched points than a fast hand covers
-//              in the time between them (FAST_PX_PER_MS x dt, at least maxJump = 40 px); a longer hop
-//              dispatches the in-between sample instead;
+//   never a teleport: a skip may not put more than maxJump (40 px) between two dispatched points, and
+//              no more than IDLE_HOP_PX (20 px) after IDLE_MS (40 ms) with nothing sent; a longer hop
+//              dispatches the in-between sample instead, so a late walk stretches in time rather than
+//              jumping (SC 210 lab v2: the old cap, 3 px/ms x the time since the last dispatch, turned
+//              slow dispatches under load into hops of 60-103 px a few ms apart; an r40 engine walks
+//              any hop >= 24 px after >= 40 ms idle);
 //   a stall is a pause: a single dispatch slower than STALL_MS shifts the schedule by the excess
 //              instead of being caught up by skipping.
 //
@@ -26,9 +29,12 @@ export const MAX_JUMP_PX = 40;
 // A single dispatch slower than this is a STALL (the page or the box was busy), not latency: nothing
 // reached the page while it lasted, so the plan pauses with it instead of skipping ahead afterwards.
 export const STALL_MS = 60;
-// A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s). A skip may hop as far as that
-// covers in the time since the last dispatch, and never less than MAX_JUMP_PX.
+// A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s).
 export const FAST_PX_PER_MS = 3;
+// After this long with nothing dispatched, a skip may hop at most IDLE_HOP_PX: what a hand at a moderate
+// 2.5 px/ms covers in one 125 Hz report (8 ms), and below the 24 px an r40 engine walks.
+export const IDLE_MS = 40;
+export const IDLE_HOP_PX = 20;
 
 export interface PacedStep { x: number; y: number; sleepMs: number; }
 
@@ -97,9 +103,31 @@ export async function walk<S extends PacedStep>(
   return sent;
 }
 
-/** The largest hop allowed between two dispatched points `dtMs` apart: what a fast hand covers in that
- *  time, never less than maxJump. */
-export const jumpCap = (maxJump: number, dtMs: number): number => Math.max(maxJump, FAST_PX_PER_MS * Math.max(0, dtMs));
+/** How far inside the viewport a planned path is kept (SC 210 fix 2, verifier B: the planner's overshoot
+ *  arcs left the window near its edges and the page saw no events while the pointer was outside). */
+export const VIEW_MARGIN_PX = 2;
+
+/** `steps` with every sample but the last moved inside the viewport `vw` x `vh` (`margin` px in). The last
+ *  sample -- where the move was aimed -- is never changed, and a move aimed outside the viewport is
+ *  returned as it is. Only coordinates change. Port of _pacing.keep_in_view. */
+export function keepInView<S extends PacedStep>(steps: S[], vw: number, vh: number, margin = VIEW_MARGIN_PX): S[] {
+  if (!steps.length || !vw || !vh) return steps;
+  const t = steps[steps.length - 1];
+  if (!(t.x >= 0 && t.x <= vw && t.y >= 0 && t.y <= vh)) return steps;
+  const lx = Math.min(margin, t.x), hx = Math.max(vw - margin, t.x);
+  const ly = Math.min(margin, t.y), hy = Math.max(vh - margin, t.y);
+  return steps.map((s, k) => {
+    if (k === steps.length - 1) return s;
+    const x = Math.min(Math.max(s.x, lx), hx), y = Math.min(Math.max(s.y, ly), hy);
+    return x === s.x && y === s.y ? s : { ...s, x, y };
+  });
+}
+
+/** The largest hop a SKIP may make between two dispatched points `dtMs` apart: maxJump, and IDLE_HOP_PX
+ *  after an idle gap. Never more for a longer gap: a walk that fell behind stretches in time instead of
+ *  catching up with a jump (the planner's own consecutive samples always go out). Port of
+ *  _pacing._jump_cap. */
+export const jumpCap = (maxJump: number, dtMs: number): number => (dtMs < IDLE_MS ? maxJump : Math.min(maxJump, IDLE_HOP_PX));
 
 // Measured on PRO r38 under load: one move answered after 523 ms. Catching that up by skipping coarsened
 // the rest of the glide to maximum hops, and across the fixture's iframe the page saw a 110 px jump. A

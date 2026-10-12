@@ -770,7 +770,8 @@ describe.runIf(LIVE)("live humanized form input", () => {
     await page.locator("#trialbtn").click({ trial: true });
     await page.dblclick("#trialbtn", { trial: true });
     await page.hover("#trialbtn", { trial: true });
-    await page.locator("#trialbtn").tap({ trial: true });
+    await expect(page.locator("#trialbtn").tap({ trial: true }))   // no hasTouch here: Playwright's own error
+      .rejects.toThrow(/does not support tap/);
     await page.click("#trialbtn", { trial: true, position: { x: 5, y: 5 } });
     await page.check("#cb", { trial: true });
     await page.locator("#cb").setChecked(true, { trial: true });
@@ -930,4 +931,135 @@ describe.runIf(LIVE)("live humanized form input", () => {
     expect(cv, `CV ${cv.toFixed(2)} over ${gaps.length} gaps (rollover ${rolls})`).toBeGreaterThanOrEqual(0.3);
     expect(cv).toBeLessThanOrEqual(1.0);
   }, 600_000);
+
+  // ------------------------------------------------- SC 210 fix 2: twins, masks, Playwright's error wording
+  it("a MUI-style button is clicked humanized and its trial passes", async () => {
+    // A ripple span with inset:0 and pointer-events:none fills the button: the old twin rule called every
+    // such button covered, sent the click to stock Playwright and failed trial (verifier A).
+    await page.locator("#muibtn").scrollIntoViewIfNeeded();
+    await page.click("#muibtn", { trial: true, timeout: 1500 });
+    await page.locator("#muibtn").click({ trial: true, timeout: 1500 });
+    await page.hover("#muibtn", { trial: true, timeout: 1500 });
+    await reset();
+    await page.click("#muibtn");
+    expect(await moves(), "the click glided (humanized), not a native jump").toBeGreaterThanOrEqual(5);
+    expect((await ev("mousedown", "muibtn")).map((e) => e.tr)).toEqual([true]);
+  }, T);
+
+  it("a label-wrapped custom checkbox is checked humanized", async () => {
+    await page.locator("#swlab").scrollIntoViewIfNeeded();
+    await page.check("#swchk", { trial: true, timeout: 1500 });
+    await reset();
+    await page.check("#swchk", { position: { x: 20, y: 15 } });   // on the mark, off the input's own 3 px rim
+    expect(await page.isChecked("#swchk")).toBe(true);
+    expect(await moves(), "humanized, not stock Playwright").toBeGreaterThanOrEqual(5);
+    expect((await ev("mousedown", "swmark")).map((e) => e.tr)).toEqual([true]);
+    await reset();
+    await page.locator("#swchk").uncheck();
+    expect(await page.isChecked("#swchk")).toBe(false);
+    expect(await moves()).toBeGreaterThanOrEqual(5);
+  }, T);
+
+  it("a decorative span under a button's text is not an overlay", async () => {
+    await page.locator("#bgbtn").scrollIntoViewIfNeeded();
+    await page.click("#bgbtn", { trial: true, timeout: 1500 });
+    await reset();
+    await page.click("#bgbtn", { position: { x: 60, y: 20 } });
+    expect(await moves()).toBeGreaterThanOrEqual(5);
+    expect((await ev("click", "bgtext"))[0].tr).toBe(true);
+  }, T);
+
+  it("a real overlay is still covered", async () => {
+    await page.locator("#ovbtn").scrollIntoViewIfNeeded();
+    await expect(page.click("#ovbtn", { trial: true, timeout: 600 })).rejects.toBeInstanceOf(errors.TimeoutError);
+    await reset();
+    await expect(page.click("#ovbtn", { timeout: 900 })).rejects.toBeInstanceOf(errors.TimeoutError);
+    expect(await ev("mousedown", "ovbtn"), "no press reached the covered button").toEqual([]);
+  }, T);
+
+  for (const [sel, value, want, keys] of [
+    ["#exp", "123456", "12/34", "12345"],                               // MM/YY on maxlength 5 (verifier B)
+    ["#telmask", "5551234567890", "555-123-4567", "555123456789"],      // 3-3-4 dashes on maxlength 12
+    ["#pcmask", "1234abx", "1234 AB", "1234abx"],                       // a script that formats and cuts
+  ] as const) {
+    it(`a mask that stops taking keys is typed once (${sel})`, async () => {
+      typos(0);
+      await reset();
+      await page.fill(sel, value);
+      expect(await page.inputValue(sel)).toBe(want);
+      const downs = await ev("keydown", sel.slice(1));
+      expect(downs.map((e) => e.key).join("")).toBe(keys);
+      expect(downs.filter((e) => e.ctrl || e.meta || e.key === "Backspace"), "wiped and retyped").toEqual([]);
+      expect(downs.every((e) => e.tr)).toBe(true);
+    }, T);
+  }
+
+  const apiError = async (p: Promise<unknown>): Promise<[string, string]> => {
+    try { await p; } catch (e: any) { return [e instanceof errors.TimeoutError ? "TimeoutError" : e?.name, String(e?.message).split("\n")[0]]; }
+    return ["no error", ""];
+  };
+
+  it("errors name the API the caller used", async () => {
+    // Playwright words an error after the method called ("page.click: Timeout 600ms exceeded."); the
+    // humanized calls rejected with the inner call's ("locator.waitFor: ...", "locator.isChecked: ...").
+    const L = (s: string) => page.locator(s);
+    const calls: [string, () => Promise<unknown>][] = [
+      ["page.click", () => page.click("#missing", { timeout: 600 })],
+      ["page.dblclick", () => page.dblclick("#missing", { timeout: 600 })],
+      ["page.hover", () => page.hover("#missing", { timeout: 600 })],
+      ["page.fill", () => page.fill("#missing", "x", { timeout: 600 })],
+      ["page.type", () => page.type("#missing", "x", { timeout: 600 })],
+      ["page.press", () => page.press("#missing", "a", { timeout: 600 })],
+      ["page.check", () => page.check("#missing", { timeout: 600 })],
+      ["page.uncheck", () => page.uncheck("#missing", { timeout: 600 })],
+      ["page.setChecked", () => page.setChecked("#missing", true, { timeout: 600 })],
+      ["page.selectOption", () => page.selectOption("#missing", "a", { timeout: 600 })],
+      ["locator.click", () => L("#missing").click({ timeout: 600 })],
+      ["locator.dblclick", () => L("#missing").dblclick({ timeout: 600 })],
+      ["locator.hover", () => L("#missing").hover({ timeout: 600 })],
+      ["locator.fill", () => L("#missing").fill("x", { timeout: 600 })],
+      ["locator.clear", () => L("#missing").clear({ timeout: 600 })],
+      ["locator.press", () => L("#missing").press("a", { timeout: 600 })],
+      ["locator.type", () => L("#missing").type("x", { timeout: 600 })],
+      ["locator.pressSequentially", () => L("#missing").pressSequentially("x", { timeout: 600 })],
+      ["locator.check", () => L("#missing").check({ timeout: 600 })],
+      ["locator.uncheck", () => L("#missing").uncheck({ timeout: 600 })],
+      ["locator.setChecked", () => L("#missing").setChecked(true, { timeout: 600 })],
+      ["locator.selectOption", () => L("#missing").selectOption("a", { timeout: 600 })],
+      ["locator.click(trial)", () => L("#disbtn").click({ trial: true, timeout: 600 })],
+    ];
+    const got: Record<string, [string, string]> = {}, want: Record<string, [string, string]> = {};
+    for (const [api, fn] of calls) {
+      got[api] = await apiError(fn());
+      want[api] = ["TimeoutError", api.split("(")[0] + ": Timeout 600ms exceeded."];
+    }
+    expect(got).toEqual(want);
+  }, T);
+
+  it("check on a non-checkbox rejects with Playwright's own error", async () => {
+    const native = await apiError(Object.getPrototypeOf(page).check.call(page, "#btn", { timeout: 600 }));
+    expect(native).toEqual(["Error", "page.check: Error: Not a checkbox or radio button"]);
+    expect(await apiError(page.check("#btn", { timeout: 600 }))).toEqual(native);
+    expect(await apiError(page.uncheck("#btn", { timeout: 600 }))).toEqual(["Error", native[1].replace("check", "uncheck")]);
+    expect(await apiError(page.locator("#btn").check({ timeout: 600 }))).toEqual(["Error", "locator" + native[1].slice(4)]);
+    expect(await apiError(page.locator("#btn").setChecked(true, { timeout: 600 })))
+      .toEqual(["Error", "locator.setChecked" + native[1].slice("page.check".length)]);
+  }, T);
+
+  it("tap without touch rejects like Playwright", async () => {
+    const [kind, msg] = await apiError(page.locator("#btn").tap({ timeout: 600 }));
+    expect(kind).toBe("Error");
+    expect(msg.startsWith("locator.tap: The page does not support tap"), msg).toBe(true);
+  }, T);
+
+  it("a click presses the whole pixel its hit test proved", async () => {
+    // DOM.getNodeForLocation answers for a whole pixel; a press at 971.6 next to a badge ending at 972 was
+    // proven at 972 and landed on the badge, reported as a success (verifier B).
+    for (let i = 0; i < 5; i++) {
+      await reset();
+      await page.click("#btn");
+      const d: any = (await ev("pointerdown", "btn"))[0];
+      expect(Number.isInteger(d.cx) && Number.isInteger(d.cy), `${d.cx}, ${d.cy}`).toBe(true);
+    }
+  }, T);
 });

@@ -33,14 +33,14 @@ import {
   makePersona, planMove, dragDwell, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
-import { trimTo, walk } from "./pacing.js";
+import { keepInView, trimTo, walk } from "./pacing.js";
 import {
   COVER_CHECK_MS, COVER_RETRY_MS, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_FORM_CONTROL,
   ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
-  worldFor, type DescribedElement,
+  roundHalfEven, worldFor, type DescribedElement,
 } from "./isolated.js";
 import {
-  DEFAULT_TYPO_RATE, NEARBY_LETTERS, classifyField, datetimeEqual, enginePathOk, fitMaxlength, formattedEqual,
+  DEFAULT_TYPO_RATE, NEARBY_LETTERS, classifyField, datetimeEqual, enginePathOk, fitMaxlength, formattedEqual, maskKept,
   matchOption, normalizeClickOptions, numericEqual, planDatetime, planSelect, planTypo, prePressMs, pyFloat,
   rangeAttrs, rangeFraction,
   rangeNudge, rangePoint, rangeSanitize, rangeValueOk, segmentNodesFromTree, typoEligible, typosAllowed,
@@ -157,8 +157,8 @@ export function defaultTimeoutMs(page: any): number {
 export function trialTimeoutError(selector: string, ms: number, why: string): Error {
   const msg = `Timeout ${Math.round(ms)}ms exceeded.\nCall log:\n  - waiting for locator('${selector}')\n  - ${why}`;
   const E: any = (pwErrors as any)?.TimeoutError;
-  if (typeof E === "function") return new E(msg);
-  return Object.assign(new Error(msg), { name: "TimeoutError" });
+  if (typeof E === "function") return Object.assign(new E(msg), { [SDK_PW_ERROR]: true });
+  return Object.assign(new Error(msg), { name: "TimeoutError", [SDK_PW_ERROR]: true });
 }
 
 // The characters a US-layout keyboard (Playwright's, and the engine's keyboard.getLayoutMap())
@@ -193,6 +193,50 @@ export function typoRate(): number {
  * `timeout` to fail), so timeouts propagate instead. */
 export function isTimeout(err: unknown): boolean {
   return (err as any)?.name === "TimeoutError";
+}
+
+// Playwright words every error after the API the caller used: "page.click: Timeout 800ms exceeded.",
+// "locator.check: Error: Not a checkbox or radio button". A humanized call rejected with the error of
+// whatever Playwright call it made inside (locator.waitFor, locator.isChecked; verifier B, SC 210) --
+// the same class, but a message a caller matching on it would not recognise. Pre-existing in 0.48.0.
+const API_PREFIX = /^[A-Za-z_]+\.[A-Za-z_]+: /;
+/** Marks an error the SDK raises in Playwright's place (a trial that never passed, a checkbox that would
+ * not change): it gets the caller's API prefix too. */
+const SDK_PW_ERROR = Symbol.for("clearcote.playwrightError");
+
+/** @internal exported for tests. `err` worded as Playwright words an error of `api` ("page.click",
+ * "locator.setChecked"): the inner call's "locator.waitFor: " prefix replaced (or, for an error the SDK
+ * raised in Playwright's place, added), in the message and the stack's first line. The object, and so
+ * its class, is kept. Anything else is returned as it is. */
+export function asApiError<T>(err: T, api: string): T {
+  const e: any = err;
+  if (!(e instanceof Error) || typeof e.message !== "string") return err;
+  const m = API_PREFIX.exec(e.message);
+  if (!m && !(err as any)[SDK_PW_ERROR] && e.name !== "TimeoutError") return err;
+  const msg = api + ": " + (m ? e.message.slice(m[0].length) : e.message);
+  if (msg === e.message) return err;
+  const old = e.message;
+  try {
+    e.message = msg;
+    if (typeof e.stack === "string") e.stack = e.stack.replace(old, msg);
+  } catch { /* a frozen error keeps its words */ }
+  return err;
+}
+
+/** @internal `fn`, with every Playwright error it rejects with worded as `api`'s (asApiError). */
+export function apiErrors<A extends any[], R>(api: string, fn: (...a: A) => Promise<R>): (...a: A) => Promise<R> {
+  return async (...a: A): Promise<R> => {
+    try {
+      return await fn(...a);
+    } catch (e) {
+      throw asApiError(e, api);
+    }
+  };
+}
+
+/** @internal An Error the SDK raises where Playwright would, worded by the caller's API (apiErrors). */
+export function sdkPlaywrightError(message: string): Error {
+  return Object.assign(new Error(message), { [SDK_PW_ERROR]: true });
 }
 
 // The form-route boxes are viewport CSS px, like Playwright's boundingBox().
@@ -288,11 +332,28 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // the whole path — the same code powers a free move AND a held-button drag.
   //
   // Paced against a WALL CLOCK (pacing.ts): each sample goes out at its planned time and late ones
-  // are skipped (never the last, never a > 40 px jump). "Move, then sleep the planned gap" added the
+  // are skipped (never the last, and no hop longer than a fast hand covers in the time since the last
+  // dispatch: 3 px/ms of it, at least 40 px). "Move, then sleep the planned gap" added the
   // ~27 ms mouse.move round trip to every 6-8 ms sample: a 1.05 s planned glide took 3.5-5.4 s on
   // PRO r38 (SC 209), ambient motion 5.7x as long.
   const dispatch = async (steps: Step[]): Promise<void> => {
-    await walk(steps, async (x, y) => { await nativeMove(x, y); st.placed = true; });
+    const vp = await viewBounds();
+    await walk(vp ? keepInView(steps, vp.width, vp.height) : steps, async (x, y) => { await nativeMove(x, y); st.placed = true; });
+  };
+  // The viewport a planned path is kept inside (keepInView: the planner's overshoot arcs left the window
+  // near its edges, verifier B), read in the isolated world at most every 2 s; null when it cannot be read.
+  let vb: { t: number; vp: { width: number; height: number } | null } | null = null;
+  const viewBounds = async (): Promise<{ width: number; height: number } | null> => {
+    const now = Date.now();
+    if (vb === null || now - vb.t > 2000) {
+      let vp: { width: number; height: number } | null = null;
+      try {
+        const wh = await worldFor(page).evaluate<[number, number]>(ISO_VIEWPORT);
+        if (wh && wh[0] && wh[1]) vp = { width: Number(wh[0]), height: Number(wh[1]) };
+      } catch { /* detached / navigating / no CDP: no clamp */ }
+      vb = { t: now, vp };
+    }
+    return vb.vp;
   };
 
   // Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective homing)
@@ -922,19 +983,22 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // Does a press at viewport (x, y) reach the element filling `box`? true / false, or null when it
   // cannot be told here (CDP is unavailable). A point inside a child frame is answered by the <iframe>
   // element that holds it (IsolatedWorld.nodeAt).
-  const hitInBox = async (box: Rect, x: number, y: number): Promise<boolean | null> => {
+  // `sel`: a plain-CSS selector for the element, when the caller has one: whether the hit is THAT
+  // element (ISO_HIT_IN_BOX), not just one that fills the box.
+  const hitInBox = async (box: Rect, x: number, y: number, sel: string | null = null): Promise<boolean | null> => {
     const w = worldFor(page);
     const nid = await w.nodeAt(x, y);
     if (nid === undefined) return null;
-    const res = await w.callOnNode<boolean | null>(nid, ISO_HIT_IN_BOX,
-      { x: box.x, y: box.y, width: box.width, height: box.height });
+    const b: Record<string, unknown> = { x: box.x, y: box.y, width: box.width, height: box.height };
+    if (sel) b.sel = sel;
+    const res = await w.callOnNode<boolean | null>(nid, ISO_HIT_IN_BOX, b);
     return res === undefined || res === null ? null : Boolean(res);
   };
 
   // Does the element filling `box` own its centre -- not clipped by a scrolling container, not
   // covered? The browser's own hit test, read in the isolated world.
-  const hitOk = async (box: Rect): Promise<boolean> =>
-    (await hitInBox(box, box.x + box.width / 2, box.y + box.height / 2)) === true;
+  const hitOk = async (box: Rect, sel: string | null = null): Promise<boolean> =>
+    (await hitInBox(box, box.x + box.width / 2, box.y + box.height / 2, sel)) === true;
 
   // The box of a plain-CSS selector's first match, read (and scrolled into view) in the isolated
   // world: not even the one boundingBox() handle, and its textContent preview, is made. Used only
@@ -952,7 +1016,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       return null;
     }
     let box = rectBox(r);
-    if (box && !((await inView(box)) && (await hitOk(box)))) {
+    if (box && !((await inView(box)) && (await hitOk(box, selector)))) {
       // scrollIntoViewIfNeeded also scrolls a scrolling container that clips it, and does nothing
       // when it already shows (then the cover is an overlay: the click's own check)
       box = rectBox(await w.evaluate<any>(ISO_CSS_BOX, { sel: selector, scroll: true }));
@@ -995,12 +1059,12 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     const css = await cssBox(selector);
     if (css) return css;
     let box = await loc.boundingBox();
-    if (box && !((await inView(box)) && (await hitOk(box)))) {
+    if (box && !((await inView(box)) && (await hitOk(box, selector)))) {
       // Off-screen: scroll the window to it and prove it shows there (hit test), with no new handle.
       // Clipped by a scrolling container, covered, or the window scroll did not bring it out:
       // Playwright's scroll, which also scrolls containers, and a fresh box.
       const moved = !(await inView(box)) ? await scrollWindowTo(box) : null;
-      if (moved && (await inView(moved)) && (await hitOk(moved))) return moved;
+      if (moved && (await inView(moved)) && (await hitOk(moved, selector))) return moved;
       await loc.scrollIntoViewIfNeeded({ timeout });
       box = await loc.boundingBox();
     }
@@ -1052,7 +1116,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     } else if (info.disabled) {
       return false;
     }
-    const pt = at ? { x: at[0], y: at[1] } : clickPoint(box, st, persona); // 2D gaussian toward the centre
+    const p0 = at ? { x: at[0], y: at[1] } : clickPoint(box, st, persona); // 2D gaussian toward the centre
+    const pt = { x: roundHalfEven(p0.x), y: roundHalfEven(p0.y) };      // the pixel the hit test answered for
     await glide(pt.x, pt.y);
     await pressHere(pt.x, pt.y);
     return true;
@@ -1129,7 +1194,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     // outside the try: a native call that raises must raise ONCE, not be retried by the handler
     return nativeType(selector, text, options);
   };
-  (page as any).type = (selector: string, text: string, options: any = {}) => locked(() => htype(selector, text, options));
+  (page as any).type = apiErrors("page.type", (selector: string, text: string, options: any = {}) =>
+    locked(() => htype(selector, text, options)));
 
   // Type `value` into a text control and PROVE it landed. The value is read through Playwright's
   // utility world (`inputValue`): it sees the control the locator means, wherever focus is, and the page
@@ -1142,15 +1208,17 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     // What the field can hold: a maxlength keeps the first N characters (what Playwright's insertText
     // leaves too), and a person types only those -- the field stops taking keys.
     let want = value;
+    let limit: [number | string | null, string | null, string | null] = [null, null, null];
     if (!isCe) {
-      want = info
-        ? fitMaxlength(value, info.maxlength, info.tag, info.type)
-        : fitMaxlength(value, await loc.getAttribute("maxlength"),
-          (await loc.locator("xpath=self::textarea").count()) ? "textarea" : "input", (await loc.getAttribute("type")) || "");
+      limit = info
+        ? [info.maxlength, info.tag, info.type]
+        : [await loc.getAttribute("maxlength"),
+          (await loc.locator("xpath=self::textarea").count()) ? "textarea" : "input", (await loc.getAttribute("type")) || ""];
+      want = fitMaxlength(value, ...limit);
     }
     // Bulk values (over 200 characters) are still inserted at once -- typing thousands of keys would
     // crawl -- but the way a person pastes: glide to the field, click into it, then insert.
-    const bulk = Array.from(value).length > 200;
+    const bulk = Array.from(want).length > 200; // what the field holds: a 300-character value cut to 5 is typed
     if (bulk && !nativeKbInsert) return false;
     if (!(await focusClick(box, box ? provenPoint(box, info) : null, loc, selector))) return false;
     await sleep(rand(40, 120));
@@ -1178,14 +1246,16 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     await put(want);
     let got = await read();
     if (got === null) return false;
-    if (got === want || formattedEqual(got, want)) return true; // exact, or a mask that only re-punctuated it
+    // exact; a mask that only re-punctuated what was typed (a phone format); or one that re-punctuated it
+    // and then stopped taking keys (MM/YY on maxlength 5): no wipe and retype (maskKept)
+    if (got === want || formattedEqual(got, want) || maskKept(got, want, ...limit)) return true;
     if (bulk) return false; // an inserted value that did not land: Playwright's fill, not a second paste
     // Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips, then
     // give the field to Playwright -- a correct value beats pretty input.
     await clearFocused(read);
     await put(want, false);
     got = await read();
-    return got !== null && (got === want || formattedEqual(got, want));
+    return got !== null && (got === want || formattedEqual(got, want) || maskKept(got, want, ...limit));
   };
 
   // A range input: drag the thumb (or click the track) to the value, then arrow-nudge to it exactly.
@@ -1329,13 +1399,14 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     // raises, as before humanize), and anything the humane route could not prove it did right.
     return nativePageFill(selector, value, options);
   };
-  (page as any).fill = (selector: string, value: string, options: any = {}) => locked(() => hfill(selector, value, options));
+  (page as any).fill = apiErrors("page.fill", (selector: string, value: string, options: any = {}) =>
+    locked(() => hfill(selector, value, options)));
 
-  (page as any).dblclick = (selector: string, options: any = {}) => locked(() => {
+  (page as any).dblclick = apiErrors("page.dblclick", (selector: string, options: any = {}) => locked(() => {
     const o = { ...(options ?? {}) };
     if (o.clickCount === undefined) o.clickCount = 2;
     return targetedClick(nativePageDblclick, selector, o, false, options ?? {});
-  });
+  }));
 
   const hpress = async (selector: string, key: string, options: any): Promise<any> => {
     try {
@@ -1352,7 +1423,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     }
     return nativePagePress(selector, key, options);
   };
-  (page as any).press = (selector: string, key: string, options: any = {}) => locked(() => hpress(selector, key, options));
+  (page as any).press = apiErrors("page.press", (selector: string, key: string, options: any = {}) =>
+    locked(() => hpress(selector, key, options)));
 
   // ------------------------------------------------------------------------- selectOption
   // Open the drop-down with a click, move its highlight with the planned keys, commit with Enter: one
@@ -1559,8 +1631,8 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       }
       return nativePageSelect(selector, values, options);
     };
-    (page as any).selectOption = (selector: string, values: any, options: any = {}) =>
-      locked(() => hselect(selector, values, options));
+    (page as any).selectOption = apiErrors("page.selectOption", (selector: string, values: any, options: any = {}) =>
+      locked(() => hselect(selector, values, options)));
   }
 
   // ------------------------------------------------------------------ check / uncheck / setChecked
@@ -1580,18 +1652,19 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     if ((await loc.isChecked({ timeout: opts.timeout })) === checked) return;
     await targetedClick(nativePageClick, selector, { ...opts }, false, null);
     if ((await loc.isChecked()) === checked) return;
-    throw new Error("Clicking the checkbox did not change its state");
+    throw sdkPlaywrightError("Clicking the checkbox did not change its state");
   };
   for (const [name, want] of [["check", true], ["uncheck", false]] as const) {
     if (typeof (page as any)[name] === "function") {
       const orig = (page as any)[name].bind(page);
-      (page as any)[name] = (selector: string, options: any = {}) => locked(() => setChecked(orig, selector, want, options));
+      (page as any)[name] = apiErrors("page." + name, (selector: string, options: any = {}) =>
+        locked(() => setChecked(orig, selector, want, options)));
     }
   }
   if (typeof (page as any).setChecked === "function") {
     const origSc = (page as any).setChecked.bind(page);
-    (page as any).setChecked = (selector: string, checked: boolean, options: any = {}) =>
-      locked(() => setChecked((s: string, o: any) => origSc(s, checked, o), selector, Boolean(checked), options));
+    (page as any).setChecked = apiErrors("page.setChecked", (selector: string, checked: boolean, options: any = {}) =>
+      locked(() => setChecked((s: string, o: any) => origSc(s, checked, o), selector, Boolean(checked), options)));
   }
 
   // ------------------------------------------------------------------------- click / hover
@@ -1604,12 +1677,12 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   // fading out). A point inside a child frame is answered by the <iframe> element that holds it
   // (IsolatedWorld.nodeAt), so no Playwright trial runs for it either. false when covered; null when
   // the hit test cannot run (no CDP): the caller goes native.
-  const reachesPoint = async (box: Rect, x: number, y: number): Promise<boolean | null> => {
+  const reachesPoint = async (box: Rect, x: number, y: number, sel: string | null = null): Promise<boolean | null> => {
     const deadline = Date.now() + COVER_CHECK_MS;
-    let hit = await hitInBox(box, x, y);
+    let hit = await hitInBox(box, x, y, sel);
     while (hit === false && Date.now() < deadline) {
       await sleep(80);
-      hit = await hitInBox(box, x, y);
+      hit = await hitInBox(box, x, y, sel);
     }
     return hit;
   };
@@ -1646,7 +1719,7 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
           const { x, y } = o.position ? await positionPoint(box, o.position)
             : { x: box.x + box.width / 2, y: box.y + box.height / 2 };
           await sleep(50); // stable: 50 ms on, the element still fills `box` (ISO_HIT_IN_BOX)
-          if ((await hitInBox(box, x, y)) !== false) return; // null: the hit test cannot run -- nothing to add
+          if ((await hitInBox(box, x, y, selector)) !== false) return; // null: the hit test cannot run -- nothing to add
           why = `element is not stable, or another element would receive the pointer at (${Math.round(x)}, ${Math.round(y)})`;
         }
       }
@@ -1667,14 +1740,19 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     nativeOpts: any | null): Promise<any> => {
     const opts = options ?? {};
     const o = normalizeClickOptions(opts);
+    let aim: Point | null = null; // where Playwright's own click lands, once the box is known (native)
     const native = async () => {
       if (!orig) throw new Error("humanized click could not run");
       try {
         return await orig(selector, nativeOpts ?? opts);
       } finally {
         // Native click/hover genuinely move the browser pointer to the element. Leaving `placed`
-        // false afterwards made the next wheel anchor believe the pointer was still unplaced.
+        // false afterwards made the next wheel anchor believe the pointer was still unplaced -- and the
+        // engine path walked again from its own stale point (engineInSync; verifier A #6). The next
+        // SDK glide starts where Playwright pressed: `position`, else the centre of the box.
         st.placed = true;
+        eng.at = null;
+        if (aim) { st.x = aim.x; st.y = aim.y; }
       }
     };
     if (o.trial) return trial(selector, opts, noClick);
@@ -1685,19 +1763,25 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
       // native at once instead of timing out first.
       const box = await boxOf(loc, timeout, o.force, selector);
       if (!box) throw new NativeSignal();
+      aim = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
       if (!o.force && !(await loc.isEnabled())) throw new NativeSignal();
       let x: number, y: number;
       if (o.position) {
         ({ x, y } = await positionPoint(box, o.position));
+        aim = { x, y };
       } else {
         ({ x, y } = clickPoint(box, st, persona));
       }
+      // Whole pixels: the hit test below answers for the pixel DOM.getNodeForLocation rounds to, so the
+      // press goes to that pixel too. A press at 971.6 next to a badge ending at 972 was proven at 972 and
+      // landed on the badge, reported as a success (verifier B, SC 210).
+      x = roundHalfEven(x); y = roundHalfEven(y);
       if (!o.force && orig) {
         // Stability, then covered-by: 50 ms on, the element must still fill `box` (an animation in
         // flight does not) and own the click point -- no trusted press at a point some overlay owns.
         // Either failing goes native: Playwright waits for it.
         await sleep(50);
-        if (!(await reachesPoint(box, x, y))) throw new NativeSignal();
+        if (!(await reachesPoint(box, x, y, selector))) throw new NativeSignal();
       }
       if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) throw new NativeSignal();
       if (!noClick && !o.force && orig && engineClicksMode() === "all" && enginePathOk(o) && await engineGlide(x, y, false)) {
@@ -1734,10 +1818,10 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
     return native();
   };
 
-  (page as any).click = (selector: string, options: any = {}) =>
-    locked(() => targetedClick(nativePageClick, selector, options, false, null));
-  (page as any).hover = (selector: string, options: any = {}) =>
-    locked(() => targetedClick(nativePageHover, selector, options, true, null));
+  (page as any).click = apiErrors("page.click", (selector: string, options: any = {}) =>
+    locked(() => targetedClick(nativePageClick, selector, options, false, null)));
+  (page as any).hover = apiErrors("page.hover", (selector: string, options: any = {}) =>
+    locked(() => targetedClick(nativePageHover, selector, options, true, null)));
   // Locator.dragTo({ trial: true }) answers its checks here too (see the Locator patch).
   (page as any)._clearcoteTrial = (selector: string, options: any, noClick: boolean) =>
     locked(() => trial(selector, options, noClick));
@@ -1853,67 +1937,79 @@ function patchLocatorClass(sample: Locator): void {
     if (on(self) && await strict(self)) return [true, await fn()];
     return [false, undefined];
   };
+  // Every routed method words its errors as Playwright words the Locator method (asApiError): through
+  // page.*, an error read "page.click: ..." or "locator.waitFor: ...".
+  const apiMethod = (api: string, fn: (this: any, ...a: any[]) => Promise<any>) =>
+    async function (this: any, ...a: any[]): Promise<any> {
+      try { return await fn.apply(this, a); } catch (e) { throw asApiError(e, api); }
+    };
+  // Playwright's tap rejects at once in a context without hasTouch ("The page does not support tap");
+  // routed as a click it clicked instead (SC 210 error parity). A context it cannot read is routed.
+  const noTouch = (self: any): boolean => {
+    try { return self.page().context()._options.hasTouch !== true; } catch { return false; }
+  };
 
-  proto.fill = async function (this: any, value: string, kw: any = {}) {
+  proto.fill = apiMethod("locator.fill", async function (this: any, value: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().fill(sel(this), value, pickOptions(kw, FILL_OPTS)));
     return done ? r : oFill.call(this, value, kw);
-  };
-  proto.click = async function (this: any, kw: any = {}) {
+  });
+  proto.click = apiMethod("locator.click", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().click(sel(this), pickOptions(kw, CLICK_OPTS)));
     return done ? r : oClick.call(this, kw);
-  };
-  proto.type = async function (this: any, text: string, kw: any = {}) {
+  });
+  proto.type = apiMethod("locator.type", async function (this: any, text: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().type(sel(this), text, pickOptions(kw, TYPE_OPTS)));
     return done ? r : oType.call(this, text, kw);
-  };
-  proto.dblclick = async function (this: any, kw: any = {}) {
+  });
+  proto.dblclick = apiMethod("locator.dblclick", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().dblclick(sel(this), pickOptions(kw, DBL_OPTS)));
     return done ? r : oDbl.call(this, kw);
-  };
-  proto.hover = async function (this: any, kw: any = {}) {
+  });
+  proto.hover = apiMethod("locator.hover", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().hover(sel(this), pickOptions(kw, HOVER_OPTS)));
     return done ? r : oHover.call(this, kw);
-  };
-  proto.press = async function (this: any, key: string, kw: any = {}) {
+  });
+  proto.press = apiMethod("locator.press", async function (this: any, key: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().press(sel(this), key, pickOptions(kw, PRESS_OPTS)));
     return done ? r : oPress.call(this, key, kw);
-  };
-  proto.pressSequentially = async function (this: any, text: string, kw: any = {}) {
+  });
+  proto.pressSequentially = apiMethod("locator.pressSequentially", async function (this: any, text: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().type(sel(this), text, pickOptions(kw, TYPE_OPTS)));
     return done ? r : oPressSeq.call(this, text, kw);
-  };
-  proto.clear = async function (this: any, kw: any = {}) {
+  });
+  proto.clear = apiMethod("locator.clear", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().fill(sel(this), "", pickOptions(kw, FILL_OPTS)));
     return done ? r : oClear.call(this, kw);
-  };
-  proto.tap = async function (this: any, kw: any = {}) {
+  });
+  proto.tap = apiMethod("locator.tap", async function (this: any, kw: any = {}) {
+    if (noTouch(this)) return oTap.call(this, kw);
     const [done, r] = await route(this, () => this.page().click(sel(this), pickOptions(kw, HOVER_OPTS)));
     return done ? r : oTap.call(this, kw);
-  };
-  proto.check = async function (this: any, kw: any = {}) {
+  });
+  proto.check = apiMethod("locator.check", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().check(sel(this), pickOptions(kw, CHECK_OPTS)));
     return done ? r : oCheck.call(this, kw);
-  };
-  proto.uncheck = async function (this: any, kw: any = {}) {
+  });
+  proto.uncheck = apiMethod("locator.uncheck", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().uncheck(sel(this), pickOptions(kw, CHECK_OPTS)));
     return done ? r : oUncheck.call(this, kw);
-  };
+  });
   if (typeof oSetChecked === "function") {
-    proto.setChecked = async function (this: any, checked: boolean, kw: any = {}) {
+    proto.setChecked = apiMethod("locator.setChecked", async function (this: any, checked: boolean, kw: any = {}) {
       const [done, r] = await route(this, () => this.page().setChecked(sel(this), checked, pickOptions(kw, CHECK_OPTS)));
       return done ? r : oSetChecked.call(this, checked, kw);
-    };
+    });
   }
   // Delegate to the humanized page.selectOption, like every other method here: one implementation
   // behind the page method is what stops the two entry points drifting apart.
   if (typeof oSelectOption === "function") {
-    proto.selectOption = async function (this: any, values: any, kw: any = {}) {
+    proto.selectOption = apiMethod("locator.selectOption", async function (this: any, values: any, kw: any = {}) {
       const [done, r] = await route(this, () => this.page().selectOption(sel(this), values, pickOptions(kw, SELECT_OPTS)));
       return done ? r : oSelectOption.call(this, values, kw);
-    };
+    });
   }
 
-  proto.dragTo = async function (this: any, target: any, kw: any = {}) {
+  proto.dragTo = apiMethod("locator.dragTo", async function (this: any, target: any, kw: any = {}) {
     if (kw?.trial && on(this) && on(target) && await strict(this) && await strict(target)) {
       // Playwright's drag trial moves the pointer onto the source and presses there (SC 209); the SDK
       // runs the checks of both ends instead: visible, stable, receives the pointer.
@@ -1950,7 +2046,7 @@ function patchLocatorClass(sample: Locator): void {
       } catch { /* fall back */ }
     }
     return oDragTo.call(this, target, kw);
-  };
+  });
 }
 
 /** Install humanize/showCursor on a browser: wraps newPage/newContext so every page is covered. */

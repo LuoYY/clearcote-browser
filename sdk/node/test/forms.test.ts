@@ -90,7 +90,7 @@ describe("shared vectors", () => {
     const tested = ["classify_field", "typos_allowed", "typo_eligible", "nearby_digits", "typeahead_simulate",
       "plan_select", "match_option", "range_sanitize", "range_value_ok", "range_point", "range_nudge",
       "plan_datetime", "datetime_equal", "formatted_equal", "normalize_click_options", "engine_path_ok",
-      "fit_maxlength", "pre_press_center", "pre_press_ms"];
+      "fit_maxlength", "mask_kept", "pre_press_center", "pre_press_ms"];
     expect(Object.keys(VEC).filter((k) => !k.startsWith("_")).sort()).toEqual([...tested].sort());
   });
 });
@@ -353,6 +353,10 @@ describe("properties", () => {
 describe("maxlength + pre-press pause (SC 210)", () => {
   it.each(cases("fit_maxlength"))("fitMaxlength #%i", (_, c) => {
     expect(F.fitMaxlength(c.value, c.maxlength, c.tag, c.type)).toBe(c.want);
+  });
+
+  it.each(cases("mask_kept"))("maskKept #%i", (_, c) => {
+    expect(F.maskKept(c.got, c.want, c.maxlength, c.tag, c.type)).toBe(c.result);
   });
 
   it.each(cases("pre_press_center"))("prePressCenter #%i", (_, c) => {

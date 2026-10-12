@@ -14,8 +14,10 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  attachHumanize, createInputLock, isTimeout, pickOptions, selectWants, typoRate, wantIndex,
+  apiErrors, asApiError, attachHumanize, createInputLock, isTimeout, pickOptions, sdkPlaywrightError, selectWants, typoRate,
+  wantIndex,
 } from "../src/humanize.js";
+import { errors as pwErrors } from "playwright-core";
 import {
   ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL,
   ISO_SCROLL_BY, ISO_VIEWPORT,
@@ -659,6 +661,28 @@ describe("fill: text", () => {
     expect(f.natives).toEqual([]);
   }, SLOW);
 
+  // SC 210 fix 2 (verifier B): a mask that re-punctuates and then stops taking keys was typed, wiped
+  // with Ctrl+A Backspace, typed again and handed to Playwright -- for the same visible value.
+  const expiry = (v: string) => { const d = v.replace(/\D/g, "").slice(0, 4); return d.length > 2 ? `${d.slice(0, 2)}/${d.slice(2)}` : d; };
+  const telDashes = (v: string) => { const d = v.replace(/\D/g, "").slice(0, 10); return [d.slice(0, 3), d.slice(3, 6), d.slice(6)].filter(Boolean).join("-"); };
+  const postcode = (v: string) => { const d = v.toUpperCase().replace(/[^0-9A-Z]/g, "").slice(0, 6); return d.length > 4 ? `${d.slice(0, 4)} ${d.slice(4)}` : d; };
+  for (const [name, format, maxlength, value, want, keys] of [
+    ["MM/YY on maxlength 5", expiry, 5, "123456", "12/34", "12345"],
+    ["3-3-4 dashes on maxlength 12", telDashes, 12, "5551234567890", "555-123-4567", "555123456789"],
+    ["a script that formats and cuts, no maxlength", postcode, undefined, "1234abx", "1234 AB", "1234abx"],
+  ] as const) {
+    it(`a mask that stops taking keys is typed once: ${name}`, async () => {
+      process.env[ENV] = "0";
+      const f = await attached({ field: { format, maxlength } });
+      await f.page.fill("#m", value);
+      expect(f.field.value).toBe(want);
+      expect(f.natives).toEqual([]);
+      const typed: string[] = f.events.filter((e) => e.t === "press" || e.t === "kdown").map((e) => (e.t === "press" ? e.a.k : e.a));
+      expect(typed.filter((k) => k.length === 1).join("")).toBe(keys);
+      expect(typed.filter((k) => ["ControlOrMeta", "ControlOrMeta+a", "Backspace"].includes(k)), "wiped and retyped").toEqual([]);
+    }, SLOW);
+  }
+
   it("a covered field is clicked where a person clicks; when the overlay keeps the caret, Playwright fills it", async () => {
     process.env[ENV] = "0";
     const f = await attached({ field: { value: "old" }, covered: true });
@@ -961,10 +985,12 @@ describe("type / press", () => {
   it("no read anywhere in this file resolved a target by querySelector, nor ran in the page's world", () => {
     // (page.evaluate throws in every fake.) The one querySelectorAll is ISO_CSS_BOX: a fast path for a
     // plain-CSS selector, used only when Playwright counts the same elements, never the way a target
-    // is resolved (the hit test is).
+    // is resolved (the hit test is). ISO_HIT_IN_BOX (SC 210 fix 2) reads the caller's plain-CSS selector
+    // only to tell whether the element the hit test found IS that element (its first match must still
+    // fill the box, else the box rule answers), and asks whether a twin holds a control.
     expect(allExpressions.length).toBeGreaterThan(0);
     for (const e of allExpressions) {
-      if (!e.startsWith(`(${ISO_CSS_BOX})`)) expect(e).not.toContain("querySelector");
+      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.includes(ISO_HIT_IN_BOX)) expect(e).not.toContain("querySelector");
     }
     expect(allExpressions.some((e) => e.startsWith(`(${ISO_CSS_BOX})`))).toBe(true);
   });
@@ -1181,4 +1207,47 @@ describe("Locator patch", () => {
     expect(await s.page.locator("#country").selectOption("Germany")).toEqual(["ger"]);
     expect(s.of("change").length).toBe(1);
   }, SLOW);
+});
+
+describe("Playwright's error wording (SC 210 fix 2)", () => {
+  it("an error is worded as the API the caller used, class kept", () => {
+    const e = new pwErrors.TimeoutError("locator.waitFor: Timeout 800ms exceeded.\nCall log:\n  - waiting for locator('#x')");
+    const n = asApiError(e, "page.click");
+    expect(n).toBe(e);
+    expect(n).toBeInstanceOf(pwErrors.TimeoutError);
+    expect(n.message.split("\n")[0]).toBe("page.click: Timeout 800ms exceeded.");
+    expect(n.message.endsWith("waiting for locator('#x')")).toBe(true);
+    expect(asApiError(sdkPlaywrightError("Clicking the checkbox did not change its state"), "locator.check").message)
+      .toBe("locator.check: Clicking the checkbox did not change its state");
+    const plain = new TypeError("cannot read x");
+    expect(asApiError(plain, "page.click").message).toBe("cannot read x");
+  });
+
+  it("a humanized call rejects with the caller's API name", async () => {
+    const f = apiErrors("page.check", async () => { throw new pwErrors.TimeoutError("locator.isChecked: Timeout 500ms exceeded."); });
+    await expect(f()).rejects.toThrow(/^page\.check: Timeout 500ms exceeded\.$/);
+  });
+});
+
+describe("paths stay in the viewport; whole-pixel presses (SC 210 fix 2)", () => {
+  it("glides near the edges stay inside the viewport", async () => {
+    // The planner's overshoot arcs left the window near its edges (verifier B). This fake's viewport is 1280 x 800.
+    const f = await attached();
+    const pts: [number, number][] = [[1276, 400], [640, 3], [4, 790], [1277, 797], [100, 2], [1270, 6], [3, 3]];
+    for (let r = 0; r < 3; r++) for (const [x, y] of pts) await f.page.mouse.move(x, y);
+    const out = f.of("move").filter((e) => !(e.a.x >= 0 && e.a.x <= 1280 && e.a.y >= 0 && e.a.y <= 800));
+    expect(out.length, JSON.stringify(out.slice(0, 3))).toBe(0);
+  }, 60_000);
+
+  it("a humanized click presses the whole pixel the hit test proved", async () => {
+    // DOM.getNodeForLocation answers for a whole pixel: a press at 971.6 was proven at 972 and landed on a
+    // badge next to the target (verifier B).
+    const f = await attached();
+    for (let i = 0; i < 6; i++) {
+      await f.page.click("#btn");
+      const m = f.of("move");
+      const last = m[m.length - 1].a;
+      expect(Number.isInteger(last.x) && Number.isInteger(last.y), JSON.stringify(last)).toBe(true);
+    }
+  }, 60_000);
 });

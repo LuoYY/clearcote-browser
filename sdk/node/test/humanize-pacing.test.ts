@@ -159,7 +159,9 @@ describe("humanize pacing: planned paths keep their planned duration", () => {
         const mv = f.log.filter((e) => e.op === "move");
         expect(mv.length).toBeGreaterThan(0);
         expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeGreaterThanOrEqual(0.8 * ms);
-        expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeLessThanOrEqual(1.2 * ms);
+        // With 25 ms latency a late walk stretches instead of catching up with jumps (SC 210 fix 2, no hop
+        // over 40 px): ambient's fast flicks run long (Python, 30 plans: worst 1.67x at 600 ms).
+        expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeLessThanOrEqual((lat === 0 ? 1.2 : 1.8) * ms);
         expect(hopsOk(mv)).toBe(true);
       }, 60_000);
     }
@@ -205,6 +207,22 @@ describe("pacing.walk", () => {
     expect(c.sent.length).toBeGreaterThan(10);
     expect(c.sent[c.sent.length - 1].x).toBe(39 * 30);
   });
+
+  for (const stall of [200, 350, 500]) {
+    it(`after a ${stall} ms stall it stretches instead of jumping (SC 210 lab v2)`, async () => {
+      // 35 hops of 60-103 px a few ms apart on r38 under load: the old cap (3 px/ms x the time since the
+      // last dispatch) let a slow dispatch turn into one big catch-up hop. Now <= 40 px, <= 20 px after it.
+      const steps = Array.from({ length: 300 }, (_, i) => ({ x: i * 3, y: 0, sleepMs: 2 }));
+      let t = 0;
+      const sent: { x: number; t: number }[] = [];
+      await walk(steps, async (x) => { t += [3, 9, 15].includes(sent.length) ? stall : 25; sent.push({ x, t }); },
+        { now: () => t, sleep: async (ms) => { t += Math.max(0, ms); } });
+      const hops = sent.slice(1).map((s, k) => s.x - sent[k].x);
+      expect(Math.max(...hops)).toBeLessThanOrEqual(40 + 1e-6);
+      for (const k of [3, 9, 15]) expect(hops[k], `the hop after stall ${k}`).toBeLessThanOrEqual(20 + 1e-6);
+      expect(sent[sent.length - 1].x).toBe(299 * 3);
+    });
+  }
 
   it("pauses through a stall instead of skipping after it", async () => {
     const steps = Array.from({ length: 200 }, (_, i) => ({ x: i * 2, y: 0, sleepMs: 5 }));
@@ -258,5 +276,15 @@ describe("pacing.walk", () => {
       expect(total).toBeLessThanOrEqual(600 + 1e-6);
       if (total > 1.1 * 300) expect(speedAt(plan, cut.length - 1)).toBeLessThanOrEqual(0.3 * peak);
     }
+  });
+});
+
+describe("keepInView (SC 210 fix 2)", () => {
+  it("moves samples inside but never the target", async () => {
+    const { keepInView } = await import("../src/pacing.js");
+    const steps = [{ x: 10, y: 5, sleepMs: 8 }, { x: -12, y: -3, sleepMs: 8 }, { x: 1290, y: 400, sleepMs: 8 }, { x: 1279, y: 799, sleepMs: 8 }];
+    expect(keepInView(steps, 1280, 800).map((s) => [s.x, s.y])).toEqual([[10, 5], [2, 2], [1279, 400], [1279, 799]]);
+    const aimedOut = [{ x: 10, y: 5, sleepMs: 8 }, { x: 1300, y: 900, sleepMs: 8 }];
+    expect(keepInView(aimedOut, 1280, 800)).toBe(aimedOut);
   });
 });

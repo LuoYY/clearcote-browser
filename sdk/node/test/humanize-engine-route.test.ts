@@ -80,6 +80,20 @@ describe("engine pointer path routing", () => {
     expect(log.some((e) => e[0] === "down")).toBe(true);
   }, 20_000);
 
+  it("after a native fallback click the engine does not walk from its stale position", async () => {
+    // A selector click the SDK hands to Playwright moves the real pointer to the element; the engine does
+    // not see it either (verifier A #6: only `placed` was recorded, so the engine walked again).
+    const eng = new Engine();
+    const { page, log, browser } = makePage(eng);
+    await attachHumanize(browser as never, page, { humanize: true, seed: "route" });
+    await page.mouse.click(300, 300);   // engine: its cursor is now (300, 300)
+    await page.click("#elsewhere");     // this fake cannot resolve it: Playwright's own click
+    await page.mouse.click(400, 200);
+    expect(eng.calls.length).toBe(1);
+    const moves = log.filter((e) => e[0] === "move");
+    expect(moves[moves.length - 1].slice(1)).toEqual([400, 200]);
+  }, 20_000);
+
   it("an engine answer after its walk is not followed by a second wait", async () => {
     const eng = new Engine();
     const { page, browser } = makePage(eng);
