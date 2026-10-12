@@ -267,12 +267,18 @@ page.click("#row", button="right")         # click options are honoured (button,
 dragging, scrolling and typing — all dispatched as **native trusted input** (`isTrusted === true`,
 `navigator.webdriver` stays `false`), at both the page level (`page.click`/`hover`/`dblclick`/
 `type`/`fill`/`press`, `page.mouse.*`, `page.keyboard.type`) and the locator level
-(`locator.click`/`type`/`fill`/`hover`/`press_sequentially`/`drag_to`/`check`/…). Mouse paths are
-slightly bowed cubic-beziers built from the *last* cursor position (no snap back to the corner),
-walked as a **sum of sub-movements with a min-jerk velocity profile** — a ballistic primary that
-slightly over/undershoots plus a corrective move, i.e. the multi-peak velocity of real reaching, not
-one symmetric bell. Because they use native input, the button held by `mouse.down()` stays held
-across the move, so `down → move → up` is a real drag (slider captchas work). Clicks get an
+(`locator.click`/`type`/`fill`/`hover`/`press_sequentially`/`drag_to`/`check`/…). Mouse paths start
+from the *last* cursor position (no snap back to the corner) and are walked as a **sum of sub-movements
+with a min-jerk velocity profile**: an arcing ballistic primary that reaches its top speed before the
+halfway point and either stops a little short of the target or, in a share of moves fixed per identity
+(15–38 %), passes it and comes back, then a short corrective move. Because they use native input, the
+button held by `mouse.down()` stays held across the move, so `down → move → up` is a real drag (slider
+captchas work); a move with the button held is planned as a drag, a flat leg that stays within a few
+pixels of the line from grab to drop (a slider handle stays on its track), with the occasional small
+overshoot and pull-back. `page.mouse.click(x, y)` is walked by the engine's own pointer path when the
+engine has one and knows where the pointer is (nothing else moved it since its last walk);
+`CLEARCOTE_HUMANIZE_ENGINE_CLICKS=off` keeps every click on the SDK's path, and `=all` also sends
+`page.click(selector)` / `locator.click()` there (plain left single clicks on a point the hit test proved). Clicks get an
 actionability pre-flight (visible + enabled + stable + not covered) and fall back to the native click
 if it fails. The "not covered" check is the browser's own hit test, read in an isolated world: the
 pointer does not move before the glide and nothing is pressed (only a click point inside a child frame

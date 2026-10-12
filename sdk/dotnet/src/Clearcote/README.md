@@ -173,7 +173,9 @@ The `clearcote cloud` command line ships with the Node and Python packages only.
 Playwright's input is instant: a click presses and releases in the same millisecond, a keystroke
 holds for ~1 ms, and every click lands on the element's exact centre. No hand does any of that, and
 each is separately measurable from the page. `Humanize` replaces those with a seeded motor persona —
-Fitts-timed minimum-jerk pointer paths, human press-hold and key dwell, dispersed landing points, and
+Fitts-timed minimum-jerk pointer paths (an arcing primary that peaks before the halfway point and, in a
+share of moves fixed per identity, passes the target and comes back; `HumanDragToAsync` legs stay
+within a few pixels of the line from grab to drop), human press-hold and key dwell, dispersed landing points, and
 dropdown selection driven with the keyboard so the **engine** fires `input`/`change` (Playwright's
 `SelectOptionAsync` dispatches them from script, so they arrive `isTrusted: false`). Typing rolls over
 on some fast key pairs (the next key goes down before the previous one comes up), and
