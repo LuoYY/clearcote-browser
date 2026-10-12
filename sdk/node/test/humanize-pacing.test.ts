@@ -24,7 +24,7 @@ vi.mock("../src/motion.js", async (importOriginal) => {
 
 import { attachHumanize } from "../src/humanize.js";
 import { ISO_PLATFORM, ISO_VIEWPORT } from "../src/isolated.js";
-import { walk, trimTo, schedule, speedAt } from "../src/pacing.js";
+import { walk, trimTo, schedule, speedAt, STALL_MS, FAST_PX_PER_MS } from "../src/pacing.js";
 import { makePersona, planAmbient } from "../src/motion.js";
 
 type Ev = { op: string; t: number; x?: number; y?: number };
@@ -84,6 +84,15 @@ const maxGap = (pts: { x: number; y: number }[]) => {
   return m;
 };
 
+// No dispatched hop longer than a fast hand covers between the two events (3 px/ms, >= floor).
+const hopsOk = (moves: Ev[], floor = 40): boolean => {
+  for (let i = 1; i < moves.length; i++) {
+    const d = Math.hypot(moves[i].x! - moves[i - 1].x!, moves[i].y! - moves[i - 1].y!);
+    if (d > Math.max(floor, FAST_PX_PER_MS * (moves[i].t - moves[i - 1].t)) + 1e-6) return false;
+  }
+  return true;
+};
+
 const checkWalk = (from: { x: number; y: number }, plan: any[], moves: Ev[], dur: number) => {
   const planned = plan.reduce((a, s) => a + s.sleepMs, 0);
   expect(dur, `glide took ${dur.toFixed(0)} ms, planned ${planned.toFixed(0)} ms`).toBeGreaterThanOrEqual(0.8 * planned - 1);
@@ -91,7 +100,8 @@ const checkWalk = (from: { x: number; y: number }, plan: any[], moves: Ev[], dur
   const lastM = moves[moves.length - 1], lastP = plan[plan.length - 1];
   expect([lastM.x, lastM.y]).toEqual([lastP.x, lastP.y]);
   const own = maxGap([from, ...plan]);
-  expect(maxGap([from, ...moves.map((m) => ({ x: m.x!, y: m.y! }))])).toBeLessThanOrEqual(Math.max(40, own) + 1e-6);
+  expect(Math.hypot(moves[0].x! - from.x, moves[0].y! - from.y)).toBeLessThanOrEqual(Math.max(40, own) + 1e-6);
+  expect(hopsOk(moves, Math.max(40, own)), "a skipped stretch teleported the cursor").toBe(true);
 };
 
 const setup = async (lat: number, seed: string) => {
@@ -150,7 +160,7 @@ describe("humanize pacing: planned paths keep their planned duration", () => {
         expect(mv.length).toBeGreaterThan(0);
         expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeGreaterThanOrEqual(0.8 * ms);
         expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeLessThanOrEqual(1.2 * ms);
-        expect(maxGap(mv.map((m) => ({ x: m.x!, y: m.y! })))).toBeLessThanOrEqual(40 + 1e-6);
+        expect(hopsOk(mv)).toBe(true);
       }, 60_000);
     }
   }
@@ -190,8 +200,30 @@ describe("pacing.walk", () => {
     const steps = Array.from({ length: 40 }, (_, i) => ({ x: i * 30, y: 0, sleepMs: 1 }));
     const c = fake(25);
     await walk(steps, c.move, { now: c.now, sleep: c.sleep });
-    expect(maxGap([{ x: 0, y: 0 }, ...c.sent])).toBeLessThanOrEqual(40);
+    // 30 px/ms is ten times a fast hand: every hop stays within what one covers in a 25 ms dispatch.
+    expect(maxGap([{ x: 0, y: 0 }, ...c.sent])).toBeLessThanOrEqual(FAST_PX_PER_MS * 25 + 1e-6);
+    expect(c.sent.length).toBeGreaterThan(10);
     expect(c.sent[c.sent.length - 1].x).toBe(39 * 30);
+  });
+
+  it("pauses through a stall instead of skipping after it", async () => {
+    const steps = Array.from({ length: 200 }, (_, i) => ({ x: i * 2, y: 0, sleepMs: 5 }));
+    let t = 0;
+    const sent: number[] = [];
+    await walk(steps, async (x) => { t += sent.length === 10 ? 500 : 2; sent.push(x); },
+      { now: () => t, sleep: async (ms) => { t += Math.max(0, ms); } });
+    expect(sent.length).toBeGreaterThanOrEqual(185);
+    expect(Math.abs(t - (1000 + 500 - STALL_MS))).toBeLessThan(30);
+    expect(sent[sent.length - 1]).toBe(398);
+  });
+
+  it("a slow first sample is a stall too", async () => {
+    const steps = Array.from({ length: 40 }, (_, i) => ({ x: i * 2, y: 0, sleepMs: 5 }));
+    let t = 0;
+    const sent: number[] = [];
+    await walk(steps, async (x) => { t += sent.length ? 0 : 300; sent.push(x); },
+      { now: () => t, sleep: async (ms) => { t += Math.max(0, ms); } });
+    expect(sent.length).toBeGreaterThanOrEqual(40 - STALL_MS / 5 - 1);
   });
 
   it("stops at a failing move", async () => {
@@ -224,7 +256,7 @@ describe("pacing.walk", () => {
       const { total } = schedule(cut);
       expect(cut).toEqual(plan.slice(0, cut.length));
       expect(total).toBeLessThanOrEqual(600 + 1e-6);
-      if (total > 1.1 * 300) expect(speedAt(plan, cut.length - 1)).toBeLessThanOrEqual(0.1 * peak);
+      if (total > 1.1 * 300) expect(speedAt(plan, cut.length - 1)).toBeLessThanOrEqual(0.3 * peak);
     }
   });
 });

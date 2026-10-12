@@ -14,8 +14,11 @@ sleeps before it) and keeps that clock:
                one, so the path keeps the plan's shape and the move keeps the plan's duration;
 * never skipped: the final sample (the move must land exactly where it was aimed), and a sample
   marked as changing button state;
-* never a teleport: a skip that would put more than ``max_jump`` px between two dispatched points
-  dispatches the in-between sample instead (a fast hand covers ~40 px in one 25 ms dispatch).
+* never a teleport: a skip may not put more between two dispatched points than a fast hand covers in
+  the time between them (FAST_PX_PER_MS x dt, at least ``max_jump`` = 40 px); a longer hop dispatches
+  the in-between sample instead;
+* a stall is a pause: a single dispatch slower than ``STALL_MS`` shifts the schedule by the excess
+  instead of being caught up by skipping.
 
 Sleeps are local (``time.sleep`` / ``asyncio.sleep``), never ``page.wait_for_timeout``: that is a
 CDP round trip per call, protocol traffic a detector can score inside the humanize path.
@@ -28,6 +31,12 @@ import math
 import time
 
 MAX_JUMP_PX = 40.0
+# A single dispatch slower than this is a STALL (the page or the box was busy), not latency: nothing
+# reached the page while it lasted, so the plan pauses with it instead of skipping ahead afterwards.
+STALL_MS = 60.0
+# A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s). A skip may hop as far as that
+# covers in the time since the last dispatch, and never less than MAX_JUMP_PX.
+FAST_PX_PER_MS = 3.0
 
 
 def schedule(steps):
@@ -59,6 +68,12 @@ def next_index(steps, due, i, last, elapsed_ms, max_jump=MAX_JUMP_PX, pinned=_de
     return j
 
 
+def _jump_cap(max_jump, dt_ms):
+    """The largest hop allowed between two dispatched points ``dt_ms`` apart: what a fast hand covers in
+    that time, never less than ``max_jump``."""
+    return max(max_jump, FAST_PX_PER_MS * max(0.0, dt_ms))
+
+
 def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned):
     """Dispatch ``steps`` through ``move(x, y)`` against a wall clock (see module doc). Stops at the
     first ``move`` that raises. Returns the number of samples dispatched."""
@@ -71,20 +86,23 @@ def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_defa
     n = len(steps)
     i = 0
     last = None
+    t_last = t0
     sent = 0
     while i < n:
         el = (clock() - t0) * 1000.0
         if el < due[i]:
             sleep((due[i] - el) / 1000.0)
         else:
-            i = next_index(steps, due, i, last, el, max_jump, pinned)
+            i = next_index(steps, due, i, last, el, _jump_cap(max_jump, (clock() - t_last) * 1000.0), pinned)
         x, y = steps[i][0], steps[i][1]
+        tb = clock()
         try:
             move(x, y)
         except Exception:  # noqa: BLE001 - page gone / navigating: stop walking
             return sent
         sent += 1
-        last = (x, y)
+        t0 += _stall_s(tb, clock())
+        last, t_last = (x, y), tb
         i += 1
     el = (clock() - t0) * 1000.0
     if el < total:
@@ -103,25 +121,39 @@ async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, 
     n = len(steps)
     i = 0
     last = None
+    t_last = t0
     sent = 0
     while i < n:
         el = (clock() - t0) * 1000.0
         if el < due[i]:
             await sleep((due[i] - el) / 1000.0)
         else:
-            i = next_index(steps, due, i, last, el, max_jump, pinned)
+            i = next_index(steps, due, i, last, el, _jump_cap(max_jump, (clock() - t_last) * 1000.0), pinned)
         x, y = steps[i][0], steps[i][1]
+        tb = clock()
         try:
             await move(x, y)
         except Exception:  # noqa: BLE001
             return sent
         sent += 1
-        last = (x, y)
+        t0 += _stall_s(tb, clock())
+        last, t_last = (x, y), tb
         i += 1
     el = (clock() - t0) * 1000.0
     if el < total:
         await sleep((total - el) / 1000.0)
     return sent
+
+
+def _stall_s(tb, ta):
+    """Seconds to shift the schedule by after a dispatch that ran from ``tb`` to ``ta``.
+
+    Measured on PRO r38 under load: one move answered after 523 ms. Catching that up by skipping
+    coarsened the rest of the glide to maximum hops, and across the fixture's iframe the page saw a
+    110 px jump. A single dispatch slower than STALL_MS is a stall: nothing reached the page while it
+    lasted, so the plan pauses with it and only STALL_MS is caught up."""
+    took = (ta - tb) * 1000.0
+    return (took - STALL_MS) / 1000.0 if took > STALL_MS else 0.0
 
 
 def _speed(steps, k):
@@ -166,6 +198,12 @@ def trim_to(steps, ms, lo=0.85, hi=1.10, stretch=2.0):
         best = ends[-1] if ends else 0
     peak = max(_speed(steps, k) for k in range(len(steps)))
     if peak > 0 and _speed(steps, best) > 0.3 * peak:
+        # First the rest of the +-20 % the caller was promised, then forward.
+        wide = [k for k in range(len(steps)) if 0.8 * ms <= end[k] <= 1.15 * ms]
+        if wide:
+            k = min(wide, key=lambda k: _speed(steps, k))
+            if _speed(steps, k) <= 0.3 * peak:
+                return steps[:k + 1]
         for k in range(best + 1, len(steps)):
             if end[k] > stretch * ms:
                 break

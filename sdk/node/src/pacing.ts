@@ -12,14 +12,23 @@
 //              path keeps the plan's shape and the move keeps the plan's duration;
 //   never skipped: the final sample (the move lands exactly where it was aimed) and a sample marked
 //              as changing button state (`pinned`);
-//   never a teleport: a skip that would put more than maxJump px between two dispatched points
-//              dispatches the in-between sample instead (a fast hand covers ~40 px per 25 ms).
+//   never a teleport: a skip may not put more between two dispatched points than a fast hand covers
+//              in the time between them (FAST_PX_PER_MS x dt, at least maxJump = 40 px); a longer hop
+//              dispatches the in-between sample instead;
+//   a stall is a pause: a single dispatch slower than STALL_MS shifts the schedule by the excess
+//              instead of being caught up by skipping.
 //
 // Sleeps are local timers, never page.waitForTimeout (a CDP round trip a detector can score).
 // Nothing here changes what the planner returns; only WHEN each sample goes out and which late ones
 // are dropped.
 
 export const MAX_JUMP_PX = 40;
+// A single dispatch slower than this is a STALL (the page or the box was busy), not latency: nothing
+// reached the page while it lasted, so the plan pauses with it instead of skipping ahead afterwards.
+export const STALL_MS = 60;
+// A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s). A skip may hop as far as that
+// covers in the time since the last dispatch, and never less than MAX_JUMP_PX.
+export const FAST_PX_PER_MS = 3;
 
 export interface PacedStep { x: number; y: number; sleepMs: number; }
 
@@ -66,23 +75,37 @@ export async function walk<S extends PacedStep>(
   const pinned = o.pinned ?? (() => false);
   if (!steps.length) return 0;
   const { due, total } = schedule(steps);
-  const t0 = now();
+  let t0 = now();
+  let tLast = t0;
   let i = 0, sent = 0;
   let last: { x: number; y: number } | null = null;
   while (i < steps.length) {
     const el = now() - t0;
     if (el < due[i]) await sleep(due[i] - el);
-    else i = nextIndex(steps, due, i, last, el, maxJump, pinned);
+    else i = nextIndex(steps, due, i, last, el, jumpCap(maxJump, now() - tLast), pinned);
     const s = steps[i];
+    const tb = now();
     try { await move(s.x, s.y); } catch { return sent; }
     sent++;
+    t0 += stallMs(now() - tb);
     last = { x: s.x, y: s.y };
+    tLast = tb;
     i++;
   }
   const el = now() - t0;
   if (el < total) await sleep(total - el);   // the last sample's own dwell (a settle hold, a frame)
   return sent;
 }
+
+/** The largest hop allowed between two dispatched points `dtMs` apart: what a fast hand covers in that
+ *  time, never less than maxJump. */
+export const jumpCap = (maxJump: number, dtMs: number): number => Math.max(maxJump, FAST_PX_PER_MS * Math.max(0, dtMs));
+
+// Measured on PRO r38 under load: one move answered after 523 ms. Catching that up by skipping coarsened
+// the rest of the glide to maximum hops, and across the fixture's iframe the page saw a 110 px jump. A
+// single dispatch slower than STALL_MS is a stall: nothing reached the page while it lasted, so the plan
+// pauses with it and only STALL_MS is caught up.
+const stallMs = (took: number): number => (took > STALL_MS ? took - STALL_MS : 0);
 
 /** px/ms arriving at sample k (0 for the first). */
 export function speedAt(steps: readonly PacedStep[], k: number): number {
@@ -121,6 +144,14 @@ export function trimTo<S extends PacedStep>(steps: S[], ms: number, lo = 0.85, h
   let peak = 0;
   for (let k = 0; k < steps.length; k++) peak = Math.max(peak, speedAt(steps, k));
   if (peak > 0 && speedAt(steps, best) > 0.3 * peak) {
+    // First the rest of the +-20 % the caller was promised, then forward.
+    let wk = -1, wv = Infinity;
+    for (let k = 0; k < steps.length; k++) {
+      if (end[k] < 0.8 * ms || end[k] > 1.15 * ms) continue;
+      const v = speedAt(steps, k);
+      if (v < wv) { wk = k; wv = v; }
+    }
+    if (wk >= 0 && wv <= 0.3 * peak) return steps.slice(0, wk + 1);
     for (let k = best + 1; k < steps.length; k++) {
       if (end[k] > stretch * ms) break;
       if (speedAt(steps, k) <= 0.1 * peak) { best = k; break; }

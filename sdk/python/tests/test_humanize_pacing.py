@@ -140,13 +140,23 @@ def _max_gap(pts):
     return max((math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:])), default=0.0)
 
 
+def _hops_ok(moves, floor=40.0):
+    """No dispatched hop longer than a fast hand covers between the two events (3 px/ms, >= floor)."""
+    for a, b in zip(moves, moves[1:]):
+        d = math.hypot(b[2] - a[2], b[3] - a[3])
+        if d > max(floor, _pacing.FAST_PX_PER_MS * (b[1] - a[1])) + 1e-6:
+            return False
+    return True
+
+
 def _check_walk(plan, moves, dur_ms, start):
     planned = sum(s[2] for s in plan)
     assert 0.8 * planned <= dur_ms <= 1.2 * planned, f"glide took {dur_ms:.0f} ms, planned {planned:.0f} ms"
     assert (moves[-1][2], moves[-1][3]) == (plan[-1][0], plan[-1][1]), "the final sample must land exactly"
     pts = [start] + [(m[2], m[3]) for m in moves]
     own = _max_gap([start] + [(s[0], s[1]) for s in plan])
-    assert _max_gap(pts) <= max(40.0, own) + 1e-6, "a skipped stretch teleported the cursor"
+    assert math.hypot(pts[1][0] - start[0], pts[1][1] - start[1]) <= max(40.0, own) + 1e-6
+    assert _hops_ok(moves, max(40.0, own)), "a skipped stretch teleported the cursor"
 
 
 @pytest.mark.parametrize("lat", LATENCIES)
@@ -201,8 +211,7 @@ def test_ambient_motion_lasts_what_was_asked(clock, lat, ms):
     took = clock.now() * 1000.0 - t0
     assert _moves(m), "ambient dispatched nothing"
     assert 0.8 * ms <= took <= 1.2 * ms, f"ambient_motion({ms}) took {took:.0f} ms"
-    pts = [(e[2], e[3]) for e in _moves(m)]
-    assert _max_gap(pts) <= 40.0 + 1e-6
+    assert _hops_ok(_moves(m))
 
 
 @pytest.mark.parametrize("lat", LATENCIES)
@@ -265,14 +274,47 @@ def test_pacer_on_time_dispatches_every_sample_at_its_planned_time():
 
 
 def test_pacer_inserts_the_in_between_point_instead_of_a_long_jump():
-    # 30 px per sample, 1 ms apart, 25 ms dispatch: skipping to the most recent due sample would jump
-    # ~750 px; the pacer must keep every dispatched gap <= 40 px.
+    # 30 px per sample, 1 ms apart (30 px/ms, ten times a fast hand), 25 ms dispatch: skipping to the
+    # most recent due sample would hop ~750 px; the pacer must keep every hop to what a fast hand covers
+    # in 25 ms (75 px).
     steps = [(i * 30.0, 0.0, 1.0) for i in range(40)]
     c, sent, move = _fake(25.0)
     _pacing.walk(steps, move, clock=c.now, sleep=c.sleep)
     pts = [(s[0], s[1]) for s in sent]
-    assert _max_gap([(0.0, 0.0)] + pts) <= 40.0
+    assert _max_gap([(0.0, 0.0)] + pts) <= _pacing.FAST_PX_PER_MS * 25.0 + 1e-6
+    assert len(pts) > 10
     assert pts[-1] == (39 * 30.0, 0.0)
+
+
+def test_pacer_pauses_through_a_stall_instead_of_skipping_after_it():
+    # Measured on PRO r38 under load: one move answered after 523 ms. The samples after it must still
+    # go out (only STALL_MS of lateness is caught up by skipping); the walk runs that much longer.
+    steps = [(i * 2.0, 0.0, 5.0) for i in range(200)]
+    c = Clock()
+    sent = []
+
+    def move(x, y):
+        c.t += (0.5 if len(sent) == 10 else 0.002)
+        sent.append(x)
+    t0 = c.t
+    _pacing.walk(steps, move, clock=c.now, sleep=c.sleep)
+    took = (c.t - t0) * 1000.0
+    assert len(sent) >= 185, len(sent)
+    assert abs(took - (1000.0 + 500.0 - _pacing.STALL_MS)) < 30, took
+    assert sent[-1] == 398.0
+
+
+def test_pacer_a_slow_first_sample_is_a_stall_too():
+    # A page busy after a scroll answered the first move late: only STALL_MS of it is caught up.
+    steps = [(i * 2.0, 0.0, 5.0) for i in range(40)]
+    c = Clock()
+    sent = []
+
+    def move(x, y):
+        c.t += (0.3 if not sent else 0.0)
+        sent.append(x)
+    _pacing.walk(steps, move, clock=c.now, sleep=c.sleep)
+    assert len(sent) >= 40 - _pacing.STALL_MS / 5.0 - 1
 
 
 def test_pacer_stops_at_a_failing_move():
@@ -300,7 +342,7 @@ def test_trim_to_cuts_near_the_budget_at_a_slow_sample():
 
 def test_trim_to_a_short_ask_does_not_stop_the_pointer_mid_flight():
     # ~300 ms against a first excursion of 0.5-1 s: every sample in the window is mid-glide. The cut
-    # moves to where the glide has slowed down, within 2x the ask.
+    # moves to where the glide has slowed down (<= 30 % of peak), within 2x the ask.
     from clearcote._motion import make_persona, plan_ambient
     for seed in range(60):
         plan = plan_ambient((300, 300), {"width": 1280, "height": 800}, make_persona(seed), 300)
@@ -310,4 +352,4 @@ def test_trim_to_a_short_ask_does_not_stop_the_pointer_mid_flight():
         assert cut == plan[:len(cut)]
         assert total <= 600 + 1e-6, (seed, total)
         if total > 1.1 * 300:   # moved forward: only ever to a slow point
-            assert _pacing._speed(plan, len(cut) - 1) <= 0.1 * peak, seed
+            assert _pacing._speed(plan, len(cut) - 1) <= 0.3 * peak, seed

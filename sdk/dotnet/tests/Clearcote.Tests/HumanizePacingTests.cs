@@ -92,14 +92,15 @@ public class HumanizePacingTests
             var leg = m.Log.Skip(n0).ToList();
             Assert.All(leg, e => Assert.Equal("move", e.Op));
             Assert.Equal(((float)tx, (float)ty), (leg[^1].X, leg[^1].Y));
-            double maxGap = 0;
-            (double X, double Y) prev = (fx, fy);
-            foreach (var e in leg)
+            // No hop longer than a fast hand covers between the two events (3 px/ms, >= 40 px or the plan's own).
+            double first = Math.Sqrt((leg[0].X - fx) * (leg[0].X - fx) + (leg[0].Y - fy) * (leg[0].Y - fy));
+            Assert.True(first <= Math.Max(40, ownGap) + 0.01, $"the first sample hopped {first:F1} px");
+            for (int k = 1; k < leg.Count; k++)
             {
-                maxGap = Math.Max(maxGap, Math.Sqrt((e.X - prev.X) * (e.X - prev.X) + (e.Y - prev.Y) * (e.Y - prev.Y)));
-                prev = (e.X, e.Y);
+                double d = Math.Sqrt(Math.Pow(leg[k].X - leg[k - 1].X, 2) + Math.Pow(leg[k].Y - leg[k - 1].Y, 2));
+                double cap = Math.Max(Math.Max(40, ownGap), Pacing.FastPxPerMs * (leg[k].T - leg[k - 1].T));
+                Assert.True(d <= cap + 0.01, $"a skipped stretch hopped {d:F1} px in {leg[k].T - leg[k - 1].T:F0} ms");
             }
-            Assert.True(maxGap <= Math.Max(40, ownGap) + 0.01, $"a skipped stretch jumped {maxGap:F1} px");
         }
     }
 
@@ -135,6 +136,20 @@ public class HumanizePacingTests
     }
 
     [Fact]
+    public async Task Pacer_pauses_through_a_stall_instead_of_skipping_after_it()
+    {
+        // Measured on PRO r38 under load: one move answered after 523 ms, the pacer then skipped to catch
+        // up and the fixture's iframe crossing showed the page a 110 px jump. Now the plan pauses.
+        var steps = Enumerable.Range(0, 200).Select(i => new Step(i * 2, 0, 5)).ToList();
+        var c = new FakeClock();
+        await Pacing.WalkAsync(steps, (x, y) => { c.T += c.Sent.Count == 10 ? 500 : 2; c.Sent.Add((x, y, c.T)); return Task.CompletedTask; },
+            () => c.T, c.Sleep);
+        Assert.True(c.Sent.Count >= 185, $"{c.Sent.Count} sent");
+        Assert.True(Math.Abs(c.T - (1000 + 500 - Pacing.StallMs)) < 30, $"took {c.T}");
+        Assert.Equal(398.0, c.Sent[^1].X);
+    }
+
+    [Fact]
     public async Task Pacer_dispatches_the_in_between_point_instead_of_a_long_jump()
     {
         var steps = Enumerable.Range(0, 40).Select(i => new Step(i * 30, 0, 1)).ToList();
@@ -142,7 +157,9 @@ public class HumanizePacingTests
         await Pacing.WalkAsync(steps, c.Move(25), () => c.T, c.Sleep);
         double prev = 0, gap = 0;
         foreach (var s in c.Sent) { gap = Math.Max(gap, s.X - prev); prev = s.X; }
-        Assert.True(gap <= 40);
+        // 30 px/ms is ten times a fast hand: every hop stays within what one covers in a 25 ms dispatch.
+        Assert.True(gap <= Pacing.FastPxPerMs * 25 + 1e-6, $"hop {gap}");
+        Assert.True(c.Sent.Count > 10);
         Assert.Equal(39 * 30.0, c.Sent[^1].X);
     }
 }
