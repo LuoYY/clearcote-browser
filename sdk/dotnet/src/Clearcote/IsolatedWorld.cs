@@ -109,6 +109,11 @@ public sealed class IsolatedWorld
     // offset); Playwright's boxes, CDP's box model and the mouse are all VIEWPORT coordinates. Measured
     // on r37: a field scrolled 547 px down answered "No node found" at its viewport centre and the input
     // itself at centre + scroll.
+    //
+    // No ignorePointerEventsNone: in CDP `true` means "hit-test pointer-events:none elements TOO", so a
+    // decorative layer with pointer-events:none over a control was returned instead of the control and every
+    // form route fell back to stock Playwright (SC 209: 6/6 untrusted change events). The default (false)
+    // skips such layers, exactly as a real press does.
     internal static Dictionary<string, object> NodeAtParams(double x, double y, (double X, double Y)? scroll)
     {
         var (sx, sy) = scroll ?? (0, 0);
@@ -116,11 +121,38 @@ public sealed class IsolatedWorld
         {
             // Math.Round's default (to even) is Python's round().
             ["x"] = (int)Math.Round(x + sx), ["y"] = (int)Math.Round(y + sy),
-            ["includeUserAgentShadowDOM"] = false, ["ignorePointerEventsNone"] = true,
+            ["includeUserAgentShadowDOM"] = false,
         };
     }
 
-    /// backendNodeId of the MAIN-FRAME element at viewport point (x, y), or null. <paramref name="scroll"/>:
+    /// The frame directly under <paramref name="main"/> that contains <paramref name="frameId"/> (itself for
+    /// a direct child), from a Page.getFrameTree answer's <c>frameTree</c>; null when it is not below the main frame.
+    internal static string? TopChildFrame(JsonElement tree, string frameId, string main)
+    {
+        var parents = new Dictionary<string, string?>();
+        void Walk(JsonElement t, string? parent)
+        {
+            if (t.ValueKind != JsonValueKind.Object || !t.TryGetProperty("frame", out var f)
+                || f.ValueKind != JsonValueKind.Object || !f.TryGetProperty("id", out var idEl)
+                || idEl.GetString() is not { Length: > 0 } id)
+                return;
+            parents[id] = parent;
+            if (t.TryGetProperty("childFrames", out var kids) && kids.ValueKind == JsonValueKind.Array)
+                foreach (var k in kids.EnumerateArray()) Walk(k, id);
+        }
+        Walk(tree, null);
+        var fid = frameId;
+        for (int n = 0; n < 64; n++)
+        {
+            if (!parents.TryGetValue(fid, out var up) || up is null) return null;
+            if (up == main) return fid;
+            fid = up;
+        }
+        return null;
+    }
+
+    /// backendNodeId of the MAIN-FRAME element at viewport point (x, y) -- for a point inside a child frame,
+    /// the &lt;iframe&gt; element that holds it --, or null. <paramref name="scroll"/>:
     /// the page's (scrollX, scrollY) if the caller already has it (read here otherwise).
     ///
     /// <para>CDP's hit test (DOM.getNodeForLocation) runs in the renderer with no script at all, so this is
@@ -144,8 +176,24 @@ public sealed class IsolatedWorld
             return null;
         if (h.TryGetProperty("frameId", out var f) && f.ValueKind == JsonValueKind.String
             && !string.IsNullOrEmpty(f.GetString()) && _frame is not null && f.GetString() != _frame)
-            return null;   // inside an iframe: not this world's document
+            return await OwnerInMainAsync(f.GetString()!).ConfigureAwait(false);
         return id.GetInt32();
+    }
+
+    /// A point inside a child frame: the &lt;iframe&gt; element in the MAIN document that holds it (through
+    /// every nesting level), or null. To the main document a press there lands on that element: a control the
+    /// iframe covers is covered, a target that is (or contains) the iframe is reached. This replaced the only
+    /// Playwright trial humanize still ran (it moved the pointer and pressed, and page listeners registered
+    /// first saw it).
+    private async Task<int?> OwnerInMainAsync(string frameId)
+    {
+        var tree = await SendAsync("Page.getFrameTree").ConfigureAwait(false);
+        if (_frame is null || tree is not { ValueKind: JsonValueKind.Object } t || !t.TryGetProperty("frameTree", out var ft))
+            return null;
+        if (TopChildFrame(ft, frameId, _frame) is not { } top) return null;
+        var own = await SendAsync("DOM.getFrameOwner", new Dictionary<string, object> { ["frameId"] = top }).ConfigureAwait(false);
+        return own is { ValueKind: JsonValueKind.Object } o && o.TryGetProperty("backendNodeId", out var b)
+               && b.ValueKind == JsonValueKind.Number ? b.GetInt32() : null;
     }
 
     /// Run <paramref name="fnSource"/> -- a <c>function (arg) { ... }</c> whose <c>this</c> is the node --
@@ -251,16 +299,25 @@ public sealed class IsolatedWorld
     internal const string FormControl = "input, textarea, select, [contenteditable=''], [contenteditable='true'], [contenteditable='plaintext-only']";
     // Does the element the browser's hit test found at a click point belong to the element whose box the
     // caller holds -- the hit element itself, or an ancestor (across open shadow roots) that has exactly
-    // that box? `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
+    // that box -- with no OTHER element of that same box beside the hit's path inside it (a wrapper's
+    // control under an overlay: the wrap has the input's box, the press lands on the overlay)?
+    // `this` = the hit node (DOM.getNodeForLocation, pointer-events:none skipped, as for a real
     // press). The covered-point check without a Playwright trial: a trial MOVES the real pointer onto the
     // element and back and performs a press whose events Playwright blocks, so a page saw a mousemove
     // inside the target, a jump back and a pointerdown/click before every humanized click (verifier B).
     internal const string HitInBox = @"function (b) {
+  const same = r => Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
+    Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5;
+  const path = new Set();
   let e = this.nodeType === 1 ? this : this.parentElement;
   for (let n = 0; e && n < 128; n++) {
-    const r = e.getBoundingClientRect();
-    if (Math.abs(r.x - b.x) <= 1.5 && Math.abs(r.y - b.y) <= 1.5 &&
-        Math.abs(r.width - b.width) <= 1.5 && Math.abs(r.height - b.height) <= 1.5) return true;
+    path.add(e);
+    if (same(e.getBoundingClientRect())) {
+      const all = e.getElementsByTagName('*');
+      if (all.length <= 4000)
+        for (const d of all) if (!path.has(d) && same(d.getBoundingClientRect())) return false;
+      return true;
+    }
     const p = e.parentNode;
     e = e.parentElement || (p && p.nodeType === 11 && p.host) || null;
   }

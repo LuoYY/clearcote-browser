@@ -630,8 +630,32 @@ public class FormsTests
         Assert.Equal(100, (int)p["x"]);
         Assert.Equal(598, (int)p["y"]);
         Assert.False((bool)p["includeUserAgentShadowDOM"]);
-        Assert.True((bool)p["ignorePointerEventsNone"]);
         Assert.Equal(12, (int)IsolatedWorld.NodeAtParams(12.5, 0, null)["x"]);   // round half to even, like Python
+    }
+
+    [Fact]
+    public void Node_at_skips_pointer_events_none_layers_like_a_real_press()
+    {
+        // ignorePointerEventsNone = true makes CDP hit-test pointer-events:none elements TOO: a decorative layer
+        // over a control answered instead of the control and every form route fell back to stock Playwright
+        // (SC 209). The flag must be absent or false.
+        var p = IsolatedWorld.NodeAtParams(5, 5, null);
+        Assert.False(p.TryGetValue("ignorePointerEventsNone", out var v) && (bool)v);
+    }
+
+    [Fact]
+    public void A_child_frame_point_is_placed_under_the_main_documents_iframe()
+    {
+        // A point inside a child frame is answered by the <iframe> in the MAIN document that holds it (through
+        // every nesting level): DOM.getFrameOwner of the frame directly under the main one.
+        var tree = JsonDocument.Parse(@"{""frame"":{""id"":""MAIN""},""childFrames"":[
+            {""frame"":{""id"":""C1"",""parentId"":""MAIN""},""childFrames"":[{""frame"":{""id"":""C2"",""parentId"":""C1""}}]},
+            {""frame"":{""id"":""D1"",""parentId"":""MAIN""}}]}").RootElement;
+        Assert.Equal("C1", IsolatedWorld.TopChildFrame(tree, "C1", "MAIN"));
+        Assert.Equal("C1", IsolatedWorld.TopChildFrame(tree, "C2", "MAIN"));
+        Assert.Equal("D1", IsolatedWorld.TopChildFrame(tree, "D1", "MAIN"));
+        Assert.Null(IsolatedWorld.TopChildFrame(tree, "MAIN", "MAIN"));
+        Assert.Null(IsolatedWorld.TopChildFrame(tree, "GONE", "MAIN"));
     }
 
     [Fact]

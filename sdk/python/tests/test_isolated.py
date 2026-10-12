@@ -175,12 +175,75 @@ def test_node_at_uses_the_renderer_hit_test_and_rounds_to_pixels():
     w = IsolatedWorld(_FakePage(cdp))
     assert w.node_at(10.6, 20.4) == 42
     hit = [p for m, p in cdp.calls if m == "DOM.getNodeForLocation"][0]
-    assert hit == {"x": 11, "y": 20, "includeUserAgentShadowDOM": False, "ignorePointerEventsNone": True}
+    assert hit == {"x": 11, "y": 20, "includeUserAgentShadowDOM": False}
 
 
-def test_node_at_refuses_a_node_inside_another_frame():
-    cdp = _HitCdp(hit={"backendNodeId": 42, "frameId": "IFRAME-7"})
-    assert IsolatedWorld(_FakePage(cdp)).node_at(1, 1) is None
+def test_node_at_skips_pointer_events_none_layers_like_a_real_press():
+    # ignorePointerEventsNone: true makes CDP hit-test pointer-events:none elements TOO, so a
+    # decorative layer over a control answered instead of the control (SC 209: every select/fill
+    # under such a layer fell back to stock Playwright). The flag must be absent or false.
+    cdp = _HitCdp(hit={"backendNodeId": 42, "frameId": "MAIN"})
+    IsolatedWorld(_FakePage(cdp)).node_at(5, 5)
+    hit = [p for m, p in cdp.calls if m == "DOM.getNodeForLocation"][0]
+    assert not hit.get("ignorePointerEventsNone", False)
+
+
+class _FrameCdp(_HitCdp):
+    """A main frame with child frame C1, which holds C2: the hit lands in ``hit_frame``."""
+
+    def __init__(self, hit_frame, owners=None):
+        super().__init__(hit={"backendNodeId": 42, "frameId": hit_frame})
+        self.owners = owners if owners is not None else {"C1": 501, "C2": 777}
+
+    def send(self, method, params=None):
+        if method == "Page.getFrameTree":
+            self.calls.append((method, params))
+            return {"frameTree": {"frame": {"id": "MAIN"}, "childFrames": [
+                {"frame": {"id": "C1", "parentId": "MAIN"},
+                 "childFrames": [{"frame": {"id": "C2", "parentId": "C1"}}]}]}}
+        if method == "DOM.getFrameOwner":
+            self.calls.append((method, params))
+            fid = params["frameId"]
+            if fid not in self.owners:
+                raise RuntimeError("Frame with the given id was not found.")
+            return {"backendNodeId": self.owners[fid]}
+        return super().send(method, params)
+
+
+def test_node_at_answers_a_child_frame_point_with_its_iframe_element():
+    # A press there lands on the <iframe> as far as the main document goes: no Playwright trial
+    # (which moved the pointer and pressed) is needed to tell whether it reaches the target.
+    cdp = _FrameCdp("C1")
+    assert IsolatedWorld(_FakePage(cdp)).node_at(1, 1) == 501
+    assert ("DOM.getFrameOwner", {"frameId": "C1"}) in cdp.calls
+
+
+def test_node_at_walks_nested_frames_up_to_the_main_documents_iframe():
+    cdp = _FrameCdp("C2")
+    assert IsolatedWorld(_FakePage(cdp)).node_at(1, 1) == 501   # C1's <iframe>, not C2's
+    assert [p for m, p in cdp.calls if m == "DOM.getFrameOwner"] == [{"frameId": "C1"}]
+
+
+def test_node_at_is_none_when_the_frame_owner_cannot_be_read():
+    assert IsolatedWorld(_FakePage(_FrameCdp("C1", owners={}))).node_at(1, 1) is None
+    assert IsolatedWorld(_FakePage(_FrameCdp("GONE"))).node_at(1, 1) is None
+
+
+def test_async_node_at_answers_a_child_frame_point_with_its_iframe_element():
+    import asyncio
+    cdp = _FrameCdp("C2")
+
+    class _ACdp:
+        async def send(self, method, params=None):
+            return cdp.send(method, params)
+
+    class _ACtx:
+        async def new_cdp_session(self, page):
+            return _ACdp()
+
+    page = type("P", (), {})()
+    page.context = _ACtx()
+    assert asyncio.run(AsyncIsolatedWorld(page).node_at(1, 1)) == 501
 
 
 def test_node_at_is_none_when_nothing_is_there():
