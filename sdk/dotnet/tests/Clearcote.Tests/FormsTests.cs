@@ -79,7 +79,7 @@ public class FormsTests
     {
         "classify_field", "typos_allowed", "typo_eligible", "formatted_equal", "nearby_digits", "typeahead_simulate",
         "plan_select", "match_option", "range_sanitize", "range_value_ok", "range_point", "range_nudge", "plan_datetime",
-        "datetime_equal", "normalize_click_options", "engine_path_ok", "fit_maxlength", "pre_press_center", "pre_press_ms",
+        "datetime_equal", "normalize_click_options", "engine_path_ok", "fit_maxlength", "mask_kept", "pre_press_center", "pre_press_ms",
     };
 
     [Fact]
@@ -689,6 +689,15 @@ public class FormsTests
         var ml = c.GetProperty("maxlength");
         int? n = ml.ValueKind == JsonValueKind.Number ? ml.GetInt32() : null;
         Assert.Equal(Str(c, "want"), Forms.FitMaxlength(Str(c, "value")!, n, Str(c, "tag"), Str(c, "type")));
+    }
+
+    [Theory, MemberData(nameof(Cases), "mask_kept")]
+    public void Mask_kept(int i)
+    {
+        var c = Case("mask_kept", i);
+        var ml = c.GetProperty("maxlength");
+        int? n = ml.ValueKind == JsonValueKind.Number ? ml.GetInt32() : null;
+        Assert.Equal(c.GetProperty("result").GetBoolean(), Forms.MaskKept(Str(c, "got"), Str(c, "want"), n, Str(c, "tag"), Str(c, "type")));
     }
 
     [Theory, MemberData(nameof(Cases), "pre_press_center")]

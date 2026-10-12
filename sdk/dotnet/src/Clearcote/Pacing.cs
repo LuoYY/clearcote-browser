@@ -18,9 +18,11 @@ namespace Clearcote;
 /// <see cref="WalkAsync"/> schedules each sample at its planned offset from the start and keeps that
 /// clock: on time it sleeps until the sample's planned time; behind, it skips the samples whose time has
 /// passed and dispatches the most recent due one. Never skipped: the final sample and a sample marked as
-/// changing button state. Never a teleport: a skip may not hop further than a fast hand covers in the time
-/// between two dispatches (<see cref="FastPxPerMs"/>, at least <see cref="MaxJumpPx"/>); a longer hop
-/// dispatches the in-between sample instead. A stall is a pause: a single
+/// changing button state. Never a teleport: a skip may not hop further than <see cref="MaxJumpPx"/>, nor
+/// further than <see cref="IdleHopPx"/> after <see cref="IdleMs"/> with nothing sent; a longer hop dispatches
+/// the in-between sample instead, so a late walk stretches in time rather than jumping (SC 210 lab v2: the
+/// old cap, 3 px/ms x the time since the last dispatch, turned slow dispatches under load into hops of
+/// 60-103 px a few ms apart; an r40 engine walks any hop &gt;= 24 px after &gt;= 40 ms idle). A stall is a pause: a single
 /// dispatch slower than <see cref="StallMs"/> shifts the schedule by the excess instead of being caught up
 /// by skipping,. Sleeps are local timers,
 /// never a protocol round trip. Nothing here changes what the planner returns.
@@ -33,9 +35,15 @@ internal static class Pacing
     /// nothing reached the page while it lasted, so the plan pauses with it instead of skipping ahead.</summary>
     public const double StallMs = 60;
 
-    /// <summary>A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s). A skip may hop as far
-    /// as that covers in the time since the last dispatch, and never less than <see cref="MaxJumpPx"/>.</summary>
+    /// <summary>A fast hand: ~3 px/ms (a quick flick across a 1080p screen in ~0.6 s).</summary>
     public const double FastPxPerMs = 3;
+
+    /// <summary>After this long with nothing dispatched, a skip may hop at most <see cref="IdleHopPx"/>.</summary>
+    public const double IdleMs = 40;
+
+    /// <summary>What a hand at a moderate 2.5 px/ms covers in one 125 Hz report (8 ms), below the 24 px an r40
+    /// engine walks.</summary>
+    public const double IdleHopPx = 20;
 
     /// <summary>Planned dispatch offsets (ms from the start) of every step, and the planned total.</summary>
     public static (double[] Due, double Total) Schedule(IReadOnlyList<Step> steps)
@@ -102,7 +110,31 @@ internal static class Pacing
         return sent;
     }
 
-    /// <summary>The largest hop allowed between two dispatched points <paramref name="dtMs"/> apart: what a
-    /// fast hand covers in that time, never less than <paramref name="maxJump"/>.</summary>
-    public static double JumpCap(double maxJump, double dtMs) => Math.Max(maxJump, FastPxPerMs * Math.Max(0, dtMs));
+    /// <summary>How far inside the viewport a planned path is kept (SC 210 fix 2, verifier B: the planner's
+    /// overshoot arcs left the window near its edges and the page saw no events while the pointer was outside).</summary>
+    public const double ViewMarginPx = 2;
+
+    /// <summary><paramref name="steps"/> with every sample but the last moved inside the viewport
+    /// (<see cref="ViewMarginPx"/> in). The last sample -- where the move was aimed -- is never changed, and a
+    /// move aimed outside the viewport is returned as it is. Only coordinates change. Port of _pacing.keep_in_view.</summary>
+    public static IReadOnlyList<Step> KeepInView(IReadOnlyList<Step> steps, double vw, double vh, double margin = ViewMarginPx)
+    {
+        if (steps.Count == 0 || vw <= 0 || vh <= 0) return steps;
+        var t = steps[^1];
+        if (!(t.X >= 0 && t.X <= vw && t.Y >= 0 && t.Y <= vh)) return steps;
+        double lx = Math.Min(margin, t.X), hx = Math.Max(vw - margin, t.X);
+        double ly = Math.Min(margin, t.Y), hy = Math.Max(vh - margin, t.Y);
+        var out_ = new List<Step>(steps.Count);
+        for (int k = 0; k < steps.Count; k++)
+        {
+            var s = steps[k];
+            out_.Add(k == steps.Count - 1 ? s : s with { X = Math.Clamp(s.X, lx, hx), Y = Math.Clamp(s.Y, ly, hy) });
+        }
+        return out_;
+    }
+
+    /// <summary>The largest hop a SKIP may make between two dispatched points <paramref name="dtMs"/> apart:
+    /// <paramref name="maxJump"/>, and <see cref="IdleHopPx"/> after an idle gap. Never more for a longer gap: a
+    /// walk that fell behind stretches in time instead of catching up with a jump. Port of _pacing._jump_cap.</summary>
+    public static double JumpCap(double maxJump, double dtMs) => dtMs < IdleMs ? maxJump : Math.Min(maxJump, IdleHopPx);
 }

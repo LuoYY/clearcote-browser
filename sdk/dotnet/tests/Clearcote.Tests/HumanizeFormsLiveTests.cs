@@ -1270,4 +1270,147 @@ public class HumanizeFormsLiveTests : IClassFixture<FormsLiveBrowser>
         Assert.True(cv >= 0.3 && cv <= 1.0, $"inter-key variation {cv:F2} over {gaps.Count} gaps");
         Assert.True(rolls > 0, "rollover happened");
     }
+
+    // ------------------------------------------------- SC 210 fix 2: twins, masks, Playwright's error wording
+    [Fact]
+    public Task A_mui_style_button_is_clicked_humanized_and_its_trial_passes() => Live(async page =>
+    {
+        // A ripple span with inset:0 and pointer-events:none fills the button: the old twin rule called every such
+        // button covered, sent the click to stock Playwright and failed Trial (verifier A).
+        await page.Locator("#muibtn").ScrollIntoViewIfNeededAsync();
+        await page.HumanClickAsync("#muibtn", new HumanClickOptions { Trial = true, Timeout = 1500 });
+        await page.Locator("#muibtn").HumanClickAsync(new LocatorClickOptions { Trial = true, Timeout = 1500 });
+        await page.HumanHoverAsync("#muibtn", new HumanClickOptions { Trial = true, Timeout = 1500 });
+        await Reset(page);
+        await page.HumanClickAsync("#muibtn");
+        Assert.True(await Moves(page) >= 5, "the click glided (humanized), not a native jump" + Why);
+        Assert.Equal(new[] { true }, (await Ev(page, "mousedown", "muibtn")).Select(Tr).ToArray());
+    });
+
+    [Fact]
+    public Task A_label_wrapped_custom_checkbox_is_checked_humanized() => Live(async page =>
+    {
+        await page.Locator("#swlab").ScrollIntoViewIfNeededAsync();
+        await page.HumanCheckAsync("#swchk", new PageCheckOptions { Trial = true, Timeout = 1500 });
+        await Reset(page);
+        await page.HumanCheckAsync("#swchk", new PageCheckOptions { Position = new Position { X = 20, Y = 15 } });
+        Assert.True(await page.IsCheckedAsync("#swchk"));
+        Assert.True(await Moves(page) >= 5, "humanized, not stock Playwright" + Why);
+        Assert.Equal(new[] { true }, (await Ev(page, "mousedown", "swmark")).Select(Tr).ToArray());
+        await Reset(page);
+        await page.Locator("#swchk").HumanUncheckAsync();
+        Assert.False(await page.IsCheckedAsync("#swchk"));
+        Assert.True(await Moves(page) >= 5, "humanized uncheck" + Why);
+    });
+
+    [Fact]
+    public Task A_decorative_span_under_a_buttons_text_is_not_an_overlay() => Live(async page =>
+    {
+        await page.Locator("#bgbtn").ScrollIntoViewIfNeededAsync();
+        await page.HumanClickAsync("#bgbtn", new HumanClickOptions { Trial = true, Timeout = 1500 });
+        await Reset(page);
+        await page.HumanClickAsync("#bgbtn", new HumanClickOptions { Position = new Position { X = 60, Y = 20 } });
+        Assert.True(await Moves(page) >= 5, "humanized" + Why);
+        Assert.True(Tr((await Ev(page, "click", "bgtext"))[0]));
+    });
+
+    [Fact]
+    public Task A_real_overlay_is_still_covered() => Live(async page =>
+    {
+        await page.Locator("#ovbtn").ScrollIntoViewIfNeededAsync();
+        await Assert.ThrowsAsync<System.TimeoutException>(
+            () => page.HumanClickAsync("#ovbtn", new HumanClickOptions { Trial = true, Timeout = 600 }));
+        await Reset(page);
+        await Assert.ThrowsAsync<System.TimeoutException>(() => page.HumanClickAsync("#ovbtn", new HumanClickOptions { Timeout = 900 }));
+        Assert.Empty(await Ev(page, "mousedown", "ovbtn"));
+    });
+
+    [Theory]
+    [InlineData("#exp", "123456", "12/34", "12345")]                              // MM/YY on maxlength 5 (verifier B)
+    [InlineData("#telmask", "5551234567890", "555-123-4567", "555123456789")]     // 3-3-4 dashes on maxlength 12
+    [InlineData("#pcmask", "1234abx", "1234 AB", "1234abx")]                      // a script that formats and cuts
+    public Task A_mask_that_stops_taking_keys_is_typed_once(string sel, string value, string want, string keys) =>
+        WithTypoRate(0, () => Live(async page =>
+        {
+            await Reset(page);
+            await page.HumanFillAsync(sel, value);
+            Assert.Equal(want, await page.InputValueAsync(sel));
+            var downs = await Ev(page, "keydown", sel[1..]);
+            Assert.Equal(keys, string.Concat(downs.Select(e => S(e, "key"))));
+            Assert.Empty(downs.Where(e => e.GetProperty("ctrl").GetBoolean() || e.GetProperty("meta").GetBoolean() || S(e, "key") == "Backspace"));
+            Assert.All(downs, e => Assert.True(Tr(e)));
+        }));
+
+    private static async Task<(string Type, string Line)> Error(Func<Task> call)
+    {
+        try { await call(); }
+        catch (Exception e) { return (e.GetType().FullName!, e.Message.Split('\n')[0]); }
+        return ("no exception", "");
+    }
+
+    [Fact]
+    public Task Errors_are_playwrights_own_for_the_same_call() => Live(async page =>
+    {
+        // Each humanized call fails as the Playwright call it stands for: the same exception type and message. The
+        // humanized calls raised the error of whatever Playwright call they made inside (verifier B, SC 210).
+        page.SetDefaultTimeout(600);
+        var L = page.Locator("#missing");
+        var pairs = new (string Name, Func<Task> Native, Func<Task> Human)[]
+        {
+            ("page click", () => page.ClickAsync("#missing", new() { Timeout = 600 }), () => page.HumanClickAsync("#missing", new HumanClickOptions { Timeout = 600 })),
+            ("page dblclick", () => page.DblClickAsync("#missing", new() { Timeout = 600 }), () => page.HumanDblClickAsync("#missing", new HumanClickOptions { Timeout = 600 })),
+            ("page hover", () => page.HoverAsync("#missing", new() { Timeout = 600 }), () => page.HumanHoverAsync("#missing", new HumanClickOptions { Timeout = 600 })),
+            ("page fill", () => page.FillAsync("#missing", "x", new() { Timeout = 600 }), () => page.HumanFillAsync("#missing", "x", new() { Timeout = 600 })),
+            ("page check", () => page.CheckAsync("#missing", new() { Timeout = 600 }), () => page.HumanCheckAsync("#missing", new() { Timeout = 600 })),
+            ("page uncheck", () => page.UncheckAsync("#missing", new() { Timeout = 600 }), () => page.HumanUncheckAsync("#missing", new() { Timeout = 600 })),
+            ("page setChecked", () => page.SetCheckedAsync("#missing", true, new() { Timeout = 600 }), () => page.HumanSetCheckedAsync("#missing", true, new() { Timeout = 600 })),
+            ("page selectOption", () => page.SelectOptionAsync("#missing", "a", new() { Timeout = 600 }), () => page.HumanSelectOptionAsync("#missing", new[] { "a" }, new() { Timeout = 600 })),
+            ("locator click", () => L.ClickAsync(new() { Timeout = 600 }), () => L.HumanClickAsync(new LocatorClickOptions { Timeout = 600 })),
+            ("locator dblclick", () => L.DblClickAsync(new() { Timeout = 600 }), () => L.HumanDblClickAsync(new HumanClickOptions { Timeout = 600 })),
+            ("locator hover", () => L.HoverAsync(new() { Timeout = 600 }), () => L.HumanHoverAsync(new HumanClickOptions { Timeout = 600 })),
+            ("locator fill", () => L.FillAsync("x", new() { Timeout = 600 }), () => L.HumanFillAsync("x", new() { Timeout = 600 })),
+            ("locator type", () => L.PressSequentiallyAsync("x"), () => L.HumanTypeAsync("x")),
+            ("locator press", () => L.PressAsync("a"), () => L.HumanPressAsync("a")),
+            ("locator check", () => L.CheckAsync(new() { Timeout = 600 }), () => L.HumanCheckAsync(new() { Timeout = 600 })),
+            ("locator uncheck", () => L.UncheckAsync(new() { Timeout = 600 }), () => L.HumanUncheckAsync(new() { Timeout = 600 })),
+            ("locator setChecked", () => L.SetCheckedAsync(true, new() { Timeout = 600 }), () => L.HumanSetCheckedAsync(true, new() { Timeout = 600 })),
+            ("locator selectOption", () => L.SelectOptionAsync("a", new() { Timeout = 600 }), () => L.HumanSelectOptionAsync(new[] { "a" }, new() { Timeout = 600 })),
+            ("locator click trial (disabled)", () => page.Locator("#disbtn").ClickAsync(new() { Trial = true, Timeout = 600 }),
+                () => page.Locator("#disbtn").HumanClickAsync(new LocatorClickOptions { Trial = true, Timeout = 600 })),
+            ("page check (a button)", () => page.CheckAsync("#btn", new() { Timeout = 600 }), () => page.HumanCheckAsync("#btn", new() { Timeout = 600 })),
+            ("page uncheck (a button)", () => page.UncheckAsync("#btn", new() { Timeout = 600 }), () => page.HumanUncheckAsync("#btn", new() { Timeout = 600 })),
+            ("locator check (a button)", () => page.Locator("#btn").CheckAsync(new() { Timeout = 600 }), () => page.Locator("#btn").HumanCheckAsync(new() { Timeout = 600 })),
+            ("locator setChecked (a button)", () => page.Locator("#btn").SetCheckedAsync(true, new() { Timeout = 600 }),
+                () => page.Locator("#btn").HumanSetCheckedAsync(true, new() { Timeout = 600 })),
+        };
+        var diffs = new List<string>();
+        var rows = new List<string>();
+        foreach (var (name, native, human) in pairs)
+        {
+            var n = await Error(native);
+            var h = await Error(human);
+            Assert.True(n.Type != "no exception", name + ": Playwright's own call did not fail");
+            rows.Add($"{name}: Playwright {n.Type} \"{n.Line}\" | humanized {h.Type} \"{h.Line}\"");
+            if (n != h) diffs.Add(rows[^1]);
+        }
+        // The table, for a report (CLEARCOTE_TEST_ERRORS_TABLE names a file to write it to).
+        var table = Environment.GetEnvironmentVariable("CLEARCOTE_TEST_ERRORS_TABLE");
+        if (!string.IsNullOrEmpty(table)) await File.WriteAllLinesAsync(table, rows);
+        Assert.True(diffs.Count == 0, string.Join("\n", diffs));
+    });
+
+    [Fact]
+    public Task A_click_presses_the_whole_pixel_its_hit_test_proved() => Live(async page =>
+    {
+        // DOM.getNodeForLocation answers for a whole pixel; a press at 971.6 next to a badge ending at 972 was
+        // proven at 972 and landed on the badge, reported as a success (verifier B).
+        for (int i = 0; i < 5; i++)
+        {
+            await Reset(page);
+            await page.HumanClickAsync("#btn");
+            var d = (await Ev(page, "pointerdown", "btn"))[0];
+            double cx = D(d, "cx"), cy = D(d, "cy");
+            Assert.True(cx == Math.Floor(cx) && cy == Math.Floor(cy), $"{cx}, {cy}");
+        }
+    });
 }

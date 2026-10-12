@@ -139,6 +139,26 @@ public class HumanizePacingTests
         Assert.Equal(350.0, c.T, 6);
     }
 
+    [Theory]
+    [InlineData(200)]
+    [InlineData(350)]
+    [InlineData(500)]
+    public async Task Pacer_after_a_long_stall_stretches_instead_of_jumping(double stall)
+    {
+        // SC 210 lab v2: 35 hops of 60-103 px a few ms apart on r38 under load. The old cap (3 px/ms x the time
+        // since the last dispatch) let a slow dispatch turn into one big catch-up hop. Now <= 40 px, and
+        // <= 20 px right after an idle gap: the walk takes longer instead.
+        var steps = Enumerable.Range(0, 300).Select(i => new Step(i * 3, 0, 2)).ToList();
+        var c = new FakeClock();
+        var stalls = new HashSet<int> { 3, 9, 15 };
+        await Pacing.WalkAsync(steps, (x, y) => { c.T += stalls.Contains(c.Sent.Count) ? stall : 25; c.Sent.Add((x, y, c.T)); return Task.CompletedTask; },
+            () => c.T, c.Sleep);
+        var hops = c.Sent.Zip(c.Sent.Skip(1), (a, b) => b.X - a.X).ToList();
+        Assert.True(hops.Max() <= 40 + 1e-6, $"a hop of {hops.Max()} px");
+        foreach (var k in stalls) Assert.True(hops[k] <= 20 + 1e-6, $"the hop after stall {k}: {hops[k]} px");
+        Assert.Equal(299 * 3.0, c.Sent[^1].X);
+    }
+
     [Fact]
     public async Task Pacer_pauses_through_a_stall_instead_of_skipping_after_it()
     {
@@ -165,5 +185,15 @@ public class HumanizePacingTests
         Assert.True(gap <= Pacing.FastPxPerMs * 25 + 1e-6, $"hop {gap}");
         Assert.True(c.Sent.Count > 10);
         Assert.Equal(39 * 30.0, c.Sent[^1].X);
+    }
+
+    [Fact]
+    public void Keep_in_view_moves_samples_inside_but_never_the_target()
+    {
+        var steps = new[] { new Step(10, 5, 8), new Step(-12, -3, 8), new Step(1290, 400, 8), new Step(1279, 799, 8) };
+        Assert.Equal(new[] { (10.0, 5.0), (2.0, 2.0), (1279.0, 400.0), (1279.0, 799.0) },
+            Pacing.KeepInView(steps, 1280, 800).Select(s => (s.X, s.Y)).ToArray());
+        var aimedOut = new[] { new Step(10, 5, 8), new Step(1300, 900, 8) };
+        Assert.Same(aimedOut, Pacing.KeepInView(aimedOut, 1280, 800));
     }
 }

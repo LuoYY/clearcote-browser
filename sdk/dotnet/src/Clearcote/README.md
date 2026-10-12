@@ -200,7 +200,7 @@ await page.HumanPressAsync("Enter");
 Forms (`HumanFillAsync`, `HumanSelectOptionAsync`, `HumanCheckAsync` / `HumanUncheckAsync` /
 `HumanSetCheckedAsync`) are handled the way a person handles them: a text field is clicked, emptied
 only if it holds something (held Ctrl/Cmd+A, Backspace) and typed (a `maxlength` field gets only the
-characters it can hold; a value over 200 characters is inserted in one go after the click); a drop-down is opened with a click,
+characters it can hold; a field whose input mask re-punctuates what is typed, such as an `MM/YY` expiry or a dashed phone number, is typed once and never wiped and retyped; a value over 200 characters is inserted in one go after the click); a drop-down is opened with a click,
 moved by type-ahead and committed with Enter, so it fires **one** trusted change; list boxes get row
 clicks with Ctrl/Cmd held for more rows; a range thumb is dragged; date and time editors are typed
 segment by segment in the order the browser shows them, with the same key timing as text. Every press

@@ -221,6 +221,32 @@ internal static class Forms
         return value;
     }
 
+    /// <summary>
+    /// Is <paramref name="got"/> what a formatting mask leaves of <paramref name="want"/> once the field stops
+    /// taking keys -- what a person typing <paramref name="want"/> ends up with too, so typing it again (or
+    /// Playwright's fill, which the same mask cuts the same way) changes nothing? Its letters and digits are a
+    /// shorter prefix of <paramref name="want"/>'s (<see cref="FormattedEqual"/> covers the whole value) AND
+    /// either the field is full (<paramref name="maxlength"/> UTF-16 units: MM/YY on maxlength 5 holds "12/34"
+    /// of "12345") or the page re-punctuated what was typed (<paramref name="got"/> is not just the first
+    /// characters of <paramref name="want"/>: "1234 AB" of "1234abx"). A value cut short with nothing
+    /// re-punctuated and room left is a lost key: false, and the caller types it again. Port of
+    /// _forms.mask_kept (verifier B, SC 210: MM/YY and a 12-place phone mask were typed, wiped with Ctrl+A
+    /// Backspace and typed again).
+    /// </summary>
+    public static bool MaskKept(string? got, string? want, int? maxlength = null, string? tag = "input", string? inputType = "")
+    {
+        if (string.IsNullOrEmpty(got) || want is null) return false;
+        var a = Chars(got).Where(IsAlnum).Select(CaseFold).ToList();
+        var b = Chars(want).Where(IsAlnum).Select(CaseFold).ToList();
+        if (a.Count == 0 || a.Count >= b.Count || !a.SequenceEqual(b.Take(a.Count))) return false;
+        int n = maxlength ?? -1;
+        var t = (tag ?? "").ToLowerInvariant();
+        if (n >= 0 && (t == "textarea" || (t == "input" && MaxlengthTypes.Contains((inputType ?? "").ToLowerInvariant())))
+            && got.Length >= n) return true;   // string length is UTF-16 units, as maxlength counts
+        var cps = Chars(got).Count();
+        return got != string.Concat(Chars(want).Take(cps));
+    }
+
     // ------------------------------------------------------------------------------ pre-press pause
     /// <summary>Lower bound of the pause between the pointer coming to rest and the button going down (ms).</summary>
     public const double PrePressMinMs = 40;

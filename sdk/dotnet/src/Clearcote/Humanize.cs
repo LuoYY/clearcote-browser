@@ -157,7 +157,34 @@ public static class Humanize
     // moved on this page and still sits at the document origin. Ambient records that the one-per-page
     // pre-keystroke placement has been spent. NotchPx is the wheel notch of the platform the page
     // claims, read on the first wheel and kept (0 until then).
-    private sealed class PointerState { public double X; public double Y; public bool Known; public bool Ambient; public int NotchPx; }
+    private sealed class PointerState
+    {
+        public double X; public double Y; public bool Known; public bool Ambient; public int NotchPx;
+        public long ViewAt = long.MinValue; public (double W, double H)? View;   // ViewBoundsAsync's cache
+    }
+
+    /// <summary>The viewport a planned path is kept inside (<see cref="Pacing.KeepInView"/>: the planner's overshoot
+    /// arcs left the window near its edges, verifier B), read in the isolated world at most every 2 s; null when it
+    /// cannot be read.</summary>
+    private static async Task<(double W, double H)?> ViewBoundsAsync(IPage page, PointerState st)
+    {
+        long now = Environment.TickCount64;
+        if (st.ViewAt == long.MinValue || now - st.ViewAt > 2000)
+        {
+            (double W, double H)? vp = null;
+            try
+            {
+                var r = await IsolatedWorld.For(page).EvaluateAsync(IsolatedWorld.Viewport).ConfigureAwait(false);
+                if (r is { } el && el.ValueKind == JsonValueKind.Array && el.GetArrayLength() == 2
+                    && el[0].GetDouble() > 0 && el[1].GetDouble() > 0)
+                    vp = (el[0].GetDouble(), el[1].GetDouble());
+            }
+            catch { /* detached / navigating / no CDP: no clamp */ }
+            st.ViewAt = now;
+            st.View = vp;
+        }
+        return st.View;
+    }
 
     // Test seam: a forced rollover share for one page, in place of the persona's (the tests pin 0 and 1).
     internal static readonly ConditionalWeakTable<IPage, StrongBox<double>> RolloverOverride = new();
@@ -331,10 +358,13 @@ public static class Humanize
         // across the whole path — that is what makes a drag a drag rather than a teleport.
         //
         // Paced against a WALL CLOCK (Pacing): each sample goes out at its planned time and late ones
-        // are skipped (never the last, never a > 40 px jump). "Move, then sleep the planned gap" added
+        // are skipped (never the last, and no hop longer than a fast hand covers in the time since the last
+        // dispatch: 3 px/ms of it, at least 40 px). "Move, then sleep the planned gap" added
         // the ~27 ms move round trip to every 6-8 ms sample: a 1.05 s planned glide took 3.5-5.4 s on
         // PRO r38 (SC 209).
-        await Pacing.WalkAsync(steps, (x, y) => page.Mouse.MoveAsync((float)x, (float)y)).ConfigureAwait(false);
+        var vp = await ViewBoundsAsync(page, st).ConfigureAwait(false);
+        await Pacing.WalkAsync(vp is { } v ? Pacing.KeepInView(steps, v.W, v.H) : steps,
+            (x, y) => page.Mouse.MoveAsync((float)x, (float)y)).ConfigureAwait(false);
         st.X = toX;
         st.Y = toY;
     }
@@ -631,13 +661,18 @@ public static class Humanize
                     x = pt.X;
                     y = pt.Y;
                 }
+                // Whole pixels: the hit test answers for the pixel DOM.getNodeForLocation rounds to, so the press goes
+                // to that pixel too. A press at 971.6 next to a badge ending at 972 was proven at 972 and landed on
+                // the badge, reported as a success (verifier B, SC 210).
+                x = Math.Round(x);
+                y = Math.Round(y);
                 if (!o.Force)
                 {
                     // Stability, then covered-by: 50 ms on, the element must still fill `bb` (an animation in
                     // flight does not) and own the click point -- no trusted press at a point some overlay
                     // owns. Either failing goes native: Playwright waits for it.
                     await Task.Delay(50).ConfigureAwait(false);
-                    if (await ReachesPointAsync(page, bb, x, y).ConfigureAwait(false) != true)
+                    if (await ReachesPointAsync(page, bb, x, y, CssOf(loc)).ConfigureAwait(false) != true)
                         goNative = Fallback("click: the point does not reach the element (covered, moving or clipped)");
                 }
                 if (!goNative)
@@ -696,14 +731,18 @@ public static class Humanize
     /// null when it cannot be told here (CDP is unavailable). A point inside a child frame is answered by the
     /// &lt;iframe&gt; element that holds it (IsolatedWorld.NodeAtAsync).
     /// </summary>
-    private static async Task<bool?> HitInBoxAsync(IPage page, LocatorBoundingBoxResult box, double x, double y)
+    private static async Task<bool?> HitInBoxAsync(IPage page, LocatorBoundingBoxResult box, double x, double y, string? sel = null)
     {
         var w = IsolatedWorld.For(page);
         if (await w.NodeAtAsync(x, y).ConfigureAwait(false) is not int nid) return null;
-        var r = await w.CallOnNodeAsync(nid, IsolatedWorld.HitInBox, new Dictionary<string, object?>
+        var b = new Dictionary<string, object?>
         {
             ["x"] = (double)box.X, ["y"] = (double)box.Y, ["width"] = (double)box.Width, ["height"] = (double)box.Height,
-        }).ConfigureAwait(false);
+        };
+        // A plain-CSS selector for the element (CssOf): whether the hit is THAT element (IsolatedWorld.HitInBox),
+        // not just one that fills the box.
+        if (!string.IsNullOrEmpty(sel)) b["sel"] = sel;
+        var r = await w.CallOnNodeAsync(nid, IsolatedWorld.HitInBox, b).ConfigureAwait(false);
         return r is not { } v ? null : v.ValueKind == JsonValueKind.True;
     }
 
@@ -717,14 +756,14 @@ public static class Humanize
     /// inside a child frame is answered by the &lt;iframe&gt; element that holds it, so no Playwright trial runs
     /// for it either. False when covered; null when the hit test cannot run (no CDP): the caller goes native.
     /// </summary>
-    private static async Task<bool?> ReachesPointAsync(IPage page, LocatorBoundingBoxResult box, double x, double y)
+    private static async Task<bool?> ReachesPointAsync(IPage page, LocatorBoundingBoxResult box, double x, double y, string? sel = null)
     {
         var deadline = Environment.TickCount64 + (long)CoverCheckMs;
-        var hit = await HitInBoxAsync(page, box, x, y).ConfigureAwait(false);
+        var hit = await HitInBoxAsync(page, box, x, y, sel).ConfigureAwait(false);
         while (hit == false && Environment.TickCount64 < deadline)
         {
             await Task.Delay(80).ConfigureAwait(false);
-            hit = await HitInBoxAsync(page, box, x, y).ConfigureAwait(false);
+            hit = await HitInBoxAsync(page, box, x, y, sel).ConfigureAwait(false);
         }
         if (hit is null) FallbackTrace?.Invoke("click: the hit test cannot run here");
         return hit;
@@ -800,7 +839,7 @@ public static class Humanize
                         ? await PositionPointAsync(page, bb, pos).ConfigureAwait(false)
                         : (bb.X + bb.Width / 2.0, bb.Y + bb.Height / 2.0);
                     await Task.Delay(50).ConfigureAwait(false);   // stable: 50 ms on, the element still fills `bb`
-                    if (await HitInBoxAsync(page, bb, x, y).ConfigureAwait(false) != false) return;   // null: cannot tell -- nothing to add
+                    if (await HitInBoxAsync(page, bb, x, y, CssOf(loc)).ConfigureAwait(false) != false) return;   // null: cannot tell -- nothing to add
                     why = $"element is not stable, or another element would receive the pointer at ({x:0}, {y:0})";
                 }
             }
@@ -2029,13 +2068,13 @@ public static class Humanize
         }
         if (await CssBoxAsync(loc).ConfigureAwait(false) is { } css) return css;
         var box = await loc.BoundingBoxAsync().ConfigureAwait(false);
-        if (box is not null && !(await InViewAsync(page, box).ConfigureAwait(false) && await HitOkAsync(page, box).ConfigureAwait(false)))
+        if (box is not null && !(await InViewAsync(page, box).ConfigureAwait(false) && await HitOkAsync(page, box, CssOf(loc)).ConfigureAwait(false)))
         {
             // Off-screen: scroll the window to it and prove it shows there (hit test), with no new handle.
             // Clipped by a scrolling container, covered, or the window scroll did not bring it out:
             // Playwright's scroll, which also scrolls containers, and a fresh box.
             var moved = !await InViewAsync(page, box).ConfigureAwait(false) ? await ScrollWindowToAsync(page, box).ConfigureAwait(false) : null;
-            if (moved is not null && await InViewAsync(page, moved).ConfigureAwait(false) && await HitOkAsync(page, moved).ConfigureAwait(false))
+            if (moved is not null && await InViewAsync(page, moved).ConfigureAwait(false) && await HitOkAsync(page, moved, CssOf(loc)).ConfigureAwait(false))
                 return moved;
             await loc.ScrollIntoViewIfNeededAsync(new LocatorScrollIntoViewIfNeededOptions { Timeout = timeout }).ConfigureAwait(false);
             box = await loc.BoundingBoxAsync().ConfigureAwait(false);
@@ -2094,7 +2133,7 @@ public static class Humanize
             return null;
         }
         var box = RectBox(r);
-        if (box is not null && !(await InViewAsync(page, box).ConfigureAwait(false) && await HitOkAsync(page, box).ConfigureAwait(false)))
+        if (box is not null && !(await InViewAsync(page, box).ConfigureAwait(false) && await HitOkAsync(page, box, sel).ConfigureAwait(false)))
         {
             // scrollIntoViewIfNeeded also scrolls a scrolling container that clips it, and does nothing when it
             // already shows (then the cover is an overlay: the click's own check)
@@ -2106,8 +2145,8 @@ public static class Humanize
 
     /// <summary>Does the element filling <paramref name="box"/> own its centre -- not clipped by a scrolling
     /// container, not covered? The browser's own hit test, read in the isolated world.</summary>
-    private static async Task<bool> HitOkAsync(IPage page, LocatorBoundingBoxResult box)
-        => await HitInBoxAsync(page, box, box.X + box.Width / 2.0, box.Y + box.Height / 2.0).ConfigureAwait(false) == true;
+    private static async Task<bool> HitOkAsync(IPage page, LocatorBoundingBoxResult box, string? sel = null)
+        => await HitInBoxAsync(page, box, box.X + box.Width / 2.0, box.Y + box.Height / 2.0, sel).ConfigureAwait(false) == true;
 
     /// <summary>Is <paramref name="box"/> wholly inside the viewport?</summary>
     private static async Task<bool> InViewAsync(IPage page, LocatorBoundingBoxResult box)
@@ -2185,7 +2224,8 @@ public static class Humanize
         }
         else if (info.Disabled) return false;
         var from = st.Known ? new Point(st.X, st.Y) : new Point(bb.X - 120, bb.Y - 90);
-        var pt = at ?? Motion.ClickPoint(new Box(bb.X, bb.Y, bb.Width, bb.Height), from, p);
+        var p0 = at ?? Motion.ClickPoint(new Box(bb.X, bb.Y, bb.Width, bb.Height), from, p);
+        var pt = new Point(Math.Round(p0.X), Math.Round(p0.Y));   // the pixel the hit test answered for
         await GlideAsync(page, p, st, pt.X, pt.Y, Math.Max(6, bb.Width)).ConfigureAwait(false);
         await ClickAtAsync(page, p, pt.X, pt.Y).ConfigureAwait(false);
         return true;
@@ -2259,20 +2299,22 @@ public static class Humanize
         // What the field can hold: a maxlength keeps the first N characters (what Playwright's insertText
         // leaves too), and a person types only those -- the field stops taking keys.
         var want = value;
+        (int? Max, string? Tag, string? Type) limit = (null, null, null);
         if (!isCe)
         {
-            if (info is not null) want = Forms.FitMaxlength(value, info.Maxlength, info.Tag, info.Type);
+            if (info is not null) limit = (info.Maxlength, info.Tag, info.Type);
             else
             {
                 var mlAttr = await loc.GetAttributeAsync("maxlength").ConfigureAwait(false);
                 int? ml = int.TryParse(mlAttr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var mlv) ? mlv : null;
                 var tag = await loc.Locator("xpath=self::textarea").CountAsync().ConfigureAwait(false) > 0 ? "textarea" : "input";
-                want = Forms.FitMaxlength(value, ml, tag, await loc.GetAttributeAsync("type").ConfigureAwait(false) ?? "");
+                limit = (ml, tag, await loc.GetAttributeAsync("type").ConfigureAwait(false) ?? "");
             }
+            want = Forms.FitMaxlength(value, limit.Max, limit.Tag, limit.Type);
         }
         // Bulk values (over 200 characters) are still inserted at once -- typing thousands of keys would
         // crawl -- but the way a person pastes: glide to the field, click into it, then insert.
-        bool bulk = value.EnumerateRunes().Count() > 200;
+        bool bulk = want.EnumerateRunes().Count() > 200;   // what the field holds: a 300-character value cut to 5 is typed
         async Task Put(string text, bool typos)
         {
             if (bulk)
@@ -2312,14 +2354,16 @@ public static class Humanize
         await Put(want, typos: true).ConfigureAwait(false);
         var got = await Read().ConfigureAwait(false);
         if (got is null) return false;
-        if (got == want || Forms.FormattedEqual(got, want)) return true;   // exact, or a mask that only re-punctuated it
+        // exact; a mask that only re-punctuated what was typed (a phone format); or one that re-punctuated it and
+        // then stopped taking keys (MM/YY on maxlength 5): no wipe and retype (Forms.MaskKept)
+        if (got == want || Forms.FormattedEqual(got, want) || Forms.MaskKept(got, want, limit.Max, limit.Tag, limit.Type)) return true;
         if (bulk) return false;   // an inserted value that did not land: Playwright's fill, not a second paste
         // Wrong value (an autocompleter interfered, a key was lost): one clean retry without slips, then
         // give the field to Playwright -- a correct value beats pretty input.
         await ClearFocusedAsync(page, p, Read).ConfigureAwait(false);
         await Put(want, typos: false).ConfigureAwait(false);
         got = await Read().ConfigureAwait(false);
-        return got is not null && (got == want || Forms.FormattedEqual(got, want));
+        return got is not null && (got == want || Forms.FormattedEqual(got, want) || Forms.MaskKept(got, want, limit.Max, limit.Tag, limit.Type));
     }
 
     private static async Task<double?> InputNumberAsync(ILocator loc)
