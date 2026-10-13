@@ -113,8 +113,11 @@ from .cloud import (
 )
 from ._docker import DockerUnavailableError, docker_requested, launch_docker
 
+from ._hold import press_and_hold
+
 __all__ = [
     "launch",
+    "press_and_hold",
     "Cloud",
     "AsyncCloud",
     "CloudError",

@@ -36,6 +36,7 @@ from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     platform_from_navigator, rollover_rate, wheel_notches,
 )
+from ._hold import press_and_hold_async
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk_async as _paced_walk
 
 
@@ -1673,6 +1674,20 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # Locator.drag_to(trial=True) answers its checks here too (see the Locator patch).
     page._clearcote_trial = _serial(_trial)
 
+    # press_and_hold (_hold.py): see the sync file. It holds the page lock for the whole hold (one
+    # action at a time); inside it uses page.mouse (not locked) and the hooks below.
+    page._clearcote_box_of = lambda loc, timeout, selector=None: _box_of(loc, timeout, False, selector)
+    page._clearcote_pointer = lambda: st["pos"]
+
+    async def _nudge(x, y):
+        await native_move(x, y)
+        st["pos"] = (x, y)
+        st["placed"] = True
+    page._clearcote_nudge = _nudge
+    page._clearcote_hold = _serial(press_and_hold_async)
+    page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: page._clearcote_hold(
+        page.locator(selector).first, duration, **kw))
+
     # Marker the Locator-class patch keys off: humanize is active for THIS page.
     page._clearcote_humanized = True
     _patch_locator_class()
@@ -1875,6 +1890,12 @@ def _patch_locator_class():
     Locator.uncheck = api_errors("Locator.uncheck", uncheck)
     Locator.drag_to = api_errors("Locator.drag_to", drag_to)
     Locator.select_option = api_errors("Locator.select_option", select_option)
+    # New, not a Playwright method: press and hold this element (_hold.py), under the page lock when the
+    # page is humanized. Works on frame locators too: it presses at viewport coordinates.
+    async def press_and_hold(self, duration=None, **kw):
+        hold = getattr(self.page, "_clearcote_hold", None) or press_and_hold_async
+        return await hold(self, duration, **kw)
+    Locator.press_and_hold = api_errors("Locator.press_and_hold", press_and_hold)
     if o_set_checked is not None:
         Locator.set_checked = api_errors("Locator.set_checked", set_checked)
 

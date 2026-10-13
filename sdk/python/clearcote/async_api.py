@@ -53,8 +53,11 @@ from .release import RELEASE
 
 from . import __version__ as __version__  # re-export the package version
 
+from ._hold import press_and_hold_async as press_and_hold
+
 __all__ = [
     "launch",
+    "press_and_hold",
     "launch_persistent_context",
     "launch_agent",
     "executable_path",

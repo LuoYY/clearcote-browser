@@ -9,6 +9,7 @@ navigator.webdriver stays False). It works whether you drive the page directly o
                    (mouse.down → mouse.move → mouse.up), page.keyboard.type
   * locator level — locator.click / type / fill / hover / dblclick / press /
                     press_sequentially / clear / check / uncheck / tap / drag_to
+  * press and hold — page.press_and_hold(selector) / locator.press_and_hold() (_hold.py)
                     (routed through the humanized page methods; main-frame locators only,
                     with a safe fall-through to native for anything exotic)
 
@@ -50,6 +51,7 @@ from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     platform_from_navigator, rollover_rate, wheel_notches,
 )
+from ._hold import press_and_hold
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk as _paced_walk
 
 # IIFE so it runs both as an add_init_script source AND when passed to page.evaluate().
@@ -1911,6 +1913,21 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # Locator.drag_to(trial=True) answers its checks here too (see the Locator patch).
     page._clearcote_trial = _trial
 
+    # press_and_hold (_hold.py) runs on the public page.mouse (so its glide and pre-press pause are
+    # these wrappers'), and takes three things from here: the box helper (wait, wheel scroll, hit-test
+    # proof), where the pointer is (for the persona's click point), and a move that does NOT glide --
+    # the held hand's one-pixel drift, which a planned drag leg would turn into a walk.
+    page._clearcote_box_of = lambda loc, timeout, selector=None: _box_of(loc, timeout, False, selector)
+    page._clearcote_pointer = lambda: st["pos"]
+
+    def _nudge(x, y):
+        native_move(x, y)
+        st["pos"] = (x, y)
+        st["placed"] = True
+    page._clearcote_nudge = _nudge
+    page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: press_and_hold(
+        page.locator(selector).first, duration, **kw))
+
     # Marker the Locator-class patch keys off: humanize is active for THIS page.
     page._clearcote_humanized = True
     _patch_locator_class()
@@ -2135,6 +2152,10 @@ def _patch_locator_class():
     Locator.uncheck = api_errors("Locator.uncheck", uncheck)
     Locator.drag_to = api_errors("Locator.drag_to", drag_to)
     Locator.select_option = api_errors("Locator.select_option", select_option)
+    # New, not a Playwright method: press and hold this element (_hold.py). Works on frame locators too:
+    # it presses at viewport coordinates through page.mouse.
+    Locator.press_and_hold = api_errors(
+        "Locator.press_and_hold", lambda self, duration=None, **kw: press_and_hold(self, duration, **kw))
     if o_set_checked is not None:
         Locator.set_checked = api_errors("Locator.set_checked", set_checked)
 
