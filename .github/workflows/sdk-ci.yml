@@ -92,7 +92,10 @@ jobs:
           export TMPDIR="$RUNNER_TEMP/sdk-test-tmp"
           mkdir -p "$TMPDIR"
           npm test
-          left="$(ls -A "$TMPDIR")"
+          # playwright-core 1.49 makes its playwright-artifacts-* directory on connectOverCDP and does not remove it
+          # on close (newer versions do; measured 10-13: 1.49.0 leaves it, 1.56.1 does not). That is Playwright's own
+          # leftover on the floor version, so only it is allowed here; the "node" job keeps the strict check.
+          left="$(ls -A "$TMPDIR" | grep -v '^playwright-artifacts-' || true)"
           if [ -n "$left" ]; then echo "::error::the test run left these in its temp directory:"; echo "$left"; exit 1; fi
 
   python:
