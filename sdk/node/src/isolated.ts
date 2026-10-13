@@ -112,8 +112,9 @@ export class IsolatedWorld {
     if (world && this.ctx === world) this.ctx = null;
   }
 
-  /** Run `(fnSource)(arg)` (`arg` JSON-serialisable) and resolve to its JSON value, or undefined. */
-  async evaluate<T = unknown>(fnSource: string, arg?: unknown): Promise<T | undefined> {
+  /** Run `(fnSource)(arg)` (`arg` JSON-serialisable) and resolve to its JSON value, or undefined.
+   *  `awaitPromise`: a function that returns a promise answers with what the promise resolves to. */
+  async evaluate<T = unknown>(fnSource: string, arg?: unknown, awaitPromise = false): Promise<T | undefined> {
     for (let attempt = 0; attempt < 2; attempt++) { // a stale context (navigation) is re-created once
       let world: Promise<WorldCtx> | undefined;
       try {
@@ -121,6 +122,7 @@ export class IsolatedWorld {
         world = e.world;
         return resultValue<T>(await e.cdp.send("Runtime.evaluate", {
           expression: `(${fnSource})(${JSON.stringify(arg ?? null)})`, contextId: (await world).id, returnByValue: true,
+          ...(awaitPromise ? { awaitPromise: true } : {}),
         }));
       } catch {
         this.drop(world);
@@ -224,6 +226,14 @@ export const COVER_RETRY_MS = 2000;
 
 // The reads humanize makes, as functions of one JSON argument (run by IsolatedWorld.evaluate).
 export const ISO_VIEWPORT = "() => [innerWidth, innerHeight]";
+// Resolves once the document has drawn two animation frames (at once after the first time; false after
+// `ms` without them). The engine pointer path walks in the browser without waiting for the page, and a
+// fresh headless browser's first page drew one or two frames, then stalled until something asked for one:
+// the walk sent meanwhile was lost (SC 216: no press on 2 of 8 first clicks, 1-9 moves on the others).
+export const ISO_FRAMES = `(ms) => window.__ccFramed ? true : new Promise((done) => {
+  const t = setTimeout(() => { window.__ccFramed = 1; done(false); }, ms);
+  requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); window.__ccFramed = 1; done(true); }));
+})`;
 // The platform the page believes (the persona's), for the wheel notch size.
 export const ISO_PLATFORM = "() => { const d = navigator.userAgentData; return (d && d.platform) || navigator.platform || ''; }";
 // The main frame's scroll offset: DOM.getNodeForLocation wants document coordinates.

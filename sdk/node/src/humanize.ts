@@ -37,7 +37,7 @@ import { keepInView, trimTo, walk } from "./pacing.js";
 import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
 import {
   COVER_CHECK_MS, COVER_RETRY_MS, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_FORM_CONTROL,
-  ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
+  ISO_FRAMES, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
   roundHalfEven, worldFor, type DescribedElement,
 } from "./isolated.js";
 import {
@@ -137,6 +137,10 @@ export async function sendEngineCommand(
   names.set(method, legacy);
   return r;
 }
+
+// The longest an engine walk waits for the page to draw (ISO_FRAMES): measured 111-812 ms on a fresh
+// headless browser's first page (r40, SC 216). A page that never draws (a hidden tab) walks after it.
+const FRAMES_WAIT_MS = 1500;
 
 /** @internal exported for tests. Did this browser's engine already say it has no pointer-path command? */
 export function engineHasNoPointerPath(cacheKey: object | null): boolean {
@@ -392,6 +396,9 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
         eng.key = br ?? ctx; // the command name is a property of the engine: learn it once per browser
         eng.session = br ? await br.newBrowserCDPSession() : tsession;
       }
+      // The engine does not wait for the page: what it walks into a page that has not drawn yet is lost
+      // (a fresh headless browser's first page, SC 216). Wait for two frames first; free once drawn.
+      await worldFor(page).evaluate(ISO_FRAMES, FRAMES_WAIT_MS, true);
       const dx = x - st.x, dy = y - st.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
       const dur = Math.min(1.10, Math.max(0.28, 0.30 + dist / 1700)) * (0.85 + 0.30 * Math.random());

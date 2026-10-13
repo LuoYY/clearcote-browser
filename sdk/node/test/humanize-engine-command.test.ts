@@ -123,3 +123,35 @@ describe("mouse.click through the engine", () => {
     expect(session.names()).toEqual([POINTER_PATH, POINTER_PATH_LEGACY]);
   }, 20_000);
 });
+
+// A fresh headless page drops what the engine walks before it has drawn frames (SC 216, r38 and r40):
+// 2 of 8 first clicks delivered no press, the others 1-9 moves. Waiting for two animation frames first
+// fixed 18 of 18. The wait runs in the isolated world, before the engine command is sent.
+describe("the first engine walk on a page waits for drawn frames", () => {
+  it("sends the pointer path only after the frame wait answered", async () => {
+    const log: [string, number][] = [];
+    const t0 = Date.now();
+    const target = {
+      send: async (m: string, p?: any) => {
+        if (m === "Target.getTargetInfo") return { targetInfo: { targetId: "T1" } };
+        if (m === "Page.getFrameTree") return { frameTree: { frame: { id: "F1" } } };
+        if (m === "Page.createIsolatedWorld") return { executionContextId: 7 };
+        if (m === "Runtime.evaluate" && /requestAnimationFrame/.test(p?.expression ?? "")) {
+          expect(p.awaitPromise).toBe(true);
+          await new Promise((r) => setTimeout(r, 300));
+          log.push(["frames", Date.now() - t0]);
+          return { result: { value: true } };
+        }
+        return undefined;
+      },
+    };
+    const engine = { send: async (m: string) => { log.push([m, Date.now() - t0]); return undefined; } };
+    const browser = { newBrowserCDPSession: async () => engine };
+    const page = fakePage(browser);
+    page.context = () => ({ newCDPSession: async () => target, browser: () => browser });
+    await attachHumanize(browser as never, page, { humanize: true, seed: "t" });
+    await page.mouse.click(300, 200);
+    expect(log.map(([m]) => m)).toEqual(["frames", POINTER_PATH]);
+    expect(log[1][1]).toBeGreaterThanOrEqual(log[0][1]);
+  }, 20_000);
+});
