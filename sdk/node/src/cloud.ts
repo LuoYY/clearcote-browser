@@ -163,6 +163,7 @@ export const SESSION_FIELDS: Readonly<Record<string, string>> = {
   adblock: "adblock",
   solveSliders: "solveSliders",
   solveCheckboxes: "solveCheckboxes",
+  solvePressHold: "solvePressHold",
   humanize: "humanize",
   challengeService: "challengeService",
   keepAlive: "keepAlive",
@@ -352,6 +353,8 @@ export interface CloudSessionOptions {
   solveSliders?: boolean;
   /** Default true: the server clicks "verify you are human" checkboxes for you. false leaves them to your script. */
   solveCheckboxes?: boolean;
+  /** Default true: the server holds "press and hold" verification buttons for you. false leaves them to your script. */
+  solvePressHold?: boolean;
   /** Default true: the server moves your mouse along human paths and holds clicks for a human press time
    *  (any client). false turns it off. A `launch({ cloud })` humanizes in the SDK instead and turns this off for you. */
   humanize?: boolean;
