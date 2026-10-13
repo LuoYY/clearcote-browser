@@ -448,14 +448,16 @@ There is one open build and one licensed build. The licensed build is offered tw
 
 | Chromium | Licensed build (Free with GitHub, Pro) | Open build |
 |---|---|---|
-| **153** (`153.0.8010.53`) | **Available now** | ~Nov 2026 |
+| **155** (`155.0.8059.39`) | **Available now** | ~Dec 2026 |
+| **154** (`154.0.8037.57`) | Available | ~Dec 2026 |
+| **153** (`153.0.8010.53`) | Available | ~Nov 2026 |
 | **152** (`152.0.7977.82`) | Available | ~Nov 2026 |
 | **151** (`151.0.7922.108`) | Available | ~Oct 2026 |
 | **150** (`150.0.7871.114`) | Available | **Available now** |
 | **149** (`149.0.7827.114`) | Available | Available |
 
 Open-build dates are estimates on a two-month cadence, not promises. Choose a major with
-`launch(version="150")`, or omit `version` for the newest your tier allows.
+`launch(version="155")`, or omit `version` for the newest your tier allows.
 
 ---
 
