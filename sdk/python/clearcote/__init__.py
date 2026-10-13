@@ -185,7 +185,7 @@ __all__ = [
     "RELEASE",
     "__version__",
 ]
-__version__ = "0.50.0"
+__version__ = "0.50.1"
 
 _pw = None  # the shared, lazily-started Playwright driver (one per process)
 
