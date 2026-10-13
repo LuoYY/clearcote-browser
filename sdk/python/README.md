@@ -338,6 +338,27 @@ inside a frame, which cannot be checked), and only what actually landed is delet
 `0.02`; `0` turns typos off). Since 0.48.0 the asyncio API (`clearcote.async_api`) makes the same slips as
 the sync API, and humanizes `page.press` / `page.dblclick` too.
 
+**Press and hold** (`press_and_hold`) is one long press for controls that act only while the button
+stays down: hold-to-confirm buttons, long-press menus, press-and-hold verification buttons.
+
+```python
+page.press_and_hold("#hold", 3000)                       # hold for 3 s
+page.press_and_hold("#hold", until=lambda: page.locator("#hold[data-state=done]").count() > 0)
+page.frame_locator("iframe").locator("button").press_and_hold()   # frames work too
+
+from clearcote import press_and_hold                     # any page, humanize on or off
+press_and_hold(page.locator("#hold"), 2500, position={"x": 40, "y": 20})
+```
+
+It waits for the element and scrolls it into view, glides to a point inside it, pauses, presses and
+holds: `duration` ms (a fresh 2.8–3.8 s when not given), or until `until()` returns true (asked every
+100 ms; `duration` is then the longest it may last, 15 s by default) — and lets go 160–350 ms after
+that, as a hand reacts. While the button is down the pointer drifts by a pixel now and then, never more
+than 2 px from the press, every move reporting the button held (`tremor=False` keeps it still). It
+returns `True`, or `False` when `until` never became true, and the button is always released, also when
+`until` raises or (async) the task is cancelled. Options: `position`, `button`, `timeout` (for the
+element to show). In `clearcote.async_api` it is awaited and `until` may be async.
+
 `show_cursor=True` injects a red cursor dot that follows the real mouse, handy for watching a
 headed run. Both default to off for a local launch (a cloud launch defaults `humanize` to on); everything
 stays standard Playwright when `humanize=False`.
