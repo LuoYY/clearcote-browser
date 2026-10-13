@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { installHumanize, attachHumanize, CURSOR_OVERLAY } from "../src/humanize.js";
+import { installHumanize, installHumanizeOnContext, attachHumanize, CURSOR_OVERLAY } from "../src/humanize.js";
 
 // a minimal stand-in: newPage/newContext are stable property functions so identity is comparable.
 const fakeBrowser = () =>
@@ -27,6 +27,40 @@ describe("installHumanize", () => {
     const nc = b.newContext;
     installHumanize(b as never, { showCursor: true });
     expect(b.newContext).not.toBe(nc);
+  });
+});
+
+// launch() is a persistent context, and on playwright-core 1.49.x a persistent context has no Browser:
+// context.browser() is null. Humanize used to attach only when it found one, so it was silently off.
+describe("installHumanizeOnContext without a Browser", () => {
+  const fakeContext = (pages: object[]) => {
+    const listeners: Record<string, (p: object) => void> = {};
+    const ctx = {
+      browser: () => null,
+      pages: () => pages,
+      on: (ev: string, fn: (p: object) => void) => { listeners[ev] = fn; },
+      addInitScript: async () => {},
+    };
+    return { ctx, listeners };
+  };
+
+  it("humanizes the pages already open and every new one", () => {
+    const open = {};
+    const { ctx, listeners } = fakeContext([open]);
+    installHumanizeOnContext(ctx as never, { humanize: true, seed: "no-browser" });
+    expect((open as any).__clearcoteHumanized).toBe(true);
+    expect(listeners.page).toBeTypeOf("function");
+    const later = {};
+    listeners.page(later);
+    expect((later as any).__clearcoteHumanized).toBe(true);
+  });
+
+  it("stays off when humanize and showCursor are off", () => {
+    const open = {};
+    const { ctx, listeners } = fakeContext([open]);
+    installHumanizeOnContext(ctx as never, {});
+    expect((open as any).__clearcoteHumanized).toBeUndefined();
+    expect(listeners.page).toBeUndefined();
   });
 });
 

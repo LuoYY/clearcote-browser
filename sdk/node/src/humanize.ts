@@ -280,7 +280,7 @@ export function engineClicksMode(): "off" | "coords" | "all" {
   return "coords";
 }
 
-export async function attachHumanize(browser: Browser, page: Page, opts: HumanizeOptions): Promise<void> {
+export async function attachHumanize(browser: Browser | null, page: Page, opts: HumanizeOptions): Promise<void> {
   // IDEMPOTENCY GUARD — do not remove.
   //
   // installHumanize wraps BOTH browser.newPage and browser.newContext. Playwright's newPage()
@@ -2089,15 +2089,20 @@ export function installHumanize(browser: Browser, opts: HumanizeOptions): void {
   };
 }
 
-/** Install humanize/showCursor on a single context (used for launchPersistentContext). */
+/** Install humanize/showCursor on a single context (used for launchPersistentContext).
+ *
+ * Attaches whether or not the context has a Browser. A persistent context has none on older
+ * playwright-core (context.browser() is null on 1.49.x), and launch() is a persistent context by
+ * default: this used to attach only when a Browser was found, so on those versions humanize was
+ * silently off. attachHumanize needs only the page; the engine route takes the browser from the
+ * page's context when there is one and uses the page's own CDP session when there is not (there the
+ * engine answers only to the pre-r34 name, POINTER_PATH_LEGACY: one miss per context, measured on r38). */
 export function installHumanizeOnContext(
   context: BrowserContext, opts: HumanizeOptions, browser?: Browser | null
 ): void {
   if (!opts.humanize && !opts.showCursor) return;
   const b = browser ?? context.browser();
   if (opts.showCursor) { context.addInitScript(CURSOR_OVERLAY).catch(() => {}); }
-  if (b) {
-    context.on("page", (p) => { attachHumanize(b, p, opts).catch(() => {}); });
-    for (const p of context.pages()) attachHumanize(b, p, opts).catch(() => {});
-  }
+  context.on("page", (p) => { attachHumanize(b, p, opts).catch(() => {}); });
+  for (const p of context.pages()) attachHumanize(b, p, opts).catch(() => {});
 }
