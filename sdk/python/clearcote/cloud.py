@@ -175,6 +175,7 @@ SESSION_FIELDS = {
     "adblock": "adblock",
     "solve_sliders": "solveSliders",
     "solve_checkboxes": "solveCheckboxes",
+    "solve_press_hold": "solvePressHold",
     "humanize": "humanize",
     "challenge_service": "challengeService",
     "keep_alive": "keepAlive",

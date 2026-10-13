@@ -599,7 +599,7 @@ What changes in the cloud:
   `accept_language`), `geoip`, `headless`, `light_stealth`, `proxy` (`"managed"`, a URL, or
   `{server, username, password}`), `country`/`state`/`city`, `proxy_session`, `timeout_sec`,
   `idle_timeout_sec`, `max_gb`, `version`, `profile`, `url`, `adblock`, `solve_sliders`,
-  `solve_checkboxes`, `challenge_service`, `keep_alive`, `record`, `note`, `worker`. `humanize` and `show_cursor` run in the SDK, exactly as for
+  `solve_checkboxes`, `solve_press_hold`, `challenge_service`, `keep_alive`, `record`, `note`, `worker`. `humanize` and `show_cursor` run in the SDK, exactly as for
   a local browser. `timeout` and `slow_mo` go to the CDP connect, where `timeout` defaults to 120 s (the
   browser starts as you connect).
 - **Input is humanized by default.** A cloud launch types, clicks and scrolls the way
@@ -612,6 +612,10 @@ What changes in the cloud:
 - **Human-check checkboxes are clicked for you.** A separate option: a cloud browser clicks "verify you
   are human" boxes by itself, in any tab or frame. Pass `solve_checkboxes=False` when your script
   handles them.
+- **Press-and-hold buttons are held for you.** A third option: a cloud browser presses and holds a
+  "press and hold" verification button by itself, in any tab or frame, until it reports done. Pass
+  `solve_press_hold=False` when your script handles them (for example with
+  [`press_and_hold`](#humanized-input-humanize-show_cursor)). Local browsers never do this on their own.
 - **Harder challenges can go to a solving service (off by default).** `challenge_service=True`, or a
   dict of `categories`, `sites`, `key`, `api_key`, `mode`, `max_solves`, `max_spend_eur` (the API's
   camelCase names work too): what the free actions cannot clear is solved with your own solving-service key
