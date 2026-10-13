@@ -72,10 +72,7 @@ describe.runIf(LIVE)("live path shape and engine routing", () => {
   /** Records the pointer-path walks the engine accepted on the browser CDP session humanize opens. */
   const spyEngine = () => {
     const log: any[] = [];
-    const br: any = page.context().browser();
-    const orig = br.newBrowserCDPSession.bind(br);
-    br.newBrowserCDPSession = async () => {
-      const s = await orig();
+    const spy = (s: any) => {
       const send = s.send.bind(s);
       s.send = async (method: string, params?: any) => {
         const out = await send(method, params);
@@ -84,6 +81,17 @@ describe.runIf(LIVE)("live path shape and engine routing", () => {
       };
       return s;
     };
+    // Without a Browser (a persistent context on older playwright-core) the engine is reached over the
+    // page's own CDP session instead.
+    const ctx: any = page.context();
+    const br: any = ctx.browser();
+    if (br) {
+      const orig = br.newBrowserCDPSession.bind(br);
+      br.newBrowserCDPSession = async () => spy(await orig());
+    } else {
+      const orig = ctx.newCDPSession.bind(ctx);
+      ctx.newCDPSession = async (p: any) => spy(await orig(p));
+    }
     return log;
   };
 
