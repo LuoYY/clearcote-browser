@@ -34,6 +34,7 @@ import {
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
+import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
 import {
   COVER_CHECK_MS, COVER_RETRY_MS, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_FORM_CONTROL,
   ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
@@ -1826,6 +1827,20 @@ export async function attachHumanize(browser: Browser, page: Page, opts: Humaniz
   (page as any)._clearcoteTrial = (selector: string, options: any, noClick: boolean) =>
     locked(() => trial(selector, options, noClick));
 
+  // pressAndHold (hold.ts): the hooks it reads off the page. It holds the page lock for the whole hold
+  // (one action at a time); inside it uses page.mouse (not locked) and these hooks. _clearcoteNudge is
+  // the tremor step: a native move (no glide) that keeps the tracked position where the pointer is.
+  (page as any)._clearcoteBoxOf = (loc: Locator, timeout: number | undefined, selector: string | null = null) =>
+    boxOf(loc, timeout, false, selector);
+  (page as any)._clearcotePointer = (): Point => ({ x: st.x, y: st.y });
+  (page as any)._clearcoteNudge = async (x: number, y: number): Promise<void> => {
+    await nativeMove(x, y);
+    st.x = x; st.y = y; st.placed = true;
+  };
+  (page as any)._clearcoteHold = (loc: Locator, o?: PressAndHoldOptions) => locked(() => pressAndHold(loc, o));
+  (page as any).pressAndHold = apiErrors("page.pressAndHold", (selector: string, o?: PressAndHoldOptions) =>
+    (page as any)._clearcoteHold(page.locator(selector).first(), o));
+
   // Marker the Locator-class patch keys off: humanize is active for THIS page.
   (page as any)._clearcoteHumanized = true;
   patchLocatorClass(page.locator("html"));
@@ -2008,6 +2023,14 @@ function patchLocatorClass(sample: Locator): void {
       return done ? r : oSelectOption.call(this, values, kw);
     });
   }
+
+  // New, not a Playwright method: press and hold this element (hold.ts), under the page lock when the
+  // page is humanized. Works on frame locators and non-humanized pages too: it presses at viewport
+  // coordinates through page.mouse.
+  proto.pressAndHold = apiMethod("locator.pressAndHold", async function (this: any, kw?: PressAndHoldOptions) {
+    const hold = this.page()._clearcoteHold;
+    return typeof hold === "function" ? hold(this, kw) : pressAndHold(this, kw);
+  });
 
   proto.dragTo = apiMethod("locator.dragTo", async function (this: any, target: any, kw: any = {}) {
     if (kw?.trial && on(this) && on(target) && await strict(this) && await strict(target)) {

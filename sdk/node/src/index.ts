@@ -120,6 +120,7 @@ export { isFingerprintPassthrough } from "./fingerprint.js";
 export { DEFAULT_IGNORED_ARGS, gpuBlocklistArgs, gpuBackendArgs, xDisplayAvailable, mesaEglAvailable, gateEngineSwitches, engineSupportsSwitch } from "./launchopts.js";
 export { serveMultiplex, type MultiplexOptions, type MultiplexServer } from "./multiplex.js";
 export type { HumanizeOptions } from "./humanize.js";
+export { pressAndHold, type PressAndHoldOptions, type HoldButton } from "./hold.js";
 export { Profile, listProfiles, loadProfile, PROFILE_DIR, type ProfileOptions } from "./profile.js";
 // Profile library: real captured personas, selected for coherence with THIS host.
 export {
