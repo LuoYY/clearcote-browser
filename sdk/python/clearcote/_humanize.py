@@ -44,7 +44,7 @@ from ._forms import (
 from ._isolated import (
     ACTIVE_FIELD as ISO_ACTIVE_FIELD, ACTIVE_VALUE as ISO_ACTIVE_VALUE, COVER_CHECK_MS, COVER_RETRY_MS,
     CSS_BOX as ISO_CSS_BOX, DESCRIBE as ISO_DESCRIBE, FORM_CONTROL, HIT_IN_BOX as ISO_HIT_IN_BOX,
-    LISTBOX_ROW as ISO_LISTBOX_ROW, SCROLL_BY as ISO_SCROLL_BY,
+    FRAMES as ISO_FRAMES, LISTBOX_ROW as ISO_LISTBOX_ROW, SCROLL_BY as ISO_SCROLL_BY,
     PLATFORM as ISO_PLATFORM, VIEWPORT as ISO_VIEWPORT, world_for,
 )
 from ._motion import (
@@ -157,6 +157,10 @@ def _needs_shift(ch):
 # SC 210); r40 keeps "dispatchPointerPath" out of it. The old name still works and is the only one r33
 # and older know.
 ENGINE_POINTER_PATH = ("Browser.dispatchPointerPath", "Browser.humanizedClick")
+
+# The longest an engine walk waits for the page to draw (ISO_FRAMES): measured 111-812 ms on a fresh
+# headless browser's first page (r40, SC 216). A page that never draws (a hidden tab) walks after it.
+FRAMES_WAIT_MS = 1500
 
 
 def _cdp_method_missing(err):
@@ -370,6 +374,13 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 b = getattr(page.context, "browser", None)
                 _eng["session"] = (b.new_browser_cdp_session()
                                    if b is not None else tsession)
+            # The engine does not wait for the page: what it walks into a page that has not drawn yet is
+            # lost (a fresh headless browser's first page, SC 216). Wait for two frames first; free once
+            # drawn. Best effort: a wait that fails still walks (the engine route stays on).
+            try:
+                world_for(page).evaluate(ISO_FRAMES, FRAMES_WAIT_MS, await_promise=True)
+            except Exception:  # noqa: BLE001
+                pass
             dx, dy = x - st["pos"][0], y - st["pos"][1]
             dist = (dx * dx + dy * dy) ** 0.5
             dur = min(1.10, max(0.28, 0.30 + dist / 1700.0)) * (0.85 + 0.30 * random.random())

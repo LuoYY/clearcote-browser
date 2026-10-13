@@ -86,6 +86,7 @@ class _Page:
         self.mouse = _Mouse(self.log)
         self.keyboard = _Keyboard()
         self.main_frame = object()
+        self._cc_isolated_world = None   # not __getattr__'s stub: world_for makes a real one
         browser = type("B", (), {"new_browser_cdp_session": lambda _self: engine})()
         self.context = type("C", (), {"browser": browser,
                                       "new_cdp_session": lambda _self, page: _Target()})()
@@ -221,6 +222,7 @@ class _APage:
         self.mouse = _AMouse(self.log)
         self.keyboard = _AKeyboard()
         self.main_frame = object()
+        self._cc_isolated_world = None
 
         async def browser_session(_self):
             return engine
@@ -297,3 +299,85 @@ def test_async_engine_answer_after_its_walk_is_not_followed_by_a_second_wait(mon
     asyncio.run(run())
     _, params = page._eng.calls[1]
     assert out["t1"] - out["t0"] == pytest.approx(params["duration"] + 0.12, abs=1e-9)
+
+
+# --- the first engine walk on a page waits for drawn frames (SC 216) ------------------------------
+# A fresh headless page drops what the engine walks before it has drawn frames (r38 and r40): the first
+# click of a fresh browser delivered 2-4 pointer moves for the whole walk, some no press at all. The
+# wait runs in the isolated world (two animation frames), before the engine command is sent.
+
+class _FramesTarget:
+    """The page's CDP session: an isolated world whose two-frame wait answers after `wait_s`."""
+
+    def __init__(self, clock, log, wait_s=0.3):
+        self.clock, self.log, self.wait_s = clock, log, wait_s
+
+    def send(self, method, params=None):
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": "T1"}}
+        if method == "Page.getFrameTree":
+            return {"frameTree": {"frame": {"id": "F1"}}}
+        if method == "Page.createIsolatedWorld":
+            return {"executionContextId": 7}
+        if method == "Runtime.evaluate" and "requestAnimationFrame" in (params or {}).get("expression", ""):
+            assert params.get("awaitPromise") is True
+            self.clock.sleep(self.wait_s)
+            self.log.append(("frames", self.clock.now))
+            return {"result": {"value": True}}
+        return {}
+
+
+class _LoggingEngine(_Engine):
+    def __init__(self, clock, log):
+        super().__init__(clock)
+        self.log = log
+
+    def send(self, method, params=None):
+        if method in H.ENGINE_POINTER_PATH:
+            self.log.append((method, self.clock.now))
+        return _Engine.send(self, method, params)
+
+
+def test_the_engine_walk_is_sent_only_after_the_frame_wait(monkeypatch):
+    clock, log = _Clock(), []
+    monkeypatch.setattr(H, "time", clock)
+    monkeypatch.delenv("CLEARCOTE_HUMANIZE_ENGINE_CLICKS", raising=False)
+    eng = _LoggingEngine(clock, log)
+    p = _Page(eng)
+    target = _FramesTarget(clock, log)
+    p.context = type("C", (), {"browser": p.context.browser, "new_cdp_session": lambda _self, page: target})()
+    H.attach_humanize(None, p, humanize=True, seed="frames")
+    p.mouse.click(300, 200)
+    assert [m for m, _ in log] == ["frames", H.ENGINE_POINTER_PATH[0]], log
+    assert log[1][1] >= log[0][1]
+
+
+def test_async_the_engine_walk_is_sent_only_after_the_frame_wait(monkeypatch):
+    import asyncio
+    import clearcote._humanize_async as HA
+    clock, log = _Clock(), []
+    monkeypatch.setattr(HA, "time", clock, raising=False)
+    monkeypatch.setattr(HA, "asyncio", _AsyncShim(clock))
+    monkeypatch.delenv("CLEARCOTE_HUMANIZE_ENGINE_CLICKS", raising=False)
+
+    class _AEng(_LoggingEngine):
+        async def send(self, method, params=None):
+            return _LoggingEngine.send(self, method, params)
+
+    class _ATgt(_FramesTarget):
+        async def send(self, method, params=None):
+            return _FramesTarget.send(self, method, params)
+
+    p = _APage(_AEng(clock, log))
+    target = _ATgt(clock, log)
+
+    async def target_session(_self, page):
+        return target
+    p.context = type("C", (), {"browser": p.context.browser, "new_cdp_session": target_session})()
+
+    async def run():
+        await HA.attach_humanize(None, p, humanize=True, seed="frames")
+        await p.mouse.click(300, 200)
+    asyncio.run(run())
+    assert [m for m, _ in log] == ["frames", H.ENGINE_POINTER_PATH[0]], log
+    assert log[1][1] >= log[0][1]

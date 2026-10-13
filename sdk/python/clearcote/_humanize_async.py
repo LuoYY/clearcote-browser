@@ -23,13 +23,13 @@ from ._forms import (
 )
 from ._humanize import (
     CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _engine_clicks_mode, _host_platform,
-    _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, as_api_error,
+    FRAMES_WAIT_MS, _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, as_api_error,
     default_timeout_ms, engine_path_memo, trial_timeout_error, typo_rate,
 )
 from ._isolated import (
     ACTIVE_FIELD as ISO_ACTIVE_FIELD, ACTIVE_VALUE as ISO_ACTIVE_VALUE, COVER_CHECK_MS, COVER_RETRY_MS,
     CSS_BOX as ISO_CSS_BOX, DESCRIBE as ISO_DESCRIBE, FORM_CONTROL, HIT_IN_BOX as ISO_HIT_IN_BOX,
-    LISTBOX_ROW as ISO_LISTBOX_ROW, SCROLL_BY as ISO_SCROLL_BY,
+    FRAMES as ISO_FRAMES, LISTBOX_ROW as ISO_LISTBOX_ROW, SCROLL_BY as ISO_SCROLL_BY,
     PLATFORM as ISO_PLATFORM, VIEWPORT as ISO_VIEWPORT, async_world_for,
 )
 from ._motion import (
@@ -189,6 +189,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 b = getattr(page.context, "browser", None)
                 _eng["session"] = (await b.new_browser_cdp_session()
                                    if b is not None else tsession)
+            # The engine does not wait for the page: what it walks into a page that has not drawn yet is
+            # lost (a fresh headless browser's first page, SC 216). Wait for two frames first; free once
+            # drawn. Best effort: a wait that fails still walks (the engine route stays on).
+            try:
+                await async_world_for(page).evaluate(ISO_FRAMES, FRAMES_WAIT_MS, await_promise=True)
+            except Exception:  # noqa: BLE001
+                pass
             dx, dy = x - st["pos"][0], y - st["pos"][1]
             dist = (dx * dx + dy * dy) ** 0.5
             dur = min(1.10, max(0.28, 0.30 + dist / 1700.0)) * (0.85 + 0.30 * random.random())

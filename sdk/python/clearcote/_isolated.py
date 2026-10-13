@@ -95,14 +95,15 @@ class IsolatedWorld:
             self._ctx = self._cdp.send(
                 "Page.createIsolatedWorld", {"frameId": self._frame})["executionContextId"]
 
-    def evaluate(self, fn_source, arg=None):
-        """Run ``(fn_source)(arg)`` (``arg`` JSON-serialisable) and return its JSON value, or None."""
+    def evaluate(self, fn_source, arg=None, await_promise=False):
+        """Run ``(fn_source)(arg)`` (``arg`` JSON-serialisable) and return its JSON value, or None.
+        ``await_promise``: a function that returns a promise answers with what the promise resolves to."""
         for _ in range(2):  # a stale context (navigation) is re-created once
             try:
                 self._ensure()
                 return _value(self._cdp.send("Runtime.evaluate", {
                     "expression": _expression(fn_source, arg), "contextId": self._ctx,
-                    "returnByValue": True}))
+                    "returnByValue": True, **({"awaitPromise": True} if await_promise else {})}))
             except Exception:  # noqa: BLE001
                 self._ctx = None
         return None
@@ -211,13 +212,13 @@ class AsyncIsolatedWorld:
                     created = await self._cdp.send("Page.createIsolatedWorld", {"frameId": self._frame})
                     self._ctx = created["executionContextId"]
 
-    async def evaluate(self, fn_source, arg=None):
+    async def evaluate(self, fn_source, arg=None, await_promise=False):
         for _ in range(2):
             try:
                 await self._ensure()
                 return _value(await self._cdp.send("Runtime.evaluate", {
                     "expression": _expression(fn_source, arg), "contextId": self._ctx,
-                    "returnByValue": True}))
+                    "returnByValue": True, **({"awaitPromise": True} if await_promise else {})}))
             except Exception:  # noqa: BLE001
                 self._ctx = None
         return None
@@ -305,6 +306,14 @@ COVER_RETRY_MS = 2000
 
 # The reads humanize makes, as functions of one JSON argument (run by IsolatedWorld.evaluate).
 VIEWPORT = "() => [innerWidth, innerHeight]"
+# Resolves once the document has drawn two animation frames (at once after the first time; False after
+# `ms` without them). The engine pointer path walks in the browser without waiting for the page, and a
+# fresh headless browser's first page drew one or two frames, then stalled until something asked for one:
+# the walk sent meanwhile was lost (SC 216: 2-4 moves on the first click, some with no press).
+FRAMES = """(ms) => window.__ccFramed ? true : new Promise((done) => {
+  const t = setTimeout(() => { window.__ccFramed = 1; done(false); }, ms);
+  requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); window.__ccFramed = 1; done(true); }));
+})"""
 # The platform the page believes (the persona's), for the wheel notch size.
 PLATFORM = "() => { const d = navigator.userAgentData; return (d && d.platform) || navigator.platform || ''; }"
 
