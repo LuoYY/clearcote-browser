@@ -243,6 +243,38 @@ to `Fingerprint` and the identity moves the same way in the Python and Node SDKs
 derived from the seed with a shared RNG, so it is a property of the identity rather than of the
 language.
 
+### Press and hold (`PressAndHoldAsync`)
+
+For controls that act only while the button stays down — a hold-to-confirm button, a long-press menu, a
+"press and hold" verification button — `PressAndHoldAsync` makes one long press on the element and returns
+`Task<bool>`:
+
+```csharp
+// hold for 3 s exactly
+await page.PressAndHoldAsync("#confirm", new PressAndHoldOptions { Duration = 3000 });
+
+// hold until the page says it is done (polled every 100 ms, released 160-350 ms later; gives up after 15 s)
+bool ok = await page.Locator("#hold").PressAndHoldAsync(new PressAndHoldOptions
+{
+    Until = async () => await page.Locator("#hold[data-state=done]").CountAsync() > 0,
+});
+```
+
+It waits for the element to be visible (`Timeout`), brings it into view, moves to a point inside it
+(`Position`, relative to the element's top-left, else a persona-shaped point near the centre), presses
+(`Button`, default left) and holds for `Duration` ms (default 2.8-3.8 s) or until `Until` returns true. While
+the button is down the pointer drifts now and then by whole pixels, never more than 2 px from the press point
+(`Tremor = false` keeps it still); every one of those moves reports the button held. It returns `true` when the
+hold ran its full duration or `Until` became true, `false` when `Until` never did. The button is always
+released, also when `Until` throws or the `CancellationToken` is cancelled mid-hold. A non-positive or
+non-finite `Duration`, or an unknown `Button`, throws `ArgumentException`.
+
+On a page with a persona (`Humanize.Attach`, or any earlier `Human*` call on it) the approach is a humanized
+glide, the press comes after the persona's pre-press pause, and the hold takes its turn with the page's other
+`Human*` calls. On any other page the pointer moves straight there with `page.Mouse`. A locator inside an
+iframe (`FrameLocator`, or a locator made on a child `IFrame`) works too: the press is made at viewport
+coordinates.
+
 **These are extension methods, not replacements.** C# cannot patch `IPage`/`ILocator` the way the
 Python and Node SDKs patch their page objects, so ordinary `ClickAsync` stays exactly as Playwright
 wrote it and you opt in per call. The locator forms are strict like Playwright's (more than one match

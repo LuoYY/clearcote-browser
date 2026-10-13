@@ -127,6 +127,8 @@ public sealed record HumanClickOptions
 ///   HumanDragToAsync      pointer-press-dwell-duration at both ends of the gesture (grab hesitation
 ///                         after the press, settle before the release) plus a held-button path
 ///                         instead of down/teleport/up, which a range thumb reads as no drag at all.
+///   PressAndHoldAsync     one long press (a hold-to-confirm or "press and hold" button) with sparse
+///                         whole-pixel drift while held, every move reporting the button down (Hold.cs).
 ///
 /// FORMS (a port of the Python SDK's humanized form input; the planning lives in Forms.cs and is pinned to
 /// the other SDKs by sdk/testdata/humanize_forms_vectors.json):
@@ -146,7 +148,7 @@ public sealed record HumanClickOptions
 /// Every DOM read goes through the isolated world (IsolatedWorld) or Playwright's own utility-world
 /// queries, never the page's main world.
 /// </summary>
-public static class Humanize
+public static partial class Humanize
 {
     // Persona per page. ConditionalWeakTable so a closed page is collectable — a Dictionary here
     // would pin every page a long-lived process ever opened.
