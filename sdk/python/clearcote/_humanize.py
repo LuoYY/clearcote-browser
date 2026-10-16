@@ -48,7 +48,7 @@ from ._isolated import (
     PLATFORM as ISO_PLATFORM, VIEWPORT as ISO_VIEWPORT, world_for,
 )
 from ._motion import (
-    WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, drag_hesitation, click_hold, key_dwell, click_point,
+    WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, drag_hesitation, hesitate_then_drag, click_hold, key_dwell, click_point,
     plan_ambient, platform_from_navigator, rollover_rate, wheel_notches,
 )
 from ._scroll import (
@@ -2119,12 +2119,19 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         return None
 
     def _creep(frm, toward, grab_ms):
-        """The drag-start hesitation: after the press the hand holds 100-300 ms, creeping < 8 px toward
-        where it is about to go (_motion.drag_hesitation), before the leg proper."""
+        """The drag-start hesitation alone (the drop point not known yet): after the press the hand
+        holds, creeping < 8 px toward where it is about to go (_motion.drag_hesitation)."""
         steps = drag_hesitation(frm, toward, persona, dur_ms=grab_ms)
         _dispatch(steps)
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])
+
+    def _held_drag(frm, to, grab_ms, settle=True):
+        """Hesitation + the held leg in one walk (_motion.hesitate_then_drag): inside 8 px of the press
+        for the persona's grab window (100-300 ms), then the drag leg to ``to``."""
+        steps, _ = hesitate_then_drag(frm, to, persona, grab_ms, settle=settle)
+        _dispatch(steps)
+        st["pos"] = (to[0], to[1])
 
     def _drag(src, dst, opts):
         """The humanized drag of locator ``src`` onto locator ``dst`` (Locator.drag_to,
@@ -2162,9 +2169,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         st["held"] = True
         try:
             native_down()
-            guess = tp or (tbox["x"] + tbox["width"] / 2, tbox["y"] + tbox["height"] / 2)
-            _creep(sp, guess, grab_ms)
             if tp is None:
+                _creep(sp, (tbox["x"] + tbox["width"] / 2, tbox["y"] + tbox["height"] / 2), grab_ms)
                 # the drop zone is out of view: the free hand scrolls it in while the other holds
                 got, ok, _ = bring_into_view(_scroll_io(), lambda: _peek_box(dst, dsel))
                 if not ok or not got:
@@ -2176,7 +2182,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 pos = opts.get("target_position")
                 tp = _position_point(got, {"position": pos}) if pos else click_point(got, st["pos"], persona)
                 tp = (float(round(tp[0])), float(round(tp[1])))
-            _glide(tp[0], tp[1], settle=True, held=True)
+                _glide(tp[0], tp[1], settle=True, held=True)
+            else:
+                _held_drag(sp, tp, grab_ms)
             time.sleep(release_ms / 1000.0)
         finally:
             try:
@@ -2208,9 +2216,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             st["drag_legs"] = 0
             return _settled_read(read)
         ux, uy = dx / d, dy / d
-        _creep((px, py), (px + dx, py + dy), grab_ms)
         past = _rand(3.0, 8.0)
-        _glide(px + dx + ux * past, py + dy + uy * past, held=True)
+        _held_drag((px, py), (px + dx + ux * past, py + dy + uy * past), grab_ms, settle=False)
         legs = 1
         got = (0.0, 0.0)
         while True:
@@ -2262,6 +2269,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             native_down()
             got = _drag_by_core(p0[0], p0[1], float(dx), float(dy), read, float(opts.get("tolerance") or 2.0),
                                 grab_ms)
+            page._clearcote_drag_legs = st.get("drag_legs")
             time.sleep(release_ms / 1000.0)
         finally:
             try:

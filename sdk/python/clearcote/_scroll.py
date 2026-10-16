@@ -135,6 +135,19 @@ def scroll_need(box, view, frac):
     return dx, dy
 
 
+def aim_need(box, view, frac, ax, ay):
+    """(dx, dy) still to scroll so the target sits where :func:`scroll_need` aimed it, on the axes
+    (``ax``, ``ay``) that were out of view when the scroll began -- also once it shows: a person who
+    meant to bring it to the upper half does not stop the moment its bottom edge peeks in."""
+    vx, vy, vw, vh = view
+    dx = dy = 0.0
+    if ay:
+        dy = (box["y"] - (vy + vh * 0.05)) if box["height"] > vh * 0.9 else             (box["y"] + box["height"] / 2) - (vy + vh * frac)
+    if ax:
+        dx = (box["x"] - (vx + vw * 0.05)) if box["width"] > vw * 0.9 else             (box["x"] + box["width"] / 2) - (vx + vw / 2)
+    return dx, dy
+
+
 def undershoot(need_px, rng: Optional[Callable[[], float]] = None):
     """The first flick's distance: 60-90 % of the need (a hand undershoots and corrects)."""
     if rng is None:
@@ -415,15 +428,21 @@ def bring_into_view(io, box_fn, frac=None, rng: Optional[Callable[[], float]] = 
     device = io.device()
     notch = io.notch_px()
     placed = False
+    ax, ay = (v != 0 for v in scroll_need(box, view, frac))
+    if scroller:
+        ax, ay = ax and bool(scroller.get("x")), ay and bool(scroller.get("y"))
+    tol = notch * 0.5 if device != "trackpad" else 6.0
+    shown_rounds = 0
     while notches < NOTCH_BUDGET:
-        dx, dy = scroll_need(box, view, frac)
-        if scroller:
-            if not scroller.get("y"):
-                dy = 0.0
-            if not scroller.get("x"):
-                dx = 0.0
-        if abs(dx) < 1 and abs(dy) < 1:
-            return box, in_view(box, view), notches
+        dx, dy = aim_need(box, view, frac, ax, ay)
+        if in_view(box, view):
+            # in view: done once it is about where it was aimed (a whole notch cannot do better than
+            # half a notch), or after two corrections
+            if (abs(dx) < tol and abs(dy) < tol) or shown_rounds >= 2:
+                return box, True, notches
+            shown_rounds += 1
+        elif abs(dx) < 1 and abs(dy) < 1:
+            return box, False, notches
         if not placed:
             _place_over(io, view, rng)
             placed = True
@@ -434,8 +453,8 @@ def bring_into_view(io, box_fn, frac=None, rng: Optional[Callable[[], float]] = 
             _send_trackpad(io, ask_x, ask_y, rng)
             notches += max(1, _js_round(math.hypot(ask_x, ask_y) / notch))
         else:
-            ny = wheel_notches(ask_y, notch) if abs(ask_y) >= 1 else 0
-            nx = wheel_notches(ask_x, notch) if abs(ask_x) >= 1 else 0
+            ny = wheel_notches(ask_y, notch) if abs(ask_y) >= tol else 0
+            nx = wheel_notches(ask_x, notch) if abs(ask_x) >= tol else 0
             ny = min(ny, NOTCH_BUDGET - notches)
             if ny:
                 _send_notches(io, ny, "y", 1 if ask_y > 0 else -1, rng)
@@ -444,15 +463,17 @@ def bring_into_view(io, box_fn, frac=None, rng: Optional[Callable[[], float]] = 
             if nx:
                 _send_notches(io, nx, "x", 1 if ask_x > 0 else -1, rng)
                 notches += nx
+            if not (nx or ny):
+                return box, in_view(box, view), notches
         before = box
         box = _read_settled(box_fn, io)
         if box is None:
             return None, False, notches
-        if abs(box["x"] - before["x"]) < MIN_MOVE_PX and abs(box["y"] - before["y"]) < MIN_MOVE_PX:
-            return box, False, notches    # the wheel does not scroll this: not a scrollable container
         if scroller:
             scroller = scroller_fn() if scroller_fn else scroller
             view = _view_of(io, scroller)
-        if in_view(box, view):
-            return box, True, notches
+        if abs(box["x"] - before["x"]) < MIN_MOVE_PX and abs(box["y"] - before["y"]) < MIN_MOVE_PX:
+            # the wheel did not move it: the end of the scroll (fine when it shows), or not a
+            # scrollable container (the caller falls back)
+            return box, in_view(box, view), notches
     return box, False, notches

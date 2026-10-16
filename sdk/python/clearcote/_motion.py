@@ -432,8 +432,8 @@ def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Opti
     samples spanning 100-300 ms (centred per persona), the pointer creeping < 8 px toward ``to`` with a
     little sideways wobble. The last sample is where :func:`plan_drag` then starts. The samples are
     drawn from ``rng`` AFTER nothing: a caller plans the leg from the returned end point, so the leg's
-    own draws keep their order. ``dur_ms``: the caller's grab window (the persona's grab dwell), clamped
-    to 100-300 ms, in place of this persona's own draw (which is still drawn, so the order holds).
+    own draws keep their order. ``dur_ms``: the caller's own length for the creep (40-300 ms; see
+    :func:`hesitate_then_drag`), in place of this persona's draw (which is still drawn, so the order holds).
     Same numbers in motion.ts dragHesitation and Motion.DragHesitation."""
     if rng is None:
         rng = random.random
@@ -447,7 +447,7 @@ def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Opti
     ux, uy = ((tx - fx) / d, (ty - fy) / d) if d >= 1e-6 else (1.0, 0.0)
     dur = _clamp(centre * _lerp(0.8, 1.2, rng()), HESITATION_MS[0], HESITATION_MS[1])
     if dur_ms is not None:
-        dur = _clamp(float(dur_ms), HESITATION_MS[0], HESITATION_MS[1])
+        dur = _clamp(float(dur_ms), 40.0, HESITATION_MS[1])
     reach = amp * _lerp(0.6, 1.0, rng())
     step_ms = 1000.0 / p.device_hz
     n = int(max(3, _js_round(dur / step_ms)))
@@ -466,6 +466,39 @@ def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Opti
             px, py = fx + ux * (HESITATION_MAX_PX - 1.0), fy + uy * (HESITATION_MAX_PX - 1.0)
         out.append((px, py, dt * _lerp(0.9, 1.1, rng())))
     return out
+
+
+def leg_exit_ms(frm, steps, radius=HESITATION_MAX_PX):
+    """When (ms from the start of ``steps``) the walk first leaves the ``radius`` circle around ``frm``;
+    the whole length when it never does."""
+    t = 0.0
+    for x, y, sl in steps:
+        if math.hypot(x - frm[0], y - frm[1]) >= radius:
+            return t
+        t += sl
+    return t
+
+
+def hesitate_then_drag(frm, to, p: Persona, window_ms: float, settle: bool = True, rng: Optional[Rng] = None):
+    """The held part of a drag: the hesitation creep, then the :func:`plan_drag` leg, planned together
+    so the pointer stays inside 8 px of the press for ``window_ms`` (clamped 100-300; the persona's grab
+    dwell) and then goes. The leg's own slow start counts toward the window: the creep is planned for
+    what the window leaves (at least 40 ms). Returns (steps, creep_count)."""
+    if rng is None:
+        rng = random.random
+    w = _clamp(float(window_ms), HESITATION_MS[0], HESITATION_MS[1])
+    creep = drag_hesitation(frm, to, p, rng, dur_ms=w)
+    leg = plan_drag(creep[-1][:2], to, p, settle=settle, rng=rng)
+    t8 = leg_exit_ms(frm, leg)
+    want = max(40.0, w - t8)
+    have = sum(s[2] for s in creep)
+    if abs(have - want) > 1.0:
+        # re-time the creep to what the window leaves (same shape, scaled in time and reach)
+        k = want / have
+        creep = [(frm[0] + (x - frm[0]) * min(1.0, k), frm[1] + (y - frm[1]) * min(1.0, k), sl * k)
+                 for x, y, sl in creep]
+        leg = plan_drag(creep[-1][:2], to, p, settle=settle, rng=rng)
+    return creep + leg, len(creep)
 
 
 def drag_dwell(p: Persona, rng: Optional[Rng] = None):
