@@ -11,9 +11,12 @@
 namespace Clearcote;
 
 /// <summary>Per-identity typing signature, stable per seed (<see cref="Keys.TypingTraitsOf"/>).</summary>
+/// <remarks><c>RepeatFirstMs</c> / <c>RepeatGapMs</c>: the OS key auto-repeat delay (252..498) and interval (26..39),
+/// a machine setting and so one per identity (verifier A's R1, SC 232); <see cref="Keys.PlanRepeat"/> adds +-2 / +-1 ms.</remarks>
 public sealed record TypingTraits(
     double Wpm, double SameFinger, double SameHand, double Alternate, double TabPref, double TypoRate,
-    double SubmitCenterMs, double TabCenterMs, string SelectStyle, string BlurStyle);
+    double SubmitCenterMs, double TabCenterMs, string SelectStyle, string BlurStyle,
+    double RepeatFirstMs, double RepeatGapMs);
 
 /// <summary>OS auto-repeat timing for one held key.</summary>
 public sealed record RepeatPlan(double FirstMs, double GapMs, double ReleaseMs);
@@ -44,7 +47,10 @@ public static class Keys
         double tabCenter = Lerp(190, 330, r());
         string select = r() < 0.55 ? "triple" : "keys";
         string blur = r() < 0.5 ? "tab" : "click";
-        return new TypingTraits(wpm, sameFinger, sameHand, alternate, tabPref, typoRate, submitCenter, tabCenter, select, blur);
+        double repeatFirst = Lerp(252, 498, r());   // the two repeat draws came last (R1): every earlier trait is unchanged
+        double repeatGap = Lerp(26, 39, r());
+        return new TypingTraits(wpm, sameFinger, sameHand, alternate, tabPref, typoRate, submitCenter, tabCenter, select, blur,
+            repeatFirst, repeatGap);
     }
 
     private static readonly string[] Rows = { "`1234567890-=", "qwertyuiop[]\\", "asdfghjkl;'", "zxcvbnm,./" };
@@ -128,10 +134,13 @@ public static class Keys
     public static double ModifierLeadMs(Rng rng) => Lerp(40, 110, rng());
     public static double ModifierLagMs(Rng rng) => Lerp(20, 80, rng());
 
-    public static RepeatPlan PlanRepeat(Rng rng)
+    /// <summary>OS auto-repeat timing for one held key: the persona's repeat delay and interval (a machine setting,
+    /// <see cref="TypingTraitsOf"/>) seen through +-2 / +-1 ms of timer jitter per run, and the hand's release. Draw
+    /// order: first jitter, gap jitter, release (_keys.plan_repeat).</summary>
+    public static RepeatPlan PlanRepeat(TypingTraits t, Rng rng)
     {
-        double first = Lerp(250, 500, rng());
-        double gap = Lerp(25, 40, rng());
+        double first = t.RepeatFirstMs + Lerp(-2, 2, rng());
+        double gap = t.RepeatGapMs + Lerp(-1, 1, rng());
         double release = Lerp(20, 60, rng());
         return new RepeatPlan(first, gap, release);
     }

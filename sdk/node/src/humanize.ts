@@ -36,7 +36,7 @@ import {
 } from "./motion.js";
 import {
   ANCHOR_TARGET_W, ISO_SCROLLER, ISO_SCROLL_RANGE, anchorNeeded, anchorPoint, bringIntoView, inView as boxIn, inputDevice,
-  pacedWheel, planTrackpad, wheelDrift, type ScrollBox, type ScrollIO, type Scroller,
+  pacedWheel, planTrackpad, trackpadTraits, wheelDrift, type ScrollBox, type ScrollIO, type Scroller,
 } from "./scroll.js";
 import {
   dwellMs, moveOffDelayMs, moveOffRoll, planDwell, planMoveOff,
@@ -402,6 +402,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // The typing identity (WPM, bigram factors, Tab preference, pauses) from a salted side stream
   // of the persona seed (keys.typingTraits): the persona's own draws are unchanged.
   const traits = typingTraits(persona.seed);
+  // The trackpad identity (report rate, inertia decay): another salted side stream of the seed (R2).
+  const tpTraits = trackpadTraits(persona.seed);
   // Keys the CALLER holds through keyboard.down: key -> [when it went down, the hold it is owed].
   const heldKeys = new Map<string, [number, number]>();
   // A keydown->keyup hold: lane B's keyDwell (log-normal around the persona's median, preset-scaled).
@@ -843,6 +845,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     sleep: async (ms) => { await sleep(ms * tempo); }, // the preset scales the scroll-into-view pauses
     notchPx: () => wheelNotchPx(),
     device: () => inputDev(),
+    trackpad: () => tpTraits,
     scrollRange: async () => {
       const r = await worldFor(page).evaluate<unknown>(ISO_SCROLL_RANGE);
       return Array.isArray(r) && r.length === 4 ? r.map(Number) : null;
@@ -874,10 +877,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   };
   const wheelRun = async (device: string, dx: number, dy: number, sendWheel: (a: number, b: number) => Promise<void>): Promise<void> => {
     if (device === "trackpad") {
-      // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then
-      // an inertia tail (scroll.ts planTrackpad). Playwright sends pixel deltas either way (deltaMode 0);
-      // a notch persona's deltas are whole multiples of its notch.
-      await pacedWheel(planTrackpad(dx, dy), sendWheel, async (ms) => { await sleep(ms); });
+      // A trackpad persona swipes the exact distance: 2-40 px events at the persona's 60-120/s on a min-jerk
+      // bell, then an inertia tail (scroll.ts planTrackpad / trackpadTraits). Playwright sends pixel deltas
+      // either way (deltaMode 0); a notch persona's deltas are whole multiples of its notch.
+      await pacedWheel(planTrackpad(dx, dy, tpTraits), sendWheel, async (ms) => { await sleep(ms); });
       return;
     }
     const notch = await wheelNotchPx();
@@ -1257,9 +1260,9 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   };
 
   // One key: pressed with the persona's hold (or the caller's `delay`); with `repeat` > 1 HELD the way an
-  // OS auto-repeats it -- one keydown, the repeat delay (250-500 ms), then a keydown with repeat=true every
-  // 25-40 ms (Playwright sends a key that is already down as an autoRepeat keydown), `repeat` keydowns in
-  // all, then one keyup.
+  // OS auto-repeats it -- one keydown, the machine's repeat delay (250-500 ms, a persona trait), then a
+  // keydown with repeat=true at its repeat interval (25-40 ms, likewise; Playwright sends a key that is
+  // already down as an autoRepeat keydown), `repeat` keydowns in all, then one keyup.
   const holdKey = async (k: string, delay: number | null = null, repeat = 1): Promise<void> => {
     const n = Math.max(1, Math.floor(Number(repeat) || 1));
     if (n === 1 || !nativeKbDown || !nativeKbUp) {
@@ -1269,7 +1272,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       }
       return;
     }
-    const rp = planRepeat(Math.random);
+    const rp = planRepeat(traits, Math.random);
     await nativeKbDown(k);
     try {
       await sleep(rp.firstMs);

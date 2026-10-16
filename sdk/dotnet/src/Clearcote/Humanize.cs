@@ -1516,9 +1516,10 @@ public static partial class Humanize
 
         if (await DeviceAsync(page, st).ConfigureAwait(false) == "trackpad")
         {
-            // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then an
-            // inertia tail (Scroll.PlanTrackpad). Playwright sends pixel deltas either way (deltaMode 0).
-            await Scroll.PacedWheelAsync(Scroll.PlanTrackpad(deltaX, deltaY),
+            // A trackpad persona swipes the exact distance: 2-40 px events at the persona's 60-120/s on a min-jerk
+            // bell, then an inertia tail (Scroll.PlanTrackpad / TrackpadTraitsOf: a salted side stream of the seed, R2).
+            // Playwright sends pixel deltas either way (deltaMode 0).
+            await Scroll.PacedWheelAsync(Scroll.PlanTrackpad(deltaX, deltaY, Scroll.TrackpadTraitsOf(p.Seed)),
                 (a, b) => sendWheel((float)a, (float)b), ms => Task.Delay((int)Math.Round(ms))).ConfigureAwait(false);
             return;
         }
@@ -1603,6 +1604,7 @@ public static partial class Humanize
         public Task SleepAsync(double ms) => Task.Delay((int)Math.Round(ms * Humanize.Tempo(_page)));   // the preset scales the pauses
         public Task<int> NotchPxAsync() => Humanize.NotchPxAsync(_page, _st);
         public Task<string> DeviceAsync() => Humanize.DeviceAsync(_page, _st);
+        public TrackpadTraits Trackpad => Scroll.TrackpadTraitsOf(_p.Seed);
         public async Task<double[]?> ScrollRangeAsync()
         {
             var r = await IsolatedWorld.For(_page).EvaluateAsync(Scroll.IsoScrollRange).ConfigureAwait(false);
@@ -2098,7 +2100,7 @@ public static partial class Humanize
             await page.Keyboard.PressAsync(k, new KeyboardPressOptions { Delay = delay ?? (float)Motion.KeyDwell(p) }).ConfigureAwait(false);
             return;
         }
-        var rp = Keys.PlanRepeat(Unseeded);
+        var rp = Keys.PlanRepeat(TraitsFor(page), Unseeded);   // the machine's repeat delay / interval: persona traits (R1)
         await page.Keyboard.DownAsync(k).ConfigureAwait(false);
         try
         {

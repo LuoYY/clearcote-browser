@@ -16,16 +16,18 @@ Python humanizers, with their closures, both drive it.
 Devices. Playwright's ``mouse.wheel`` sends pixel deltas, so a page sees ``deltaMode 0`` whatever the
 persona; what tells a mouse from a trackpad is the SHAPE of the stream: a mouse persona sends whole
 multiples of the platform notch (100 px Windows, 120 Linux, 40 macOS; ``_motion.WHEEL_NOTCH_PX``) in
-finger-flick bursts, a trackpad persona sends 2-40 px events at 60-120 events/s following a min-jerk
-velocity profile, then an inertia tail that decays exponentially for at least 300 ms.
+finger-flick bursts, a trackpad persona sends 2-40 px events at its report rate (60-120 events/s, a
+persona trait: :func:`trackpad_traits`) following a min-jerk velocity profile, then an inertia tail that
+decays exponentially (its time constant a trait too) for at least 300 ms.
 """
 
+from dataclasses import dataclass
 import math
 import random
 import time
 from typing import Callable, Optional
 
-from ._motion import _clamp, _js_round, _lerp, gauss_from, min_jerk, wheel_anchor_point, wheel_notches  # noqa: F401
+from ._motion import _MASK, _clamp, _js_round, _lerp, gauss_from, min_jerk, mulberry32, wheel_anchor_point, wheel_notches  # noqa: F401
 
 # ---------------------------------------------------------------- the anchor (one set of numbers)
 # Where a reading hand parks the pointer before scrolling: upper-middle of the viewport, gaussian
@@ -53,12 +55,36 @@ READ_PAUSE_RATE = 0.07
 READ_PAUSE_MS = (150.0, 450.0)
 
 # ---------------------------------------------------------------- trackpad
-TRACKPAD_HZ = (60.0, 120.0)            # events per second during the finger phase
+TRACKPAD_HZ = (60.0, 120.0)            # events per second during the finger phase (a persona trait)
 TRACKPAD_PX = (2.0, 40.0)              # per-event delta during the finger phase
+TRACKPAD_DECAY_MS = (140.0, 220.0)     # inertia time constant (a persona trait; x 0.9-1.1 per swipe)
 INERTIA_MIN_MS = 300.0                 # the tail lasts at least this long
 INERTIA_STOP_PX = 1.0                  # ... and runs until |delta| falls under this
 TRACKPAD_PAUSE_RATE = 0.20
 TRACKPAD_PAUSE_MS = (120.0, 400.0)
+
+# Salt for the trackpad identity stream (mulberry32(seed ^ salt), like the typing and hesitation
+# traits): a trackpad's report rate and its inertia curve are HARDWARE constants, one per identity --
+# drawn per scroll (as before verifier A's R2, SC 232) one "trackpad" reported at 61 and then 118 events/s
+# within a session. Distinct from the other eight salts (_motion / _keys / _attention).
+_TRACKPAD_SALT = 0xCC9E2D51
+
+
+@dataclass(frozen=True)
+class TrackpadTraits:
+    """Per-identity trackpad signature, stable per seed (trackpad_traits)."""
+
+    hz: float        # report rate during the finger phase, 60..120 events/s
+    decay_ms: float  # inertia time constant, 140..220 ms (each swipe x 0.9..1.1)
+
+
+def trackpad_traits(seed_int):
+    """The trackpad identity of persona seed ``seed_int`` (Persona.seed), from its salted side stream.
+    Draw order: hz, decay -- the same in scroll.ts trackpadTraits and Scroll.TrackpadTraitsOf."""
+    r = mulberry32((int(seed_int) ^ _TRACKPAD_SALT) & _MASK)
+    hz = _lerp(TRACKPAD_HZ[0], TRACKPAD_HZ[1], r())
+    decay = _lerp(TRACKPAD_DECAY_MS[0], TRACKPAD_DECAY_MS[1], r())
+    return TrackpadTraits(hz=hz, decay_ms=decay)
 
 
 def anchor_point(vw, vh, rng: Optional[Callable[[], float]] = None):
@@ -225,19 +251,20 @@ def _swipe(dist, dt, tau_r, decay_ms):
     return folded, tail
 
 
-def plan_trackpad_strokes(dx, dy, rng: Optional[Callable[[], float]] = None):
-    """The swipes of a trackpad scroll of (dx, dy): a list of {"finger": [(ex, ey, sleep_ms)],
-    "tail": [...], "gap_ms": float}. See :func:`plan_trackpad`. Draw order (shared with scroll.ts /
-    Scroll.cs): rate, pause?, pause length, pause swipe, pause position, then per swipe share, lift
-    point, decay, gap; then one timing jitter per event, finger before tail, swipe by swipe."""
+def plan_trackpad_strokes(dx, dy, traits, rng: Optional[Callable[[], float]] = None):
+    """The swipes of a trackpad scroll of (dx, dy) on the trackpad ``traits`` (:func:`trackpad_traits`): a
+    list of {"finger": [(ex, ey, sleep_ms)], "tail": [...], "gap_ms": float}. See :func:`plan_trackpad`.
+    Draw order (shared with scroll.ts / Scroll.cs): pause?, pause length, pause swipe, pause position,
+    then per swipe share, lift point, decay jitter, gap; then one timing jitter per event, finger before
+    tail, swipe by swipe. The report rate is the trait exactly (the per-event 0.92-1.08 jitter is its
+    timer); the decay is the trait x 0.9-1.1 per swipe (the lift velocity shapes it)."""
     if rng is None:
         rng = random.random
     d = math.hypot(dx, dy)
     if d < TRACKPAD_PX[0]:
         return [{"finger": [(dx, dy, 0.0)], "tail": [], "gap_ms": 0.0}] if (dx or dy) else []
     ux, uy = dx / d, dy / d
-    hz = _lerp(TRACKPAD_HZ[0], TRACKPAD_HZ[1], rng())
-    dt = 1000.0 / hz
+    dt = 1000.0 / traits.hz
     n = max(1, int(math.ceil(d / TRACKPAD_STROKE_PX)))
     pause = rng() < TRACKPAD_PAUSE_RATE
     pause_ms = _lerp(TRACKPAD_PAUSE_MS[0], TRACKPAD_PAUSE_MS[1], rng())
@@ -245,7 +272,7 @@ def plan_trackpad_strokes(dx, dy, rng: Optional[Callable[[], float]] = None):
     pause_at = _lerp(0.25, 0.75, rng())
     specs = []
     for _ in range(n):
-        specs.append((_lerp(0.9, 1.1, rng()), _lerp(0.55, 0.75, rng()), _lerp(140.0, 220.0, rng()),
+        specs.append((_lerp(0.9, 1.1, rng()), _lerp(0.55, 0.75, rng()), traits.decay_ms * _lerp(0.9, 1.1, rng()),
                       _lerp(TRACKPAD_GAP_MS[0], TRACKPAD_GAP_MS[1], rng())))
     total_share = sum(sp[0] for sp in specs)
     out = []
@@ -266,16 +293,17 @@ def plan_trackpad_strokes(dx, dy, rng: Optional[Callable[[], float]] = None):
     return out
 
 
-def plan_trackpad(dx, dy, rng: Optional[Callable[[], float]] = None):
-    """A two-finger trackpad scroll of (dx, dy) px as (ex, ey, sleep_ms) wheel events, in order.
+def plan_trackpad(dx, dy, traits, rng: Optional[Callable[[], float]] = None):
+    """A two-finger trackpad scroll of (dx, dy) px on the trackpad ``traits`` as (ex, ey, sleep_ms) wheel
+    events, in order.
 
-    Per swipe (one per <= 900 px): a finger phase of 2-40 px events at 60-120 events/s following a
-    min-jerk velocity bell, lifted while still moving; then an inertia tail decaying exponentially for
-    at least 300 ms, events until |delta| < 1 px. In 20 % of scrolls the finger stalls once mid-swipe
-    for 120-400 ms. Deltas sum to (dx, dy); ``sleep_ms`` is the wait AFTER each event (a swipe's last
-    event carries the gap before the next swipe)."""
+    Per swipe (one per <= 900 px): a finger phase of 2-40 px events at the persona's 60-120 events/s
+    following a min-jerk velocity bell, lifted while still moving; then an inertia tail decaying
+    exponentially (the persona's time constant) for at least 300 ms, events until |delta| < 1 px. In 20 %
+    of scrolls the finger stalls once mid-swipe for 120-400 ms. Deltas sum to (dx, dy); ``sleep_ms`` is
+    the wait AFTER each event (a swipe's last event carries the gap before the next swipe)."""
     out = []
-    for sw in plan_trackpad_strokes(dx, dy, rng):
+    for sw in plan_trackpad_strokes(dx, dy, traits, rng):
         evs = sw["finger"] + sw["tail"]
         if evs and sw["gap_ms"]:
             ex, ey, sl = evs[-1]
@@ -351,7 +379,7 @@ class ScrollIO:
 
     ``viewport()`` -> (vw, vh); ``pointer()`` -> (x, y); ``placed()`` / ``held()`` -> bool;
     ``glide(x, y, target_w)``; ``wheel(dx, dy)`` (one NATIVE wheel event); ``sleep(seconds)``;
-    ``notch_px()`` -> int; ``device()`` -> "mouse" | "trackpad";
+    ``notch_px()`` -> int; ``device()`` -> "mouse" | "trackpad"; ``trackpad()`` -> TrackpadTraits;
     ``scroller()`` -> None (the window scrolls) or {"rect": (x, y, w, h), "x": bool, "y": bool}, the
     nearest scrollable ancestor of the target; ``rng`` -> a () -> float."""
 
@@ -392,7 +420,7 @@ def _send_notches(io, n, axis, sign, rng):
 
 
 def _send_trackpad(io, dx, dy, rng):
-    paced_wheel(plan_trackpad(dx, dy, rng), io.wheel, io.sleep)
+    paced_wheel(plan_trackpad(dx, dy, io.trackpad(), rng), io.wheel, io.sleep)
 
 
 def _view_of(io, scroller):
@@ -552,7 +580,7 @@ async def _send_notches_async(io, n, axis, sign, rng):
 
 
 async def _send_trackpad_async(io, dx, dy, rng):
-    await paced_wheel_async(plan_trackpad(dx, dy, rng), io.wheel, io.sleep)
+    await paced_wheel_async(plan_trackpad(dx, dy, io.trackpad(), rng), io.wheel, io.sleep)
 
 
 async def _view_of_async(io, scroller):

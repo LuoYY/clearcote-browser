@@ -47,7 +47,7 @@ from ._motion import (
 )
 from ._scroll import (
     ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, SCROLL_RANGE as ISO_SCROLL_RANGE, anchor_needed, anchor_point, bring_into_view_async,
-    in_view as _box_in, input_device as _input_device, paced_wheel_async, plan_trackpad, wheel_drift,
+    in_view as _box_in, input_device as _input_device, paced_wheel_async, plan_trackpad, trackpad_traits, wheel_drift,
 )
 from ._attention import (
     IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
@@ -140,6 +140,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     _stock_kb = {n: getattr(page.keyboard, n, None) for n in _KB_METHODS}
     # The typing identity and the caller's held keys (see _humanize.attach_humanize).
     traits = typing_traits(persona.seed)
+    tp_traits = trackpad_traits(persona.seed)   # the trackpad identity (report rate, inertia decay), R2
     held_keys = {}
 
     def _kdwell():
@@ -865,6 +866,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             sleep = staticmethod(_tsleep)   # the preset scales the scroll-into-view pauses
             notch_px = staticmethod(_notch_px)
             device = staticmethod(_device)
+            trackpad = staticmethod(lambda: tp_traits)
 
             @staticmethod
             async def scroll_range():
@@ -878,7 +880,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # persona swipes the exact distance instead (_scroll.plan_trackpad).
         await _wheel_anchor()
         if await _device() == "trackpad":
-            await paced_wheel_async(plan_trackpad(delta_x, delta_y), send_wheel, asyncio.sleep)
+            await paced_wheel_async(plan_trackpad(delta_x, delta_y, tp_traits), send_wheel, asyncio.sleep)
             return
         notch = await _notch_px()
         plan = ([(0, notch if delta_y > 0 else -notch)] * wheel_notches(delta_y, notch)
@@ -1242,9 +1244,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
 
     async def _hold_key(k, delay=None, repeat=1):
         """One key: pressed with the persona's hold (or the caller's ``delay``); with ``repeat`` > 1 HELD
-        the way an OS auto-repeats it -- one keydown, the repeat delay (250-500 ms), then a keydown with
-        repeat=true every 25-40 ms (Playwright sends a key that is already down as an autoRepeat
-        keydown), ``repeat`` keydowns in all, then one keyup."""
+        the way an OS auto-repeats it -- one keydown, the machine's repeat delay (250-500 ms, a persona
+        trait), then a keydown with repeat=true at its repeat interval (25-40 ms, likewise; Playwright
+        sends a key that is already down as an autoRepeat keydown), ``repeat`` keydowns in all, then one
+        keyup."""
         repeat = max(1, int(repeat or 1))
         if repeat == 1 or native_kb_down is None or native_kb_up is None:
             for j in range(repeat):
@@ -1252,7 +1255,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 if j < repeat - 1:
                     await asyncio.sleep(_rand(60, 150) / 1000.0)
             return
-        rp = plan_repeat(random.random)
+        rp = plan_repeat(traits, random.random)
         try:
             await native_kb_down(k)   # inside the try: a keydown in flight when cancelled was still sent
             await asyncio.sleep(rp.first_ms / 1000.0)

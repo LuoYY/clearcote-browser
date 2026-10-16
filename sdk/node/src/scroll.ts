@@ -12,10 +12,11 @@
  * Devices. Playwright's `mouse.wheel` sends pixel deltas, so a page sees `deltaMode 0` whatever the
  * persona; what tells a mouse from a trackpad is the SHAPE of the stream: a mouse persona sends whole
  * multiples of the platform notch (100 px Windows, 120 Linux, 40 macOS) in finger-flick bursts, a
- * trackpad persona 2-40 px events at 60-120 events/s on a min-jerk bell, then an inertia tail that decays
- * exponentially for at least 300 ms.
+ * trackpad persona 2-40 px events at its report rate (60-120 events/s, a persona trait: trackpadTraits) on a
+ * min-jerk bell, then an inertia tail that decays exponentially (its time constant a trait too) for at least
+ * 300 ms.
  */
-import { gaussFrom, minJerk, wheelAnchorPoint, wheelNotches, type Rng } from "./motion.js";
+import { gaussFrom, minJerk, mulberry32, wheelAnchorPoint, wheelNotches, type Rng } from "./motion.js";
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -48,8 +49,9 @@ const READ_PAUSE_RATE = 0.07;
 const READ_PAUSE_MS: readonly [number, number] = [150, 450];
 
 // ------------------------------------------------------------------ trackpad
-export const TRACKPAD_HZ: readonly [number, number] = [60, 120];
+export const TRACKPAD_HZ: readonly [number, number] = [60, 120];       // a persona trait (trackpadTraits)
 export const TRACKPAD_PX: readonly [number, number] = [2, 40];
+export const TRACKPAD_DECAY_MS: readonly [number, number] = [140, 220]; // a persona trait; x 0.9-1.1 per swipe
 export const INERTIA_MIN_MS = 300;
 export const INERTIA_STOP_PX = 1;
 export const TRACKPAD_PAUSE_RATE = 0.2;
@@ -58,6 +60,25 @@ export const TRACKPAD_STROKE_PX = 900;
 export const TRACKPAD_PEAK_PX = 38;
 export const TRACKPAD_GAP_MS: readonly [number, number] = [80, 200];
 export const TRACKPAD_NUDGE_PX = 60;
+
+// Salt for the trackpad identity stream (Python _TRACKPAD_SALT, .NET TrackpadSalt): a trackpad's report rate
+// and its inertia curve are HARDWARE constants, one per identity (verifier A's R2, SC 232: drawn per scroll,
+// one "trackpad" reported at 61 and then 118 events/s within a session).
+const TRACKPAD_SALT = 0xcc9e2d51;
+
+/** Per-identity trackpad signature, stable per seed (trackpadTraits). */
+export interface TrackpadTraits {
+  hz: number;      // report rate during the finger phase, 60..120 events/s
+  decayMs: number; // inertia time constant, 140..220 ms (each swipe x 0.9..1.1)
+}
+
+/** The trackpad identity of persona seed `seedInt`; draw order hz, decay (_scroll.trackpad_traits). */
+export function trackpadTraits(seedInt: number): TrackpadTraits {
+  const r = mulberry32((seedInt ^ TRACKPAD_SALT) >>> 0);
+  const hz = lerp(TRACKPAD_HZ[0], TRACKPAD_HZ[1], r());
+  const decayMs = lerp(TRACKPAD_DECAY_MS[0], TRACKPAD_DECAY_MS[1], r());
+  return { hz, decayMs };
+}
 
 /** The wheel anchor for a vw x vh viewport (two gaussians from `rng`, x first). */
 export function anchorPoint(vw: number, vh: number, rng: Rng = Math.random): [number, number] {
@@ -172,13 +193,14 @@ function swipe(dist: number, dt: number, tauR: number, decayMs: number): [number
 export interface WheelEv { dx: number; dy: number; sleepMs: number; }
 export interface Swipe { finger: WheelEv[]; tail: WheelEv[]; gapMs: number; }
 
-/** The swipes of a trackpad scroll of (dx, dy); see planTrackpad. Draw order as Python's. */
-export function planTrackpadStrokes(dx: number, dy: number, rng: Rng = Math.random): Swipe[] {
+/** The swipes of a trackpad scroll of (dx, dy) on the trackpad `t` (trackpadTraits); see planTrackpad. Draw
+ * order as Python's: the report rate is the trait exactly (the per-event 0.92-1.08 jitter is its timer), the
+ * decay the trait x 0.9-1.1 per swipe. */
+export function planTrackpadStrokes(dx: number, dy: number, t: TrackpadTraits, rng: Rng = Math.random): Swipe[] {
   const d = Math.hypot(dx, dy);
   if (d < TRACKPAD_PX[0]) return dx || dy ? [{ finger: [{ dx, dy, sleepMs: 0 }], tail: [], gapMs: 0 }] : [];
   const ux = dx / d, uy = dy / d;
-  const hz = lerp(TRACKPAD_HZ[0], TRACKPAD_HZ[1], rng());
-  const dt = 1000 / hz;
+  const dt = 1000 / t.hz;
   const n = Math.max(1, Math.ceil(d / TRACKPAD_STROKE_PX));
   const pause = rng() < TRACKPAD_PAUSE_RATE;
   const pauseMs = lerp(TRACKPAD_PAUSE_MS[0], TRACKPAD_PAUSE_MS[1], rng());
@@ -186,7 +208,7 @@ export function planTrackpadStrokes(dx: number, dy: number, rng: Rng = Math.rand
   const pauseAt = lerp(0.25, 0.75, rng());
   const specs: [number, number, number, number][] = [];
   for (let i = 0; i < n; i++)
-    specs.push([lerp(0.9, 1.1, rng()), lerp(0.55, 0.75, rng()), lerp(140, 220, rng()), lerp(TRACKPAD_GAP_MS[0], TRACKPAD_GAP_MS[1], rng())]);
+    specs.push([lerp(0.9, 1.1, rng()), lerp(0.55, 0.75, rng()), t.decayMs * lerp(0.9, 1.1, rng()), lerp(TRACKPAD_GAP_MS[0], TRACKPAD_GAP_MS[1], rng())]);
   const totalShare = specs.reduce((a, s) => a + s[0], 0);
   const out: Swipe[] = [];
   let done = 0;
@@ -207,12 +229,13 @@ export function planTrackpadStrokes(dx: number, dy: number, rng: Rng = Math.rand
   return out;
 }
 
-/** A two-finger trackpad scroll of (dx, dy) px as wheel events in order (`sleepMs` = wait AFTER the
- * event). Per swipe (<= 900 px): 2-40 px events at 60-120/s on a min-jerk bell, lifted while moving,
- * then an inertia tail decaying for >= 300 ms until |delta| < 1; 20 % of scrolls stall once 120-400 ms. */
-export function planTrackpad(dx: number, dy: number, rng: Rng = Math.random): WheelEv[] {
+/** A two-finger trackpad scroll of (dx, dy) px on the trackpad `t` as wheel events in order (`sleepMs` = wait
+ * AFTER the event). Per swipe (<= 900 px): 2-40 px events at the persona's 60-120/s on a min-jerk bell, lifted
+ * while moving, then an inertia tail decaying (the persona's time constant) for >= 300 ms until |delta| < 1;
+ * 20 % of scrolls stall once 120-400 ms. */
+export function planTrackpad(dx: number, dy: number, t: TrackpadTraits, rng: Rng = Math.random): WheelEv[] {
   const out: WheelEv[] = [];
-  for (const sw of planTrackpadStrokes(dx, dy, rng)) {
+  for (const sw of planTrackpadStrokes(dx, dy, t, rng)) {
     const evs = sw.finger.concat(sw.tail);
     if (evs.length && sw.gapMs) evs[evs.length - 1] = { ...evs[evs.length - 1], sleepMs: evs[evs.length - 1].sleepMs + sw.gapMs };
     out.push(...evs);
@@ -268,6 +291,8 @@ export interface ScrollIO {
   sleep(ms: number): Promise<void>;
   notchPx(): Promise<number>;
   device(): Promise<"mouse" | "trackpad">;
+  /** The persona's trackpad (report rate, inertia decay). */
+  trackpad(): TrackpadTraits;
   /** The window's [scrollX, scrollY, maxX, maxY], when it can be read. */
   scrollRange?(): Promise<number[] | null>;
 }
@@ -314,7 +339,7 @@ export async function pacedWheel(events: WheelEv[], wheel: (dx: number, dy: numb
 }
 
 async function sendTrackpad(io: ScrollIO, dx: number, dy: number, rng: Rng): Promise<void> {
-  await pacedWheel(planTrackpad(dx, dy, rng), (a, b) => io.wheel(a, b), (ms) => io.sleep(ms));
+  await pacedWheel(planTrackpad(dx, dy, io.trackpad(), rng), (a, b) => io.wheel(a, b), (ms) => io.sleep(ms));
 }
 
 async function viewOf(io: ScrollIO, scroller: Scroller | null): Promise<View> {

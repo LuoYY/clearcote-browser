@@ -43,9 +43,16 @@ public class HumanizeDragScrollTests
     [Fact]
     public void Trackpad_stream_matches_the_vectors()
     {
+        foreach (var v in Vec.GetProperty("trackpad_traits").EnumerateArray())
+        {
+            var t = Scroll.TrackpadTraitsOf(Motion.MakePersona(v.GetProperty("persona").GetString()).Seed);
+            Close(v.GetProperty("hz").GetDouble(), t.Hz, 1e-9);
+            Close(v.GetProperty("decay_ms").GetDouble(), t.DecayMs, 1e-9);
+        }
         foreach (var v in Vec.GetProperty("trackpad").EnumerateArray())
         {
             var ev = Scroll.PlanTrackpad(v.GetProperty("dx").GetDouble(), v.GetProperty("dy").GetDouble(),
+                Scroll.TrackpadTraitsOf(Motion.MakePersona(v.GetProperty("persona").GetString()).Seed),
                 Motion.Mulberry32((uint)v.GetProperty("rng").GetInt32()));
             Assert.Equal(v.GetProperty("n").GetInt32(), ev.Count);
             foreach (var s in v.GetProperty("samples").EnumerateArray())
@@ -112,7 +119,7 @@ public class HumanizeDragScrollTests
     {
         for (int seed = 1; seed <= 200; seed++)
         {
-            var sw = Scroll.PlanTrackpadStrokes(0, 120 + seed * 13, Motion.Mulberry32((uint)seed));
+            var sw = Scroll.PlanTrackpadStrokes(0, 120 + seed * 13, Scroll.TrackpadTraitsOf((uint)seed), Motion.Mulberry32((uint)seed));
             foreach (var s in sw)
             {
                 Assert.All(s.Finger, e => Assert.InRange(Math.Abs(e.Dy), 2 - 1e-9, 40));
@@ -126,6 +133,26 @@ public class HumanizeDragScrollTests
     }
 
     [Fact]
+    public void R2_trackpad_rate_and_inertia_decay_are_persona_traits_with_fresh_swipes()
+    {
+        // A trackpad's report rate and inertia decay are HARDWARE constants, one per identity (verifier A, SC 232).
+        var a = Scroll.TrackpadTraitsOf(Motion.MakePersona("ident-1").Seed);
+        var b = Scroll.TrackpadTraitsOf(Motion.MakePersona("ident-1").Seed);
+        var c = Scroll.TrackpadTraitsOf(Motion.MakePersona("ident-2").Seed);
+        Assert.Equal(a, b);
+        Assert.NotEqual(a, c);
+        Assert.InRange(a.Hz, 60, 120);
+        Assert.InRange(a.DecayMs, 140, 220);
+        var e1 = Scroll.PlanTrackpad(0, 500, a); var e2 = Scroll.PlanTrackpad(0, 500, a);
+        Assert.NotEqual(e1.Select(e => e.Dy).ToArray(), e2.Select(e => e.Dy).ToArray());
+        double dt = 1000 / a.Hz;
+        foreach (var ev in new[] { e1, e2, Scroll.PlanTrackpad(0, 300, a), Scroll.PlanTrackpad(200, 0, a) })
+            foreach (var e in ev.Take(3)) Assert.InRange(e.SleepMs, 0.92 * dt - 1e-9, 1.08 * dt + 1e-9);
+        var hz = Enumerable.Range(0, 300).Select(i => Math.Round(Scroll.TrackpadTraitsOf(Motion.MakePersona($"seed-{i}").Seed).Hz, 3)).Distinct().Count();
+        Assert.True(hz > 290);
+    }
+
+    [Fact]
     public void Seed_fixes_traits_but_every_action_draws_fresh()
     {
         var a = Motion.MakePersona("ident-1");
@@ -133,7 +160,8 @@ public class HumanizeDragScrollTests
         var h1 = Motion.DragHesitation(new Point(100, 100), new Point(400, 120), a);
         var h2 = Motion.DragHesitation(new Point(100, 100), new Point(400, 120), b);
         Assert.NotEqual(h1.Select(s => s.X).ToArray(), h2.Select(s => s.X).ToArray());
-        Assert.NotEqual(Scroll.PlanTrackpad(0, 500).Select(e => e.Dy).ToArray(), Scroll.PlanTrackpad(0, 500).Select(e => e.Dy).ToArray());
+        var tp = Scroll.TrackpadTraitsOf(a.Seed);
+        Assert.NotEqual(Scroll.PlanTrackpad(0, 500, tp).Select(e => e.Dy).ToArray(), Scroll.PlanTrackpad(0, 500, tp).Select(e => e.Dy).ToArray());
         Assert.NotEqual(Scroll.AnchorPoint(1280, 800), Scroll.AnchorPoint(1280, 800));
     }
 }

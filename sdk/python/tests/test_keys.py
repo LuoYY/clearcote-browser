@@ -4,6 +4,7 @@ vectors cannot express. Lane D of SC 232; on 0.51.0 there was no planner (the mo
 import dataclasses
 import json
 import os
+import random
 import statistics
 
 import pytest
@@ -37,6 +38,7 @@ def test_typing_traits_are_in_their_bands_and_differ_across_seeds():
     ts = [_traits("seed-%d" % i) for i in range(400)]
     assert all(28 <= t.wpm <= 75 and 1.5 <= t.same_finger <= 1.9 and 1.1 <= t.same_hand <= 1.3
                and 0.85 <= t.alternate <= 1.0 and 0.60 <= t.tab_pref <= 0.85 and 0.005 <= t.typo_rate <= 0.04
+               and 252 <= t.repeat_first_ms <= 498 and 26 <= t.repeat_gap_ms <= 39
                for t in ts)
     assert len({round(t.wpm, 3) for t in ts}) > 390
     assert {t.select_style for t in ts} == {"triple", "keys"} and {t.blur_style for t in ts} == {"tab", "click"}
@@ -72,7 +74,7 @@ def test_split_chord_vectors(case):
 @pytest.mark.parametrize("case", VEC["timing"], ids=lambda c: c["persona"])
 def test_timing_vectors(case):
     tr, rng = _traits(case["persona"]), mulberry32(case["rng"])
-    rp = K.plan_repeat(rng)
+    rp = K.plan_repeat(tr, rng)
     assert [rp.first_ms, rp.gap_ms, rp.release_ms] == pytest.approx(case["repeat"], abs=1e-9)
     assert K.modifier_lead_ms(rng) == pytest.approx(case["lead"], abs=1e-9)
     assert K.modifier_lag_ms(rng) == pytest.approx(case["lag"], abs=1e-9)
@@ -92,9 +94,26 @@ def test_bands_of_the_pauses_and_repeat():
         tr = _traits(p)
         for _ in range(300):
             assert 250 <= K.submit_pause_ms(tr, rng) <= 900 and 120 <= K.tab_pause_ms(tr, rng) <= 400
-            rp = K.plan_repeat(rng)
+            rp = K.plan_repeat(tr, rng)
             assert 250 <= rp.first_ms <= 500 and 25 <= rp.gap_ms <= 40 and 20 <= rp.release_ms <= 60
             assert 40 <= K.modifier_lead_ms(rng) <= 110 and 20 <= K.modifier_lag_ms(rng) <= 80
+
+
+def test_key_repeat_delay_and_rate_are_persona_traits_with_fresh_per_run_jitter():
+    """R1 (verifier A, SC 232): the OS auto-repeat delay and interval are a MACHINE setting -- one per
+    identity, like device_hz -- not a per-run draw (two runs in one session repeated at 27 then 39 ms on
+    949f5b1). Same seed => the same two traits; every run adds only +-2 / +-1 ms of timer jitter and its
+    own release; a different seed has different traits."""
+    a, b, c = _traits("ident-1"), _traits("ident-1"), _traits("ident-2")
+    assert (a.repeat_first_ms, a.repeat_gap_ms) == (b.repeat_first_ms, b.repeat_gap_ms)
+    assert (a.repeat_first_ms, a.repeat_gap_ms) != (c.repeat_first_ms, c.repeat_gap_ms)
+    assert 252 <= a.repeat_first_ms <= 498 and 26 <= a.repeat_gap_ms <= 39
+    plans = [K.plan_repeat(a, random.random) for _ in range(60)]   # unseeded: a run's own draws
+    assert all(abs(p.first_ms - a.repeat_first_ms) <= 2.0 and abs(p.gap_ms - a.repeat_gap_ms) <= 1.0 for p in plans)
+    assert max(p.gap_ms for p in plans) - min(p.gap_ms for p in plans) <= 2.0
+    assert len({p.release_ms for p in plans}) > 50 and len({p.first_ms for p in plans}) > 50
+    # the traits sit at the end of the KEYS stream: every earlier trait is what 949f5b1 drew
+    assert dataclasses.asdict(a)["wpm"] == dataclasses.asdict(b)["wpm"]
 
 
 SAME_FINGER = ["ed", "de", "ju", "ki", "lo", "fr", "sw", "ol"]

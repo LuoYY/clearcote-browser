@@ -101,7 +101,7 @@ public class KeysTests
         {
             var t = TraitsOf(c.GetProperty("persona").GetString()!);
             var r = Motion.Mulberry32(c.GetProperty("rng").GetUInt32());
-            var rp = Keys.PlanRepeat(r);
+            var rp = Keys.PlanRepeat(t, r);
             Close(new[] { rp.FirstMs, rp.GapMs, rp.ReleaseMs }, Nums(c.GetProperty("repeat")));
             Close(new[] { Keys.ModifierLeadMs(r), Keys.ModifierLagMs(r) }, new[] { c.GetProperty("lead").GetDouble(), c.GetProperty("lag").GetDouble() });
             Close(Enumerable.Range(0, 4).Select(_ => Keys.SubmitPauseMs(t, r)).ToList(), Nums(c.GetProperty("submit")));
@@ -116,6 +116,21 @@ public class KeysTests
         var r = Motion.Mulberry32(Vec.GetProperty("ks_rng").GetUInt32());
         var s = Forms.Chars(Vec.GetProperty("ks_text").GetString()!);
         Close(Enumerable.Range(0, s.Length - 1).Select(i => Keys.PlanGap(t, s[i], s[i + 1], r)).ToList(), Nums(Vec.GetProperty("ks_reference")));
+    }
+
+    [Fact]
+    public void R1_key_repeat_delay_and_rate_are_persona_traits_with_fresh_per_run_jitter()
+    {
+        // The OS auto-repeat delay and interval are a MACHINE setting, one per identity (verifier A, SC 232).
+        var a = TraitsOf("ident-1"); var b = TraitsOf("ident-1"); var c = TraitsOf("ident-2");
+        Assert.Equal((a.RepeatFirstMs, a.RepeatGapMs), (b.RepeatFirstMs, b.RepeatGapMs));
+        Assert.NotEqual((a.RepeatFirstMs, a.RepeatGapMs), (c.RepeatFirstMs, c.RepeatGapMs));
+        Assert.InRange(a.RepeatFirstMs, 252, 498);
+        Assert.InRange(a.RepeatGapMs, 26, 39);
+        var plans = Enumerable.Range(0, 60).Select(_ => Keys.PlanRepeat(a, Random.Shared.NextDouble)).ToList();
+        Assert.All(plans, p => { Assert.True(Math.Abs(p.FirstMs - a.RepeatFirstMs) <= 2); Assert.True(Math.Abs(p.GapMs - a.RepeatGapMs) <= 1); });
+        Assert.True(plans.Select(p => p.ReleaseMs).Distinct().Count() > 50);
+        Assert.True(plans.Select(p => p.FirstMs).Distinct().Count() > 50);
     }
 
     // ------------------------------------------------------------------ the wrapper on a fake clock

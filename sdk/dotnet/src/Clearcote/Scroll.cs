@@ -11,6 +11,10 @@ public readonly record struct WheelEvent(double Dx, double Dy, double SleepMs);
 /// <summary>One trackpad swipe: the finger phase, the inertia tail and the gap before the next swipe.</summary>
 public sealed record TrackpadSwipe(List<WheelEvent> Finger, List<WheelEvent> Tail, double GapMs);
 
+/// <summary>Per-identity trackpad signature, stable per seed (<see cref="Scroll.TrackpadTraitsOf"/>): the report
+/// rate during the finger phase (60..120 events/s) and the inertia time constant (140..220 ms, x 0.9..1.1 per swipe).</summary>
+public sealed record TrackpadTraits(double Hz, double DecayMs);
+
 /// <summary>The nearest scrollable ancestor of a target: its visible client rect and the axes it scrolls.</summary>
 public sealed record Scroller(double X, double Y, double Width, double Height, bool AxisX, bool AxisY,
     double[]? Range = null);
@@ -29,6 +33,8 @@ internal interface IScrollIO
     Task SleepAsync(double ms);
     Task<int> NotchPxAsync();
     Task<string> DeviceAsync();
+    /// <summary>The persona's trackpad (report rate, inertia decay).</summary>
+    TrackpadTraits Trackpad { get; }
     /// <summary>The window's [scrollX, scrollY, maxX, maxY], or null when it cannot be read.</summary>
     Task<double[]?> ScrollRangeAsync();
 }
@@ -46,7 +52,8 @@ internal interface IScrollIO
 ///
 /// Playwright's <c>Mouse.WheelAsync</c> sends pixel deltas, so a page sees <c>deltaMode 0</c> whatever the
 /// persona; a notch persona's deltas are whole multiples of its notch (100 px Windows, 120 Linux, 40 macOS),
-/// a trackpad persona's are 2-40 px events at 60-120/s ending in an inertia tail.
+/// a trackpad persona's are 2-40 px events at its report rate (60-120/s, a persona trait: <see cref="TrackpadTraitsOf"/>)
+/// ending in an inertia tail whose time constant is a trait too.
 /// </summary>
 public static class Scroll
 {
@@ -74,10 +81,22 @@ public static class Scroll
     private const double ReadPauseRate = 0.07;
 
     // ---- trackpad
-    public static readonly (double Lo, double Hi) TrackpadHz = (60, 120), TrackpadPx = (2, 40);
+    public static readonly (double Lo, double Hi) TrackpadHz = (60, 120), TrackpadPx = (2, 40), TrackpadDecayMs = (140, 220);
     public const double InertiaMinMs = 300, InertiaStopPx = 1, TrackpadPauseRate = 0.2;
     public static readonly (double Lo, double Hi) TrackpadPauseMs = (120, 400), TrackpadGapMs = (80, 200);
     public const double TrackpadStrokePx = 900, TrackpadPeakPx = 38, TrackpadNudgePx = 60;
+    // Salt for the trackpad identity stream (Python _TRACKPAD_SALT, scroll.ts TRACKPAD_SALT): a trackpad's report rate
+    // and inertia curve are HARDWARE constants, one per identity (verifier A's R2, SC 232).
+    private const uint TrackpadSalt = 0xCC9E2D51;
+
+    /// <summary>The trackpad identity of persona seed <paramref name="seed"/>; draw order hz, decay (_scroll.trackpad_traits).</summary>
+    public static TrackpadTraits TrackpadTraitsOf(uint seed)
+    {
+        Rng r = Motion.Mulberry32(seed ^ TrackpadSalt);
+        double hz = Lerp(TrackpadHz.Lo, TrackpadHz.Hi, r());
+        double decay = Lerp(TrackpadDecayMs.Lo, TrackpadDecayMs.Hi, r());
+        return new TrackpadTraits(hz, decay);
+    }
 
     /// <summary>The wheel anchor for a vw x vh viewport (two gaussians from <paramref name="rng"/>, x first).</summary>
     public static (double X, double Y) AnchorPoint(double vw, double vh, Rng? rng = null) => Motion.WheelAnchorPoint(vw, vh, rng);
@@ -202,8 +221,10 @@ public static class Scroll
         return (folded, tl);
     }
 
-    /// <summary>The swipes of a trackpad scroll of (dx, dy); see <see cref="PlanTrackpad"/>. Draw order as Python's.</summary>
-    public static List<TrackpadSwipe> PlanTrackpadStrokes(double dx, double dy, Rng? rng = null)
+    /// <summary>The swipes of a trackpad scroll of (dx, dy) on the trackpad <paramref name="t"/>; see <see cref="PlanTrackpad"/>.
+    /// Draw order as Python's: the report rate is the trait exactly (the per-event 0.92-1.08 jitter is its timer), the
+    /// decay the trait x 0.9-1.1 per swipe.</summary>
+    public static List<TrackpadSwipe> PlanTrackpadStrokes(double dx, double dy, TrackpadTraits t, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
         double d = Hypot(dx, dy);
@@ -212,8 +233,7 @@ public static class Scroll
                 ? new List<TrackpadSwipe> { new(new List<WheelEvent> { new(dx, dy, 0) }, new List<WheelEvent>(), 0) }
                 : new List<TrackpadSwipe>();
         double ux = dx / d, uy = dy / d;
-        double hz = Lerp(TrackpadHz.Lo, TrackpadHz.Hi, rng());
-        double dt = 1000 / hz;
+        double dt = 1000 / t.Hz;
         int n = Math.Max(1, (int)Math.Ceiling(d / TrackpadStrokePx));
         bool pause = rng() < TrackpadPauseRate;
         double pauseMs = Lerp(TrackpadPauseMs.Lo, TrackpadPauseMs.Hi, rng());
@@ -221,7 +241,7 @@ public static class Scroll
         double pauseAt = Lerp(0.25, 0.75, rng());
         var specs = new List<(double Share, double TauR, double Decay, double Gap)>();
         for (int i = 0; i < n; i++)
-            specs.Add((Lerp(0.9, 1.1, rng()), Lerp(0.55, 0.75, rng()), Lerp(140, 220, rng()), Lerp(TrackpadGapMs.Lo, TrackpadGapMs.Hi, rng())));
+            specs.Add((Lerp(0.9, 1.1, rng()), Lerp(0.55, 0.75, rng()), t.DecayMs * Lerp(0.9, 1.1, rng()), Lerp(TrackpadGapMs.Lo, TrackpadGapMs.Hi, rng())));
         double totalShare = 0;
         foreach (var sp in specs) totalShare += sp.Share;
         var outSwipes = new List<TrackpadSwipe>();
@@ -248,14 +268,15 @@ public static class Scroll
     }
 
     /// <summary>
-    /// A two-finger trackpad scroll of (dx, dy) px as wheel events in order (<c>SleepMs</c> = wait AFTER the
-    /// event). Per swipe (&lt;= 900 px): 2-40 px events at 60-120/s on a min-jerk bell, lifted while moving, then
-    /// an inertia tail decaying for &gt;= 300 ms until |delta| &lt; 1; 20 % of scrolls stall once 120-400 ms.
+    /// A two-finger trackpad scroll of (dx, dy) px on the trackpad <paramref name="t"/> as wheel events in order
+    /// (<c>SleepMs</c> = wait AFTER the event). Per swipe (&lt;= 900 px): 2-40 px events at the persona's 60-120/s on a
+    /// min-jerk bell, lifted while moving, then an inertia tail decaying (the persona's time constant) for &gt;= 300 ms
+    /// until |delta| &lt; 1; 20 % of scrolls stall once 120-400 ms.
     /// </summary>
-    public static List<WheelEvent> PlanTrackpad(double dx, double dy, Rng? rng = null)
+    public static List<WheelEvent> PlanTrackpad(double dx, double dy, TrackpadTraits t, Rng? rng = null)
     {
         var outEv = new List<WheelEvent>();
-        foreach (var sw in PlanTrackpadStrokes(dx, dy, rng))
+        foreach (var sw in PlanTrackpadStrokes(dx, dy, t, rng))
         {
             var evs = new List<WheelEvent>(sw.Finger);
             evs.AddRange(sw.Tail);
@@ -343,7 +364,7 @@ public static class Scroll
     }
 
     private static Task SendTrackpadAsync(IScrollIO io, double dx, double dy, Rng rng)
-        => PacedWheelAsync(PlanTrackpad(dx, dy, rng), io.WheelAsync, io.SleepAsync);
+        => PacedWheelAsync(PlanTrackpad(dx, dy, io.Trackpad, rng), io.WheelAsync, io.SleepAsync);
 
     private static async Task<Box> ViewOfAsync(IScrollIO io, Scroller? sc)
     {

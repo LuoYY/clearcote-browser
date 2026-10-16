@@ -47,12 +47,16 @@ class TypingTraits:
     tab_center_ms: float    # centre of the pause before Tab after typing, 190..330 (draws 120..400)
     select_style: str       # "triple" (triple click) or "keys" (Home, Shift+End) for select_text
     blur_style: str         # "tab" (Tab away) or "click" (a blank point) for blur
+    repeat_first_ms: float  # the OS key auto-repeat DELAY, 252..498 (a machine setting: one per identity)
+    repeat_gap_ms: float    # the OS key auto-repeat INTERVAL, 26..39 (likewise; plan_repeat adds +-2 / +-1 ms)
 
 
 def typing_traits(seed_int):
     """The typing identity of persona seed ``seed_int`` (Persona.seed), from its salted side stream.
     Draw order: wpm, same_finger, same_hand, alternate, tab_pref, typo_rate, submit_center, tab_center,
-    select_style, blur_style -- the same in keys.ts typingTraits and Keys.TypingTraitsOf."""
+    select_style, blur_style, repeat_first, repeat_gap -- the same in keys.ts typingTraits and
+    Keys.TypingTraitsOf. The two repeat draws came last (verifier A's R1, SC 232) so every earlier trait of
+    every seed is unchanged."""
     r = mulberry32((int(seed_int) ^ _KEYS_SALT) & _MASK)
     wpm = _lerp(28.0, 75.0, r())
     same_finger = _lerp(1.5, 1.9, r())
@@ -64,9 +68,12 @@ def typing_traits(seed_int):
     tab_center = _lerp(190.0, 330.0, r())
     select_style = "triple" if r() < 0.55 else "keys"
     blur_style = "tab" if r() < 0.5 else "click"
+    repeat_first = _lerp(252.0, 498.0, r())
+    repeat_gap = _lerp(26.0, 39.0, r())
     return TypingTraits(wpm=wpm, same_finger=same_finger, same_hand=same_hand, alternate=alternate,
                         tab_pref=tab_pref, typo_rate=typo_rate, submit_center_ms=submit_center,
-                        tab_center_ms=tab_center, select_style=select_style, blur_style=blur_style)
+                        tab_center_ms=tab_center, select_style=select_style, blur_style=blur_style,
+                        repeat_first_ms=repeat_first, repeat_gap_ms=repeat_gap)
 
 
 # ------------------------------------------------------------------------------ the finger map
@@ -199,9 +206,15 @@ class RepeatPlan:
     release_ms: float   # the last repeat -> keyup: 20-60 ms
 
 
-def plan_repeat(rng):
-    """OS auto-repeat timing for one held key. Draw order: first, gap, release."""
-    return RepeatPlan(first_ms=_lerp(250.0, 500.0, rng()), gap_ms=_lerp(25.0, 40.0, rng()),
+def plan_repeat(traits, rng):
+    """OS auto-repeat timing for one held key. The repeat DELAY and INTERVAL are the machine's settings
+    (``traits.repeat_first_ms`` / ``repeat_gap_ms``: a control-panel constant, so one per identity), seen
+    through +-2 / +-1 ms of timer jitter per run; the release is the hand's. Draw order: first jitter, gap
+    jitter, release. Before verifier A's R1 (SC 232) both were drawn per run (250-500 / 25-40 ms): one
+    machine repeating at 27 ms and then 39 ms within a session, a device-constant contradiction any keydown
+    log shows."""
+    return RepeatPlan(first_ms=traits.repeat_first_ms + _lerp(-2.0, 2.0, rng()),
+                      gap_ms=traits.repeat_gap_ms + _lerp(-1.0, 1.0, rng()),
                       release_ms=_lerp(20.0, 60.0, rng()))
 
 

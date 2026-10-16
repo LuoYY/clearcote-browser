@@ -69,7 +69,7 @@ describe("keys.ts against the shared vectors", () => {
     for (const c of VEC.split_chord) expect(K.splitChord(c.key), c.key).toEqual([c.mods, c.key_out]);
     for (const c of VEC.timing) {
       const t = traitsOf(c.persona), r = mulberry32(c.rng);
-      const rp = K.planRepeat(r);
+      const rp = K.planRepeat(t, r);
       close([rp.firstMs, rp.gapMs, rp.releaseMs], c.repeat);
       close([K.modifierLeadMs(r), K.modifierLagMs(r)], [c.lead, c.lag]);
       close([0, 1, 2, 3].map(() => K.submitPauseMs(t, r)), c.submit);
@@ -80,6 +80,21 @@ describe("keys.ts against the shared vectors", () => {
   it("the KS reference is this planner", () => {
     const t = traitsOf(VEC.ks_persona), r = mulberry32(VEC.ks_rng), s = Array.from(VEC.ks_text as string);
     close(s.slice(0, -1).map((ch, i) => K.planGap(t, ch, s[i + 1], r)), VEC.ks_reference);
+  });
+
+  it("R1: the key repeat delay and rate are persona traits; a run adds only +-2 / +-1 ms and its own release", () => {
+    const a = traitsOf("ident-1"), b = traitsOf("ident-1"), c = traitsOf("ident-2");
+    expect([a.repeatFirstMs, a.repeatGapMs]).toEqual([b.repeatFirstMs, b.repeatGapMs]);
+    expect([a.repeatFirstMs, a.repeatGapMs]).not.toEqual([c.repeatFirstMs, c.repeatGapMs]);
+    expect(a.repeatFirstMs).toBeGreaterThanOrEqual(252); expect(a.repeatFirstMs).toBeLessThanOrEqual(498);
+    expect(a.repeatGapMs).toBeGreaterThanOrEqual(26); expect(a.repeatGapMs).toBeLessThanOrEqual(39);
+    const plans = Array.from({ length: 60 }, () => K.planRepeat(a, Math.random));   // unseeded per run
+    for (const p of plans) {
+      expect(Math.abs(p.firstMs - a.repeatFirstMs)).toBeLessThanOrEqual(2);
+      expect(Math.abs(p.gapMs - a.repeatGapMs)).toBeLessThanOrEqual(1);
+    }
+    expect(new Set(plans.map((p) => p.releaseMs)).size).toBeGreaterThan(50);
+    expect(new Set(plans.map((p) => p.firstMs)).size).toBeGreaterThan(50);
   });
 
   it("the JS reads are the Python module's (same Tab order, blank point and selection logic)", () => {

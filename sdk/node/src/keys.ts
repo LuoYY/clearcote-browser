@@ -33,6 +33,8 @@ export interface TypingTraits {
   tabCenterMs: number;    // 190..330
   selectStyle: "triple" | "keys";
   blurStyle: "tab" | "click";
+  repeatFirstMs: number;  // the OS key auto-repeat DELAY, 252..498 (a machine setting: one per identity)
+  repeatGapMs: number;    // the OS key auto-repeat INTERVAL, 26..39 (likewise; planRepeat adds +-2 / +-1 ms)
 }
 
 /** The typing identity of persona seed `seedInt` (Persona.seed). Draw order as _keys.typing_traits. */
@@ -48,7 +50,10 @@ export function typingTraits(seedInt: number): TypingTraits {
   const tabCenterMs = lerp(190, 330, r());
   const selectStyle = r() < 0.55 ? "triple" : "keys";
   const blurStyle = r() < 0.5 ? "tab" : "click";
-  return { wpm, sameFinger, sameHand, alternate, tabPref, typoRate, submitCenterMs, tabCenterMs, selectStyle, blurStyle };
+  const repeatFirstMs = lerp(252, 498, r()); // the two repeat draws came last (R1): every earlier trait is unchanged
+  const repeatGapMs = lerp(26, 39, r());
+  return { wpm, sameFinger, sameHand, alternate, tabPref, typoRate, submitCenterMs, tabCenterMs, selectStyle, blurStyle,
+    repeatFirstMs, repeatGapMs };
 }
 
 // US QWERTY touch-typing fingers: 0-3 left pinky..index, 4-7 right index..pinky; rows 0 (digits)..3.
@@ -127,10 +132,12 @@ export const modifierLagMs = (rng: Rng): number => lerp(20, 80, rng());
 
 export interface RepeatPlan { firstMs: number; gapMs: number; releaseMs: number }
 
-/** OS auto-repeat timing for one held key. Draw order: first, gap, release. */
-export function planRepeat(rng: Rng): RepeatPlan {
-  const firstMs = lerp(250, 500, rng());
-  const gapMs = lerp(25, 40, rng());
+/** OS auto-repeat timing for one held key: the persona's repeat delay and interval (a machine setting,
+ * typingTraits) seen through +-2 / +-1 ms of timer jitter per run, and the hand's release. Draw order: first
+ * jitter, gap jitter, release (_keys.plan_repeat). */
+export function planRepeat(t: TypingTraits, rng: Rng): RepeatPlan {
+  const firstMs = t.repeatFirstMs + lerp(-2, 2, rng());
+  const gapMs = t.repeatGapMs + lerp(-1, 1, rng());
   const releaseMs = lerp(20, 60, rng());
   return { firstMs, gapMs, releaseMs };
 }

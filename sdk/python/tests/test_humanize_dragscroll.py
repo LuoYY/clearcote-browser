@@ -224,8 +224,11 @@ def test_scroll_vectors_match_the_python_planner():
     for v in doc["drift"]:
         dx, dy = S.wheel_drift(mulberry32(v["rng"]))
         assert abs(dx - v["dx"]) < 1e-9 and abs(dy - v["dy"]) < 1e-9
+    for v in doc["trackpad_traits"]:
+        t = S.trackpad_traits(make_persona(v["persona"]).seed)
+        assert abs(t.hz - v["hz"]) < 1e-9 and abs(t.decay_ms - v["decay_ms"]) < 1e-9
     for v in doc["trackpad"]:
-        ev = S.plan_trackpad(v["dx"], v["dy"], mulberry32(v["rng"]))
+        ev = S.plan_trackpad(v["dx"], v["dy"], S.trackpad_traits(make_persona(v["persona"]).seed), mulberry32(v["rng"]))
         assert len(ev) == v["n"]
         for i, ex, ey, sl in v["samples"]:
             assert abs(ev[i][0] - ex) < 1e-6 and abs(ev[i][1] - ey) < 1e-6 and abs(ev[i][2] - sl) < 1e-6
@@ -261,6 +264,28 @@ def test_same_seed_same_traits_but_fresh_per_action_draws():
     h1 = drag_hesitation((100, 100), (400, 120), a)
     h2 = drag_hesitation((100, 100), (400, 120), b)
     assert h1 != h2
-    assert S.plan_trackpad(0, 500) != S.plan_trackpad(0, 500)
+    tp = S.trackpad_traits(a.seed)
+    assert S.plan_trackpad(0, 500, tp) != S.plan_trackpad(0, 500, tp)
     assert S.anchor_point(1280, 800) != S.anchor_point(1280, 800)
     assert S.target_frac() != S.target_frac()
+
+
+def test_trackpad_rate_and_inertia_decay_are_persona_traits_with_fresh_swipes():
+    """R2 (verifier A, SC 232): a trackpad's report rate (60-120/s) and inertia decay (140-220 ms) are
+    HARDWARE constants -- one per identity -- not per-scroll draws (one "trackpad" reported at 61 then
+    118 events/s within a session on 949f5b1). Same seed => equal traits; every swipe still draws its
+    own shares, lift points, pauses and timing jitter."""
+    from clearcote import _scroll as S
+    a, b, c = (S.trackpad_traits(make_persona(s).seed) for s in ("ident-1", "ident-1", "ident-2"))
+    assert a == b and a != c
+    assert 60 <= a.hz <= 120 and 140 <= a.decay_ms <= 220
+    e1, e2 = S.plan_trackpad(0, 500, a), S.plan_trackpad(0, 500, a)
+    assert e1 != e2, "the swipe itself is unseeded"
+    # the finger phase runs at the persona's rate (per-event jitter 0.92-1.08 around 1000/hz) in every scroll
+    dt = 1000.0 / a.hz
+    for ev in (e1, e2, S.plan_trackpad(0, 300, a), S.plan_trackpad(200, 0, a)):
+        finger = [sl for _, _, sl in ev[:3]]
+        assert all(0.92 * dt - 1e-9 <= sl <= 1.08 * dt + 1e-9 for sl in finger), (finger, dt)
+    ts = [S.trackpad_traits(make_persona("seed-%d" % i).seed) for i in range(300)]
+    assert len({round(t.hz, 3) for t in ts}) > 290
+

@@ -76,7 +76,7 @@ def main():
     for p, rs in (("ha-1", 21), ("ha-4", 22), ("user-7423", 23)):
         tr = typing_traits(make_persona(p).seed)
         rng = mulberry32(rs)
-        rp = plan_repeat(rng)
+        rp = plan_repeat(tr, rng)
         timing.append({"persona": p, "rng": rs,
                        "repeat": [rp.first_ms, rp.gap_ms, rp.release_ms],
                        "lead": modifier_lead_ms(rng), "lag": modifier_lag_ms(rng),

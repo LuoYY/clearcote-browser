@@ -176,8 +176,12 @@ describe("shared vectors (humanize_scroll_vectors.json)", () => {
       const [dx, dy] = S.wheelDrift(M.mulberry32(v.rng));
       close(dx, v.dx, 1e-9); close(dy, v.dy, 1e-9);
     }
+    for (const v of VEC.trackpad_traits) {
+      const t = S.trackpadTraits(M.makePersona(v.persona).seed);
+      close(t.hz, v.hz, 1e-9); close(t.decayMs, v.decay_ms, 1e-9);
+    }
     for (const v of VEC.trackpad) {
-      const evs = S.planTrackpad(v.dx, v.dy, M.mulberry32(v.rng));
+      const evs = S.planTrackpad(v.dx, v.dy, S.trackpadTraits(M.makePersona(v.persona).seed), M.mulberry32(v.rng));
       expect(evs.length).toBe(v.n);
       for (const [i, ex, ey, sl] of v.samples) { close(evs[i].dx, ex); close(evs[i].dy, ey); close(evs[i].sleepMs, sl); }
     }
@@ -202,6 +206,25 @@ describe("shared vectors (humanize_scroll_vectors.json)", () => {
   });
 });
 
+describe("R2: the trackpad rate and inertia decay are persona traits", () => {
+  it("same seed => equal traits; every swipe draws fresh at the persona's rate", async () => {
+    const S: any = await import("../src/scroll.js");
+    const [a, b, c] = ["ident-1", "ident-1", "ident-2"].map((s) => S.trackpadTraits(M.makePersona(s).seed));
+    expect(a).toEqual(b);
+    expect(a).not.toEqual(c);
+    expect(a.hz).toBeGreaterThanOrEqual(60); expect(a.hz).toBeLessThanOrEqual(120);
+    expect(a.decayMs).toBeGreaterThanOrEqual(140); expect(a.decayMs).toBeLessThanOrEqual(220);
+    const e1 = S.planTrackpad(0, 500, a), e2 = S.planTrackpad(0, 500, a);
+    expect(e1).not.toEqual(e2);
+    const dt = 1000 / a.hz;
+    for (const ev of [e1, e2, S.planTrackpad(0, 300, a), S.planTrackpad(200, 0, a)]) {
+      for (const e of ev.slice(0, 3)) { expect(e.sleepMs).toBeGreaterThanOrEqual(0.92 * dt - 1e-9); expect(e.sleepMs).toBeLessThanOrEqual(1.08 * dt + 1e-9); }
+    }
+    const hz = new Set(Array.from({ length: 300 }, (_, i) => Math.round(S.trackpadTraits(M.makePersona(`seed-${i}`).seed).hz * 1000)));
+    expect(hz.size).toBeGreaterThan(290);
+  });
+});
+
 describe("seed = persona traits only", () => {
   it("same seed: the same persona; every drag, scroll and swipe draws fresh", async () => {
     const S: any = await import("../src/scroll.js");
@@ -210,7 +233,8 @@ describe("seed = persona traits only", () => {
     const h1 = (M as any).dragHesitation({ x: 100, y: 100 }, { x: 400, y: 120 }, a);
     const h2 = (M as any).dragHesitation({ x: 100, y: 100 }, { x: 400, y: 120 }, b);
     expect(h1).not.toEqual(h2);
-    expect(S.planTrackpad(0, 500)).not.toEqual(S.planTrackpad(0, 500));
+    const tp = S.trackpadTraits(a.seed);
+    expect(S.planTrackpad(0, 500, tp)).not.toEqual(S.planTrackpad(0, 500, tp));
     expect(S.anchorPoint(1280, 800)).not.toEqual(S.anchorPoint(1280, 800));
     expect(S.targetFrac()).not.toBe(S.targetFrac());
   });

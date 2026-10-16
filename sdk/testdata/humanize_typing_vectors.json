@@ -274,7 +274,9 @@
    "submit_center_ms": 652.4552414892241,
    "tab_center_ms": 273.8917835569009,
    "select_style": "triple",
-   "blur_style": "click"
+   "blur_style": "click",
+   "repeat_first_ms": 279.7040905491449,
+   "repeat_gap_ms": 38.33306663646363
   },
   {
    "persona": "ha-2",
@@ -287,7 +289,9 @@
    "submit_center_ms": 693.8812866224907,
    "tab_center_ms": 312.4717993522063,
    "select_style": "keys",
-   "blur_style": "tab"
+   "blur_style": "tab",
+   "repeat_first_ms": 383.1765248612501,
+   "repeat_gap_ms": 34.54203602625057
   },
   {
    "persona": "ha-3",
@@ -300,7 +304,9 @@
    "submit_center_ms": 744.7843200177886,
    "tab_center_ms": 237.4157104641199,
    "select_style": "keys",
-   "blur_style": "click"
+   "blur_style": "click",
+   "repeat_first_ms": 262.143303708639,
+   "repeat_gap_ms": 31.138388918712735
   },
   {
    "persona": "ha-4",
@@ -313,7 +319,9 @@
    "submit_center_ms": 677.2614636924118,
    "tab_center_ms": 306.7637119721621,
    "select_style": "triple",
-   "blur_style": "click"
+   "blur_style": "click",
+   "repeat_first_ms": 429.9840737544,
+   "repeat_gap_ms": 30.29906716896221
   },
   {
    "persona": "ha-5",
@@ -326,7 +334,9 @@
    "submit_center_ms": 640.0980715989135,
    "tab_center_ms": 286.88235440291464,
    "select_style": "keys",
-   "blur_style": "click"
+   "blur_style": "click",
+   "repeat_first_ms": 379.97531222272664,
+   "repeat_gap_ms": 35.03830367559567
   },
   {
    "persona": "ha-6",
@@ -339,7 +349,9 @@
    "submit_center_ms": 540.8449072157964,
    "tab_center_ms": 212.52834188286215,
    "select_style": "keys",
-   "blur_style": "tab"
+   "blur_style": "tab",
+   "repeat_first_ms": 266.6609712294303,
+   "repeat_gap_ms": 36.94998130761087
   },
   {
    "persona": "user-7423",
@@ -352,7 +364,9 @@
    "submit_center_ms": 605.655531771481,
    "tab_center_ms": 213.07256530504674,
    "select_style": "triple",
-   "blur_style": "tab"
+   "blur_style": "tab",
+   "repeat_first_ms": 297.56051081372425,
+   "repeat_gap_ms": 32.43428032263182
   },
   {
    "persona": "forms-unit",
@@ -365,7 +379,9 @@
    "submit_center_ms": 733.8486565742642,
    "tab_center_ms": 302.52174232155085,
    "select_style": "triple",
-   "blur_style": "tab"
+   "blur_style": "tab",
+   "repeat_first_ms": 460.7392794289626,
+   "repeat_gap_ms": 31.1859676647
   },
   {
    "persona": "t",
@@ -378,7 +394,9 @@
    "submit_center_ms": 718.2201102143154,
    "tab_center_ms": 232.21882848534733,
    "select_style": "triple",
-   "blur_style": "tab"
+   "blur_style": "tab",
+   "repeat_first_ms": 318.38087070034817,
+   "repeat_gap_ms": 27.750010565156117
   }
  ],
  "finger_of": [
@@ -1104,8 +1122,8 @@
    "persona": "ha-1",
    "rng": 21,
    "repeat": [
-    358.07280539302155,
-    31.70543589279987,
+    279.43325543543324,
+    38.22712475550361,
     31.33136125281453
    ],
    "lead": 66.76703061908484,
@@ -1127,8 +1145,8 @@
    "persona": "ha-4",
    "rng": 22,
    "repeat": [
-    405.4670830955729,
-    28.550983464810997,
+    430.4715470839292,
+    29.77253163093701,
     29.007197245955467
    ],
    "lead": 54.37223145738244,
@@ -1150,8 +1168,8 @@
    "persona": "user-7423",
    "rng": 23,
    "repeat": [
-    273.18066626321524,
-    26.02467836928554,
+    295.9314014739357,
+    31.570904105203226,
     45.28448162600398
    ],
    "lead": 61.38287793379277,

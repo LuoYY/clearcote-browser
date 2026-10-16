@@ -60,7 +60,7 @@ from ._motion import (
 )
 from ._scroll import (
     ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, SCROLL_RANGE as ISO_SCROLL_RANGE, anchor_needed, anchor_point, bring_into_view, in_view as _box_in,
-    input_device as _input_device, paced_wheel, plan_trackpad, wheel_drift,
+    input_device as _input_device, paced_wheel, plan_trackpad, trackpad_traits, wheel_drift,
 )
 from ._attention import (
     IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
@@ -491,6 +491,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # The typing identity (WPM, bigram factors, Tab preference, typo rate, pauses), from a salted side
     # stream of the persona seed (_keys.typing_traits): the persona's own draws are unchanged.
     traits = typing_traits(persona.seed)
+    # The trackpad identity (report rate, inertia decay): another salted side stream of the seed (R2).
+    tp_traits = trackpad_traits(persona.seed)
     # Keys the CALLER holds through keyboard.down (key -> when it went down): a chord does not press a
     # modifier that is already down, typing does not press Shift under a caller's Shift, and the key's
     # keyup waits out a human hold (hkb_down / hkb_up).
@@ -1225,6 +1227,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             sleep = staticmethod(_tsleep)   # the preset scales the scroll-into-view pauses
             notch_px = staticmethod(_notch_px)
             device = staticmethod(_device)
+            trackpad = staticmethod(lambda: tp_traits)
 
             @staticmethod
             def scroll_range():
@@ -1242,12 +1245,13 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         one), and the notches come in finger-flick bursts.
 
         A TRACKPAD persona (_device(): the caller's ``input_device``, else macOS) scrolls the exact
-        distance as a two-finger swipe instead: 2-40 px events at 60-120/s on a min-jerk bell, then an
-        inertia tail (_scroll.plan_trackpad). Playwright sends every wheel as pixel deltas, so a page
-        sees deltaMode 0 either way; a notch persona's deltas are whole multiples of its notch."""
+        distance as a two-finger swipe instead: 2-40 px events at the persona's 60-120/s on a min-jerk
+        bell, then an inertia tail (_scroll.plan_trackpad, _scroll.trackpad_traits). Playwright sends
+        every wheel as pixel deltas, so a page sees deltaMode 0 either way; a notch persona's deltas are
+        whole multiples of its notch."""
         _wheel_anchor()
         if _device() == "trackpad":
-            paced_wheel(plan_trackpad(delta_x, delta_y), send_wheel, time.sleep)
+            paced_wheel(plan_trackpad(delta_x, delta_y, tp_traits), send_wheel, time.sleep)
             return
         notch = _notch_px()
         plan = ([(0, notch if delta_y > 0 else -notch)] * wheel_notches(delta_y, notch)
@@ -1654,9 +1658,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
 
     def _hold_key(k, delay=None, repeat=1):
         """One key: pressed with the persona's hold (or the caller's ``delay``); with ``repeat`` > 1 HELD
-        the way an OS auto-repeats it -- one keydown, the repeat delay (250-500 ms), then a keydown with
-        repeat=true every 25-40 ms (Playwright sends a key that is already down as an autoRepeat
-        keydown), ``repeat`` keydowns in all, then one keyup."""
+        the way an OS auto-repeats it -- one keydown, the machine's repeat delay (250-500 ms, a persona
+        trait), then a keydown with repeat=true at its repeat interval (25-40 ms, likewise; Playwright
+        sends a key that is already down as an autoRepeat keydown), ``repeat`` keydowns in all, then one
+        keyup."""
         repeat = max(1, int(repeat or 1))
         if repeat == 1 or native_kb_down is None or native_kb_up is None:
             for j in range(repeat):
@@ -1664,7 +1669,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 if j < repeat - 1:
                     time.sleep(_rand(60, 150) / 1000.0)
             return
-        rp = plan_repeat(random.random)
+        rp = plan_repeat(traits, random.random)
         native_kb_down(k)
         try:
             time.sleep(rp.first_ms / 1000.0)
