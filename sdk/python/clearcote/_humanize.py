@@ -52,6 +52,7 @@ from ._motion import (
     platform_from_navigator, rollover_rate, wheel_notches,
 )
 from ._hold import press_and_hold
+from . import _motion as _motion_mod
 from ._keys import (
     BLANK_POINT, FOCUSABLE, SEARCH_SLIP_RATE, SELECTION_STATE, TAB_DISTANCE, WORD_FIX_RATE, flight_ms,
     modifier_lag_ms, modifier_lead_ms, plan_gap, plan_repeat, split_chord, submit_pause_ms, tab_pause_ms,
@@ -310,6 +311,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         typo_rate field when present, else the typing identity's 0.5-4 %)."""
         if os.environ.get("CLEARCOTE_HUMANIZE_TYPO_RATE") not in (None, ""):
             return typo_rate()
+        lane_b = getattr(_motion_mod, "typo_rate", None)   # lane B's typo_rate(persona) on hz2/timing
+        if callable(lane_b):
+            try:
+                return float(lane_b(persona))
+            except Exception:  # noqa: BLE001
+                pass
         v = getattr(persona, "typo_rate", None)
         return float(v) if isinstance(v, (int, float)) else traits.typo_rate
 

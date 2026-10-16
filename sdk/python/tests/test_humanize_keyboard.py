@@ -355,6 +355,16 @@ def test_a_search_field_sometimes_keeps_a_slip_and_a_text_field_never(clock, mon
         assert p.keyboard.value == text
 
 
+def test_same_seed_same_traits_but_fresh_per_key_draws(clock, no_roll):
+    # The seed fixes the TRAITS only; each key's flight is unseeded, or every session of an identity would
+    # type the same text with the same timing (a cross-session fingerprint).
+    a, b = spage("ha-1", clock), spage("ha-1", clock)
+    a.keyboard.type("the same words typed twice")
+    b.keyboard.type("the same words typed twice")
+    assert char_gaps(a) != char_gaps(b)
+    assert typing_traits(make_persona("ha-1").seed) == typing_traits(make_persona("ha-1").seed)
+
+
 # ============================================================================ async: simulated page
 class KWorld(World):
     async def evaluate(self, src, arg=None, **kw):
