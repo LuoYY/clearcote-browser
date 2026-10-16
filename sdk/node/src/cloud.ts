@@ -34,6 +34,7 @@ import type { Browser, BrowserContext } from "playwright-core";
 import { AGENT_KEYS } from "./agent.js";
 import { FINGERPRINT_KEYS } from "./fingerprint.js";
 import { installHumanize, installHumanizeOnContext } from "./humanize.js";
+import { humanizePayload, resolveHumanize, type HumanizeSetting } from "./hzoptions.js";
 import { warnStockRuntimeCloud } from "./launchopts.js";
 import { toProxySpec } from "./net.js";
 
@@ -367,7 +368,7 @@ export interface CloudSessionOptions {
 }
 
 /** Options of a cloud `launch()`: the session options plus what the SDK handles itself. */
-export interface CloudLaunchOptions extends CloudSessionOptions {
+export interface CloudLaunchOptions extends Omit<CloudSessionOptions, "humanize"> {
   /** true (or a Cloud client) for a cloud browser; unset follows CLEARCOTE_CLOUD. */
   cloud?: boolean | Cloud;
   /** API key; defaults to CLEARCOTE_API_KEY. */
@@ -377,8 +378,9 @@ export interface CloudLaunchOptions extends CloudSessionOptions {
   /** Default true on a cloud launch: humanize all input in the SDK exactly as for a local browser (typing at
    *  the persona's cadence with key rollover, clicks, the wheel in whole notches; a coordinate mouse.click goes
    *  to the engine's own pointer path), and switch the hosted browser's own mouse humanizer off. false: no
-   *  humanizing at all. (Only the server's: create the session with `cloud.browsers.create()`.) */
-  humanize?: boolean;
+   *  humanizing at all. "strict" or a HumanizeOptions object as for a local launch (sent along as the session's
+   *  humanizeOptions). (Only the server's: create the session with `cloud.browsers.create()`.) */
+  humanize?: HumanizeSetting;
   showCursor?: boolean;
   quiet?: boolean;
   /** Playwright connectOverCDP options (milliseconds). `timeout` defaults to 120 000 here (the browser
@@ -1090,6 +1092,11 @@ function prepareLaunch(options: Record<string, unknown>, persistent: boolean, us
   // humanizers would fight over the cursor. humanize: false turns the SDK's off as well (none at all).
   if (sdk.humanize === undefined || sdk.humanize === null) sdk.humanize = true;
   body.humanize = false;
+  // The options object (preset, strict, engine, ...) runs in the SDK too; the session carries a copy as
+  // humanizeOptions so the server can show and later apply it. A separate key, not humanize: {...}: the
+  // control plane answers 400 to a non-boolean humanize today, and ignores keys it does not know.
+  const hz = resolveHumanize(sdk.humanize); // throws on an unknown option before the session is created
+  if (hz && sdk.humanize !== true) body.humanizeOptions = humanizePayload(hz);
   return { sdk, body };
 }
 
@@ -1150,7 +1157,7 @@ export async function launchCloud(options: Record<string, unknown>, persistent =
     // The humanizer's persona seed: the fingerprint, else the identity label, so one identity keeps one
     // hand across sessions (a local launch seeds from the fingerprint the same way).
     const seed = (body.fingerprint ?? body.identity) as string | number | undefined;
-    const humanize = { humanize: sdk.humanize as boolean | undefined, showCursor: sdk.showCursor as boolean | undefined, seed };
+    const humanize = { humanize: sdk.humanize as HumanizeSetting | undefined, showCursor: sdk.showCursor as boolean | undefined, seed };
     for (const ctx of browser.contexts()) installHumanizeOnContext(ctx, humanize, browser); // the session's own context and its tabs
     installHumanize(browser, humanize);
     if (!persistent) return browser;
