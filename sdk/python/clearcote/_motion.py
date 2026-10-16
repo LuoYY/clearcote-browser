@@ -427,6 +427,15 @@ HESITATION_MS = (100.0, 300.0)
 HESITATION_MAX_PX = 8.0
 
 
+def hesitation_traits(p: Persona):
+    """This persona's hesitation TRAITS, from its salted stream: (typical length ms 130-260, creep reach
+    px 2-6, sideways wobble px 0.4-1.2). Only traits come from the seed; every per-drag draw in
+    :func:`drag_hesitation` is unseeded (``random.random``) unless a test passes ``rng``, so two sessions of
+    one identity do not replay identical drags."""
+    r = mulberry32((p.seed ^ _HESITATION_SALT) & _MASK)
+    return _lerp(130.0, 260.0, r()), _lerp(2.0, 6.0, r()), _lerp(0.4, 1.2, r())
+
+
 def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Optional[float] = None):
     """Plan the still-but-not-frozen moment between the grab and the drag leg frm->to: (x, y, sleep_ms)
     samples spanning 100-300 ms (centred per persona), the pointer creeping < 8 px toward ``to`` with a
@@ -437,10 +446,7 @@ def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Opti
     Same numbers in motion.ts dragHesitation and Motion.DragHesitation."""
     if rng is None:
         rng = random.random
-    r = mulberry32((p.seed ^ _HESITATION_SALT) & _MASK)
-    centre = _lerp(130.0, 260.0, r())          # this hand's typical hesitation
-    amp = _lerp(2.0, 6.0, r())                 # how far it creeps (px)
-    wobble = _lerp(0.4, 1.2, r())              # sideways (px)
+    centre, amp, wobble = hesitation_traits(p)
     fx, fy = frm
     tx, ty = to
     d = math.hypot(tx - fx, ty - fy)

@@ -179,6 +179,101 @@ public static class Motion
     }
 
     /// <summary>Grab/release dwell times (ms) for a held-button drag.</summary>
+    // Salt for the drag-start hesitation traits (Python _HESITATION_SALT, motion.ts HESITATION_SALT): a
+    // salted stream keeps MakePersona's draw ORDER, and PlanDrag itself is untouched.
+    private const uint HesitationSalt = 0xC2B2AE35;
+    /// <summary>The drag-start hesitation window (ms): a hand that has just closed on a handle holds 100-300 ms.</summary>
+    public const double HesitationMinMs = 100, HesitationMaxMs = 300;
+    /// <summary>... creeping a few px, never this far, before the leg proper.</summary>
+    public const double HesitationMaxPx = 8;
+
+    /// <summary>
+    /// The still-but-not-frozen moment between the grab and the drag leg from->to: samples spanning
+    /// 100-300 ms (centred per persona; <paramref name="durMs"/>, 40-300, overrides the length while the
+    /// persona's draw is still made), creeping under 8 px toward <paramref name="to"/> with a little sideways
+    /// wobble. Same numbers as Python <c>_motion.drag_hesitation</c> and motion.ts <c>dragHesitation</c>
+    /// (sdk/testdata/humanize_scroll_vectors.json). Measured on r38 / SDK 0.51.0 (SC 232): every drag's first
+    /// held move was already the full-speed leg.
+    /// </summary>
+    public static List<Step> DragHesitation(Point from, Point to, Persona p, Rng? rng = null, double? durMs = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        Rng r = Mulberry32(p.Seed ^ HesitationSalt);
+        double centre = Lerp(130, 260, r());
+        double amp = Lerp(2, 6, r());
+        double wobble = Lerp(0.4, 1.2, r());
+        double d = Hypot(to.X - from.X, to.Y - from.Y);
+        double ux = d >= 1e-6 ? (to.X - from.X) / d : 1, uy = d >= 1e-6 ? (to.Y - from.Y) / d : 0;
+        double dur = Clamp(centre * Lerp(0.8, 1.2, rng()), HesitationMinMs, HesitationMaxMs);
+        if (durMs is double dm) dur = Clamp(dm, 40, HesitationMaxMs);
+        double reach = amp * Lerp(0.6, 1.0, rng());
+        double stepMs = 1000 / p.DeviceHz;
+        int n = (int)Math.Max(3, JsRound(dur / stepMs));
+        double dt = dur / n;
+        double phase = rng() * 2 * Math.PI;
+        var outSteps = new List<Step>();
+        double side = 0;
+        for (int i = 1; i <= n; i++)
+        {
+            double tau = (double)i / n;
+            double along = reach * MinJerk(tau);
+            side = 0.8 * side + GaussFrom(rng) * wobble * 0.25;
+            double s = Clamp(side + wobble * 0.5 * Math.Sin(phase + 2 * Math.PI * tau), -1.5, 1.5);
+            double px = from.X + ux * along - uy * s, py = from.Y + uy * along + ux * s;
+            if (Hypot(px - from.X, py - from.Y) >= HesitationMaxPx - 0.5)
+            {
+                px = from.X + ux * (HesitationMaxPx - 1);
+                py = from.Y + uy * (HesitationMaxPx - 1);
+            }
+            outSteps.Add(new Step(px, py, dt * Lerp(0.9, 1.1, rng())));
+        }
+        return outSteps;
+    }
+
+    /// <summary>When (ms from the start of <paramref name="steps"/>) the walk first leaves the
+    /// <paramref name="radius"/> circle around <paramref name="from"/>; the whole length when it never does.</summary>
+    public static double LegExitMs(Point from, IReadOnlyList<Step> steps, double radius = HesitationMaxPx)
+    {
+        double t = 0;
+        foreach (var s in steps)
+        {
+            if (Hypot(s.X - from.X, s.Y - from.Y) >= radius) return t;
+            t += s.SleepMs;
+        }
+        return t;
+    }
+
+    /// <summary>
+    /// The held part of a drag: the hesitation creep, then the <see cref="PlanDrag"/> leg, planned together so
+    /// the pointer stays inside 8 px of the press for <paramref name="windowMs"/> (clamped 100-300: the
+    /// persona's grab dwell) and then goes. Same as Python <c>hesitate_then_drag</c>.
+    /// </summary>
+    public static (List<Step> Steps, int Creep) HesitateThenDrag(Point from, Point to, Persona p, double windowMs,
+        bool settle = true, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double w = Clamp(windowMs, HesitationMinMs, HesitationMaxMs);
+        var creep = DragHesitation(from, to, p, rng, w);
+        var leg = PlanDrag(new Point(creep[^1].X, creep[^1].Y), to, p, settle, rng);
+        double t8 = LegExitMs(from, leg);
+        double want = Math.Max(40, w - t8);
+        double have = 0;
+        foreach (var s in creep) have += s.SleepMs;
+        if (Math.Abs(have - want) > 1)
+        {
+            double k = want / have, m = Math.Min(1, k);
+            for (int i = 0; i < creep.Count; i++)
+            {
+                var s = creep[i];
+                creep[i] = new Step(from.X + (s.X - from.X) * m, from.Y + (s.Y - from.Y) * m, s.SleepMs * k);
+            }
+            leg = PlanDrag(new Point(creep[^1].X, creep[^1].Y), to, p, settle, rng);
+        }
+        var all = new List<Step>(creep);
+        all.AddRange(leg);
+        return (all, creep.Count);
+    }
+
     public static (double GrabMs, double ReleaseMs) DragDwell(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;

@@ -23,6 +23,7 @@ import {
   ISO_SCROLL_BY, ISO_VIEWPORT,
 } from "../src/isolated.js";
 import { typeaheadSimulate } from "../src/forms.js";
+import { ISO_SCROLLER } from "../src/scroll.js";
 
 const SLOW = 30_000; // glides and holds use real sleeps
 
@@ -1013,7 +1014,10 @@ describe("type / press", () => {
     // fill the box, else the box rule answers), and asks whether a twin holds a control.
     expect(allExpressions.length).toBeGreaterThan(0);
     for (const e of allExpressions) {
-      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.includes(ISO_HIT_IN_BOX)) expect(e).not.toContain("querySelector");
+      // ISO_SCROLLER (0.52, scroll.ts) finds the scrolling container of the same plain-CSS first match
+      // CSS_BOX already counted, so the wheel can be sent over it; it resolves no target either.
+      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.startsWith(`(${ISO_SCROLLER})`) && !e.includes(ISO_HIT_IN_BOX))
+        expect(e).not.toContain("querySelector");
     }
     expect(allExpressions.some((e) => e.startsWith(`(${ISO_CSS_BOX})`))).toBe(true);
   });

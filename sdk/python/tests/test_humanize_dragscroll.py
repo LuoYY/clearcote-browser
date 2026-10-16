@@ -244,3 +244,20 @@ def test_scroll_vectors_match_the_python_planner():
         assert abs(got[0] - v["dx"]) < 1e-9 and abs(got[1] - v["dy"]) < 1e-9
     for v in doc["device"]:
         assert S.input_device(v["platform"], v["option"]) == v["device"]
+
+
+# --------------------------------------------------------------------------- seed = traits only
+def test_same_seed_same_traits_but_fresh_per_action_draws():
+    """The seed fixes persona TRAITS; every per-action draw is unseeded, or every session of an identity
+    would replay identical drags and scrolls (a cross-session fingerprint)."""
+    from clearcote import _scroll as S
+    from clearcote._motion import drag_hesitation, hesitation_traits
+    a, b = make_persona("ident-1"), make_persona("ident-1")
+    assert hesitation_traits(a) == hesitation_traits(b)
+    assert hesitation_traits(a) != hesitation_traits(make_persona("ident-2"))
+    h1 = drag_hesitation((100, 100), (400, 120), a)
+    h2 = drag_hesitation((100, 100), (400, 120), b)
+    assert h1 != h2
+    assert S.plan_trackpad(0, 500) != S.plan_trackpad(0, 500)
+    assert S.anchor_point(1280, 800) != S.anchor_point(1280, 800)
+    assert S.target_frac() != S.target_frac()
