@@ -11,7 +11,10 @@
  *   1. waits for the element to be visible and brings it into view (the humanized wheel scroll on a
  *      humanized main-frame page, Playwright's scroll otherwise);
  *   2. moves the pointer to a point inside it (a persona-shaped point near the centre, or the
- *      caller's `position`) -- a humanized glide when humanize is on;
+ *      caller's `position`, relative to the PADDING box like Playwright's and click's) -- a humanized
+ *      glide (Fitts width = the element's smaller side) when humanize is on. On a humanized page the point
+ *      is first put to the same isolated hit test a click uses (retried COVER_CHECK_MS); a covered persona
+ *      point moves to the first probe point (edges, bottom, top) the hit test proves;
  *   3. presses (after the humanized pre-press pause) and holds for `duration` ms, or until
  *      `until()` is true -- then lets go after a human reaction delay (160-350 ms), not on the
  *      same tick the condition flipped;
@@ -39,7 +42,7 @@ export interface PressAndHoldOptions {
   /** How long the button stays down, in ms. Default: 2.8-3.8 s; with `until`, the longest the hold
    * may last (15 s when not given). */
   duration?: number;
-  /** The point to press, relative to the element's top-left (as Playwright's `position`). */
+  /** The point to press, relative to the element's padding box (as Playwright's `position` and click's). */
   position?: { x: number; y: number };
   button?: HoldButton;
   /** For the element to become visible, in ms (undefined = the page default). */
@@ -99,11 +102,13 @@ export function reactionMs(rng: Rng = Math.random): number {
   return REACTION_MS[0] + rng() * (REACTION_MS[1] - REACTION_MS[0]);
 }
 
-/** The viewport point to press: `position` (relative to the element's top-left, as Playwright's
- * `position`), else the persona's click point when there is one, else the centre. */
+/** The viewport point to press: `position` (relative to the element's PADDING box, as Playwright's
+ * `position` and the humanized click's: `border` = [left, top] border widths, added), else the persona's
+ * click point when there is one, else the centre. Before 0.52 `position` was taken from the border box
+ * here while click took it from the padding box; the two now agree. */
 export function holdPoint(box: Box, from?: Point | null, persona?: Persona | null,
-  position?: { x: number; y: number } | null): [number, number] {
-  if (position) return [box.x + Number(position.x), box.y + Number(position.y)];
+  position?: { x: number; y: number } | null, border: [number, number] = [0, 0]): [number, number] {
+  if (position) return [box.x + border[0] + Number(position.x), box.y + border[1] + Number(position.y)];
   if (persona && from) {
     const p = clickPoint(box, from, persona);
     return [p.x, p.y];
@@ -157,6 +162,7 @@ export async function pressAndHold(locator: Locator, opts: PressAndHoldOptions =
       box = null;
     }
   }
+  const iso = !!box; // the humanizer's own box: its hit test, probe points and aimed glide apply
   if (!box) {
     await loc.waitFor({ state: "visible", timeout: o.timeout });
     await loc.scrollIntoViewIfNeeded({ timeout: o.timeout });
@@ -165,12 +171,26 @@ export async function pressAndHold(locator: Locator, opts: PressAndHoldOptions =
   if (!box) throw new Error("pressAndHold: the element has no box (not rendered)");
   const persona: Persona | undefined = page._clearcotePersona;
   const posOf = page._clearcotePointer;
-  let [x, y] = holdPoint(box, typeof posOf === "function" ? posOf() : null, persona, o.position);
+  let border: [number, number] = [0, 0];
+  if (o.position && iso && typeof page._clearcoteBorderOf === "function") {
+    try { border = await page._clearcoteBorderOf(box); } catch { border = [0, 0]; }
+  }
+  let [x, y] = holdPoint(box, typeof posOf === "function" ? posOf() : null, persona, o.position, border);
   x = Math.round(x); y = Math.round(y);
+  // The covered-point check (a click's isolated hit test, retried COVER_CHECK_MS): a covered PERSONA point
+  // moves to the first probe point the hit test proves (a caller's `position` is kept: it asked for that
+  // pixel); when nothing proves, the press goes where a person would press -- there is no native hold.
+  if (iso && !o.position && typeof page._clearcoteReachesPoint === "function"
+      && (await page._clearcoteReachesPoint(box, x, y, loc._selector ?? null)) === false
+      && typeof page._clearcoteProvenPoint === "function") {
+    const alt: Point | null = await page._clearcoteProvenPoint(box, loc._selector ?? null);
+    if (alt) { x = alt.x; y = alt.y; }
+  }
   const nudge: (x: number, y: number) => Promise<void> =
     typeof page._clearcoteNudge === "function" ? page._clearcoteNudge : (nx, ny) => page.mouse.move(nx, ny);
 
-  await page.mouse.move(x, y);             // a humanized glide when humanize is on
+  if (iso && typeof page._clearcoteAimGlide === "function") await page._clearcoteAimGlide(x, y, box);
+  else await page.mouse.move(x, y);        // a humanized glide when humanize is on
   await page.mouse.down({ button: btn });  // humanized: the pre-press pause first
   const t0 = performance.now();
   const elapsed = () => performance.now() - t0;
