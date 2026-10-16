@@ -25,7 +25,7 @@ from ._humanize import (
     CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _engine_clicks_mode, _host_platform,
     FRAMES_WAIT_MS, _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, as_api_error,
     default_timeout_ms, engine_path_memo, trial_timeout_error, typo_rate,
-    TAP_NOT_HUMANIZED, native_select_args, report_fallback, select_wants, strict_mode, want_index,
+    TAP_NOT_HUMANIZED, label_stream, native_select_args, report_fallback, select_wants, strict_mode, want_index,
 )
 from ._isolated import (
     ACTIVE_FIELD as ISO_ACTIVE_FIELD, ACTIVE_VALUE as ISO_ACTIVE_VALUE, COVER_CHECK_MS, COVER_RETRY_MS,
@@ -1474,7 +1474,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
 
     # The label-text share of checkbox clicks: a stream of its own, salted with the persona, so the
     # global RNG sequence every other action draws from is unchanged (see _humanize).
-    label_rng = random.Random("%s:label" % (getattr(persona, "seed", None),))
+    label_rng = label_stream(persona)   # one stream per identity (see _humanize.label_stream)
 
     async def _label_aim(selector, loc, timeout):
         """See _humanize._label_aim: the <label> box to click instead of the input's own box (always

@@ -345,6 +345,19 @@ def native_select_args(value, options):
     return (vals if vals else None), o
 
 
+# The label-text draws of checkbox clicks (see _set_checked): one stream per persona seed, shared by every
+# page of that identity in this process.
+_LABEL_STREAMS = {}
+
+
+def label_stream(persona):
+    key = "%s:label" % (getattr(persona, "seed", None),)
+    r = _LABEL_STREAMS.get(key)
+    if r is None:
+        r = _LABEL_STREAMS[key] = random.Random(key)
+    return r
+
+
 # ------------------------------------------------------------------------- strict / fallback report
 # Lane A owns the options object (strict mode, the on_fallback hook); these read it defensively so this
 # module works with or without it: `strict` on the page's options object, else a page flag.
@@ -1834,8 +1847,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
 
     # The label-text share of checkbox clicks is drawn from a stream of its own, salted with the
     # persona: it must not shift the draws every other action makes from the global RNG (the
-    # pinned sequences), and it is stable per identity.
-    label_rng = random.Random("%s:label" % (getattr(persona, "seed", None),))
+    # pinned sequences), and it is stable per identity -- ONE stream per identity across its pages
+    # (label_stream), or every page's first checkbox would go the same way.
+    label_rng = label_stream(persona)
 
     def _label_aim(selector, loc, timeout):
         """Where a person clicks a checkbox / radio when not on its own box: its <label>. A HIDDEN

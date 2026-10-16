@@ -33,7 +33,7 @@ import time
 
 from ._forms import classify_field, formatted_equal, plan_select
 from ._isolated import (
-    DESCRIBE, FORM_CONTROL, HIT_IN_BOX, _call_params, _node_at_params, _parents, _value, async_world_for,
+    DESCRIBE, FORM_CONTROL, HIT_IN_BOX, SCROLL_BY, VIEWPORT, _call_params, _node_at_params, _parents, _value, async_world_for,
     world_for,
 )
 
@@ -216,6 +216,41 @@ def worlds_for(page):
     return fw
 
 
+def _in_view(box, vp):
+    return (box is not None and box["x"] >= 0 and box["y"] >= 0 and box["x"] + box["width"] <= vp[0]
+            and box["y"] + box["height"] <= vp[1])
+
+
+def _window_delta(box, vp):
+    """How far to scroll the WINDOW to centre ``box`` on the axes where it is out of view."""
+    dx = box["x"] + box["width"] / 2 - vp[0] / 2 if box["x"] < 0 or box["x"] + box["width"] > vp[0] else 0
+    dy = box["y"] + box["height"] / 2 - vp[1] / 2 if box["y"] < 0 or box["y"] + box["height"] > vp[1] else 0
+    return [dx, dy]
+
+
+def _into_view(page, loc, box, timeout):
+    """``box``, brought into the viewport. The WINDOW is scrolled first (in the main frame's isolated
+    world); Playwright's scroll_into_view_if_needed -- which also scrolls scrollers inside frames -- only
+    when that was not enough. Playwright's scroll waits for the element to be "stable", measured with
+    animation frames INSIDE the frame, and an out-of-process frame below the fold draws none in headless:
+    it waited out the whole timeout (live, SC 232), where the select itself needs no stability."""
+    if box is None:
+        return box
+    w = world_for(page)
+    vp = w.evaluate(VIEWPORT)
+    if not (isinstance(vp, list) and len(vp) == 2 and vp[0] and vp[1]):
+        loc.scroll_into_view_if_needed(timeout=timeout)
+        return loc.bounding_box()
+    if _in_view(box, vp):
+        return box
+    w.evaluate(SCROLL_BY, _window_delta(box, vp))
+    box = loc.bounding_box()
+    if _in_view(box, vp):
+        return box
+    loc.scroll_into_view_if_needed(timeout=timeout)
+    return loc.bounding_box()
+
+
 class Target:
     def __init__(self, fid, nid, box, fbox, info, probe):
         self.fid, self.nid, self.box, self.fbox, self.info, self.probe = fid, nid, box, fbox, info, probe
@@ -226,8 +261,7 @@ def _locate(page, loc, timeout, want):
     it: a Target, or raise _Native(why). ``want``: None (any element: a click target -- the hit may be
     a child of it), or the CSS of the control to describe (FORM_CONTROL, "select", "input")."""
     loc.wait_for(state="visible", timeout=timeout)
-    loc.scroll_into_view_if_needed(timeout=timeout)
-    box = loc.bounding_box()
+    box = _into_view(page, loc, loc.bounding_box(), timeout)
     if not box or box["width"] <= 0 or box["height"] <= 0:
         raise _Native("frame: the element has no box")
     fw = worlds_for(page)
@@ -577,10 +611,28 @@ def async_worlds_for(page):
     return fw
 
 
+async def _ainto_view(page, loc, box, timeout):
+    """Async _into_view."""
+    if box is None:
+        return box
+    w = async_world_for(page)
+    vp = await w.evaluate(VIEWPORT)
+    if not (isinstance(vp, list) and len(vp) == 2 and vp[0] and vp[1]):
+        await loc.scroll_into_view_if_needed(timeout=timeout)
+        return await loc.bounding_box()
+    if _in_view(box, vp):
+        return box
+    await w.evaluate(SCROLL_BY, _window_delta(box, vp))
+    box = await loc.bounding_box()
+    if _in_view(box, vp):
+        return box
+    await loc.scroll_into_view_if_needed(timeout=timeout)
+    return await loc.bounding_box()
+
+
 async def _alocate(page, loc, timeout, want):
     await loc.wait_for(state="visible", timeout=timeout)
-    await loc.scroll_into_view_if_needed(timeout=timeout)
-    box = await loc.bounding_box()
+    box = await _ainto_view(page, loc, await loc.bounding_box(), timeout)
     if not box or box["width"] <= 0 or box["height"] <= 0:
         raise _Native("frame: the element has no box")
     fw = async_worlds_for(page)

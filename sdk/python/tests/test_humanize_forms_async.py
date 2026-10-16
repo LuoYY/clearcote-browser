@@ -1900,9 +1900,17 @@ def test_the_label_draw_is_stable_per_persona(fast):
             out.append(lab.inside(*kinds(p, "down")[-1][4]))
         return out
 
+    from clearcote import _humanize
+
     async def go():
-        assert await one("stable-a") == await one("stable-a")
-        assert await one("stable-b") == await one("stable-b")
+        _humanize._LABEL_STREAMS.clear()
+        a1 = await one("stable-a")
+        _humanize._LABEL_STREAMS.clear()       # a fresh process: the same identity draws the same way
+        assert a1 == await one("stable-a")
+        _humanize._LABEL_STREAMS.clear()
+        b1 = await one("stable-b")
+        b2 = await one("stable-b")             # the SAME process: the identity's stream continues
+        assert b1 + b2 != [b1[0]] * 16, "pages of one identity do not all draw the same way"
     run(go())
 
 

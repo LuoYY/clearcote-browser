@@ -247,8 +247,33 @@ def test_a_persistent_context_is_humanized(server):
 
 
 # ------------------------------------------------------------------------------- tap
-def test_tap_on_a_touch_context_reports_the_fallback(browser, server):
-    ctx = browser.new_context(has_touch=True)
+@pytest.fixture(scope="module")
+def real_browser():
+    """launch() returns its persistent context (whose new_context() is that same context); a real
+    Browser -- new_context(has_touch=...), and browser.new_page()'s implicit context -- needs
+    ephemeral_profile=False."""
+    import clearcote
+    b = clearcote.launch(executable_path=LIVE, headless=True, humanize=True, fingerprint="coverage-live-3",
+                         quiet=True, ephemeral_profile=False)
+    yield b
+    b.close()
+
+
+def test_a_popup_of_browser_new_pages_implicit_context_is_humanized(real_browser, server):
+    p = real_browser.new_page()
+    try:
+        p.goto(server + "/main.html")
+        with p.context.expect_page() as pi:
+            p.click("#pop")
+        popup = pi.value
+        popup.wait_for_load_state("load")
+        assert getattr(popup, "_clearcote_humanized", False) is True
+    finally:
+        p.context.close()
+
+
+def test_tap_on_a_touch_context_reports_the_fallback(real_browser, server):
+    ctx = real_browser.new_context(has_touch=True)
     try:
         p = ctx.new_page()
         p.goto(server + "/main.html")
