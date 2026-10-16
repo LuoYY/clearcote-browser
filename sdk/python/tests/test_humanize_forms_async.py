@@ -750,8 +750,118 @@ def test_mouse_click_xy_uses_the_engine_path_only_for_a_plain_left_click(fast):
         await p.mouse.click(300, 200, button="right")
         await p.mouse.click(300, 200, delay=250)
         await p.mouse.click(300, 200, modifiers=["Shift"])
-        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath"]
+        # r43 (SC 232 lane H): the right click asks once whether the engine takes the r43 parameters (an empty
+        # dispatchKeySequence); this fake answers {} -- not r43's -32602 -- so it stays SDK-side as before.
+        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath",
+                                                                    "Browser.dispatchKeySequence"]
         assert [(d[1]) for d in kinds(p, "down")] == ["right", "left", "left"]
+    run(go())
+
+
+class _R43Session(_Session):
+    """An r43 engine: an empty Browser.dispatchKeySequence is invalid params (-32602); every call's params kept."""
+
+    def __init__(self):
+        super().__init__()
+        self.params = []
+
+    async def send(self, method, params=None):
+        if method == "Browser.dispatchKeySequence" and not (params or {}).get("keys"):
+            self.calls.append(method)
+            raise Exception("Protocol error (Browser.dispatchKeySequence): Invalid parameters")
+        self.params.append((method, dict(params or {})))
+        return await super().send(method, params)
+
+
+class _R42Session(_Session):
+    """A PRO engine before r43: the pointer path answers, Browser.dispatchKeySequence does not exist (-32601)."""
+
+    async def send(self, method, params=None):
+        if method == "Browser.dispatchKeySequence":
+            self.calls.append(method)
+            raise Exception("Protocol error (Browser.dispatchKeySequence): 'Browser.dispatchKeySequence' wasn't found")
+        return await super().send(method, params)
+
+
+def _with_session(p, s):
+    async def new_cdp_session(page):
+        return s
+    p.context = type("Ctx", (), {"new_cdp_session": staticmethod(new_cdp_session), "browser": None})()
+
+
+def test_r43_engine_walks_right_double_modified_clicks_held_legs_and_typed_runs(fast):
+    """SC 232 lane H (SDK side of pro-r43-07 / 09): on an engine that takes the r43 parameters, right / double /
+    modified clicks, held legs (buttons, fromX/fromY once the SDK moved the pointer) and slip-free typed runs
+    (ONE dispatchKeySequence with lane B's dwell and lane D's flight per key) go engine-side; a caller-chosen hold
+    stays SDK-side; the probe is asked once per browser; modifier keys are still pressed by the SDK."""
+    async def go():
+        p = await attached(_btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)                       # plain and in sync: the r42 route, no probe
+        await p.mouse.click(300, 200, button="right")       # the probe, then the engine walks it
+        await p.mouse.click(310, 200, click_count=2)
+        await p.mouse.click(320, 200, modifiers=["Shift"])
+        await p.mouse.click(300, 200, delay=250)            # a caller-chosen hold stays SDK-side
+        pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+        assert len(pp) == 4
+        assert "fromX" not in pp[0] and "button" not in pp[0] and pp[0]["noClick"] is False
+        assert pp[1].get("button") == "right" and pp[2].get("clickCount") == 2 and pp[3].get("modifiers") == 8
+        assert [c for c in s.calls if c == "Browser.dispatchKeySequence"] == ["Browser.dispatchKeySequence"], "one probe"
+        assert [(d[1]) for d in kinds(p, "down")] == ["left"], "only the held-delay click presses natively"
+        assert [k[1] for k in kinds(p, "kdown")] == ["Shift"] and [k[1] for k in kinds(p, "kup")] == ["Shift"]
+        # a held leg: dispatchPointerPath {buttons: 1, noClick}, starting where the SDK's own glide left the pointer
+        await p.mouse.down()
+        await p.mouse.move(360, 240)
+        await p.mouse.up()
+        held = [q for m, q in s.params if m == "Browser.dispatchPointerPath" and q.get("buttons")]
+        assert len(held) == 1 and held[0]["buttons"] == 1 and held[0]["noClick"] is True
+        assert (held[0]["fromX"], held[0]["fromY"], held[0]["x"], held[0]["y"]) == (300.0, 200.0, 360.0, 240.0)
+        # a typed run with no slip to plan: ONE dispatchKeySequence, US codes, Shift as modifiers 8
+        presses = len(kinds(p, "press"))
+        await p.keyboard.type("hello, World!")
+        ks = [q for m, q in s.params if m == "Browser.dispatchKeySequence"]
+        assert len(ks) == 1 and len(kinds(p, "press")) == presses
+        keys = ks[0]["keys"]
+        assert "".join(k["key"] for k in keys) == "hello, World!"
+        assert keys[5]["code"] == "Comma" and keys[7]["modifiers"] == 8 and "modifiers" not in keys[0]
+        assert keys[-1]["code"] == "Digit1" and keys[-1]["modifiers"] == 8 and keys[-1]["gapMs"] == 0.0
+        assert all(45.0 <= k["dwellMs"] <= 120.0 for k in keys)
+        assert all(k["gapMs"] >= 25.0 for k in keys[:-1])
+    run(go())
+
+
+def test_a_pro_engine_without_the_r43_extensions_is_reported_once_through_on_fallback(fast):
+    """A PRO engine before r43 (the pointer path answers, dispatchKeySequence does not exist): the SDK planner does
+    the work, lane A's on_fallback hears {api: "engine_ext"} ONCE per browser, strict mode does not raise (not a
+    native fallback), and no second probe is sent."""
+    async def go():
+        events = []
+        p = Page(_btn())
+        await H.attach_humanize(None, p, humanize={"on_fallback": events.append, "strict": True}, seed="forms-unit")
+        s = _R42Session()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)                       # the pointer path answers: a PRO engine
+        await p.mouse.click(300, 200, button="right")       # the probe says no: reported once, pressed SDK-side
+        await p.mouse.click(310, 200, click_count=2)        # no second probe, no second report
+        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath",
+                                                                    "Browser.dispatchKeySequence"]
+        assert events == [{"api": "engine_ext", "reason": H.ENGINE_EXT_MISSING, "selector": None}]
+        assert [(d[1], d[2]) for d in kinds(p, "down")] == [("right", 1), ("left", 1), ("left", 2)]
+    run(go())
+
+
+def test_engine_ext_off_keeps_the_r42_route_on_an_r43_engine(fast, monkeypatch):
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_ENGINE_EXT", "off")
+
+    async def go():
+        p = await attached(_btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)
+        await p.mouse.click(300, 200, button="right")
+        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath"], "no probe"
+        assert [(d[1]) for d in kinds(p, "down")] == ["right"]
     run(go())
 
 

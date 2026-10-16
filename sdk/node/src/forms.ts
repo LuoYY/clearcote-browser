@@ -324,6 +324,57 @@ export function enginePathOk(o: ClickPlan): boolean {
   return o.button === "left" && o.clickCount === 1 && o.modifiers.length === 0 && o.delay === null;
 }
 
+// r43 engine (SC 232 lane H): Browser.dispatchPointerPath also takes fromX/fromY, button, clickCount, modifiers,
+// buttons (held) and settle, and answers after its last event; Browser.dispatchKeySequence types a paced run.
+export const ENGINE_KEY_SEQUENCE = "Browser.dispatchKeySequence";
+const CDP_MODIFIER_BITS: Record<string, number> = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
+const BUTTON_BITS: Record<string, number> = { left: 1, right: 2, middle: 4 };
+
+/** Extra dispatchPointerPath parameters for a click an r43 engine performs itself ({} = plain left click), or null
+ * (a caller-chosen hold, an unknown button, more than 3 clicks). Same as Python engine_click_params. */
+export function engineClickParams(o: ClickPlan): Record<string, number | string> | null {
+  if (o.delay !== null || !(o.button in BUTTON_BITS) || o.clickCount < 1 || o.clickCount > 3) return null;
+  const p: Record<string, number | string> = {};
+  if (o.button !== "left") p.button = o.button;
+  if (o.clickCount !== 1) p.clickCount = o.clickCount;
+  let bits = 0;
+  for (const m of o.modifiers) bits |= CDP_MODIFIER_BITS[m as string] ?? 0;
+  if (bits) p.modifiers = bits;
+  return p;
+}
+
+export const engineHeldBits = (button?: string | null): number => BUTTON_BITS[button || "left"] ?? 1;
+
+const US_CODES: Record<string, string> = {
+  ",": "Comma", ".": "Period", "/": "Slash", ";": "Semicolon", "'": "Quote", "[": "BracketLeft", "]": "BracketRight",
+  "-": "Minus", "=": "Equal", "`": "Backquote", "\\": "Backslash", "<": "Comma", ">": "Period", "?": "Slash",
+  ":": "Semicolon", "\"": "Quote", "{": "BracketLeft", "}": "BracketRight", "_": "Minus", "+": "Equal",
+  "~": "Backquote", "|": "Backslash", "!": "Digit1", "@": "Digit2", "#": "Digit3", "$": "Digit4", "%": "Digit5",
+  "^": "Digit6", "&": "Digit7", "*": "Digit8", "(": "Digit9", ")": "Digit0",
+};
+
+/** Browser.dispatchKeySequence keys for `text` (US layout), or null when a character has no plain key.
+ * `gapMs(ch, next)` is the caller's cadence model (lane D's bigram flight). Same as Python engine_key_plan. */
+export function engineKeyPlan(text: string, dwellMs: () => number, gapMs: (ch: string, next: string) => number,
+                              needsShift: (ch: string) => boolean): Array<Record<string, unknown>> | null {
+  const chars = Array.from(text);
+  const keys: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    let k: Record<string, unknown>;
+    if (ch === "\n") k = { key: "Enter", code: "Enter" };
+    else if (ch === "\t") k = { key: "Tab", code: "Tab" };
+    else if (/^[A-Za-z0-9 ]$/.test(ch)) k = { key: ch };
+    else if (ch in US_CODES) k = { key: ch, code: US_CODES[ch] };
+    else return null;
+    k.dwellMs = dwellMs();
+    k.gapMs = i < chars.length - 1 ? gapMs(ch, chars[i + 1]) : 0;
+    if (needsShift(ch)) k.modifiers = 8;
+    keys.push(k);
+  }
+  return keys;
+}
+
 // ------------------------------------------------------------------- <select> type-ahead plan
 /** Python's str.casefold(), closely enough for option labels: full upper-casing then lower-casing
  * folds what lower-casing alone misses (sharp s -> ss, ligatures, final sigma). */

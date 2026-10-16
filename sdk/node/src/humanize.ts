@@ -83,6 +83,7 @@ import {
   rangeAttrs, rangeFraction,
   rangeNudge, rangePoint, rangeSanitize, rangeValueOk, segmentNodesFromTree, typoEligible, typosAllowed,
   type ClickPlan, type FieldClass, type OptionInfo, type SelectPlan, type TypoField, type TypoPlan,
+  ENGINE_KEY_SEQUENCE, engineClickParams, engineHeldBits, engineKeyPlan,
 } from "./forms.js";
 import {
   applyToPersona, engineModeFor, optionsOf, reportFallback, resolveHumanize, typoRateFor, withCallerApi,
@@ -192,6 +193,20 @@ export async function sendEngineCommand(
 // The longest an engine walk waits for the page to draw (ISO_FRAMES): measured 111-812 ms on a fresh
 // headless browser's first page (r40, SC 216). A page that never draws (a hidden tab) walks after it.
 const FRAMES_WAIT_MS = 1500;
+
+/** CLEARCOTE_HUMANIZE_ENGINE_EXT=off (also 0/false/no) keeps the r43 engine extensions unused (r42 behaviour). */
+export function engineExtMode(): boolean {
+  const v = (process.env.CLEARCOTE_HUMANIZE_ENGINE_EXT || "").trim().toLowerCase();
+  return !["0", "off", "false", "no", "none"].includes(v);
+}
+// CDP's "invalid params" (-32602): what an r43 engine answers to an EMPTY dispatchKeySequence.
+const isInvalidParams = (e: any): boolean =>
+  !isMethodNotFound(e) && (e?.code === -32602 || /-32602|invalid/i.test(String(e?.message ?? e)));
+// Which browsers' engines take the r43 extensions (asked once per browser, like the command name), and which
+// browsers lane A's onFallback has already heard about.
+const engineExt = new WeakMap<object, boolean>();
+const engineExtReported = new WeakSet<object>();
+export const ENGINE_EXT_MISSING = "the engine has no r43 extensions (Browser.dispatchKeySequence): the SDK planner walks and types";
 
 /** @internal exported for tests. Did this browser's engine already say it has no pointer-path command? */
 export function engineHasNoPointerPath(cacheKey: object | null): boolean {
@@ -414,7 +429,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // a wheel, a mouse.down that opens a drag, a bare keyboard.type — otherwise happens from a cursor
   // that has never been anywhere. The guarantees below key off this flag.
   // `typed`: when the last typed run ended (the submit / Tab pause owed by afterTyping), null after a glide.
-  const st = { x: rand(140, 380), y: rand(90, 240), held: false, placed: false, typed: null as number | null };
+  const st = { x: rand(140, 380), y: rand(90, 240), held: false, placed: false, typed: null as number | null,
+    heldButton: "left" as string };
   // After-action state (SC 232 lane C; see the block at the end of attachHumanize).
   const af = {
     // per-action draws are unseeded, as in planMove: the seed fixes the persona's traits only
@@ -483,21 +499,62 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // from where the pointer was. So the engine walks only while nothing else has moved the pointer
   // since its own last walk (before its first walk: while nothing has moved it at all).
   const engineInSync = (): boolean => (eng.at === null ? !st.placed : st.x === eng.at.x && st.y === eng.at.y);
-  const engineGlide = async (x: number, y: number, noClick: boolean): Promise<boolean> => {
-    if (!eng.ok || !engineInSync()) return false;
+  const engineSession = async (): Promise<void> => {
+    if (eng.session === null) {
+      const ctx: any = page.context();
+      const tsession = await ctx.newCDPSession(page);
+      const info: any = await tsession.send("Target.getTargetInfo");
+      eng.tid = info.targetInfo.targetId;
+      const br: any = ctx.browser ? ctx.browser() : null;
+      eng.key = br ?? ctx; // the command name is a property of the engine: learn it once per browser
+      eng.session = br ? await br.newBrowserCDPSession() : tsession;
+    }
+  };
+  // Lane A's onFallback hears ONCE per browser that a PRO engine (it has the pointer path) lacks the r43
+  // extensions. The hook only: the SDK planner does the work, so this is not a native fallback and strict mode
+  // does not throw.
+  const maybeReportExt = (): void => {
+    if (!eng.key || engineExt.get(eng.key) !== false || engineExtReported.has(eng.key)) return;
+    const names = engineMethodNames.get(eng.key);
+    const known = names?.get(POINTER_PATH);
+    if (!known || known === NO_ENGINE_PATH) return;
+    engineExtReported.add(eng.key);
+    optionsOf(page)?.onFallback?.({ api: "engine_ext", reason: ENGINE_EXT_MISSING });
+  };
+  // r43 engine (SC 232 lane H): dispatchPointerPath takes fromX/fromY, button, clickCount, modifiers, buttons,
+  // settle and answers after its last event; dispatchKeySequence exists. Asked once per browser, only when needed:
+  // an empty dispatchKeySequence answers -32602 (invalid params) on r43 and -32601 (not found) before; anything
+  // else counts as no (an engine that accepts no keys is not r43).
+  const engineExtOk = async (): Promise<boolean> => {
+    if (!eng.ok || !engineExtMode()) return false;
+    try { await engineSession(); } catch { return false; }
+    const known = engineExt.get(eng.key!);
+    if (known !== undefined) return known;
+    let ok: boolean;
+    try {
+      await eng.session.send(ENGINE_KEY_SEQUENCE, { targetId: eng.tid, keys: [] });
+      ok = false;
+    } catch (e: any) {
+      ok = isInvalidParams(e);
+    }
+    engineExt.set(eng.key!, ok);
+    maybeReportExt();
+    return ok;
+  };
+  // One engine pointer path to (x, y). `ext`: r43 parameters (button, clickCount, modifiers, buttons, settle),
+  // only sent to an engine that takes them; on such an engine the path also starts where THIS SDK left the
+  // pointer (fromX/fromY) instead of requiring the engine to be in sync, and no sleep follows (it answers after
+  // its last event). A plain in-sync left click never probes: the r42 route is unchanged.
+  const engineGlide = async (x: number, y: number, noClick: boolean,
+                             ext?: Record<string, number | string | boolean> | null): Promise<boolean> => {
+    if (!eng.ok) return false;
+    const useExt = !!(ext || !engineInSync()) && await engineExtOk();
+    if (!useExt && (ext || !engineInSync())) return false;
     try {
       // This browser's engine already said it has neither command: no sessions, no probe.
       const ctx0: any = page.context();
       if (engineHasNoPointerPath((ctx0.browser ? ctx0.browser() : null) ?? ctx0)) { eng.ok = false; return false; }
-      if (eng.session === null) {
-        const ctx: any = page.context();
-        const tsession = await ctx.newCDPSession(page);
-        const info: any = await tsession.send("Target.getTargetInfo");
-        eng.tid = info.targetInfo.targetId;
-        const br: any = ctx.browser ? ctx.browser() : null;
-        eng.key = br ?? ctx; // the command name is a property of the engine: learn it once per browser
-        eng.session = br ? await br.newBrowserCDPSession() : tsession;
-      }
+      await engineSession();
       // The engine does not wait for the page: what it walks into a page that has not drawn yet is lost
       // (a fresh headless browser's first page, SC 216). Wait for two frames first; free once drawn.
       await worldFor(page).evaluate(ISO_FRAMES, FRAMES_WAIT_MS, true);
@@ -505,8 +562,14 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       const dist = Math.sqrt(dx * dx + dy * dy);
       const dur = Math.min(1.10, Math.max(0.28, 0.30 + dist / 1700)) * (0.85 + 0.30 * Math.random()) * tempo;
       const tSend = Date.now();
-      await sendEngineCommand(eng.session, eng.key!, POINTER_PATH, POINTER_PATH_LEGACY,
-        { targetId: eng.tid, x, y, duration: dur, noClick });
+      const params: Record<string, unknown> = { targetId: eng.tid, x, y, duration: dur, noClick };
+      if (useExt) {
+        // r43: start where this SDK left the pointer; before any move the engine enters over the top edge itself.
+        if (st.placed && !engineInSync()) { params.fromX = st.x; params.fromY = st.y; }
+        Object.assign(params, ext || {});
+      }
+      await sendEngineCommand(eng.session, eng.key!, POINTER_PATH, POINTER_PATH_LEGACY, params);
+      maybeReportExt();
       // The engine walks the trajectory in the BROWSER process and answers this command before it
       // has finished. Without waiting, a following mouse.down() fires at the cursor's STALE
       // position — measured: a move to (110,58) then a press landed at (981,629), on <body>
@@ -515,7 +578,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       // r38 answers only after the walk AND the click (send returned 772 ms after a 600 ms walk, 2 ms
       // after the release, SC 210): wait only for what is left of `dur`, so an engine that answers
       // late does not add a second, idle `dur` after every click.
-      await sleep(Math.max(0, dur * 1000 - (Date.now() - tSend)));
+      if (!useExt) await sleep(Math.max(0, dur * 1000 - (Date.now() - tSend)));  // r43 answers after its last event
       try { await nativeMove(x, y); } catch { /* keep playwright cursor pos in sync for drags */ }
       st.x = x; st.y = y; st.placed = true;
       eng.at = { x, y };
@@ -590,6 +653,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   mouse.move = async (x: number, y: number) => {
     // A move while the button is held is a DRAG leg: planDrag keeps it on the line between grab and
     // drop (an aimed reach's arc took a slider handle 47 px off a 40 px track, SC 209).
+    // r43 engine (SC 232 lane H): held legs take the engine route (buttons carried on every sample, answered after
+    // the walk).
+    if (st.held && engineModeFor(page, engineClicksMode) !== "off" && await engineExtOk()
+        && await engineGlide(x, y, true, { buttons: engineHeldBits(st.heldButton) })) return;
     await glide(x, y, { held: st.held });
   };
   // down/up are wrapped to TRACK the held state mouse.move needs, and — critically — to make the
@@ -636,6 +703,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       await prePress();
     }
     st.held = true;
+    st.heldButton = (a[0] && a[0].button) || "left";
     try {
       return await nativeDown(...a);
     } catch (e) {
@@ -650,6 +718,19 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   const hclick = async (x: number, y: number, options: any = {}): Promise<void> => {
     const o = normalizeClickOptions(options);
     if (enginePathOk(o) && engineModeFor(page, engineClicksMode) !== "off" && await engineGlide(x, y, false)) return;
+    // r43 engine (SC 232 lane H): right/middle, double/triple and modified clicks too; the modifier KEYS are
+    // pressed here around it (lead before, lag after), as pressAt does.
+    const ext = engineClickParams(o);
+    if (ext && engineModeFor(page, engineClicksMode) !== "off" && await engineExtOk()
+        && (!o.modifiers.length || (nativeKbDown && nativeKbUp))) {
+      const held: string[] = [];
+      try {
+        for (const m of o.modifiers) { await nativeKbDown!(m); held.push(m); await sleep(rand(40, 110)); }
+        if (await engineGlide(x, y, false, ext)) return;
+      } finally {
+        for (const m of held.reverse()) { await sleep(rand(20, 80)); try { await nativeKbUp!(m); } catch { /* best effort */ } }
+      }
+    }
     await glide(x, y);
     // A press that rejects REJECTS (it was swallowed here: a click whose press failed reported success).
     // Only the pin before a press (mouse.down) stays best-effort.
@@ -680,7 +761,12 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
 
   // Held-button drag leg with the seating jiggle (settle), reachable from the module-level
   // Locator.dragTo patch (which can't see this closure) via the page object.
-  (page as any)._clearcoteHeldGlide = async (x: number, y: number) => { await glide(x, y, { settle: true }); };
+  (page as any)._clearcoteHeldGlide = async (x: number, y: number) => {
+    // r43 engine (SC 232 lane H): the held leg + seating jiggle (settle) walked engine-side, buttons carried.
+    if (st.held && engineModeFor(page, engineClicksMode) !== "off" && await engineExtOk()
+        && await engineGlide(x, y, true, { buttons: engineHeldBits(st.heldButton), settle: true })) return;
+    await glide(x, y, { settle: true });
+  };
 
   // OPT-IN: no ambient burst on load by default (it interleaves with caller-driven input,
   // e.g. a slider drag). Call page.ambientMotion(ms) explicitly, or set
@@ -1052,6 +1138,20 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // where a slip is a failure rather than a slip; `exact` false (type / pressSequentially /
   // keyboard.type, never fill) lets a search-field substitution stay uncorrected (SEARCH_SLIP_RATE).
   const rollRate = rolloverRate(persona);
+  // Type `text` with ONE Browser.dispatchKeySequence (r43, SC 232 lane H): lane B's key dwell and lane D's bigram
+  // flight per key (the caller's delay as the floor), paced in the browser. False when a character has no plain US
+  // key or the call fails up front (nothing typed yet: the per-key path types it).
+  const engineType = async (text: string, floor: number): Promise<boolean> => {
+    const keys = engineKeyPlan(text, kdwell,
+      (ch, nx) => Math.max(floor, planGap(traits, ch, nx, Math.random, (persona as any).tempo ?? 1, (persona as any).pauseScale ?? 1)),
+      needsShift);
+    if (!keys) return false;
+    try {
+      await engineSession();
+      await eng.session.send(ENGINE_KEY_SEQUENCE, { targetId: eng.tid, keys });
+      return true;
+    } catch { return false; }
+  };
   const humanTypeText = async (text: string, field?: TypoField | null, typos = true, floorMs = 0, exact = true): Promise<void> => {
     const chars = Array.from(text);
     const n = chars.length;
@@ -1062,6 +1162,13 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     const allow = rate > 0 && typosAllowed(fld);
     const search = allow && !exact && !!fld && String((fld as any).type || "").toLowerCase() === "search";
     const floor = Math.max(0, Number(floorMs) || 0);
+    // r43 engine (SC 232 lane H): a run with no slip to plan (typos off, or a field where a slip is a failure) and
+    // no caller-held Shift goes out as ONE dispatchKeySequence -- the same dwell and flight draws, paced in the
+    // browser, so the rhythm carries no CDP round trips. Rollover is not modelled there.
+    if (!allow && n > 1 && !extShift && await engineExtOk() && await engineType(text, floor)) {
+      st.typed = Date.now(); // a following Enter / Tab still waits (afterTyping)
+      return;
+    }
     // the score hook records this run's keys (nativeKb* wrappers) and scores it as "typed" at the end
     const outerRec = keyRec;
     if (outerRec === null && traceEnabled()) { keyRec = []; keyPend.clear(); }

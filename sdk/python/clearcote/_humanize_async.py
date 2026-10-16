@@ -18,6 +18,7 @@ import random
 import time
 
 from ._forms import (
+    ENGINE_KEY_SEQUENCE, engine_click_params, engine_held_bits, engine_key_plan,
     classify_field, datetime_equal, engine_path_ok, fit_maxlength, formatted_equal, mask_kept, match_option,
     normalize_click_options, numeric_equal, plan_datetime, plan_select, plan_typo, pre_press_ms, range_attrs,
     range_fraction, range_nudge, range_point,
@@ -25,6 +26,7 @@ from ._forms import (
 )
 from ._humanize import (
     CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _engine_clicks_mode, _host_platform,
+    ENGINE_EXT_MISSING, _cdp_invalid_params, _engine_ext_mode,
     FRAMES_WAIT_MS, _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, as_api_error,
     default_timeout_ms, engine_path_memo, trial_timeout_error, typo_rate, _MOD_KEYS,
     TAP_NOT_HUMANIZED, label_draw, native_select_args, report_fallback, select_wants, strict_mode, want_index,
@@ -288,21 +290,56 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             return not st["placed"]
         return st["pos"] == _eng["at"]
 
-    async def _engine_glide(x, y, no_click):
-        if not _eng["ok"] or not _engine_in_sync():
+    async def _engine_session():
+        if _eng["session"] is None:
+            tsession = await page.context.new_cdp_session(page)
+            info = await tsession.send("Target.getTargetInfo")
+            _eng["tid"] = info["targetInfo"]["targetId"]
+            b = getattr(page.context, "browser", None)
+            _eng["session"] = (await b.new_browser_cdp_session()
+                               if b is not None else tsession)
+
+    def _maybe_report_ext():
+        """See _humanize._maybe_report_ext: lane A's on_fallback hears once per browser that a PRO engine lacks
+        the r43 extensions (the hook only; strict mode does not raise)."""
+        memo = engine_path_memo(page)
+        if memo.get("ext") is not False or not memo.get("method") or memo.get("ext_reported"):
+            return
+        memo["ext_reported"] = True
+        o = _hz_options_of(page)
+        fn = getattr(o, "on_fallback", None) if o is not None else None
+        if fn is not None:
+            fn({"api": "engine_ext", "reason": ENGINE_EXT_MISSING, "selector": None})
+
+    async def _engine_ext_ok():
+        """See _humanize._engine_ext_ok: r43 dispatchPointerPath parameters + dispatchKeySequence, asked once per
+        browser (empty dispatchKeySequence: -32602 on r43, -32601 before)."""
+        if not _eng["ok"] or not _engine_ext_mode():
+            return False
+        memo = engine_path_memo(page)
+        if "ext" not in memo:
+            try:
+                await _engine_session()
+                await _eng["session"].send(ENGINE_KEY_SEQUENCE, {"targetId": _eng["tid"], "keys": []})
+                memo["ext"] = False
+            except Exception as e:  # noqa: BLE001
+                memo["ext"] = _cdp_invalid_params(e)
+            _maybe_report_ext()
+        return memo["ext"]
+
+    async def _engine_glide(x, y, no_click, ext=None):
+        """See _humanize._engine_glide (r43: `ext` parameters, fromX/fromY re-sync, no sleep after)."""
+        if not _eng["ok"]:
+            return False
+        use_ext = bool(ext or not _engine_in_sync()) and await _engine_ext_ok()
+        if not use_ext and (ext or not _engine_in_sync()):
             return False
         memo = engine_path_memo(page)
         if memo.get("method") is False:   # this browser's engine has neither name: no probe again
             _eng["ok"] = False
             return False
         try:
-            if _eng["session"] is None:
-                tsession = await page.context.new_cdp_session(page)
-                info = await tsession.send("Target.getTargetInfo")
-                _eng["tid"] = info["targetInfo"]["targetId"]
-                b = getattr(page.context, "browser", None)
-                _eng["session"] = (await b.new_browser_cdp_session()
-                                   if b is not None else tsession)
+            await _engine_session()
             # The engine does not wait for the page: what it walks into a page that has not drawn yet is
             # lost (a fresh headless browser's first page, SC 216). Wait for two frames first; free once
             # drawn. Best effort: a wait that fails still walks (the engine route stays on).
@@ -316,6 +353,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             dur *= tempo
             params = {"targetId": _eng["tid"], "x": float(x), "y": float(y),
                       "duration": dur, "noClick": bool(no_click)}
+            if use_ext:
+                if st["placed"] and not _engine_in_sync():
+                    params["fromX"], params["fromY"] = float(st["pos"][0]), float(st["pos"][1])
+                params.update(ext or {})
             t_send = time.monotonic()
             method = _eng.get("method") or memo.get("method")
             if method:
@@ -339,6 +380,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                     method = ENGINE_POINTER_PATH[1]
                 memo["method"] = method
             _eng["method"] = method
+            _maybe_report_ext()
             # The engine walks the trajectory in the BROWSER process and answers before it has
             # finished. Without waiting, a following mouse.down() fires at the cursor's stale
             # position -- measured on the sync path: a move to (110,58) then a press landed at
@@ -347,7 +389,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             # r38 answers only after the walk AND the click (send returned 772 ms after a 600 ms
             # walk, 2 ms after the release, SC 210): wait only for what is left of `dur`, so an
             # engine that answers late does not add a second, idle `dur` after every click.
-            await asyncio.sleep(max(0.0, dur - (time.monotonic() - t_send)))
+            if not use_ext:   # r43 answers after its last sample / release
+                await asyncio.sleep(max(0.0, dur - (time.monotonic() - t_send)))
             try:
                 await native_move(x, y)
             except Exception:  # noqa: BLE001
@@ -372,6 +415,11 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # races the trajectory. Kept identical to the sync file and to Node.
         # A move while the button is held is a DRAG leg: plan_drag keeps it on the line between grab
         # and drop (an aimed reach's arc took a slider handle 47 px off a 40 px track, SC 209).
+        # r43 engine (SC 232 lane H): held legs take the engine route (buttons carried, answered after the walk).
+        if (st["held"] and _hz_engine_mode(page, _engine_clicks_mode) != "off" and await _engine_ext_ok()
+                and await _engine_glide(x, y, no_click=True,
+                                        ext={"buttons": engine_held_bits(st.get("held_button"))})):
+            return
         await _glide(x, y, held=st["held"])
 
     async def hdown(**kw):
@@ -399,6 +447,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # phantom drag leg (hup already had this; hdown did not).
         try:
             st["held"] = True
+            st["held_button"] = kw.get("button") or "left"
             await native_down(**kw)
         except Exception:
             st["held"] = False
@@ -490,6 +539,25 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         o = normalize_click_options(kw, await _platform())
         if engine_path_ok(o) and _hz_engine_mode(page, _engine_clicks_mode) != "off" and await _engine_glide(x, y, no_click=False):
             return
+        # r43 engine (SC 232 lane H): right/middle, double/triple and modified clicks too (modifier keys pressed here).
+        ext = engine_click_params(o)
+        if (ext and _hz_engine_mode(page, _engine_clicks_mode) != "off" and await _engine_ext_ok()
+                and (not o["modifiers"] or (native_kb_down and native_kb_up))):
+            held = []
+            try:
+                for m in o["modifiers"]:
+                    await native_kb_down(m)
+                    held.append(m)
+                    await asyncio.sleep(_rand(40, 110) / 1000.0)
+                if await _engine_glide(x, y, no_click=False, ext=ext):
+                    return
+            finally:
+                for m in reversed(held):
+                    await asyncio.sleep(_rand(20, 80) / 1000.0)
+                    try:
+                        await native_kb_up(m)
+                    except Exception:  # noqa: BLE001
+                        pass
         await _glide(x, y)
         # A press that raises RAISES (it was swallowed here: a click whose press failed reported
         # success). Only the pin before a press (hdown) stays best-effort.
@@ -509,6 +577,11 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         await hclick(x, y, **kw)   # the internal click: the public mouse.click is the locked one
 
     async def _held_glide(x, y):
+        # r43 engine (SC 232 lane H): the held leg + settle walked engine-side, buttons carried.
+        if (st["held"] and _hz_engine_mode(page, _engine_clicks_mode) != "off" and await _engine_ext_ok()
+                and await _engine_glide(x, y, no_click=True,
+                                        ext={"buttons": engine_held_bits(st.get("held_button")), "settle": True})):
+            return
         await _glide(x, y, settle=True)              # held-button drag leg + seating jiggle
     page._clearcote_held_glide = _held_glide
 
@@ -1014,6 +1087,22 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         except Exception:  # noqa: BLE001
             return None
 
+    async def _engine_type(text, floor):
+        """See _humanize._engine_type: one Browser.dispatchKeySequence (r43) with lane B's dwell and lane D's flight."""
+        keys = engine_key_plan(text, _kdwell,
+                               lambda ch, nxt: max(floor, plan_gap(traits, ch, nxt, random.random,
+                                                                   getattr(persona, "tempo", 1.0),
+                                                                   getattr(persona, "pause_scale", 1.0))),
+                               _needs_shift)
+        if not keys:
+            return False
+        try:
+            await _engine_session()
+            await _eng["session"].send(ENGINE_KEY_SEQUENCE, {"targetId": _eng["tid"], "keys": keys})
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _human_type_text(text, field=None, typos=True, floor_ms=0.0, exact=True):
         """Type text key-by-key with human timing through Playwright's native (trusted) keyboard.
 
@@ -1032,6 +1121,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         allow = rate > 0 and typos_allowed(fld)
         search = bool(allow and not exact and fld and (fld.get("type") or "").lower() == "search")
         floor = max(0.0, float(floor_ms or 0.0))
+        # r43 engine (SC 232 lane H): a run with no slip to plan goes out as ONE dispatchKeySequence (see the sync file).
+        if not allow and n > 1 and not ext_shift and await _engine_ext_ok() and await _engine_type(text, floor):
+            st["typed"] = time.monotonic()   # a following Enter / Tab still waits (_after_typing)
+            return
         # the score hook records this run's keys (the native_kb_* wrappers) and scores it as "typed" at the end
         outer_rec = st.get("keyrec")
         if outer_rec is None and _trace.enabled():

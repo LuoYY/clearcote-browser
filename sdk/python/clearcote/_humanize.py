@@ -37,7 +37,8 @@ import time
 import os
 
 from ._forms import (
-    DEFAULT_TYPO_RATE, NEARBY_LETTERS, classify_field, datetime_equal, engine_path_ok, fit_maxlength,
+    DEFAULT_TYPO_RATE, ENGINE_KEY_SEQUENCE, NEARBY_LETTERS, classify_field, datetime_equal, engine_click_params,
+    engine_held_bits, engine_key_plan, engine_path_ok, fit_maxlength,
     formatted_equal, mask_kept, match_option, normalize_click_options, numeric_equal, plan_datetime, plan_select,
     plan_typo, pre_press_ms, range_attrs,
     range_fraction, range_nudge, range_point, range_sanitize, range_value_ok, segment_nodes_from_tree,
@@ -198,6 +199,22 @@ def _cdp_method_missing(err):
     """True for CDP's "method not found" (-32601), which Playwright reports as "'X' wasn't found"."""
     m = str(err)
     return "wasn't found" in m or "-32601" in m or "method not found" in m.lower()
+
+
+def _cdp_invalid_params(err):
+    """True for CDP's "invalid params" (-32602): what an r43 engine answers to an EMPTY dispatchKeySequence."""
+    m = str(err)
+    return not _cdp_method_missing(err) and ("-32602" in m or "invalid" in m.lower())
+
+
+def _engine_ext_mode():
+    """CLEARCOTE_HUMANIZE_ENGINE_EXT=off (also 0/false/no) keeps the r43 engine extensions unused even when the
+    engine has them: no fromX/fromY re-sync, no engine drag legs, buttons or typed runs (r42 behaviour)."""
+    v = (os.environ.get("CLEARCOTE_HUMANIZE_ENGINE_EXT") or "").strip().lower()
+    return v not in ("0", "off", "false", "no", "none")
+
+
+ENGINE_EXT_MISSING = "the engine has no r43 extensions (Browser.dispatchKeySequence): the SDK planner walks and types"
 
 
 def engine_path_memo(page):
@@ -577,21 +594,62 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return not st["placed"]
         return st["pos"] == _eng["at"]
 
-    def _engine_glide(x, y, no_click):
-        if not _eng["ok"] or not _engine_in_sync():
+    def _engine_session():
+        if _eng["session"] is None:
+            tsession = page.context.new_cdp_session(page)
+            _eng["tid"] = tsession.send(
+                "Target.getTargetInfo")["targetInfo"]["targetId"]
+            b = getattr(page.context, "browser", None)
+            _eng["session"] = (b.new_browser_cdp_session()
+                               if b is not None else tsession)
+
+    def _maybe_report_ext():
+        """Lane A's on_fallback hears ONCE per browser that a PRO engine (it has the pointer path) lacks the r43
+        extensions. The hook only: the SDK planner does the work, so this is not a native fallback and strict mode
+        does not raise."""
+        memo = engine_path_memo(page)
+        if memo.get("ext") is not False or not memo.get("method") or memo.get("ext_reported"):
+            return
+        memo["ext_reported"] = True
+        o = _hz_options_of(page)
+        fn = getattr(o, "on_fallback", None) if o is not None else None
+        if fn is not None:
+            fn({"api": "engine_ext", "reason": ENGINE_EXT_MISSING, "selector": None})
+
+    def _engine_ext_ok():
+        """Does this browser's engine take the r43 dispatchPointerPath parameters and dispatchKeySequence (and
+        answer after its last event)? Asked once per browser, only when needed: an empty dispatchKeySequence
+        answers -32602 (invalid params) on such an engine and -32601 (not found) before r43; anything else counts
+        as no (an engine that accepts no keys is not r43). Off with CLEARCOTE_HUMANIZE_ENGINE_EXT=off."""
+        if not _eng["ok"] or not _engine_ext_mode():
+            return False
+        memo = engine_path_memo(page)
+        if "ext" not in memo:
+            try:
+                _engine_session()
+                _eng["session"].send(ENGINE_KEY_SEQUENCE, {"targetId": _eng["tid"], "keys": []})
+                memo["ext"] = False
+            except Exception as e:  # noqa: BLE001
+                memo["ext"] = _cdp_invalid_params(e)
+            _maybe_report_ext()
+        return memo["ext"]
+
+    def _engine_glide(x, y, no_click, ext=None):
+        """One engine pointer path to (x, y). ``ext``: r43 parameters (button, clickCount, modifiers, buttons,
+        settle), only sent to an engine that takes them. On such an engine the path also starts where THIS SDK
+        left the pointer (fromX/fromY) instead of requiring the engine to be in sync, and no sleep follows (it
+        answers after its last event). A plain in-sync left click never probes: the r42 route is unchanged."""
+        if not _eng["ok"]:
+            return False
+        use_ext = bool(ext or not _engine_in_sync()) and _engine_ext_ok()
+        if not use_ext and (ext or not _engine_in_sync()):
             return False
         memo = engine_path_memo(page)
         if memo.get("method") is False:   # this browser's engine has neither name: no probe again
             _eng["ok"] = False
             return False
         try:
-            if _eng["session"] is None:
-                tsession = page.context.new_cdp_session(page)
-                _eng["tid"] = tsession.send(
-                    "Target.getTargetInfo")["targetInfo"]["targetId"]
-                b = getattr(page.context, "browser", None)
-                _eng["session"] = (b.new_browser_cdp_session()
-                                   if b is not None else tsession)
+            _engine_session()
             # The engine does not wait for the page: what it walks into a page that has not drawn yet is
             # lost (a fresh headless browser's first page, SC 216). Wait for two frames first; free once
             # drawn. Best effort: a wait that fails still walks (the engine route stays on).
@@ -605,6 +663,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             dur *= tempo
             params = {"targetId": _eng["tid"], "x": float(x), "y": float(y),
                       "duration": dur, "noClick": bool(no_click)}
+            if use_ext:
+                if st["placed"] and not _engine_in_sync():
+                    # r43: start where this SDK left the pointer (a glide, a native fallback); before any
+                    # move the engine enters the page over its top edge by itself (pro-r43-13).
+                    params["fromX"], params["fromY"] = float(st["pos"][0]), float(st["pos"][1])
+                params.update(ext or {})
             t_send = time.monotonic()
             method = _eng.get("method") or memo.get("method")
             if method:
@@ -628,6 +692,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                     method = ENGINE_POINTER_PATH[1]
                 memo["method"] = method
             _eng["method"] = method
+            _maybe_report_ext()
             # The engine runs the trajectory in the BROWSER process and answers this command
             # before it has finished walking it. Without waiting, a following mouse.down() fires
             # at the cursor's stale position -- measured: a move to (110,58) then a press landed
@@ -636,7 +701,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             # r38 answers only after the walk AND the click (send returned 772 ms after a 600 ms
             # walk, 2 ms after the release, SC 210): wait only for what is left of `dur`, so an
             # engine that answers late does not add a second, idle `dur` after every click.
-            time.sleep(max(0.0, dur - (time.monotonic() - t_send)))
+            if not use_ext:   # r43 answers after its last sample / release: nothing left to wait for
+                time.sleep(max(0.0, dur - (time.monotonic() - t_send)))
             # Keep Playwright's own cursor position in sync so a following
             # mouse.down()/drag presses where the engine left the cursor.
             try:
@@ -676,6 +742,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         # nothing races the trajectory.
         # A move while the button is held is a DRAG leg: plan_drag keeps it on the line between grab
         # and drop (an aimed reach's arc took a slider handle 47 px off a 40 px track, SC 209).
+        # r43 engine (SC 232 lane H): a held leg CAN take the engine route -- dispatchPointerPath {buttons}
+        # carries the held button on every sample and answers after the last one, so neither reason above
+        # holds there.
+        if (st["held"] and _hz_engine_mode(page, _engine_clicks_mode) != "off" and _engine_ext_ok()
+                and _engine_glide(x, y, no_click=True, ext={"buttons": engine_held_bits(st.get("held_button"))})):
+            return
         _glide(x, y, held=st["held"])
 
     def hdown(**kw):
@@ -713,6 +785,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         # move into a phantom drag leg. hup already guarded this; hdown did not.
         try:
             st["held"] = True
+            st["held_button"] = kw.get("button") or "left"
             native_down(**kw)
         except Exception:
             st["held"] = False
@@ -804,6 +877,26 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         o = normalize_click_options(kw, _platform())
         if engine_path_ok(o) and _hz_engine_mode(page, _engine_clicks_mode) != "off" and _engine_glide(x, y, no_click=False):
             return
+        # r43 engine (SC 232 lane H): right/middle buttons, double/triple clicks and modified clicks take the
+        # engine route too. The modifier KEYS are pressed here around it (lead before, lag after), as _press_at.
+        ext = engine_click_params(o)
+        if (ext and _hz_engine_mode(page, _engine_clicks_mode) != "off" and _engine_ext_ok()
+                and (not o["modifiers"] or (native_kb_down and native_kb_up))):
+            held = []
+            try:
+                for m in o["modifiers"]:
+                    native_kb_down(m)
+                    held.append(m)
+                    time.sleep(_rand(40, 110) / 1000.0)
+                if _engine_glide(x, y, no_click=False, ext=ext):
+                    return
+            finally:
+                for m in reversed(held):
+                    time.sleep(_rand(20, 80) / 1000.0)
+                    try:
+                        native_kb_up(m)
+                    except Exception:  # noqa: BLE001
+                        pass
         _glide(x, y)
         # A press that raises RAISES (it was swallowed here: a click whose press failed reported
         # success). Only the pin before a press (hdown) stays best-effort.
@@ -823,6 +916,11 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         hclick(x, y, **kw)
 
     def _held_glide(x, y):
+        # r43 engine (SC 232 lane H): the held leg + seating jiggle (settle) walked engine-side, buttons carried.
+        if (st["held"] and _hz_engine_mode(page, _engine_clicks_mode) != "off" and _engine_ext_ok()
+                and _engine_glide(x, y, no_click=True,
+                                  ext={"buttons": engine_held_bits(st.get("held_button")), "settle": True})):
+            return
         _glide(x, y, settle=True)                # held-button drag leg + seating jiggle
     page._clearcote_held_glide = _held_glide
 
@@ -1403,6 +1501,24 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         except Exception:  # noqa: BLE001
             return None
 
+    def _engine_type(text, floor):
+        """Type ``text`` with ONE Browser.dispatchKeySequence (r43, SC 232 lane H): lane B's key dwell and lane D's
+        bigram flight per key (the caller's ``delay`` as the floor), paced in the browser. False when a character
+        has no plain US key or the call fails up front (nothing typed yet: the per-key path types it)."""
+        keys = engine_key_plan(text, _kdwell,
+                               lambda ch, nxt: max(floor, plan_gap(traits, ch, nxt, random.random,
+                                                                   getattr(persona, "tempo", 1.0),
+                                                                   getattr(persona, "pause_scale", 1.0))),
+                               _needs_shift)
+        if not keys:
+            return False
+        try:
+            _engine_session()
+            _eng["session"].send(ENGINE_KEY_SEQUENCE, {"targetId": _eng["tid"], "keys": keys})
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def _human_type_text(text, field=None, typos=True, floor_ms=0.0, exact=True):
         """Type text key-by-key with human timing. Each char goes through Playwright's native
         keyboard (trusted), so this stays isTrusted=True.
@@ -1432,6 +1548,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         allow = rate > 0 and typos_allowed(fld)
         search = bool(allow and not exact and fld and (fld.get("type") or "").lower() == "search")
         floor = max(0.0, float(floor_ms or 0.0))
+        # r43 engine (SC 232 lane H): a run with no slip to plan (typos off, or a field where a slip is a failure)
+        # and no caller-held Shift goes out as ONE dispatchKeySequence -- the same dwell and flight draws, paced in
+        # the browser, so the rhythm carries no CDP round trips. Rollover is not modelled there.
+        if not allow and n > 1 and not ext_shift and _engine_ext_ok() and _engine_type(text, floor):
+            st["typed"] = time.monotonic()   # a following Enter / Tab still waits (_after_typing)
+            return
         # the score hook records this run's keys (the native_kb_* wrappers) and scores it as "typed" at the end
         outer_rec = st.get("keyrec")
         if outer_rec is None and _trace.enabled():

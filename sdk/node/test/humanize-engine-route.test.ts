@@ -9,7 +9,8 @@
  * afterwards added an idle second walk's worth of time to every click.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { attachHumanize, engineClicksMode, POINTER_PATH, POINTER_PATH_LEGACY } from "../src/humanize.js";
+import { ENGINE_EXT_MISSING, attachHumanize, engineClicksMode, POINTER_PATH, POINTER_PATH_LEGACY } from "../src/humanize.js";
+import { ENGINE_KEY_SEQUENCE } from "../src/forms.js";
 
 /** Browser CDP session that answers the pointer-path command after the walk (+120 ms press/release), like r38. */
 class Engine {
@@ -125,4 +126,115 @@ describe("engine pointer path routing", () => {
       expect(engineClicksMode()).toBe(want);
     }
   });
+});
+
+// ------------------------------------------------------------------ r43 engine extensions (SC 232 lane H)
+// A port of the Python fake-session tests (test_humanize_forms_async.py: _R43Session / _R42Session): the SDK side of
+// pro-r43-07 (dispatchPointerPath fromX/fromY, button, clickCount, modifiers, buttons, settle; answers after its last
+// event) and pro-r43-09 (Browser.dispatchKeySequence), feature-detected once per browser by an EMPTY key sequence.
+
+/** An r43 engine: the pointer path takes the extensions; an EMPTY dispatchKeySequence is invalid params (-32602). */
+class R43Engine extends Engine {
+  keys: any[] = [];
+  probes = 0;
+  async send(method: string, params?: any): Promise<any> {
+    if (method === ENGINE_KEY_SEQUENCE) {
+      if (!params?.keys?.length) {
+        this.probes++;
+        throw Object.assign(new Error("Protocol error (Browser.dispatchKeySequence): Invalid parameters"), { code: -32602 });
+      }
+      this.keys.push(params);
+      return {};
+    }
+    return super.send(method, params);
+  }
+}
+
+/** A PRO engine before r43: the pointer path answers, Browser.dispatchKeySequence does not exist (-32601). */
+class R42Engine extends Engine {
+  probes = 0;
+  async send(method: string, params?: any): Promise<any> {
+    if (method === ENGINE_KEY_SEQUENCE) {
+      this.probes++;
+      throw Object.assign(new Error("Protocol error (Browser.dispatchKeySequence): 'Browser.dispatchKeySequence' wasn't found"), { code: -32601 });
+    }
+    return super.send(method, params);
+  }
+}
+
+const EXT_ENVS = ["CLEARCOTE_HUMANIZE_TYPO_RATE", "CLEARCOTE_HUMANIZE_ENGINE_EXT"];
+const extSaved: Record<string, string | undefined> = {};
+
+describe("r43 engine extensions (lane H)", () => {
+  afterEach(() => {
+    for (const k of EXT_ENVS) { if (extSaved[k] === undefined) delete process.env[k]; else process.env[k] = extSaved[k]; }
+  });
+  const noTypos = () => { for (const k of EXT_ENVS) extSaved[k] = process.env[k]; process.env.CLEARCOTE_HUMANIZE_TYPO_RATE = "0"; };
+
+  it("walks right, double and modified clicks, held legs and slip-free typed runs engine-side", async () => {
+    noTypos();
+    const eng = new R43Engine();
+    const { page, log, browser } = makePage(eng);
+    await attachHumanize(browser as never, page, { humanize: true, seed: "route" });
+    await page.mouse.click(300, 200);                       // plain and in sync: the r42 route, no probe
+    await page.mouse.click(300, 200, { button: "right" });  // the probe, then the engine walks it
+    await page.mouse.click(310, 200, { clickCount: 2 });
+    await page.mouse.click(320, 200, { modifiers: ["Shift"] });
+    await page.mouse.click(300, 200, { delay: 250 });       // a caller-chosen hold stays SDK-side
+    expect(eng.calls.length).toBe(4);
+    expect(eng.probes).toBe(1);
+    expect(eng.calls[0].fromX).toBeUndefined();
+    expect(eng.calls[0].button).toBeUndefined();
+    expect(eng.calls[0].noClick).toBe(false);
+    expect(eng.calls[1].button).toBe("right");
+    expect(eng.calls[2].clickCount).toBe(2);
+    expect(eng.calls[3].modifiers).toBe(8);
+    expect(log.filter((e) => e[0] === "down").length).toBe(1);   // only the held-delay click presses natively
+    // a held leg: dispatchPointerPath {buttons: 1, noClick}, starting where the SDK's own glide left the pointer
+    await page.mouse.down();
+    await page.mouse.move(360, 240);
+    await page.mouse.up();
+    const held = eng.calls.filter((c) => c.buttons);
+    expect(held.length).toBe(1);
+    expect(held[0]).toMatchObject({ buttons: 1, noClick: true, fromX: 300, fromY: 200, x: 360, y: 240 });
+    // a typed run with no slip to plan: ONE dispatchKeySequence, US codes, Shift as modifiers 8
+    await page.keyboard.type("hello, World!");
+    expect(eng.keys.length).toBe(1);
+    const keys = eng.keys[0].keys;
+    expect(keys.map((k: any) => k.key).join("")).toBe("hello, World!");
+    expect(keys[5].code).toBe("Comma");
+    expect(keys[7].modifiers).toBe(8);
+    expect(keys[0].modifiers).toBeUndefined();
+    expect(keys[12]).toMatchObject({ code: "Digit1", modifiers: 8, gapMs: 0 });
+    for (const k of keys) { expect(k.dwellMs).toBeGreaterThanOrEqual(45); expect(k.dwellMs).toBeLessThanOrEqual(120); }
+    for (const k of keys.slice(0, -1)) expect(k.gapMs).toBeGreaterThanOrEqual(25);
+  }, 30_000);
+
+  it("a PRO engine without the extensions is reported once through onFallback; presses stay SDK-side", async () => {
+    noTypos();
+    const eng = new R42Engine();
+    const events: any[] = [];
+    const { page, log, browser } = makePage(eng);
+    await attachHumanize(browser as never, page, { humanize: { onFallback: (e: any) => events.push(e), strict: true }, seed: "route" });
+    await page.mouse.click(300, 200);                       // the pointer path answers: a PRO engine
+    await page.mouse.click(300, 200, { button: "right" });  // the probe says no: reported once, pressed SDK-side
+    await page.mouse.click(310, 200, { clickCount: 2 });    // no second probe, no second report
+    expect(eng.calls.length).toBe(1);
+    expect(eng.probes).toBe(1);
+    expect(events).toEqual([{ api: "engine_ext", reason: ENGINE_EXT_MISSING }]);
+    expect(log.filter((e) => e[0] === "down").length).toBe(3);
+  }, 30_000);
+
+  it("CLEARCOTE_HUMANIZE_ENGINE_EXT=off keeps the r42 route on an r43 engine", async () => {
+    noTypos();
+    process.env.CLEARCOTE_HUMANIZE_ENGINE_EXT = "off";
+    const eng = new R43Engine();
+    const { page, log, browser } = makePage(eng);
+    await attachHumanize(browser as never, page, { humanize: true, seed: "route" });
+    await page.mouse.click(300, 200);
+    await page.mouse.click(300, 200, { button: "right" });
+    expect(eng.calls.length).toBe(1);
+    expect(eng.probes).toBe(0);
+    expect(log.filter((e) => e[0] === "down").length).toBe(1);
+  }, 30_000);
 });
