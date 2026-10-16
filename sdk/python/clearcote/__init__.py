@@ -44,6 +44,7 @@ from ._geometry import apply_headless_geometry, caller_sized_the_window, fit_win
 from ._colorscheme import (default_color_scheme, engine_decides_color_scheme,
                            install_color_scheme_default)
 from ._humanize import install_humanize, install_humanize_on_context
+from ._hzoptions import ClearcoteStrictError, HumanizeOptions, normalize as _hz_normalize
 from ._launchopts import (  # noqa: F401  (web_bluetooth_args re-exported for tests)
     DEFAULT_IGNORED_ARGS,
     GATED_ENGINE_SWITCHES,
@@ -119,6 +120,8 @@ from ._hold import press_and_hold
 
 __all__ = [
     "launch",
+    "HumanizeOptions",
+    "ClearcoteStrictError",
     "press_and_hold",
     "Cloud",
     "AsyncCloud",
@@ -431,7 +434,8 @@ def _prepare(kwargs):
         for key, value in resolve_profile_options(profile).items():
             kwargs.setdefault(key, value)
     geoip = kwargs.pop("geoip", False)
-    humanize = kwargs.pop("humanize", False)
+    # True | False | "strict" | HumanizeOptions | dict: validated here, before anything is started
+    humanize = _hz_normalize(kwargs.pop("humanize", False))
     show_cursor = kwargs.pop("show_cursor", False)
     # widevine: True/False/None (None = CLEARCOTE_WIDEVINE, else on for a licensed launch). The profile
     # seeding for widevine=True happens in launch_persistent_context; the --widevine-cdm-path switch is

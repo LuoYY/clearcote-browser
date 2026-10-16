@@ -1,0 +1,83 @@
+{
+ "_comment": "Pinned by lane A (SC 232): the seed -> motor persona map must not change. First 20 mulberry32 draws of hash_seed(\"ha-1\") and the RNG-derived persona fields for 3 seeds, generated from SDK 0.51.0 (ceb7983). Every SDK checks these; humanize options never draw from this stream.",
+ "rng_seed": "ha-1",
+ "hash": 690103844,
+ "draws": [
+  0.8965730080381036,
+  0.9473639733623713,
+  0.758412302006036,
+  0.6357904386240989,
+  0.5548985966015607,
+  0.17171185091137886,
+  0.008461398538202047,
+  0.7597416355274618,
+  0.1577928909100592,
+  0.43431050423532724,
+  0.23808828578330576,
+  0.9445698240306228,
+  0.6471896807197481,
+  0.13971120538190007,
+  0.24451052024960518,
+  0.002530571771785617,
+  0.8670139557216316,
+  0.7855210290290415,
+  0.05886894813738763,
+  0.8585993759334087
+ ],
+ "personas": [
+  {
+   "seed_input": "ha-1",
+   "fields": {
+    "seed": 690103844,
+    "device_hz": 150,
+    "tremor_hz": 11.789455893449485,
+    "tremor_amp": 0.4081966747622937,
+    "drift_amp": 0.2907371315872297,
+    "drift_tau": 115.48985966015607,
+    "jitter": 0.3272703329101205,
+    "fitts_a": 90.50768391229212,
+    "fitts_b": 173.18191448692232,
+    "primary_frac": 0.8557792890910059,
+    "overshoot": 0.05171552521176637,
+    "max_corrections": 1,
+    "approach_bias": 0.07359484035987407
+   }
+  },
+  {
+   "seed_input": "user-7423",
+   "fields": {
+    "seed": 1247329221,
+    "device_hz": 132,
+    "tremor_hz": 11.335074057802558,
+    "tremor_amp": 0.4940799555368722,
+    "drift_amp": 0.13466101083904505,
+    "drift_tau": 152.6880319835618,
+    "jitter": 0.2782943261787295,
+    "fitts_a": 117.1461793128401,
+    "fitts_b": 124.29415015038103,
+    "primary_frac": 0.8579062362527474,
+    "overshoot": 0.06382450435310602,
+    "max_corrections": 2,
+    "approach_bias": -0.16016110626515
+   }
+  },
+  {
+   "seed_input": 42,
+   "fields": {
+    "seed": 4112119562,
+    "device_hz": 126,
+    "tremor_hz": 9.779532465152442,
+    "tremor_amp": 0.4794441258674487,
+    "drift_amp": 0.27690227436833087,
+    "drift_tau": 129.59217260591686,
+    "jitter": 0.6050487180356867,
+    "fitts_a": 105.2708088979125,
+    "fitts_b": 140.82869119476527,
+    "primary_frac": 0.841936734514311,
+    "overshoot": 0.07506462725112215,
+    "max_corrections": 1,
+    "approach_bias": -0.21323577675502747
+   }
+  }
+ ]
+}

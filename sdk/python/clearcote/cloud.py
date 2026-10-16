@@ -1162,6 +1162,13 @@ def _prepare_launch(kwargs, persistent=False, user_data_dir=None):
     if sdk.get("humanize") is None:
         sdk["humanize"] = True
     body["humanize"] = False
+    # The options object (preset, strict, engine, ...) runs in the SDK too; the session carries a copy as
+    # humanizeOptions so the server can show and later apply it. A separate key, not humanize: {...}: the
+    # control plane answers 400 to a non-boolean humanize today, and ignores keys it does not know.
+    from ._hzoptions import resolve as _hz_resolve
+    hz = _hz_resolve(sdk["humanize"])   # raises on an unknown option before the session is created
+    if hz is not None and sdk["humanize"] is not True:
+        body["humanizeOptions"] = hz.to_payload()
     return sdk, body
 
 

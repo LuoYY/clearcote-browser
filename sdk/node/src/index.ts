@@ -33,7 +33,8 @@ import { checkInstall, ensureBinary, ensureVersion, proEnsureBinary, resolvedEng
 import { fingerprintArgs, isFingerprintPassthrough, splitFingerprintOptions, type FingerprintOptions } from "./fingerprint.js";
 import { resolveGeoDetailed, startEgressDriftCheck, GeoipError, type Geo } from "./geoip.js";
 import { defaultColorScheme, engineDecidesColorScheme, installColorSchemeDefault } from "./colorscheme.js";
-import { installHumanize, installHumanizeOnContext, type HumanizeOptions } from "./humanize.js";
+import { installHumanize, installHumanizeOnContext, type HumanizeLaunchOptions } from "./humanize.js";
+import { resolveHumanize } from "./hzoptions.js";
 import { agentArgs, splitAgentOptions, type AgentOptions } from "./agent.js";
 import { resolveProfileOptions, Profile } from "./profile.js";
 import { resolveAuto, resolveLocal, localSetupHint, engineSupportsProfiles, MIN_PROFILE_ENGINE_MAJOR, DEFAULT_LOCAL_DIR, profileWithWindows11Faces, type AutoOptions, type AutoResult } from "./profileauto.js";
@@ -121,7 +122,11 @@ export { resolveReleaseChannel, type ReleaseChannel } from "./download.js";
 export { isFingerprintPassthrough } from "./fingerprint.js";
 export { DEFAULT_IGNORED_ARGS, gpuBlocklistArgs, gpuBackendArgs, xDisplayAvailable, mesaEglAvailable, gateEngineSwitches, engineSupportsSwitch } from "./launchopts.js";
 export { serveMultiplex, type MultiplexOptions, type MultiplexServer } from "./multiplex.js";
-export type { HumanizeOptions } from "./humanize.js";
+export type { HumanizeLaunchOptions } from "./humanize.js";
+export { ClearcoteStrictError, resolveHumanize } from "./hzoptions.js";
+export type {
+  HumanizeAmbient, HumanizeEngine, HumanizeFallbackEvent, HumanizeOptions, HumanizePreset, HumanizeSetting,
+} from "./hzoptions.js";
 export { pressAndHold, type PressAndHoldOptions, type HoldButton } from "./hold.js";
 export { Profile, listProfiles, loadProfile, PROFILE_DIR, type ProfileOptions } from "./profile.js";
 // Profile library: real captured personas, selected for coherence with THIS host.
@@ -329,7 +334,7 @@ interface CloudSwitchOption {
 }
 
 /** Options for {@link launch}: Playwright launch options + Clearcote fingerprint + agent + download options. */
-export interface LaunchOptions extends PlaywrightLaunchOptions, FingerprintOptions, AgentOptions, GeoipOption, ProfileOption, ExtensionsOption, EphemeralProfileOption, HumanizeOptions, DownloadOptions, LicenseOptions, ShaderDialectOption, PersonaEnvOption, FontDirsOption, Socks5UdpOption, EngineExtrasOption, CloudSwitchOption, DockerOption, WidevineOption {}
+export interface LaunchOptions extends PlaywrightLaunchOptions, FingerprintOptions, AgentOptions, GeoipOption, ProfileOption, ExtensionsOption, EphemeralProfileOption, HumanizeLaunchOptions, DownloadOptions, LicenseOptions, ShaderDialectOption, PersonaEnvOption, FontDirsOption, Socks5UdpOption, EngineExtrasOption, CloudSwitchOption, DockerOption, WidevineOption {}
 
 /** The account options a local launch drops (see CloudSwitchOption). */
 function withoutCloudOptions<T extends object>(options: T): T {
@@ -346,7 +351,7 @@ export interface PersistentContextOptions
     GeoipOption,
     ProfileOption,
     ExtensionsOption,
-    HumanizeOptions,
+    HumanizeLaunchOptions,
     DownloadOptions,
     LicenseOptions,
     ShaderDialectOption,
@@ -1057,6 +1062,7 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   // resolved later, once the executable is known.)
   const merged = mergeSavedProfile(options);
   const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, offlineKey, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
+  resolveHumanize(humanize); // true | "strict" | HumanizeOptions: an unknown option throws before anything starts
   const { fingerprint, rest: afterFp } = splitFingerprintOptions(rest);
   const { agent, rest: pwOptions } = splitAgentOptions(afterFp);
   const fontDirList = checkFontDirs(fontDirs);  // Linux fontconfig dirs: a typo throws before the lease
@@ -1185,6 +1191,7 @@ async function launchLocalPersistentContext(
 ): Promise<BrowserContext> {
   const merged = mergeSavedProfile(options);
   const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, offlineKey, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
+  resolveHumanize(humanize); // true | "strict" | HumanizeOptions: an unknown option throws before anything starts
   const { fingerprint, rest: afterFp } = splitFingerprintOptions(rest);
   const { agent, rest: pwOptions } = splitAgentOptions(afterFp);
   const fontDirList = checkFontDirs(fontDirs);  // Linux fontconfig dirs: a typo throws before the lease
