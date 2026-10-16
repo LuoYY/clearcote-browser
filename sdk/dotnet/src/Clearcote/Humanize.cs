@@ -242,7 +242,28 @@ public static partial class Humanize
         => SerialAsync<bool>(page, async () => { await body().ConfigureAwait(false); return true; });
 
     private static double TypoRateFor(IPage page)
-        => TypoRateOverride.TryGetValue(page, out var forced) ? forced.Value : TypoRate();
+    {
+        if (TypoRateOverride.TryGetValue(page, out var forced)) return forced.Value;
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(TypoRateEnv))) return TypoRate();
+        return TraitsFor(page).TypoRate;   // the persona's 0.5-4 % (Keys.TypingTraitsOf)
+    }
+
+    // ------------------------------------------------------------------ lane D keyboard state
+    /// <summary>Per-page keyboard state: when the last typed run ended (the submit / Tab pause it owes) and the
+    /// keys the CALLER holds through <see cref="HumanKeyDownAsync"/> (key -> when it went down, the hold it is owed).</summary>
+    private sealed class KeyState
+    {
+        public long? Typed;
+        public readonly Dictionary<string, (long At, double Dwell)> Held = new();
+    }
+    private static readonly ConditionalWeakTable<IPage, KeyState> KeyStates = new();
+    private static KeyState KeysOf(IPage page) => KeyStates.GetValue(page, _ => new KeyState());
+    private static readonly ConditionalWeakTable<IPage, TypingTraits> Traits = new();
+    /// <summary>The page persona's typing identity (Keys.TypingTraitsOf: a salted side stream of its seed).</summary>
+    internal static TypingTraits TraitsFor(IPage page) => Traits.GetValue(page, pg => Keys.TypingTraitsOf(PersonaFor(pg).Seed));
+    /// <summary>Every keyboard-path sleep goes through here (a test seam: the cadence tests record what is slept).</summary>
+    internal static Func<double, Task> KeySleep = ms => Task.Delay((int)Math.Max(0, Math.Round(ms)));
+    private static readonly Rng Unseeded = () => Rnd.NextDouble();
 
     // How long a covered click point is re-checked (an overlay fading out) before the native path takes over.
     internal const float CoverCheckMs = 400;
@@ -354,6 +375,7 @@ public static partial class Humanize
     private static async Task GlideAsync(IPage page, Persona p, PointerState st, double toX, double toY,
         double targetW, bool settle = false)
     {
+        KeysOf(page).Typed = null;   // the hand left the keyboard: no submit / Tab pause owed
         await SeedPointerAsync(page, st).ConfigureAwait(false);
         var steps = Motion.PlanMove(new Point(st.X, st.Y), new Point(toX, toY), p, targetW, settle);
         // Native moves carry button state, so a button held via Mouse.DownAsync stays pressed
@@ -1163,7 +1185,7 @@ public static partial class Humanize
     /// <c>PressSequentiallyAsync</c>, which focuses it without a click. Strict: more than one match raises
     /// Playwright's strict-mode error.
     /// </summary>
-    public static async Task HumanTypeAsync(this ILocator locator, string text)
+    public static async Task HumanTypeAsync(this ILocator locator, string text, float? delay = null)
     {
         ArgumentNullException.ThrowIfNull(locator);
         ArgumentNullException.ThrowIfNull(text);
@@ -1175,10 +1197,10 @@ public static partial class Humanize
             {
                 var p = PersonaFor(page);
                 await AmbientPlaceAsync(page, p, StateFor(page)).ConfigureAwait(false);   // no-op once a click placed it
-                await TypeTextAsync(page, p, text, null, typos: true).ConfigureAwait(false);
+                await TypeTextAsync(page, p, text, null, typos: true, floorMs: delay ?? 0, exact: false).ConfigureAwait(false);
                 return;
             }
-            await locator.PressSequentiallyAsync(text).ConfigureAwait(false);
+            await locator.PressSequentiallyAsync(text, delay is null ? null : new LocatorPressSequentiallyOptions { Delay = delay }).ConfigureAwait(false);
         }).ConfigureAwait(false);
     }
 
@@ -1225,6 +1247,9 @@ public static partial class Humanize
             var te = await TextEntryAsync(loc, timeout).ConfigureAwait(false);
             if (te is null) return false;
             var (box, info) = te.Value;
+            // lane D: from the field before it, Tab (persona share, verified) -- only into an empty field, as
+            // typing appends at the caret and Tab selects a field's text
+            if (await TabIntoAsync(loc, info, needEmpty: true).ConfigureAwait(false)) return true;
             if (!await FocusClickAsync(loc.Page, box, ProvenPoint(box, info), loc).ConfigureAwait(false)
                 || !await FocusedAsync(loc).ConfigureAwait(false))
                 return !Fallback("type: the click did not put the caret in the field");
@@ -1252,7 +1277,7 @@ public static partial class Humanize
     /// (the field's value is read before and after each slip), so an input mask or a maxlength that
     /// swallows the wrong key never costs a real character.</para>
     /// </summary>
-    public static async Task HumanTypeAsync(this IPage page, string text)
+    public static async Task HumanTypeAsync(this IPage page, string text, float? delay = null)
     {
         ArgumentNullException.ThrowIfNull(page);
         ArgumentNullException.ThrowIfNull(text);
@@ -1260,7 +1285,7 @@ public static partial class Humanize
         {
             var p = PersonaFor(page);
             await AmbientPlaceAsync(page, p, StateFor(page)).ConfigureAwait(false);
-            await TypeTextAsync(page, p, text, null, typos: true).ConfigureAwait(false);
+            await TypeTextAsync(page, p, text, null, typos: true, floorMs: delay ?? 0, exact: false).ConfigureAwait(false);
         }).ConfigureAwait(false);
     }
 
@@ -1269,13 +1294,22 @@ public static partial class Humanize
     /// the keys go to for the typo gate (null = read the focused element in the isolated world);
     /// <paramref name="typos"/> false types without slips (the clean retry after a failed check).
     /// </summary>
-    private static async Task TypeTextAsync(IPage page, Persona p, string text, FieldTraits? field, bool typos)
+    private static async Task TypeTextAsync(IPage page, Persona p, string text, FieldTraits? field, bool typos,
+        double floorMs = 0, bool exact = true)
     {
         // One key per code point (a surrogate pair is one character, not two half keys).
         var chars = Forms.Chars(text);
+        var tr = TraitsFor(page);
+        var ks = KeysOf(page);
         double rollover = RolloverOverride.TryGetValue(page, out var forced) ? forced.Value : Motion.RolloverRate(p);
         double rate = typos ? TypoRateFor(page) : 0.0;
-        bool allow = rate > 0 && Forms.TyposAllowed(field ?? await ActiveFieldAsync(page).ConfigureAwait(false));
+        var fld = rate > 0 ? field ?? await ActiveFieldAsync(page).ConfigureAwait(false) : null;
+        bool allow = rate > 0 && Forms.TyposAllowed(fld);
+        // lane D: a search field may keep a slip (never on fill: exact); the caller's delay is the shortest gap;
+        // no second Shift under a Shift the caller holds (HumanKeyDownAsync)
+        bool search = allow && !exact && string.Equals(fld?.Type, "search", StringComparison.OrdinalIgnoreCase);
+        double floor = Math.Max(0, floorMs);
+        bool extShift = ks.Held.ContainsKey("Shift");
         // Capitals and shifted symbols are typed the way a person types them: ShiftLeft goes down a
         // moment before the key (35-120 ms) and comes up just after it (10-70 ms), held across a run of
         // them. PressAsync("A") alone sent the key with shiftKey=false and no Shift key at all
@@ -1286,7 +1320,7 @@ public static partial class Humanize
             for (int i = 0; i < chars.Length; i++)
             {
                 var ch = chars[i];
-                bool need = NeedsShift(ch);
+                bool need = NeedsShift(ch) && !extShift;
                 if (need && !shift)
                 {
                     await page.Keyboard.DownAsync("Shift").ConfigureAwait(false);
@@ -1300,9 +1334,10 @@ public static partial class Humanize
                     if (tp is not null)
                     {
                         typo = true;
+                        bool leave = search && tp.Kind == "sub" && Rnd.NextDouble() < Keys.SearchSlipRate;
                         try
                         {
-                            consumed = await DoTypoAsync(page, p, chars, i, tp).ConfigureAwait(false);
+                            consumed = await DoTypoAsync(page, p, chars, i, tp, leave).ConfigureAwait(false);
                         }
                         catch (PlaywrightException)
                         {
@@ -1313,7 +1348,7 @@ public static partial class Humanize
                 // Rollover: one press per character never overlaps two keys, and a real typist's fast
                 // pairs do (0 overlapping keydowns in 32 keys, measured on r32/r33). Only two different
                 // plain keys, never under Shift, never next to a slip.
-                if (!typo && !shift && i + 1 < chars.Length && CanRoll(ch) && CanRoll(chars[i + 1]) && ch != chars[i + 1]
+                if (!typo && !shift && floor <= 0 && i + 1 < chars.Length && CanRoll(ch) && CanRoll(chars[i + 1]) && ch != chars[i + 1]
                     && Rnd.NextDouble() < rollover && await RollPairAsync(page, ch, chars[i + 1], p).ConfigureAwait(false))
                     ch = chars[++i];   // both typed: carry on as if after the second
                 else if (!consumed)
@@ -1326,11 +1361,10 @@ public static partial class Humanize
                 }
                 if (i < chars.Length - 1)
                 {
-                    // Gaussian inter-key cadence with a floor — a realistic distribution, not a uniform band.
-                    double d = Math.Max(25, Gauss(85, 45));
-                    if (ch.Length == 1 && char.IsWhiteSpace(ch[0])) d += Rand(20, 100);
-                    if (Rnd.NextDouble() < 0.06) d += Rand(180, 450);   // occasional thinking pause
-                    await Task.Delay((int)d).ConfigureAwait(false);
+                    // lane D: the bigram flight model (Keys.PlanGap, the planner Python and Node use): the persona's
+                    // WPM, scaled by how the hand travels between the two keys, log-normal noise, word-initial and
+                    // punctuation pauses, the whitespace and thinking pauses; the caller's delay as a floor.
+                    await KeySleep(Math.Max(floor, Keys.PlanGap(tr, ch, chars[i + 1], Unseeded))).ConfigureAwait(false);
                 }
             }
         }
@@ -1342,6 +1376,7 @@ public static partial class Humanize
                 try { await page.Keyboard.UpAsync("Shift").ConfigureAwait(false); }
                 catch (PlaywrightException) { /* best-effort */ }
             }
+            if (chars.Length > 0) ks.Typed = Environment.TickCount64;   // a following Enter / Tab waits (AfterTypingAsync)
         }
     }
 
@@ -1419,8 +1454,30 @@ public static partial class Humanize
         return new FieldTraits(JStr(f, "type"), JStr(f, "inputmode"), JStr(f, "autocomplete"), frame);
     }
 
-    // gaussian inter-key cadence (a realistic distribution, not a uniform band), in ms
-    private static int FlightMs() => (int)Math.Max(25, Gauss(85, 45));
+    /// <summary>Bring the focused field back to <paramref name="target"/> (what it held before a slip) from wherever
+    /// a word delete left it: Backspace to the common prefix, then type the rest. Nothing when unreadable.</summary>
+    private static async Task RestoreAsync(IPage page, Persona p, string target)
+    {
+        var got = await ActiveValueAsync(page).ConfigureAwait(false);
+        if (got is null || got == target) return;
+        var g = Forms.Chars(got);
+        var t = Forms.Chars(target);
+        int k = 0;
+        while (k < Math.Min(g.Length, t.Length) && g[k] == t[k]) k++;
+        if (g.Length - k > 64 || t.Length - k > 64) return;
+        if (g.Length > k)
+        {
+            await BackspacesAsync(page, p, g.Length - k).ConfigureAwait(false);
+            await Task.Delay((int)Rand(80, 200)).ConfigureAwait(false);
+        }
+        string? prev = null;
+        foreach (var c in t.Skip(k))
+        {
+            if (prev is not null) await KeySleep(Keys.FlightMs(TraitsFor(page), prev, c, Unseeded)).ConfigureAwait(false);
+            await PressOrInsertAsync(page, c, p).ConfigureAwait(false);
+            prev = c;
+        }
+    }
 
     private static async Task BackspacesAsync(IPage page, Persona p, int n)
         => await KeyAsync(page, p, "Backspace", n, 70, 150).ConfigureAwait(false);
@@ -1436,7 +1493,7 @@ public static partial class Humanize
     /// and a Backspace pressed for a key that never arrived deletes a real character. Measured before and
     /// after the slip, in the isolated world -- typos are ~2 % of keys, so this costs nearly nothing.</para>
     /// </summary>
-    private static async Task<bool> DoTypoAsync(IPage page, Persona p, string[] text, int i, TypoPlan tp)
+    private static async Task<bool> DoTypoAsync(IPage page, Persona p, string[] text, int i, TypoPlan tp, bool leave = false)
     {
         var before = await ActiveValueAsync(page).ConfigureAwait(false);
         switch (tp.Kind)
@@ -1446,14 +1503,29 @@ public static partial class Humanize
                 await PressOrInsertAsync(page, tp.Wrong ?? text[i], p).ConfigureAwait(false);
                 var got = Landed(before, await ActiveValueAsync(page).ConfigureAwait(false));
                 if (got is int g0 && g0 <= 0) return false;   // swallowed: nothing to correct
+                if (leave) return true;                        // a search field: the slip stays in place of text[i]
                 int typed = 1;
+                string prevKey = tp.Wrong ?? text[i];
                 foreach (var c in text.Skip(i + 1).Take(tp.Late))   // late notice: a key or two more
                 {
-                    await Task.Delay(FlightMs()).ConfigureAwait(false);
+                    await KeySleep(Keys.FlightMs(TraitsFor(page), prevKey, c, Unseeded)).ConfigureAwait(false);
                     await PressOrInsertAsync(page, c, p).ConfigureAwait(false);
+                    prevKey = c;
                     typed++;
                 }
                 await Task.Delay((int)Rand(140, 340)).ConfigureAwait(false);   // noticing
+                // lane D: a slip inside a word is fixed with the word-delete chord and the word typed again in
+                // Keys.WordFixRate of the cases, when the field can be read to put it back exactly
+                int ws = 0;
+                for (int j = i - 1; j >= 0; j--) if (text[j] is " " or "\n") { ws = j + 1; break; }
+                if (before is not null && i - ws + typed >= 2 && Rnd.NextDouble() < Keys.WordFixRate)
+                {
+                    await PressKeyAsync(page, p, (OperatingSystem.IsMacOS() ? "Alt" : "Control") + "+Backspace").ConfigureAwait(false);
+                    await Task.Delay((int)Rand(120, 260)).ConfigureAwait(false);
+                    await RestoreAsync(page, p, before).ConfigureAwait(false);
+                    await Task.Delay((int)Rand(80, 200)).ConfigureAwait(false);
+                    return false;
+                }
                 got = Landed(before, await ActiveValueAsync(page).ConfigureAwait(false));
                 await BackspacesAsync(page, p, got is int g ? Math.Max(0, Math.Min(typed, g)) : typed).ConfigureAwait(false);
                 await Task.Delay((int)Rand(80, 200)).ConfigureAwait(false);
@@ -1477,7 +1549,7 @@ public static partial class Humanize
             case "swap":
             {
                 await PressOrInsertAsync(page, text[i + 1], p).ConfigureAwait(false);
-                await Task.Delay(FlightMs()).ConfigureAwait(false);
+                await KeySleep(Keys.FlightMs(TraitsFor(page), text[i + 1], text[i], Unseeded)).ConfigureAwait(false);
                 await PressOrInsertAsync(page, text[i], p).ConfigureAwait(false);
                 var got = Landed(before, await ActiveValueAsync(page).ConfigureAwait(false));
                 await Task.Delay((int)Rand(140, 340)).ConfigureAwait(false);
@@ -1499,46 +1571,406 @@ public static partial class Humanize
     }
 
     /// <summary>
-    /// Press a key with the persona's hold. This is the .NET equivalent of the fix that landed in
-    /// the Python and Node SDKs in 0.19.3: <c>PressAsync</c> without a Delay emits keydown and keyUp
-    /// in the same instant, which no finger does.
+    /// Press a key with the persona's hold (or <paramref name="delay"/>, the caller's own hold). A chord
+    /// ("Control+a", "ControlOrMeta+Shift+ArrowLeft") is split: each modifier goes down in order, 40-110 ms before
+    /// the next, the key is held, 20-80 ms later the modifiers come up in reverse order -- as one press the modifier
+    /// and the key went down within ~1 ms. A modifier held through <see cref="HumanKeyDownAsync"/> is not pressed
+    /// again. <paramref name="repeat"/> &gt; 1 holds the key the way an OS auto-repeats it: one keydown, the repeat
+    /// delay (250-500 ms), then a keydown with repeat=true every 25-40 ms, <paramref name="repeat"/> keydowns in
+    /// all, one keyup. Enter right after typing waits the persona's submit pause (250-900 ms), Tab its Tab pause
+    /// (120-400 ms).
     /// </summary>
-    public static async Task HumanPressAsync(this IPage page, string key)
+    public static async Task HumanPressAsync(this IPage page, string key, int repeat = 1, float? delay = null)
     {
         ArgumentNullException.ThrowIfNull(page);
-        await SerialAsync(page, () => PressFocusedAsync(page, key)).ConfigureAwait(false);
+        await SerialAsync(page, () => PressFocusedAsync(page, key, repeat, delay)).ConfigureAwait(false);
     }
 
-    private static async Task PressFocusedAsync(IPage page, string key)
+    private static async Task PressFocusedAsync(IPage page, string key, int repeat = 1, float? delay = null)
     {
         var p = PersonaFor(page);
         // Same reason as the page-level type: one ambient placement when nothing has moved the
         // pointer here yet, so the key does not arrive on a mouse-free session.
         await AmbientPlaceAsync(page, p, StateFor(page)).ConfigureAwait(false);
-        await page.Keyboard.PressAsync(key,
-            new KeyboardPressOptions { Delay = (float)Motion.KeyDwell(p) }).ConfigureAwait(false);
+        await AfterTypingAsync(page, key).ConfigureAwait(false);
+        await PressKeyAsync(page, p, key, delay is > 0 ? delay : null, repeat).ConfigureAwait(false);
+    }
+
+    /// <summary>The pause between the last typed character and Enter or Tab, less what the caller already spent;
+    /// once per typed run (a glide in between cancels it).</summary>
+    private static async Task AfterTypingAsync(IPage page, string key)
+    {
+        var ks = KeysOf(page);
+        var t = ks.Typed;
+        ks.Typed = null;
+        if (t is null) return;
+        var (mods, k) = Keys.SplitChord(key);
+        double ms;
+        if (k == "Enter" && mods.Length == 0) ms = Keys.SubmitPauseMs(TraitsFor(page), Unseeded);
+        else if (k == "Tab" && mods.All(m => m == "Shift")) ms = Keys.TabPauseMs(TraitsFor(page), Unseeded);
+        else return;
+        double rest = ms - (Environment.TickCount64 - t.Value);
+        if (rest > 0) await KeySleep(rest).ConfigureAwait(false);
+    }
+
+    /// <summary>One key, held (see <see cref="HumanPressAsync(IPage,string,int,float?)"/>).</summary>
+    private static async Task HoldKeyAsync(IPage page, Persona p, string k, float? delay, int repeat)
+    {
+        int n = Math.Max(1, repeat);
+        if (n == 1)
+        {
+            await page.Keyboard.PressAsync(k, new KeyboardPressOptions { Delay = delay ?? (float)Motion.KeyDwell(p) }).ConfigureAwait(false);
+            return;
+        }
+        var rp = Keys.PlanRepeat(Unseeded);
+        await page.Keyboard.DownAsync(k).ConfigureAwait(false);
+        try
+        {
+            await KeySleep(rp.FirstMs).ConfigureAwait(false);
+            for (int j = 0; j < n - 1; j++)
+            {
+                if (j > 0) await KeySleep(rp.GapMs).ConfigureAwait(false);
+                await page.Keyboard.DownAsync(k).ConfigureAwait(false);   // already down: an autoRepeat keydown
+            }
+            await KeySleep(rp.ReleaseMs).ConfigureAwait(false);
+        }
+        finally
+        {
+            await page.Keyboard.UpAsync(k).ConfigureAwait(false);   // never leave the key held
+        }
+    }
+
+    private static async Task PressKeyAsync(IPage page, Persona p, string key, float? delay = null, int repeat = 1)
+    {
+        var (all, k) = Keys.SplitChord(key);
+        var held = KeysOf(page).Held;
+        var mods = all.Where(m => !held.ContainsKey(m)).ToList();
+        if (mods.Count == 0)
+        {
+            await HoldKeyAsync(page, p, k, delay, repeat).ConfigureAwait(false);
+            return;
+        }
+        var down = new List<string>();
+        try
+        {
+            foreach (var m in mods)
+            {
+                await page.Keyboard.DownAsync(m).ConfigureAwait(false);
+                down.Add(m);
+                await KeySleep(Keys.ModifierLeadMs(Unseeded)).ConfigureAwait(false);
+            }
+            await HoldKeyAsync(page, p, k, delay, repeat).ConfigureAwait(false);
+            await KeySleep(Keys.ModifierLagMs(Unseeded)).ConfigureAwait(false);
+        }
+        finally
+        {
+            down.Reverse();
+            for (int j = 0; j < down.Count; j++)
+            {
+                if (j > 0) await KeySleep(Rand(10, 40)).ConfigureAwait(false);
+                try { await page.Keyboard.UpAsync(down[j]).ConfigureAwait(false); }
+                catch (PlaywrightException) { /* one failed keyup must not strand the others */ }
+            }
+        }
     }
 
     /// <summary>
-    /// Press a key on the element with the persona's hold. A visible text field is clicked into first
-    /// (unless it already has focus); anything else -- a button, a link, a hidden helper textarea -- is
-    /// focused without a click, because a click on a button activates it and the key would then activate it
-    /// a second time.
+    /// Keyboard.DownAsync, tracked: a chord does not press a modifier held this way again, typing types no
+    /// second Shift under it, and <see cref="HumanKeyUpAsync"/> gives the key at least a persona hold.
     /// </summary>
-    public static async Task HumanPressAsync(this ILocator locator, string key)
+    public static async Task HumanKeyDownAsync(this IPage page, string key)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        await SerialAsync(page, async () =>
+        {
+            var held = KeysOf(page).Held;
+            if (!held.ContainsKey(key)) held[key] = (Environment.TickCount64, Motion.KeyDwell(PersonaFor(page)));
+            await page.Keyboard.DownAsync(key).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc cref="HumanKeyDownAsync"/>
+    public static async Task HumanKeyUpAsync(this IPage page, string key)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        await SerialAsync(page, async () =>
+        {
+            var held = KeysOf(page).Held;
+            if (held.Remove(key, out var t))
+            {
+                double rest = t.Dwell - (Environment.TickCount64 - t.At);
+                if (rest > 0) await KeySleep(rest).ConfigureAwait(false);
+            }
+            await page.Keyboard.UpAsync(key).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>Where <paramref name="info"/> sits in the page's Tab order relative to the focused element
+    /// (Keys.TabDistance, read in the isolated world), or null.</summary>
+    private sealed record TabInfo(int? Dist, bool FromText, bool Focused, bool Activatable);
+
+    private static async Task<TabInfo?> TabDistanceAsync(IPage page, FieldInfo? info)
+    {
+        if (info is null || info.Rect.Length != 4) return null;
+        try
+        {
+            var r = await IsolatedWorld.For(page).CallOnNodeAsync(info.Node, Keys.TabDistance, new Dictionary<string, object?>
+            {
+                ["x"] = info.Rect[0], ["y"] = info.Rect[1], ["width"] = info.Rect[2], ["height"] = info.Rect[3],
+            }).ConfigureAwait(false);
+            if (r is not { ValueKind: JsonValueKind.Object } o) return null;
+            int? dist = o.TryGetProperty("dist", out var d) && d.ValueKind == JsonValueKind.Number ? d.GetInt32() : null;
+            static bool B(JsonElement o, string n) => o.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.True;
+            return new TabInfo(dist, B(o, "fromText"), B(o, "focused"), B(o, "activatable"));
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Tab into <paramref name="info"/> instead of clicking it, the way a person moves between adjacent fields:
+    /// from a TEXT field 1-3 stops before it (or 1 after: Shift+Tab) in the persona's share (60-85 %);
+    /// <paramref name="force"/>: from any focused element, 3 stops either way, no roll (a button a key goes to);
+    /// <paramref name="needEmpty"/>: only an empty field (Tab selects its text). True once focus is verified there.
+    /// </summary>
+    private static async Task<bool> TabIntoAsync(ILocator loc, FieldInfo? info, bool needEmpty = false, bool force = false)
+    {
+        var page = loc.Page;
+        if (needEmpty && !string.IsNullOrEmpty(info?.Value)) return false;
+        var td = await TabDistanceAsync(page, info).ConfigureAwait(false);
+        if (td is null || td.Dist is not int d || td.Focused) return false;
+        if (force ? Math.Abs(d) is < 1 or > 3
+                  : !td.FromText || !(d is >= 1 and <= 3 || d == -1) || Rnd.NextDouble() >= TraitsFor(page).TabPref)
+            return false;
+        var p = PersonaFor(page);
+        string key = d > 0 ? "Tab" : "Shift+Tab";
+        for (int j = 0; j < Math.Abs(d); j++)
+        {
+            if (j == 0) await AfterTypingAsync(page, key).ConfigureAwait(false);
+            else await KeySleep(Rand(110, 260)).ConfigureAwait(false);
+            await PressKeyAsync(page, p, key).ConfigureAwait(false);
+        }
+        await KeySleep(Rand(40, 120)).ConfigureAwait(false);
+        return await FocusedAsync(loc).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Give <paramref name="loc"/> -- any focusable element -- the focus the way a person does: Tab within 3 stops
+    /// (always for something a click would ACTIVATE: a button, a link, a checkbox), else a humanized click for what a
+    /// click only focuses. True when focus is verified there; false for an activatable target out of Tab reach (the
+    /// pointer has glided onto it; the caller gives the focus with Playwright's FocusAsync, reported).
+    /// </summary>
+    private static async Task<bool> FocusTargetAsync(ILocator loc, float? timeout)
+    {
+        var page = loc.Page;
+        if (await FocusedAsync(loc).ConfigureAwait(false)) return true;
+        var box = await BoxOfAsync(loc, timeout, force: false).ConfigureAwait(false);
+        var info = box is null ? null : await DescribeAsync(page, box, Keys.Focusable).ConfigureAwait(false);
+        if (box is null || info is null) throw new NativeRouteException("focus: the element could not be proven");
+        var td = await TabDistanceAsync(page, info).ConfigureAwait(false);
+        bool act = td is null || td.Activatable;   // unknown: never risk an activating click
+        if (td?.Dist is int d && Math.Abs(d) is >= 1 and <= 3 && (act || Rnd.NextDouble() < TraitsFor(page).TabPref)
+            && await TabIntoAsync(loc, info, force: true).ConfigureAwait(false))
+            return true;
+        if (!act && !info.Disabled)
+        {
+            if (await FocusClickAsync(page, box, ProvenPoint(box, info), loc).ConfigureAwait(false)
+                && await FocusedAsync(loc).ConfigureAwait(false))
+            {
+                await KeySleep(Rand(40, 120)).ConfigureAwait(false);
+                return true;
+            }
+            throw new NativeRouteException("focus: the click did not focus it");
+        }
+        var p = PersonaFor(page);
+        var st = StateFor(page);
+        var from = st.Known ? new Point(st.X, st.Y) : new Point(box.X - 120, box.Y - 90);
+        var pt = Motion.ClickPoint(new Box(box.X, box.Y, box.Width, box.Height), from, p);
+        await GlideAsync(page, p, st, Math.Round(pt.X), Math.Round(pt.Y), Math.Max(6, box.Width)).ConfigureAwait(false);
+        return false;
+    }
+
+    /// <summary>
+    /// Press a key on the element. The element gets the focus the way a person gives it: a text field by Tab from
+    /// the field before it (when empty) or a click; a button, a link or another focusable element by Tab when it is
+    /// within 3 stops, else (not activatable) a click; an activatable element out of Tab reach gets the pointer
+    /// over it and Playwright's focus (reported). Never a click on a button (it activated it twice) and never
+    /// Playwright's 0 ms focus-and-press. Then the key as <see cref="HumanPressAsync(IPage,string,int,float?)"/>.
+    /// </summary>
+    public static async Task HumanPressAsync(this ILocator locator, string key, int repeat = 1, float? delay = null)
     {
         ArgumentNullException.ThrowIfNull(locator);
         var page = locator.Page;
         await SerialAsync(page, async () =>
         {
-            if (!(await RoutableAsync(locator, strict: true).ConfigureAwait(false)
-                  && await ClickIntoAsync(locator, null).ConfigureAwait(false)))
+            bool done = false;
+            if (await RoutableAsync(locator, strict: true).ConfigureAwait(false))
             {
-                await locator.FocusAsync().ConfigureAwait(false);   // strict, frame-aware: Playwright's own
-                await Task.Delay((int)Rand(40, 120)).ConfigureAwait(false);
+                try
+                {
+                    var te = await TextEntryAsync(locator, null).ConfigureAwait(false);
+                    done = te is { } t
+                        ? await TabIntoAsync(locator, t.Info, needEmpty: true).ConfigureAwait(false)
+                          || await ClickIntoAsync(locator, null).ConfigureAwait(false)
+                        : await FocusTargetAsync(locator, null).ConfigureAwait(false);
+                }
+                catch (Exception e) when (!IsTimeoutError(e))
+                {
+                    done = false;
+                }
             }
-            await PressFocusedAsync(page, key).ConfigureAwait(false);
+            if (!done)
+            {
+                Fallback("press: Playwright's focus (an activatable target out of Tab reach, or not provable)");
+                await locator.FocusAsync().ConfigureAwait(false);   // strict, frame-aware: Playwright's own
+                await KeySleep(Rand(40, 120)).ConfigureAwait(false);
+            }
+            await PressFocusedAsync(page, key, repeat, delay).ConfigureAwait(false);
         }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Focus the element the way a person does (Tab within 3 stops, in the persona's share for a field; a click
+    /// on what a click only focuses), verified; Playwright's FocusAsync for an activatable element out of Tab reach
+    /// (reported) and for anything the humane route cannot do.
+    /// </summary>
+    public static async Task HumanFocusAsync(this ILocator locator, float? timeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(locator);
+        await SerialAsync(locator.Page, async () =>
+        {
+            try
+            {
+                if (await RoutableAsync(locator, strict: true).ConfigureAwait(false)
+                    && await FocusTargetAsync(locator, timeout).ConfigureAwait(false))
+                    return;
+            }
+            catch (Exception e) when (!IsTimeoutError(e)) { /* Playwright's below */ }
+            Fallback("focus: Playwright's focus");
+            await locator.FocusAsync(new LocatorFocusOptions { Timeout = timeout }).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Leave the focused element the way the persona leaves fields: Tab to the next stop, or a click on a blank
+    /// point beside it (Keys.BlankPoint; Tab when there is none), verified; Playwright's BlurAsync otherwise.
+    /// </summary>
+    public static async Task HumanBlurAsync(this ILocator locator, float? timeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(locator);
+        var page = locator.Page;
+        await SerialAsync(page, async () =>
+        {
+            try
+            {
+                if (await RoutableAsync(locator, strict: true).ConfigureAwait(false) && await FocusedAsync(locator).ConfigureAwait(false))
+                {
+                    var p = PersonaFor(page);
+                    if (TraitsFor(page).BlurStyle == "click")
+                    {
+                        var box = await BoxOfAsync(locator, timeout, force: false).ConfigureAwait(false);
+                        var (vw, vh) = await ViewportAsync(page).ConfigureAwait(false);
+                        var r = box is null ? null : await IsolatedWorld.For(page).EvaluateAsync(Keys.BlankPoint, new Dictionary<string, object?>
+                        {
+                            ["box"] = new Dictionary<string, double> { ["x"] = box.X, ["y"] = box.Y, ["width"] = box.Width, ["height"] = box.Height },
+                            ["vw"] = vw, ["vh"] = vh,
+                        }).ConfigureAwait(false);
+                        if (r is { ValueKind: JsonValueKind.Array } a && a.GetArrayLength() == 2)
+                        {
+                            double x = Math.Round(a[0].GetDouble() + Gauss(0, 3)), y = Math.Round(a[1].GetDouble() + Gauss(0, 3));
+                            await GlideAsync(page, p, StateFor(page), x, y, 60).ConfigureAwait(false);
+                            await ClickAtAsync(page, p, x, y).ConfigureAwait(false);
+                            await KeySleep(Rand(40, 120)).ConfigureAwait(false);
+                            if (!await FocusedAsync(locator).ConfigureAwait(false)) return;
+                        }
+                    }
+                    await AfterTypingAsync(page, "Tab").ConfigureAwait(false);
+                    await PressKeyAsync(page, p, "Tab").ConfigureAwait(false);
+                    await KeySleep(Rand(40, 120)).ConfigureAwait(false);
+                    if (!await FocusedAsync(locator).ConfigureAwait(false)) return;
+                }
+            }
+            catch (Exception e) when (!IsTimeoutError(e)) { /* Playwright's below */ }
+            await locator.BlurAsync(new LocatorBlurOptions { Timeout = timeout }).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Select a text control's text the way the persona does it -- a triple click (an &lt;input&gt;), or End then
+    /// Shift+Home (Ctrl+End, Ctrl+Shift+Home in a textarea; Cmd+A on macOS) --, verified in the isolated world, one
+    /// select-all retry; Playwright's SelectTextAsync otherwise.
+    /// </summary>
+    public static async Task HumanSelectTextAsync(this ILocator locator, float? timeout = null)
+    {
+        ArgumentNullException.ThrowIfNull(locator);
+        var page = locator.Page;
+        await SerialAsync(page, async () =>
+        {
+            try
+            {
+                if (await RoutableAsync(locator, strict: true).ConfigureAwait(false)
+                    && await SelectTextCoreAsync(locator, timeout).ConfigureAwait(false))
+                    return;
+            }
+            catch (Exception e) when (!IsTimeoutError(e)) { /* Playwright's below */ }
+            Fallback("select_text: Playwright's selectText");
+            await locator.SelectTextAsync(new LocatorSelectTextOptions { Timeout = timeout }).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> SelectedAllAsync(IPage page)
+    {
+        var r = await IsolatedWorld.For(page).EvaluateAsync(Keys.SelectionState).ConfigureAwait(false);
+        if (r is not { ValueKind: JsonValueKind.Array } a || a.GetArrayLength() != 3) return false;
+        double s0 = a[0].GetDouble(), s1 = a[1].GetDouble(), n = a[2].GetDouble();
+        return Math.Min(s0, s1) == 0 && Math.Max(s0, s1) == n;
+    }
+
+    private static async Task<bool> SelectTextCoreAsync(ILocator loc, float? timeout)
+    {
+        var page = loc.Page;
+        var p = PersonaFor(page);
+        var box = await BoxOfAsync(loc, timeout, force: false).ConfigureAwait(false);
+        var info = box is null ? null : await DescribeAsync(page, box, IsolatedWorld.FormControl).ConfigureAwait(false);
+        if (box is null || info is null || info.Disabled || Forms.ClassifyField(info.Tag, info.Type, info.Ce) != "text") return false;
+        if (TraitsFor(page).SelectStyle == "triple" && info.Tag == "input")
+        {
+            var st = StateFor(page);
+            var from = st.Known ? new Point(st.X, st.Y) : new Point(box.X - 120, box.Y - 90);
+            var pt = ProvenPoint(box, info) ?? Motion.ClickPoint(new Box(box.X, box.Y, box.Width, box.Height), from, p);
+            await GlideAsync(page, p, st, Math.Round(pt.X), Math.Round(pt.Y), Math.Max(6, box.Width)).ConfigureAwait(false);
+            await PressAtAsync(page, p, Forms.NormalizeClickOptions(clickCount: 3)).ConfigureAwait(false);
+        }
+        else
+        {
+            if (!await FocusedAsync(loc).ConfigureAwait(false))
+            {
+                if (!await FocusClickAsync(page, box, ProvenPoint(box, info), loc).ConfigureAwait(false)
+                    || !await FocusedAsync(loc).ConfigureAwait(false))
+                    return false;
+                await KeySleep(Rand(120, 300)).ConfigureAwait(false);
+            }
+            if (OperatingSystem.IsMacOS()) await PressKeyAsync(page, p, "ControlOrMeta+a").ConfigureAwait(false);
+            else if (info.Tag == "input")
+            {
+                await PressKeyAsync(page, p, "End").ConfigureAwait(false);
+                await KeySleep(Rand(80, 200)).ConfigureAwait(false);
+                await PressKeyAsync(page, p, "Shift+Home").ConfigureAwait(false);
+            }
+            else
+            {
+                await PressKeyAsync(page, p, "ControlOrMeta+End").ConfigureAwait(false);
+                await KeySleep(Rand(80, 200)).ConfigureAwait(false);
+                await PressKeyAsync(page, p, "ControlOrMeta+Shift+Home").ConfigureAwait(false);
+            }
+        }
+        await KeySleep(Rand(60, 160)).ConfigureAwait(false);
+        if (await SelectedAllAsync(page).ConfigureAwait(false)) return true;
+        await SelectAllAsync(page, p).ConfigureAwait(false);
+        await KeySleep(Rand(60, 160)).ConfigureAwait(false);
+        return await SelectedAllAsync(page).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1758,22 +2190,7 @@ public static partial class Humanize
             await KeyAsync(page, p, key, n).ConfigureAwait(false);
             return;
         }
-        await page.Keyboard.DownAsync(key).ConfigureAwait(false);
-        try
-        {
-            await Task.Delay((int)Rand(380, 560)).ConfigureAwait(false);   // the repeat delay
-            int gap = (int)Rand(28, 36);                                     // one rate for the whole run
-            for (int j = 0; j < n - 1; j++)
-            {
-                await Task.Delay(gap).ConfigureAwait(false);
-                await page.Keyboard.DownAsync(key).ConfigureAwait(false);   // already down: an autoRepeat keydown
-            }
-        }
-        finally
-        {
-            await Task.Delay((int)Rand(20, 60)).ConfigureAwait(false);
-            await page.Keyboard.UpAsync(key).ConfigureAwait(false);   // never leave the key held
-        }
+        await HoldKeyAsync(page, p, key, null, n).ConfigureAwait(false);   // OS auto-repeat (Keys.PlanRepeat)
     }
 
     /// <summary>A list box's scroll state and one row's box (IsolatedWorld.ListboxRow), read from the node the
@@ -2327,9 +2744,13 @@ public static partial class Humanize
             else await TypeTextAsync(page, p, text, info?.Traits, typos).ConfigureAwait(false);
         }
         // the box BoxOfAsync resolved (no second BoundingBoxAsync handle the page could see)
-        if (!await FocusClickAsync(page, box, box is null ? null : ProvenPoint(box, info), loc).ConfigureAwait(false)) return false;
-        await Task.Delay((int)Rand(40, 120)).ConfigureAwait(false);
-        if (!await FocusedAsync(loc).ConfigureAwait(false)) return false;
+        // lane D: from the field before it, a person Tabs (persona share, focus verified); else a click
+        if (!(info is not null && await TabIntoAsync(loc, info).ConfigureAwait(false)))
+        {
+            if (!await FocusClickAsync(page, box, box is null ? null : ProvenPoint(box, info), loc).ConfigureAwait(false)) return false;
+            await Task.Delay((int)Rand(40, 120)).ConfigureAwait(false);
+            if (!await FocusedAsync(loc).ConfigureAwait(false)) return false;
+        }
 
         async Task<string?> Read()
         {
