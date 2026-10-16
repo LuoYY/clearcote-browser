@@ -86,7 +86,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         page.on("load", lambda _=None: asyncio.ensure_future(inject()))
         page.on("framenavigated",
                 lambda f: asyncio.ensure_future(inject()) if f == page.main_frame else None)
-    if not humanize:
+    if humanize is None or humanize is False:
         return
 
     # Per-identity motor persona (cadence, tremor, overshoot, handedness) seeded from the fingerprint

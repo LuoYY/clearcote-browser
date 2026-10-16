@@ -107,7 +107,7 @@ def as_api_error(err, api):
         return err
     try:
         new = type(err)(want)
-        for k in ("_name", "_stack", "_details", "_log"):
+        for k in ("_name", "_stack", "_details", "_log", "api", "reason", "selector"):
             if hasattr(err, k):
                 setattr(new, k, getattr(err, k))
     except Exception:  # noqa: BLE001
@@ -279,7 +279,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         inject()
         page.on("load", lambda _=None: inject())
         page.on("framenavigated", lambda f: inject() if f == page.main_frame else None)
-    if not humanize:
+    if humanize is None or humanize is False:
         return
 
     # Per-identity motor persona (cadence, tremor, overshoot, handedness) seeded from the fingerprint

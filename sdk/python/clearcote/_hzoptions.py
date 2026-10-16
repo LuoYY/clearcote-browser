@@ -186,8 +186,8 @@ def report_fallback(page, api, reason, selector=None):
         return event
     if o.strict:
         raise ClearcoteStrictError(
-            "humanize strict: %s%s would fall back to a stock Playwright call (%s)"
-            % (api, " %r" % (selector,) if selector else "", reason),
+            "humanize strict: %s would fall back to a stock Playwright call (%s)"
+            % ("%r" % (selector,) if selector else "the action", reason),
             api=api, reason=reason, selector=selector)
     if o.on_fallback is not None:
         o.on_fallback(event)
