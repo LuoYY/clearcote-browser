@@ -993,10 +993,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         probe point (edges, then top/bottom) the isolated hit test proves reaches the element, as a
         whole pixel inside the box; None when none does (the caller falls back)."""
         for fx, fy in probe_points[1:]:
-            # spread around the probe (5 % of the width, 10 % of the height): a fixed probe pixel would land
+            # spread around the probe (3 % of the width, 8 % of the height): a fixed probe pixel would land
             # every covered click on the same spot
-            x = box["x"] + box["width"] * fx + random.gauss(0, max(1.5, box["width"] * 0.05))
-            y = box["y"] + box["height"] * fy + random.gauss(0, max(1.0, box["height"] * 0.10))
+            x = box["x"] + box["width"] * fx + random.gauss(0, max(1.5, box["width"] * 0.03))
+            y = box["y"] + box["height"] * fy + random.gauss(0, max(1.0, box["height"] * 0.08))
             x = float(round(min(max(x, box["x"] + 1), box["x"] + box["width"] - 1)))
             y = float(round(min(max(y, box["y"] + 1), box["y"] + box["height"] - 1)))
             if _hit_in_box(box, x, y, sel) is True:

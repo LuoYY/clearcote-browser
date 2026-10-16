@@ -939,10 +939,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // box; null when none does (the caller falls back).
   const provenClickPoint = async (box: Rect, sel: string | null = null): Promise<Point | null> => {
     for (const [fx, fy] of probePoints.slice(1)) {
-      // spread around the probe (5 % of the width, 10 % of the height): a fixed probe pixel would land every
+      // spread around the probe (3 % of the width, 8 % of the height): a fixed probe pixel would land every
       // covered click on the same spot
-      const x = roundHalfEven(clamp(box.x + box.width * fx + gauss() * Math.max(1.5, box.width * 0.05), box.x + 1, box.x + box.width - 1));
-      const y = roundHalfEven(clamp(box.y + box.height * fy + gauss() * Math.max(1.0, box.height * 0.10), box.y + 1, box.y + box.height - 1));
+      const x = roundHalfEven(clamp(box.x + box.width * fx + gauss() * Math.max(1.5, box.width * 0.03), box.x + 1, box.x + box.width - 1));
+      const y = roundHalfEven(clamp(box.y + box.height * fy + gauss() * Math.max(1.0, box.height * 0.08), box.y + 1, box.y + box.height - 1));
       if ((await hitInBox(box, x, y, sel)) === true) return { x, y };
     }
     return null;
