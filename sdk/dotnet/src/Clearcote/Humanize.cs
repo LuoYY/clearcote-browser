@@ -795,8 +795,10 @@ public static partial class Humanize
         for (int i = 1; i < ProbePoints.Length; i++)
         {
             var (fx, fy) = ProbePoints[i];
-            double x = Math.Round(Math.Min(Math.Max(bb.X + bb.Width * fx + Gauss(0, 1.5), bb.X + 1), bb.X + bb.Width - 1));
-            double y = Math.Round(Math.Min(Math.Max(bb.Y + bb.Height * fy + Gauss(0, 1.0), bb.Y + 1), bb.Y + bb.Height - 1));
+            // spread around the probe (5 % of the width, 10 % of the height): a fixed probe pixel would land every
+            // covered click on the same spot
+            double x = Math.Round(Math.Min(Math.Max(bb.X + bb.Width * fx + Gauss(0, Math.Max(1.5, bb.Width * 0.05)), bb.X + 1), bb.X + bb.Width - 1));
+            double y = Math.Round(Math.Min(Math.Max(bb.Y + bb.Height * fy + Gauss(0, Math.Max(1.0, bb.Height * 0.10)), bb.Y + 1), bb.Y + bb.Height - 1));
             if (await HitInBoxAsync(page, bb, x, y, sel).ConfigureAwait(false) == true) return new Point(x, y);
         }
         return null;
