@@ -36,6 +36,10 @@ import {
 import { keepInView, trimTo, walk } from "./pacing.js";
 import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
 import {
+  BLANK_POINT, FOCUSABLE, SEARCH_SLIP_RATE, SELECTION_STATE, TAB_DISTANCE, WORD_FIX_RATE, flightMs, modifierLagMs,
+  modifierLeadMs, planGap, planRepeat, splitChord, submitPauseMs, tabPauseMs, typingTraits, type TabInfo,
+} from "./keys.js";
+import {
   COVER_CHECK_MS, COVER_RETRY_MS, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_FORM_CONTROL,
   ISO_FRAMES, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
   roundHalfEven, worldFor, type DescribedElement,
@@ -314,6 +318,27 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // seeds. Stored on the page so the module-level Locator.dragTo patch can reach it too.
   const persona: Persona = makePersona(opts.seed);
   (page as any)._clearcotePersona = persona;
+  // The typing identity (WPM, bigram factors, Tab preference, typo rate, pauses) from a salted side stream
+  // of the persona seed (keys.typingTraits): the persona's own draws are unchanged.
+  const traits = typingTraits(persona.seed);
+  // Keys the CALLER holds through keyboard.down: key -> [when it went down, the hold it is owed].
+  const heldKeys = new Map<string, [number, number]>();
+  // A keydown->keyup hold: lane B's per-persona key_dwell_window when present, else motion.keyDwell.
+  const dwell = (): number => {
+    const w = (persona as any).keyDwellWindow;
+    if (Array.isArray(w) && w.length === 2) {
+      return w[0] + Math.min(1, Math.abs(gaussFrom(Math.random)) * 0.45) * (w[1] - w[0]);
+    }
+    return keyDwell(persona);
+  };
+  const tabPref = (): number => (typeof (persona as any).tabPref === "number" ? (persona as any).tabPref : traits.tabPref);
+  // CLEARCOTE_HUMANIZE_TYPO_RATE when set, else the persona's slip rate (lane B's field, else 0.5-4 %).
+  const personaTypoRate = (): number => {
+    const v = process.env.CLEARCOTE_HUMANIZE_TYPO_RATE;
+    if (v !== undefined && v !== "") return typoRate();
+    const pr = (persona as any).typoRate;
+    return typeof pr === "number" ? pr : traits.typoRate;
+  };
   // One input action at a time on this page (see createInputLock).
   const locked = createInputLock();
 
@@ -323,7 +348,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // pointer at the default origin, so anything that delivers input WITHOUT a target to move to —
   // a wheel, a mouse.down that opens a drag, a bare keyboard.type — otherwise happens from a cursor
   // that has never been anywhere. The guarantees below key off this flag.
-  const st = { x: rand(140, 380), y: rand(90, 240), held: false, placed: false };
+  // `typed`: when the last typed run ended (the submit / Tab pause owed by afterTyping), null after a glide.
+  const st = { x: rand(140, 380), y: rand(90, 240), held: false, placed: false, typed: null as number | null };
 
   const mouse: any = page.mouse;
   const nativeMove = mouse.move.bind(mouse);
@@ -366,6 +392,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   const glide = async (x: number, y: number, o: { settle?: boolean; targetW?: number; held?: boolean } = {}): Promise<void> => {
     await dispatch(planMove(st, { x, y }, persona, { settle: o.settle, targetW: o.targetW, held: o.held }));
     st.x = x; st.y = y;
+    st.typed = null; // the hand left the keyboard: no submit / Tab pause owed
   };
 
   // Engine real-trajectory routing (PRO): send point-to-point moves/clicks through
@@ -673,14 +700,14 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // (keyboard.type's delay is only inter-key flight), so per-char press gives the missing dwell.
   // Fall back to type() for anything press can't map (some symbols / composed chars).
   const emitKey = async (ch: string): Promise<void> => {
-    try { await nativeKbPress(ch, { delay: keyDwell(persona) }); }
+    try { await nativeKbPress(ch, { delay: dwell() }); }
     catch { try { await nativeKbType(ch); } catch { /* best-effort */ } }
   };
 
   // Press `k` (n times) with the persona's hold on every press and a human gap between repeats.
   const key = async (k: string, n = 1, gap: [number, number] = [60, 150]): Promise<void> => {
     for (let j = 0; j < n; j++) {
-      await nativeKbPress(k, { delay: keyDwell(persona) });
+      await nativeKbPress(k, { delay: dwell() });
       if (j < n - 1) await sleep(rand(gap[0], gap[1]));
     }
   };
@@ -727,12 +754,12 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     } catch { return null; }
   };
 
-  // Node's inter-key flight (the cadence humanTypeText uses between characters).
-  const flightMs = () => rand(45, 150);
+  // One keyup->keydown flight of the persona's cadence (keys.flightMs, the planner Python and .NET use).
+  const flight = (prev: string | null = null, ch: string | null = null): number => flightMs(traits, prev, ch, Math.random);
 
   const backspaces = async (n: number): Promise<void> => {
     for (let k = 0; k < n; k++) {
-      await nativeKbPress("Backspace", { delay: keyDwell(persona) });
+      await nativeKbPress("Backspace", { delay: dwell() });
       if (k < n - 1) await sleep(rand(70, 150));
     }
   };
@@ -741,26 +768,61 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   const landed = (before: string | null, now: string | null): number | null =>
     before === null || now === null ? null : Array.from(now).length - Array.from(before).length;
 
-  // Make the planned slip at chars[i] and correct it. Returns true when it already typed chars[i]
-  // itself (the doubled-key case), so the caller must not type it again.
+  // Bring the focused field back to `target` (what it held before a slip) from wherever a word delete
+  // left it: Backspace to the common prefix, then type the rest. Nothing when unreadable.
+  const restore = async (target: string): Promise<void> => {
+    const got = await activeValue();
+    if (got === null || got === target) return;
+    const g = Array.from(got), t = Array.from(target);
+    let k = 0;
+    while (k < Math.min(g.length, t.length) && g[k] === t[k]) k++;
+    if (g.length - k > 64 || t.length - k > 64) return;
+    if (g.length > k) { await backspaces(g.length - k); await sleep(rand(80, 200)); }
+    let prev: string | null = null;
+    for (const c of t.slice(k)) {
+      if (prev !== null) await sleep(flight(prev, c));
+      await emitKey(c);
+      prev = c;
+    }
+  };
+
+  // The word-delete chord the ENGINE's editing honours: Alt+Backspace on macOS, else Ctrl.
+  const wordDelete = (): Promise<void> => pressKey((hostWheelPlatform() === "macos" ? "Alt" : "Control") + "+Backspace");
+
+  // Make the planned slip at chars[i] and correct it. Returns true when it already typed chars[i] itself
+  // (the doubled-key case) -- or left a substitution uncorrected (`leave`: a search field) --, so the
+  // caller must not type it again.
   //
   // Only what actually LANDED is deleted: an input mask or a maxlength can swallow the wrong key, and
   // a Backspace pressed for a key that never arrived deletes a real character (the
-  // letter-typo-in-a-numeric-mask failure). Measured before and after the slip, in the isolated world,
-  // one read each -- typos are ~2 % of keys, so this costs nearly nothing.
-  const doTypo = async (chars: string[], i: number, tp: TypoPlan): Promise<boolean> => {
+  // letter-typo-in-a-numeric-mask failure). Measured before and after the slip, in the isolated world.
+  // A substitution noticed inside a word is fixed with the word-delete chord and the word typed again in
+  // WORD_FIX_RATE of the cases (when the field can be read to put it back exactly).
+  const doTypo = async (chars: string[], i: number, tp: TypoPlan, leave = false): Promise<boolean> => {
     const before = await activeValue();
     if (tp.kind === "sub") {
       await emitKey(tp.wrong);
       let got = landed(before, await activeValue());
       if (got !== null && got <= 0) return false; // swallowed: nothing to correct
+      if (leave) return true;                     // the slip stays: the wrong key took this place
       let typed = 1;
+      let prev = tp.wrong;
       for (const c of chars.slice(i + 1, i + 1 + tp.late)) { // late notice: a key or two more
-        await sleep(flightMs());
+        await sleep(flight(prev, c));
         await emitKey(c);
+        prev = c;
         typed++;
       }
       await sleep(rand(140, 340)); // noticing
+      let ws = 0;
+      for (let j = i - 1; j >= 0; j--) if (chars[j] === " " || chars[j] === "\n") { ws = j + 1; break; }
+      if (before !== null && i - ws + typed >= 2 && nativeKbDown && Math.random() < WORD_FIX_RATE) {
+        await wordDelete();
+        await sleep(rand(120, 260));
+        await restore(before);
+        await sleep(rand(80, 200));
+        return false;
+      }
       got = landed(before, await activeValue());
       await backspaces(got === null ? typed : Math.max(0, Math.min(typed, got)));
       await sleep(rand(80, 200));
@@ -781,7 +843,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     }
     if (tp.kind === "swap") {
       await emitKey(chars[i + 1]);
-      await sleep(flightMs());
+      await sleep(flight(chars[i + 1], chars[i]));
       await emitKey(chars[i]);
       const got = landed(before, await activeValue());
       await sleep(rand(140, 340));
@@ -802,28 +864,34 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // Type text key-by-key with human timing. Each char goes through the native keyboard (trusted),
   // so this stays isTrusted===true.
   //
+  // Cadence: keys.planGap, the planner Python and .NET use (was uniform 45-150 ms here, with the
+  // thinking pause REPLACING the gap): the persona's WPM sets a base flight, scaled by how the hand
+  // travels between the two keys (same finger 1.5-1.9x, same hand 1.1-1.3x, the other hand 0.85-1.0x,
+  // a two-row reach 1.15x) and log-normal noise, plus a pause before a new word and after punctuation,
+  // the whitespace pause and a 6 % thinking pause, ADDED. `floorMs` (the caller's `delay`) is the
+  // shortest gap between two keys.
+  //
   // Capitals and shifted symbols are typed the way a person types them: ShiftLeft goes down a moment
-  // before the key (35-120 ms) and comes up just after it (10-70 ms), held across a run of them.
-  // Playwright's press("A") alone sent the key with shiftKey=false and no Shift key at all (measured
-  // on r28 with "Ab!") -- input no keyboard produces.
-  //
-  // Fast pairs ROLL OVER: the next key goes down before the previous one comes up. One press() per
-  // character never overlaps (0 of 32 keydowns, measured on r32/r33), a keystroke-dynamics tell;
-  // real typists overlap many fast pairs. The share is the persona's rolloverRate, stable per seed.
-  //
-  // Fat-finger typos are planned by forms.planTypo and never happen where a slip is a failure rather
-  // than a slip (passwords, e-mail, numbers, phone numbers, URLs, one-time codes).
+  // before the key (35-120 ms) and comes up just after it (10-70 ms), held across a run of them (none
+  // under a Shift the caller holds through keyboard.down). Fast pairs ROLL OVER at the persona's
+  // rolloverRate. Fat-finger typos are planned by forms.planTypo at the persona's rate and never happen
+  // where a slip is a failure rather than a slip; `exact` false (type / pressSequentially /
+  // keyboard.type, never fill) lets a search-field substitution stay uncorrected (SEARCH_SLIP_RATE).
   const rollRate = rolloverRate(persona);
-  const humanTypeText = async (text: string, field?: TypoField | null, typos = true): Promise<void> => {
+  const humanTypeText = async (text: string, field?: TypoField | null, typos = true, floorMs = 0, exact = true): Promise<void> => {
     const chars = Array.from(text);
     const n = chars.length;
     let shift = false;
-    const rate = typos ? typoRate() : 0;
-    const allow = rate > 0 && typosAllowed(await typingField(field));
+    const extShift = heldKeys.has("Shift");
+    const rate = typos ? personaTypoRate() : 0;
+    const fld = rate > 0 ? await typingField(field) : null;
+    const allow = rate > 0 && typosAllowed(fld);
+    const search = allow && !exact && !!fld && String((fld as any).type || "").toLowerCase() === "search";
+    const floor = Math.max(0, Number(floorMs) || 0);
     try {
       for (let i = 0; i < n; i++) {
         let ch = chars[i];
-        const need = needsShift(ch);
+        const need = needsShift(ch) && !extShift;
         if (need && !shift && nativeKbDown && nativeKbUp) {
           await nativeKbDown("Shift");
           shift = true;
@@ -836,17 +904,18 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
           const tp = planTypo(chars, i, Math.random, rate);
           if (tp !== null) {
             typo = true;
-            try { consumed = await doTypo(chars, i, tp); } catch { /* typo path best-effort */ }
+            const leave = search && tp.kind === "sub" && Math.random() < SEARCH_SLIP_RATE;
+            try { consumed = await doTypo(chars, i, tp, leave); } catch { /* typo path best-effort */ }
           }
         }
         // Rollover of ch and the next char: unshifted single-key pairs only, never a key with itself,
-        // never after a typo. keyboard.down inserts the character exactly as press does, so the typed
-        // value is unchanged. The overlap leaves ch down alone for at least 8 ms first.
+        // never after a typo, never under a caller's delay floor. keyboard.down inserts the character
+        // exactly as press does, so the typed value is unchanged.
         const nx = chars[i + 1];
         let rolled = false;
-        if (nativeKbDown && nativeKbUp && !shift && i + 1 < n && !typo && ROLL_KEYS.has(ch)
+        if (nativeKbDown && nativeKbUp && !shift && i + 1 < n && !typo && floor <= 0 && ROLL_KEYS.has(ch)
             && ROLL_KEYS.has(nx) && ch !== nx && Math.random() < rollRate) {
-          const d1 = keyDwell(persona), d2 = keyDwell(persona);
+          const d1 = dwell(), d2 = dwell();
           if (d1 - 8 >= 12) {
             const overlap = rand(12, Math.min(55, d1 - 8));
             try {
@@ -873,15 +942,81 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
           await nativeKbUp!("Shift");
           shift = false;
         }
-        if (i < n - 1) {
-          if (Math.random() < 0.06) await sleep(rand(180, 450)); // brief thinking pause
-          else await sleep(flightMs());
-          if (/\s/.test(ch)) await sleep(rand(20, 100)); // slight extra pause at word boundaries
-        }
+        if (i < n - 1) await sleep(Math.max(floor, planGap(traits, ch, chars[i + 1], Math.random)));
       }
     } finally {
       // never leave Shift held for the caller's next keystroke
       if (shift) { try { await nativeKbUp!("Shift"); } catch { /* best-effort */ } }
+      if (n) st.typed = Date.now(); // a following Enter / Tab waits (afterTyping)
+    }
+  };
+
+  // The pause between the last typed character and Enter (250-900 ms) or Tab (120-400 ms), centred per
+  // persona, less whatever the caller already spent. Once per typed run; a glide in between cancels it.
+  const afterTyping = async (k: string): Promise<void> => {
+    const t = st.typed;
+    st.typed = null;
+    if (t === null) return;
+    const [mods, base] = splitChord(k);
+    let ms: number;
+    if (base === "Enter" && !mods.length) ms = submitPauseMs(traits, Math.random);
+    else if (base === "Tab" && mods.every((m) => m === "Shift")) ms = tabPauseMs(traits, Math.random);
+    else return;
+    const rest = ms - (Date.now() - t);
+    if (rest > 0) await sleep(rest);
+  };
+
+  // One key: pressed with the persona's hold (or the caller's `delay`); with `repeat` > 1 HELD the way an
+  // OS auto-repeats it -- one keydown, the repeat delay (250-500 ms), then a keydown with repeat=true every
+  // 25-40 ms (Playwright sends a key that is already down as an autoRepeat keydown), `repeat` keydowns in
+  // all, then one keyup.
+  const holdKey = async (k: string, delay: number | null = null, repeat = 1): Promise<void> => {
+    const n = Math.max(1, Math.floor(Number(repeat) || 1));
+    if (n === 1 || !nativeKbDown || !nativeKbUp) {
+      for (let j = 0; j < n; j++) {
+        await nativeKbPress(k, { delay: delay && delay > 0 ? delay : dwell() });
+        if (j < n - 1) await sleep(rand(60, 150));
+      }
+      return;
+    }
+    const rp = planRepeat(Math.random);
+    await nativeKbDown(k);
+    try {
+      await sleep(rp.firstMs);
+      for (let j = 0; j < n - 1; j++) {
+        if (j) await sleep(rp.gapMs);
+        await nativeKbDown(k);
+      }
+      await sleep(rp.releaseMs);
+    } finally {
+      await nativeKbUp(k); // never leave the key held
+    }
+  };
+
+  // keyboard.press, humanized: a chord ("Control+a", "ControlOrMeta+Shift+ArrowLeft") is split into its
+  // modifiers and its key -- each modifier goes down in order, 40-110 ms before the next, the key is
+  // held, 20-80 ms later the modifiers come up in reverse order (as one Playwright press the modifier and
+  // the key went down within ~1 ms). A modifier the caller holds (keyboard.down) is not pressed again.
+  const pressKey = async (k: string, delay: number | null = null, repeat = 1): Promise<void> => {
+    const [all, base] = splitChord(k);
+    const mods = all.filter((m) => !heldKeys.has(m));
+    if (!mods.length) return holdKey(base, delay, repeat);
+    if (!nativeKbDown || !nativeKbUp) { await nativeKbPress(k, { delay: delay && delay > 0 ? delay : dwell() }); return; }
+    const down: string[] = [];
+    try {
+      for (const m of mods) {
+        await nativeKbDown(m);
+        down.push(m);
+        await sleep(modifierLeadMs(Math.random));
+      }
+      await holdKey(base, delay, repeat);
+      await sleep(modifierLagMs(Math.random));
+    } finally {
+      let j = 0;
+      for (const m of down.reverse()) {
+        if (j++) await sleep(rand(10, 40));
+        try { await nativeKbUp(m); } catch { /* one failed keyup must not strand the others */ }
+      }
     }
   };
 
@@ -901,7 +1036,27 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     await ambient(rand(280, 620));
   };
 
-  keyboard.type = (text: string) => locked(async () => { await keyboardWarmup(); await humanTypeText(text); });
+  keyboard.type = (text: string, options: any = {}) => locked(async () => {
+    await keyboardWarmup();
+    await humanTypeText(text, undefined, true, Number(options?.delay) || 0, false);
+  });
+
+  // keyboard.down / up, tracked: a chord does not press a modifier the caller holds, typing does not
+  // press Shift under the caller's Shift, and a down() straight followed by up() still holds the key
+  // for a persona dwell (no finger lifts a key in 0 ms).
+  if (nativeKbDown && nativeKbUp) {
+    keyboard.down = (k: string) => locked(async () => {
+      await keyboardWarmup();
+      if (!heldKeys.has(k)) heldKeys.set(k, [Date.now(), dwell()]);
+      return nativeKbDown(k);
+    });
+    keyboard.up = (k: string) => locked(async () => {
+      const t = heldKeys.get(k);
+      heldKeys.delete(k);
+      if (t) { const rest = t[1] - (Date.now() - t[0]); if (rest > 0) await sleep(rest); }
+      return nativeKbUp(k);
+    });
+  }
 
   // keyboard.press with the persona's hold, unless the caller specified their own.
   //
@@ -913,14 +1068,14 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // session sees the press path — so one un-humanised call undid the whole keyboard persona.
   //
   // The caller's own `delay` wins: press(key, {delay}) is the documented way to hold a key for a
-  // specific time, and silently overriding it would break that. Only the DEFAULT changes -- and
-  // `delay: 0` IS Playwright's default ("no hold"), so it, like any non-positive value, gets the
-  // persona's hold too (a 0 ms key hold is the tell this wrapper exists to remove).
-  keyboard.press = (key: string, options: any = {}) => locked(async () => {
+  // specific time. `delay: 0` IS Playwright's default ("no hold"), so it gets the persona's hold. A
+  // chord is pressed modifier first (pressKey); `repeat: n` (the SDK's) holds the key through n OS
+  // auto-repeat keydowns; Enter or Tab right after typing waits the persona's pause (afterTyping).
+  keyboard.press = (k: string, options: any = {}) => locked(async () => {
     await keyboardWarmup();
-    const opts = { ...(options && typeof options === "object" ? options : {}) };
-    if (!(typeof opts.delay === "number" && opts.delay > 0)) opts.delay = keyDwell(persona);
-    return nativeKbPress(key, opts);
+    const o = options && typeof options === "object" ? options : {};
+    await afterTyping(k);
+    return pressKey(k, typeof o.delay === "number" && o.delay > 0 ? o.delay : null, o.repeat ?? 1);
   });
 
   // ------------------------------------------------------- page-level targeted helpers
@@ -1140,7 +1295,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     await nativeKbDown("ControlOrMeta");
     try {
       await sleep(rand(40, 110));
-      await nativeKbPress("a", { delay: keyDwell(persona) });
+      await nativeKbPress("a", { delay: dwell() });
       await sleep(rand(20, 80));
     } finally {
       await nativeKbUp("ControlOrMeta");
@@ -1178,23 +1333,95 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   const nativeType = (selector: string, text: string, options: any) =>
     nativePageType ? nativePageType(selector, text, options) : nativePageFill(selector, text, options);
 
-  // Make `selector` the focus the way a person does (a click), unless it already is. Only text-entry
-  // controls are clicked; for anything else, and when the click did not actually put the caret there
-  // (an overlay took it), the caller goes native.
+  // Where the control `info` (described, with its hit-test node) sits in the page's Tab order relative to
+  // the focused element (keys.TAB_DISTANCE, read in the isolated world), or null.
+  const tabDistance = async (info: DescribedElement | null, selector: string | null = null): Promise<TabInfo | null> => {
+    if (!info || info.node === undefined || info.node === null || !info.rect) return null;
+    const [x, y, width, height] = info.rect;
+    const arg: Record<string, unknown> = { x, y, width, height };
+    if (typeof selector === "string" && selector) arg.sel = selector;
+    try { return (await worldFor(page).callOnNode<TabInfo | null>(info.node as number, TAB_DISTANCE, arg)) ?? null; } catch { return null; }
+  };
+
+  // Press Tab `d` times (Shift+Tab when d < 0): the first after the persona's Tab pause when it follows
+  // typing, the rest 110-260 ms apart (the eye follows the focus ring).
+  const tabSteps = async (d: number): Promise<void> => {
+    const k = d > 0 ? "Tab" : "Shift+Tab";
+    for (let j = 0; j < Math.abs(d); j++) {
+      if (j === 0) await afterTyping(k); else await sleep(rand(110, 260));
+      await pressKey(k);
+    }
+  };
+
+  // Tab into the control `info` instead of clicking it, the way a person moves between adjacent fields:
+  // when focus sits in a TEXT field 1-3 stops before it (or 1 after: Shift+Tab), in the persona's share
+  // (60-85 %, keys.typingTraits tabPref). `force`: any focused element, up to 3 stops either way, no roll
+  // (a button a press goes to). `needEmpty`: only an empty field (Tab selects a field's text; type()
+  // appends at the caret). True once focus is verified there; false = click.
+  const tabInto = async (loc: Locator, info: DescribedElement | null, selector: string | null = null,
+    needEmpty = false, force = false): Promise<boolean> => {
+    if (needEmpty && info && info.value) return false;
+    const td = await tabDistance(info, selector);
+    if (!td || td.dist === null || td.focused) return false;
+    const d = td.dist;
+    if (force) {
+      if (!(Math.abs(d) >= 1 && Math.abs(d) <= 3)) return false;
+    } else if (!td.fromText || !((d >= 1 && d <= 3) || d === -1) || Math.random() >= tabPref()) {
+      return false;
+    }
+    await tabSteps(d);
+    await sleep(rand(40, 120));
+    return focused(loc);
+  };
+
+  // Make `selector` the focus the way a person does -- Tab from the field before it (tabInto) or a click
+  // --, unless it already is. Only text-entry controls are clicked; for anything else, and when the click
+  // did not actually put the caret there (an overlay took it), the caller goes native. Tab only into an
+  // EMPTY field.
   const clickInto = async (selector: string, timeout: number | undefined): Promise<void> => {
     const loc = page.locator(selector).first();
     if (await focused(loc)) return;
     const te = await textEntry(loc, timeout, selector);
-    if (!te || !(await focusClick(te.box, provenPoint(te.box, te.info), loc, selector)) || !(await focused(loc))) {
+    if (!te) throw new NativeSignal();
+    if (await tabInto(loc, te.info, selector, true)) return;
+    if (!(await focusClick(te.box, provenPoint(te.box, te.info), loc, selector)) || !(await focused(loc))) {
       throw new NativeSignal();
     }
     await sleep(rand(40, 120));
   };
 
+  // Give `selector` -- any focusable element -- the keyboard focus the way a person does: Tab when it is
+  // 1-3 stops from the focused element (always for what a click would ACTIVATE: a button, a link, a
+  // checkbox), else a humanized click for what a click only focuses. True when focus is verified there;
+  // false for an activatable target out of Tab reach (the pointer has glided onto it; the caller gives
+  // the focus natively, reported) -- never Playwright's 0 ms focus-and-press.
+  const focusTarget = async (selector: string, timeout: number | undefined): Promise<boolean> => {
+    const loc = page.locator(selector).first();
+    if (await focused(loc)) return true;
+    const box = await boxOf(loc, timeout, false, selector);
+    const info = box ? await describe(box, FOCUSABLE) : null;
+    if (!box || !info) throw new NativeSignal();
+    const td = await tabDistance(info, selector);
+    const act = td === null || td.activatable; // unknown: never risk an activating click
+    if (td && td.dist !== null && Math.abs(td.dist) >= 1 && Math.abs(td.dist) <= 3) {
+      if ((act || Math.random() < tabPref()) && await tabInto(loc, info, selector, false, true)) return true;
+    }
+    if (!act && !info.disabled) {
+      if (await focusClick(box, provenPoint(box, info), loc, selector) && await focused(loc)) {
+        await sleep(rand(40, 120));
+        return true;
+      }
+      throw new NativeSignal();
+    }
+    const p0 = clickPoint(box, st, persona);
+    await glide(roundHalfEven(p0.x), roundHalfEven(p0.y)); // the hand goes to it; the focus has to be given
+    return false;
+  };
+
   const htype = async (selector: string, text: string, options: any): Promise<any> => {
     try {
       await clickInto(selector, options?.timeout);
-      await humanTypeText(text);
+      await humanTypeText(text, undefined, true, Number(options?.delay) || 0, false);
       return;
     } catch (e) {
       if (isTimeout(e)) throw e;
@@ -1228,9 +1455,12 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     // crawl -- but the way a person pastes: glide to the field, click into it, then insert.
     const bulk = Array.from(want).length > 200; // what the field holds: a 300-character value cut to 5 is typed
     if (bulk && !nativeKbInsert) return false;
-    if (!(await focusClick(box, box ? provenPoint(box, info) : null, loc, selector))) return false;
-    await sleep(rand(40, 120));
-    if (!(await focused(loc))) return false;
+    // From the field before it, a person Tabs (persona share, focus verified); else a click.
+    if (!(info && await tabInto(loc, info, selector))) {
+      if (!(await focusClick(box, box ? provenPoint(box, info) : null, loc, selector))) return false;
+      await sleep(rand(40, 120));
+      if (!(await focused(loc))) return false;
+    }
     const read = async (): Promise<string | null> => {
       try { return await loc.inputValue({ timeout: COVER_RETRY_MS }); } catch { return null; }
     };
@@ -1416,23 +1646,147 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     return targetedClick(nativePageDblclick, selector, o, false, options ?? {});
   }));
 
+  const nativePageFocus = typeof (page as any).focus === "function" ? (page as any).focus.bind(page) : null;
+
+  // A humanized route handed this call to Playwright: told to lane A's on_fallback hook when the page
+  // carries one (page._clearcoteOnFallback), else nothing (as before).
+  const fallback = (api: string, reason: string): void => {
+    const cb = (page as any)._clearcoteOnFallback;
+    if (typeof cb === "function") { try { cb({ api, reason }); } catch { /* the hook's own problem */ } }
+  };
+
+  // Give `selector` the focus before a key goes to it: a text field by Tab from the field before it
+  // (only when empty) or a click; anything else through focusTarget; an activatable target out of Tab
+  // reach gets the pointer over it and Playwright's focus (reported), and the key is still held.
+  const focusForPress = async (selector: string, timeout: number | undefined): Promise<void> => {
+    const loc = page.locator(selector).first();
+    if (await focused(loc)) return;
+    if (!(await loc.isVisible())) throw new NativeSignal(); // Playwright waits for it
+    const box = await boxOf(loc, timeout, false, selector);
+    const info = await describe(box);
+    if (box && info && classifyField(info.tag, info.type, info.ce) === "text") {
+      if (await tabInto(loc, info, selector, true)) return;
+      if (!(await focusClick(box, provenPoint(box, info), loc, selector)) || !(await focused(loc))) throw new NativeSignal();
+      await sleep(rand(40, 120));
+      return;
+    }
+    if (await focusTarget(selector, timeout)) return;
+    if (!nativePageFocus) throw new NativeSignal();
+    fallback("page.press", "focus: an activatable target out of Tab reach");
+    await nativePageFocus(selector, timeout !== undefined ? { timeout } : {});
+    await sleep(rand(40, 120));
+  };
+
+  // page.press (and locator.press): the target gets the focus the way a person gives it (never
+  // Playwright's focus-and-press in 0 ms), then the key goes through the keyboard model -- a chord's
+  // modifier first, the persona's hold (or the caller's `delay`), `repeat: n` as OS auto-repeat, and the
+  // submit / Tab pause after typing.
   const hpress = async (selector: string, key: string, options: any): Promise<any> => {
+    const { repeat, ...opts } = options ?? {};
     try {
-      // Click into text fields only: a press on a button or a link that is not focused yet is
-      // Playwright's (it focuses without activating); clicking it first activated it twice.
-      await clickInto(selector, options?.timeout);
-      // The persona's hold unless the caller set a real one, for the same reason keyboard.press above
-      // carries one: this is the path locator.press() delegates to.
-      const d = options?.delay;
-      await nativeKbPress(key, { delay: typeof d === "number" && d > 0 ? d : keyDwell(persona) });
+      await focusForPress(selector, opts.timeout);
+      await afterTyping(key);
+      const d = opts.delay;
+      await pressKey(key, typeof d === "number" && d > 0 ? d : null, repeat ?? 1);
       return;
     } catch (e) {
       if (isTimeout(e)) throw e;
     }
-    return nativePagePress(selector, key, options);
+    fallback("page.press", "native press");
+    let r: any;
+    for (let j = 0; j < Math.max(1, Math.floor(Number(repeat) || 1)); j++) r = await nativePagePress(selector, key, opts);
+    return r;
   };
   (page as any).press = apiErrors("page.press", (selector: string, key: string, options: any = {}) =>
     locked(() => hpress(selector, key, options)));
+
+  // page.focus / locator.focus: Tab or a click (focusTarget), verified; Playwright's focus for an
+  // activatable target out of Tab reach (reported) and for anything the humane route cannot do.
+  if (nativePageFocus) {
+    (page as any).focus = apiErrors("page.focus", (selector: string, options: any = {}) => locked(async () => {
+      try {
+        if (await focusTarget(selector, options?.timeout)) return;
+        fallback("page.focus", "an activatable target out of Tab reach");
+      } catch (e) {
+        if (isTimeout(e)) throw e;
+        fallback("page.focus", "native focus");
+      }
+      return nativePageFocus(selector, options);
+    }));
+  }
+
+  // locator.blur, humanized: a focused element is left the way the persona leaves fields -- Tab to the
+  // next stop, or a click on a blank point beside it (keys.BLANK_POINT; Tab when there is none). True when
+  // focus is verified gone; false = Playwright's blur.
+  const blurHuman = async (selector: string, options: any): Promise<boolean> => {
+    const loc = page.locator(selector).first();
+    if (!(await focused(loc))) return false;
+    if (traits.blurStyle === "click") {
+      const box = await boxOf(loc, options?.timeout, false, selector);
+      const vp = await viewport();
+      const pt = box ? await worldFor(page).evaluate<[number, number] | null>(BLANK_POINT, { box, vw: vp.width, vh: vp.height }) : null;
+      if (Array.isArray(pt) && pt.length === 2) {
+        const x = roundHalfEven(pt[0] + gauss() * 3), y = roundHalfEven(pt[1] + gauss() * 3);
+        await glide(x, y, { targetW: 60 });
+        await pressHere(x, y);
+        await sleep(rand(40, 120));
+        if (!(await focused(loc))) return true;
+      }
+    }
+    await afterTyping("Tab");
+    await pressKey("Tab");
+    await sleep(rand(40, 120));
+    return !(await focused(loc));
+  };
+
+  const selectedAll = async (): Promise<boolean> => {
+    const s = await worldFor(page).evaluate<number[] | null>(SELECTION_STATE);
+    return Array.isArray(s) && s.length === 3 && Math.min(s[0], s[1]) === 0 && Math.max(s[0], s[1]) === s[2];
+  };
+
+  // locator.selectText, humanized: a triple click (an <input>) or the keys -- End then Shift+Home
+  // (Ctrl+End, Ctrl+Shift+Home in a textarea; Cmd+A on macOS) --, per persona; verified in the isolated
+  // world (SELECTION_STATE), one select-all retry; false = Playwright's selectText.
+  const selectTextHuman = async (selector: string, options: any): Promise<boolean> => {
+    const loc = page.locator(selector).first();
+    const box = await boxOf(loc, options?.timeout, !!options?.force, selector);
+    const info = box ? await describe(box) : null;
+    if (!box || !info || info.disabled || classifyField(info.tag, info.type, info.ce) !== "text") return false;
+    if (traits.selectStyle === "triple" && info.tag === "input") {
+      const at = provenPoint(box, info);
+      const p0 = at ? { x: at[0], y: at[1] } : clickPoint(box, st, persona);
+      await glide(roundHalfEven(p0.x), roundHalfEven(p0.y));
+      await pressAt(normalizeClickOptions({ clickCount: 3 }));
+    } else {
+      if (!(await focused(loc))) {
+        if (!(await focusClick(box, provenPoint(box, info), loc, selector)) || !(await focused(loc))) return false;
+        await sleep(rand(120, 300));
+      }
+      if (hostWheelPlatform() === "macos") await pressKey("ControlOrMeta+a");
+      else if (info.tag === "input") { await pressKey("End"); await sleep(rand(80, 200)); await pressKey("Shift+Home"); }
+      else { await pressKey("ControlOrMeta+End"); await sleep(rand(80, 200)); await pressKey("ControlOrMeta+Shift+Home"); }
+    }
+    await sleep(rand(60, 160));
+    if (await selectedAll()) return true;
+    await selectAll();
+    await sleep(rand(60, 160));
+    return selectedAll();
+  };
+
+  // Run the humane `fn` (true = done); Playwright's own locator method when it declines or fails (a
+  // timeout propagates).
+  const guarded = (api: string, fn: (s: string, o: any) => Promise<boolean>, name: string) =>
+    (selector: string, options: any = {}) => locked(async () => {
+      try {
+        if (await fn(selector, options)) return;
+      } catch (e) {
+        if (isTimeout(e)) throw e;
+      }
+      fallback(api, "native");
+      return LOCATOR_NATIVE[name].call(page.locator(selector).first(), options);
+    });
+  (page as any)._clearcoteBlur = guarded("locator.blur", blurHuman, "blur");
+  (page as any)._clearcoteSelectText = guarded("locator.selectText", selectTextHuman, "selectText");
 
   // ------------------------------------------------------------------------- selectOption
   // Open the drop-down with a click, move its highlight with the planned keys, commit with Enter: one
@@ -1445,7 +1799,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     await targetedClick(nativePageClick, selector, at ? { position: at } : {}, false, null);
     await sleep(rand(220, 480)); // the list opens; the eye finds the option
     for (const ch of plan.keys) {
-      await nativeKbPress(ch, { delay: keyDwell(persona) });
+      await nativeKbPress(ch, { delay: dwell() });
       await sleep(Math.max(40, 100 + gauss() * 35)); // well inside type-ahead's 1 s window
     }
     const n = plan.arrows;
@@ -1464,19 +1818,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // each, 370 rows took 68 s (verifier B). The open popup takes these keys, so the page sees none of
   // them, only how long the pick took.
   const arrowRun = async (k: string, n: number): Promise<void> => {
-    if (n < 8 || !nativeKbDown || !nativeKbUp) { await key(k, n); return; }
-    await nativeKbDown(k);
-    try {
-      await sleep(rand(380, 560)); // the repeat delay
-      const gap = rand(28, 36);    // ~30 repeats a second
-      for (let j = 0; j < n - 1; j++) {
-        await sleep(gap);
-        await nativeKbDown(k);
-      }
-    } finally {
-      await sleep(rand(20, 60));
-      await nativeKbUp(k); // never leave the key down
-    }
+    if (n < 8) { await key(k, n); return; }
+    await holdKey(k, null, n); // OS auto-repeat (keys.planRepeat)
   };
 
   // A list box's scroll state and one row's box, read from the node the hit test found.
@@ -1904,8 +2247,8 @@ const CLICK_OPTS = ["button", "clickCount", "delay", "force", "modifiers", "noWa
 const HOVER_OPTS = ["force", "modifiers", "noWaitAfter", "position", "timeout", "trial"];
 const DBL_OPTS = ["button", "delay", "force", "modifiers", "noWaitAfter", "position", "timeout", "trial"];
 const FILL_OPTS = ["force", "noWaitAfter", "timeout"];
-const TYPE_OPTS = ["timeout"];
-const PRESS_OPTS = ["delay", "noWaitAfter", "timeout"];
+const TYPE_OPTS = ["delay", "timeout"];   // delay: the shortest gap between two keys (humanized typing)
+const PRESS_OPTS = ["delay", "noWaitAfter", "timeout", "repeat"];   // repeat: the SDK's OS auto-repeat
 const SELECT_OPTS = ["force", "noWaitAfter", "timeout"];
 const CHECK_OPTS = ["force", "noWaitAfter", "position", "timeout", "trial"];
 
@@ -1923,6 +2266,9 @@ export function pickOptions(kw: any, names: readonly string[]): Record<string, u
  * Playwright's own strict-mode error. Once routed, errors propagate as they are (the page method
  * already ran its own native fallback, so nothing is retried). Composes if another library already
  * patched the prototype. */
+// Playwright's own Locator methods the humanized blur / selectText fall back to.
+const LOCATOR_NATIVE: Record<string, any> = {};
+
 function patchLocatorClass(sample: Locator): void {
   if (locatorPatched) return;
   locatorPatched = true;
@@ -1932,7 +2278,10 @@ function patchLocatorClass(sample: Locator): void {
   const oFill = proto.fill, oClick = proto.click, oType = proto.type, oDbl = proto.dblclick,
     oHover = proto.hover, oPress = proto.press, oPressSeq = proto.pressSequentially,
     oClear = proto.clear, oTap = proto.tap, oCheck = proto.check, oUncheck = proto.uncheck,
-    oDragTo = proto.dragTo, oSelectOption = proto.selectOption, oSetChecked = proto.setChecked;
+    oDragTo = proto.dragTo, oSelectOption = proto.selectOption, oSetChecked = proto.setChecked,
+    oFocus = proto.focus, oBlur = proto.blur, oSelectText = proto.selectText;
+  LOCATOR_NATIVE.blur = oBlur;
+  LOCATOR_NATIVE.selectText = oSelectText;
 
   // Main-frame locators only: a FrameLocator's child keeps the MAIN frame as its _frame and enters the
   // iframe through its selector, so the selector is what tells. Routed through page.fill, its
@@ -1993,8 +2342,38 @@ function patchLocatorClass(sample: Locator): void {
   });
   proto.press = apiMethod("locator.press", async function (this: any, key: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().press(sel(this), key, pickOptions(kw, PRESS_OPTS)));
-    return done ? r : oPress.call(this, key, kw);
+    if (done) return r;
+    const { repeat, ...rest } = kw ?? {};   // not humanized: `repeat` presses, Playwright's own each
+    let out: any;
+    for (let j = 0; j < Math.max(1, Math.floor(Number(repeat) || 1)); j++) out = await oPress.call(this, key, rest);
+    return out;
   });
+  if (typeof oFocus === "function") {
+    proto.focus = apiMethod("locator.focus", async function (this: any, kw: any = {}) {
+      const [done, r] = await route(this, () => this.page().focus(sel(this), pickOptions(kw, ["timeout"])));
+      return done ? r : oFocus.call(this, kw);
+    });
+  }
+  if (typeof oBlur === "function") {
+    proto.blur = apiMethod("locator.blur", async function (this: any, kw: any = {}) {
+      const fn = this.page()?._clearcoteBlur;
+      if (typeof fn === "function") {
+        const [done, r] = await route(this, () => fn(sel(this), pickOptions(kw, ["timeout"])));
+        if (done) return r;
+      }
+      return oBlur.call(this, kw);
+    });
+  }
+  if (typeof oSelectText === "function") {
+    proto.selectText = apiMethod("locator.selectText", async function (this: any, kw: any = {}) {
+      const fn = this.page()?._clearcoteSelectText;
+      if (typeof fn === "function") {
+        const [done, r] = await route(this, () => fn(sel(this), pickOptions(kw, ["force", "timeout"])));
+        if (done) return r;
+      }
+      return oSelectText.call(this, kw);
+    });
+  }
   proto.pressSequentially = apiMethod("locator.pressSequentially", async function (this: any, text: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().type(sel(this), text, pickOptions(kw, TYPE_OPTS)));
     return done ? r : oPressSeq.call(this, text, kw);

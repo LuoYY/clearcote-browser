@@ -12,7 +12,7 @@
  * option forwarding, error propagation), the caller's timeout, `force`, focus through `:focus`, and the
  * per-page lock. page.evaluate throws throughout: no read may use the page's world.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   apiErrors, asApiError, attachHumanize, createInputLock, isTimeout, pickOptions, sdkPlaywrightError, selectWants, typoRate,
   wantIndex,
@@ -23,6 +23,8 @@ import {
   ISO_SCROLL_BY, ISO_VIEWPORT,
 } from "../src/isolated.js";
 import { typeaheadSimulate } from "../src/forms.js";
+import { BLANK_POINT, FOCUSABLE, SELECTION_STATE, TAB_DISTANCE, typingTraits } from "../src/keys.js";
+import { makePersona } from "../src/motion.js";
 
 const SLOW = 30_000; // glides and holds use real sleeps
 
@@ -161,6 +163,14 @@ function makeFake(opts: FakeOpts = {}) {
       return;
     }
     if (k === "End") { selAll = false; return; }
+    if (k === "Tab") {   // lane D: Tab moves the focus along the fields (Shift: back) and selects a field's text
+      const order = allFields();
+      const i = focus ? order.indexOf(focus) + (mods.has("Shift") ? -1 : 1) : -1;
+      focus = i >= 0 && i < order.length ? order[i] : null;
+      selAll = !!focus && focus.tag === "input" && focus.value !== "";
+      return;
+    }
+    if (k === "Home" && mods.has("Shift")) { selAll = true; return; }
     if (Array.from(k).length === 1) typeChar(k);
   };
   // a list box: rows of rowH px inside the box's client area, scrolled by scrollTop
@@ -203,7 +213,12 @@ function makeFake(opts: FakeOpts = {}) {
     move: async (x: number, y: number) => { pos = { x, y }; rec("move", { x, y }); },
     click: async (x: number, y: number, o: any = {}) => { pos = { x, y }; rec("click", { x, y, ...o }); pressed(x, y, false); },
     down: async (o: any = {}) => { rec("down", o); },
-    up: async (o: any = {}) => { rec("up", o); pressed(pos.x, pos.y, mods.has("ControlOrMeta") || mods.has("Control")); },
+    up: async (o: any = {}) => {
+      rec("up", o);
+      if (o.clickCount === 3 && focus && fieldAt(pos.x, pos.y) === focus) { selAll = true; return; } // a triple click selects
+      if (o.clickCount > 1) return;
+      pressed(pos.x, pos.y, mods.has("ControlOrMeta") || mods.has("Control"));
+    },
     wheel: async (dx: number, dy: number) => {
       rec("wheel", { dx, dy });
       const f = fieldAt(pos.x, pos.y);
@@ -231,7 +246,7 @@ function makeFake(opts: FakeOpts = {}) {
 
   const describeInfo = (f: Field, want: string | null) => {
     if (want === "select" && !isSelect(f)) return null;
-    if (want && want !== "select" && !["input", "textarea", "select"].includes(f.tag)) return null;
+    if (want && want !== "select" && want !== FOCUSABLE && !["input", "textarea", "select"].includes(f.tag)) return null;
     const o: any = {
       tag: f.tag, type: f.tag === "input" ? f.type : "", ce: false,
       rect: [f.box.x, f.box.y, f.box.width, f.box.height], focused: focus === f, value: f.value, min: f.min ?? null, max: f.max ?? null,
@@ -265,6 +280,15 @@ function makeFake(opts: FakeOpts = {}) {
           if (e.startsWith(`(${ISO_PLATFORM})`)) return { result: { value: "Win32" } };
           if (e.startsWith(`(${ISO_VIEWPORT})`)) return { result: { value: [1280, 800] } };
           if (e.startsWith(`(${ISO_SCROLL_BY})`)) return { result: { value: [0, 0] } };
+          if (e.startsWith(`(${SELECTION_STATE})`)) {   // lane D: select-all is the selection the fake knows
+            if (!focus) return { result: { value: null } };
+            const n = Array.from(focus.value).length;
+            return { result: { value: selAll ? [0, n, n] : [n, n, n] } };
+          }
+          if (e.startsWith(`(${BLANK_POINT})`)) {      // lane D: a blank point under the field
+            const a = argOf(e, BLANK_POINT);
+            return { result: { value: [a.box.x + a.box.width / 2, a.box.y + a.box.height + 200] } };
+          }
           if (e.startsWith(`(${ISO_CSS_BOX})`)) {
             const a = argOf(e, ISO_CSS_BOX);
             if (/internal:|>>/.test(a.sel)) return { result: { value: null } }; // not CSS the browser accepts
@@ -293,6 +317,16 @@ function makeFake(opts: FakeOpts = {}) {
               && Math.abs(b.width - arg.width) <= 1.5 && Math.abs(b.height - arg.height) <= 1.5 } };
           }
           if (params.functionDeclaration === ISO_LISTBOX_ROW) return { result: { value: f ? listboxState(f, arg.i) : null } };
+          if (params.functionDeclaration === TAB_DISTANCE) {
+            // lane D: the Tab order is the fields' order; text = an input of a text type or a textarea
+            if (!f) return { result: { value: null } };
+            const order = allFields();
+            const text = (g: Field | null) => !!g && (g.tag === "textarea" || (g.tag === "input" && ["text", "search", ""].includes(g.type)));
+            const ai = focus ? order.indexOf(focus) : -1;
+            return { result: { value: { dist: ai >= 0 ? order.indexOf(f) - ai : null, fromText: text(focus), focused: focus === f,
+              activatable: f.tag === "button" || f.tag === "select" || f.type === "checkbox", text: text(f), tag: f.tag,
+              type: f.type, n: order.length } } };
+          }
           if (params.functionDeclaration !== ISO_DESCRIBE) return { exceptionDetails: { text: "unknown call" } };
           return { result: { value: f ? describeInfo(f, arg?.want ?? null) : null } };
         }
@@ -324,7 +358,9 @@ function makeFake(opts: FakeOpts = {}) {
     click: nativeFn("click"), hover: nativeFn("hover"), dblclick: nativeFn("dblclick"), fill: nativeFn("fill"),
     press: nativeFn("press"), type: nativeFn("type"), selectOption: nativeFn("selectOption"),
     check: nativeFn("check"), uncheck: nativeFn("uncheck"), setChecked: nativeFn("setChecked"),
-    focus: async () => undefined, on: () => undefined, mainFrame: () => MAIN_FRAME, waitForTimeout: async () => undefined,
+    // Playwright's focus (what a press on an activatable target out of Tab reach falls back to): recorded
+    focus: async (sel: string, ...args: any[]) => { natives.push({ m: "focus", args: [sel, ...args] }); focus = fields[sel] ?? single; },
+    on: () => undefined, mainFrame: () => MAIN_FRAME, waitForTimeout: async () => undefined,
     viewportSize: () => ({ width: 1280, height: 800 }),
     evaluate: () => { throw new Error("humanize must not evaluate in the page's world"); },
     context: () => ({ newCDPSession: async () => cdp, browser: () => null }),
@@ -979,12 +1015,20 @@ describe("type / press", () => {
     expect(f.of("down").length).toBe(1);   // already focused: no second click
   }, SLOW);
 
-  it("a press on a button is Playwright's: no click first, so it activates once", async () => {
+  it("a press on a button is never clicked first: the pointer goes to it, the focus is given, the key is held", async () => {
+    // Lane D (SC 232): no Tab order in this fake, so the button is out of Tab reach -- Playwright's focus,
+    // reported -- and the key is a HELD press; never a click (it activated the button twice) and never
+    // Playwright's 0 ms focus-and-press.
     const f = await attached({ field: { tag: "button", type: "" } });
+    const seen: any[] = [];
+    (f.page as any)._clearcoteOnFallback = (e: any) => seen.push(e);
     await f.page.press("#counter", "Enter");
-    expect(f.natives.map((n) => n.m)).toEqual(["press"]);
+    expect(f.natives.map((n) => n.m)).toEqual(["focus"]);
     expect(f.of("click")).toEqual([]);
     expect(f.of("down")).toEqual([]);
+    expect(f.of("press").map((e) => e.a.k)).toEqual(["Enter"]);
+    expect(f.of("press")[0].a.delay).toBeGreaterThanOrEqual(45);
+    expect(seen[0]?.api).toBe("page.press");
   }, SLOW);
 
   it("typing into a hidden helper textarea is Playwright's at once, with no wait", async () => {
@@ -1010,10 +1054,12 @@ describe("type / press", () => {
     // plain-CSS selector, used only when Playwright counts the same elements, never the way a target
     // is resolved (the hit test is). ISO_HIT_IN_BOX (SC 210 fix 2) reads the caller's plain-CSS selector
     // only to tell whether the element the hit test found IS that element (its first match must still
-    // fill the box, else the box rule answers), and asks whether a twin holds a control.
+    // fill the box, else the box rule answers), and asks whether a twin holds a control. TAB_DISTANCE
+    // (lane D) walks the document's focusables for the Tab ORDER -- what a Tab press visits --, and reads
+    // the caller's plain-CSS selector the same way HIT_IN_BOX does (it must still fill the box).
     expect(allExpressions.length).toBeGreaterThan(0);
     for (const e of allExpressions) {
-      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.includes(ISO_HIT_IN_BOX)) expect(e).not.toContain("querySelector");
+      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.includes(ISO_HIT_IN_BOX) && !e.includes(TAB_DISTANCE)) expect(e).not.toContain("querySelector");
     }
     expect(allExpressions.some((e) => e.startsWith(`(${ISO_CSS_BOX})`))).toBe(true);
   });
@@ -1274,3 +1320,82 @@ describe("paths stay in the viewport; whole-pixel presses (SC 210 fix 2)", () =>
     }
   }, 60_000);
 });
+
+// ------------------------------------------------------------------- lane D (SC 232): Tab and focus
+describe("lane D: Tab between fields, presses on buttons, focus / blur / selectText", () => {
+  const seeded = async (seed: string, o: FakeOpts) => {
+    const f = makeFake(o);
+    await attachHumanize({} as never, f.page, { humanize: true, seed });
+    return f;
+  };
+  // fake timers: every planned sleep resolves at once, the order of events is what is checked
+  const drive = async <T>(p: Promise<T>): Promise<T> => { await vi.runAllTimersAsync(); return p; };
+  const three = () => ({ fields: { "#a": {}, "#b": {}, "#c": {} } });
+
+  it("fill Tabs from field to adjacent field in the persona's share, focus verified", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const out: Record<string, [number, number]> = {};
+      for (const seed of ["ha-1", "ha-2", "ha-4", "ha-5"]) {
+        let tabs = 0, n = 0;
+        for (let k = 0; k < 25; k++) {
+          const f = await seeded(seed, three());
+          for (const [sel, v] of [["#a", "alpha"], ["#b", "bravo"], ["#c", "charlie"]] as const) {
+            const before = f.events.length;
+            await drive(f.page.fill(sel, v));
+            if (sel !== "#a") { n++; if (f.events.slice(before).some((e) => e.t === "press" && e.a.k === "Tab")) tabs++; }
+          }
+          expect(f.natives).toEqual([]);
+        }
+        const want = typingTraits(makePersona(seed).seed).tabPref;
+        out[seed] = [tabs / n, want];
+        expect(Math.abs(tabs / n - want), JSON.stringify(out)).toBeLessThanOrEqual(0.2);
+      }
+    } finally { vi.useRealTimers(); }
+  }, 120_000);
+
+  it("a press on a button within Tab reach Tabs to it: no click, no native", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const f = await seeded("ha-1", { fields: { "#q": {}, "#go": { tag: "button", type: "" } } });
+      await drive(f.page.fill("#q", "hello"));
+      const downs = f.of("down").length;
+      await drive(f.page.press("#go", "Enter"));
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(downs);
+      expect(f.of("press").map((e) => e.a.k).slice(-2)).toEqual(["Tab", "Enter"]);
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("focus / blur / selectText go the humane way, with nothing native", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      for (const seed of ["ha-1", "ha-2", "ha-4", "ha-5"]) {   // blur click/tab, select triple/keys
+        const f = await seeded(seed, three());
+        await drive(f.page.fill("#a", "some text"));
+        await drive(f.page.focus("#b"));
+        await drive(f.page.focus("#a"));
+        await drive((f.page as any)._clearcoteSelectText("#a"));
+        expect(f.of("press").some((e) => e.a.k === "Home") || f.of("up").some((e) => e.a.clickCount === 3), seed).toBe(true);
+        await drive((f.page as any)._clearcoteBlur("#a"));
+        expect(f.natives, seed).toEqual([]);
+      }
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("page.type keeps the caller's delay as a floor; page.press repeat holds the key", async () => {
+    process.env[ENV] = "0";
+    const f = await seeded("ha-2", { field: {} });
+    const t0 = Date.now();
+    await f.page.type("#f", "abcd", { delay: 300 });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+    expect(f.field.value).toBe("abcd");
+    await f.page.press("#f", "ArrowRight", { repeat: 6 });
+    expect(f.of("kdown").filter((e) => e.a === "ArrowRight").length).toBe(6);
+    expect(f.of("kup").filter((e) => e.a === "ArrowRight").length).toBe(1);
+  }, SLOW);
+});
+
