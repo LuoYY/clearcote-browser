@@ -46,6 +46,10 @@ public sealed record HumanClickOptions
     /// <summary>Perform NO action: run Playwright's own trial (actionability checks only) and return.</summary>
     public bool Trial { get; init; }
 
+    /// <summary>Hover only: how long (ms) the pointer rests on the element after it arrives, drifting within 3 px.
+    /// Null: the persona's 150-900 ms; 0 or less: no dwell. Not a Playwright option: never forwarded.</summary>
+    public double? Dwell { get; init; }
+
     /// <summary>How long to wait for the element, in ms. Default: the page's default timeout. A timeout
     /// throws Playwright's timeout exception; it never falls back to a second native wait.</summary>
     public float? Timeout { get; init; }
@@ -222,7 +226,11 @@ public static partial class Humanize
     private static readonly ConditionalWeakTable<IPage, SemaphoreSlim> Gates = new();
     private static readonly AsyncLocal<IPage?> Inside = new();
 
-    private static async Task<T> SerialAsync<T>(IPage page, Func<Task<T>> body)
+    // The outermost action first runs the lazy after-action step (SC 232 lane C, PreActionAsync: a due move-off,
+    // the attention model) once it holds the gate; `after` false skips it (a trial performs no action), `coords`
+    // marks an action that names a viewport point (no exploratory scroll before it). The idle gap counts from
+    // the end of the outermost action.
+    private static async Task<T> SerialAsync<T>(IPage page, Func<Task<T>> body, bool after = true, bool coords = false)
     {
         if (ReferenceEquals(Inside.Value, page)) return await body().ConfigureAwait(false);
         var gate = Gates.GetValue(page, _ => new SemaphoreSlim(1, 1));
@@ -230,16 +238,18 @@ public static partial class Humanize
         Inside.Value = page;   // flows into body(); restored for the caller when this method returns
         try
         {
+            if (after) await PreActionAsync(page, coords).ConfigureAwait(false);
             return await body().ConfigureAwait(false);
         }
         finally
         {
+            if (after) AfterOf(page).LastEnd = NowMs();
             gate.Release();
         }
     }
 
-    private static Task SerialAsync(IPage page, Func<Task> body)
-        => SerialAsync<bool>(page, async () => { await body().ConfigureAwait(false); return true; });
+    private static Task SerialAsync(IPage page, Func<Task> body, bool after = true, bool coords = false)
+        => SerialAsync<bool>(page, async () => { await body().ConfigureAwait(false); return true; }, after, coords);
 
     private static double TypoRateFor(IPage page)
         => TypoRateOverride.TryGetValue(page, out var forced) ? forced.Value : TypoRate();
@@ -264,6 +274,8 @@ public static partial class Humanize
     {
         ArgumentNullException.ThrowIfNull(page);
         Personas.AddOrUpdate(page, Motion.MakePersona(seed));
+        // The attention model's read pause counts from the last load; ambient "load" runs after it (SC 232 lane C).
+        HookLoad(page);
     }
 
     /// <summary>The page's persona, creating a random one on first use if none was attached.</summary>
@@ -495,8 +507,8 @@ public static partial class Humanize
         // `HumanClickAsync(new() { ... })` call ambiguous. HumanClickOptions converts to this type instead.
         ArgumentNullException.ThrowIfNull(locator);
         var o = HumanClickOptions.From(options);
-        await SerialAsync(locator.Page, () => ClickCoreAsync(locator, o, strict: true, () => locator.ClickAsync(options)))
-            .ConfigureAwait(false);
+        await SerialAsync(locator.Page, () => ClickCoreAsync(locator, o, strict: true, () => locator.ClickAsync(options)),
+            after: !o.Trial).ConfigureAwait(false);
     }
 
     private static async Task ClickCoreAsync(ILocator locator, HumanClickOptions options, bool strict, Func<Task> native)
@@ -517,8 +529,8 @@ public static partial class Humanize
         ArgumentNullException.ThrowIfNull(selector);
         var o = options ?? new HumanClickOptions();
         var loc = page.Locator(selector).First;
-        await SerialAsync(page, () => ClickCoreAsync(loc, o, strict: false, () => loc.ClickAsync(o.ToClick())))
-            .ConfigureAwait(false);
+        await SerialAsync(page, () => ClickCoreAsync(loc, o, strict: false, () => loc.ClickAsync(o.ToClick())),
+            after: !o.Trial).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -529,8 +541,8 @@ public static partial class Humanize
     public static async Task HumanDblClickAsync(this ILocator locator, HumanClickOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(locator);
-        await SerialAsync(locator.Page, () => DblClickCoreAsync(locator, options ?? new HumanClickOptions(), strict: true))
-            .ConfigureAwait(false);
+        await SerialAsync(locator.Page, () => DblClickCoreAsync(locator, options ?? new HumanClickOptions(), strict: true),
+            after: options?.Trial != true).ConfigureAwait(false);
     }
 
     private static async Task DblClickCoreAsync(ILocator locator, HumanClickOptions options, bool strict)
@@ -550,7 +562,8 @@ public static partial class Humanize
         ArgumentNullException.ThrowIfNull(page);
         ArgumentNullException.ThrowIfNull(selector);
         var loc = page.Locator(selector).First;
-        await SerialAsync(page, () => DblClickCoreAsync(loc, options ?? new HumanClickOptions(), strict: false)).ConfigureAwait(false);
+        await SerialAsync(page, () => DblClickCoreAsync(loc, options ?? new HumanClickOptions(), strict: false),
+            after: options?.Trial != true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -561,8 +574,8 @@ public static partial class Humanize
     public static async Task HumanHoverAsync(this ILocator locator, HumanClickOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(locator);
-        await SerialAsync(locator.Page, () => HoverCoreAsync(locator, options ?? new HumanClickOptions(), strict: true))
-            .ConfigureAwait(false);
+        await SerialAsync(locator.Page, () => HoverCoreAsync(locator, options ?? new HumanClickOptions(), strict: true),
+            after: options?.Trial != true).ConfigureAwait(false);
     }
 
     private static async Task HoverCoreAsync(ILocator locator, HumanClickOptions options, bool strict)
@@ -582,7 +595,8 @@ public static partial class Humanize
         ArgumentNullException.ThrowIfNull(page);
         ArgumentNullException.ThrowIfNull(selector);
         var loc = page.Locator(selector).First;
-        await SerialAsync(page, () => HoverCoreAsync(loc, options ?? new HumanClickOptions(), strict: false)).ConfigureAwait(false);
+        await SerialAsync(page, () => HoverCoreAsync(loc, options ?? new HumanClickOptions(), strict: false),
+            after: options?.Trial != true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -631,7 +645,7 @@ public static partial class Humanize
     /// propagates. No Playwright trial runs at any point: <c>Trial</c> is answered by <see cref="TrialAsync"/>.
     /// </summary>
     private static async Task TargetedClickAsync(ILocator loc, HumanClickOptions options, NormalizedClick o, bool noClick,
-        Func<Task> native)
+        Func<Task> native, bool moveOff = true)
     {
         if (o.Trial)
         {
@@ -692,6 +706,7 @@ public static partial class Humanize
                                 await Task.Delay((int)Rand(40, 110)).ConfigureAwait(false);
                             }
                             await GlideAsync(page, p, st, x, y, Math.Max(6, bb.Width)).ConfigureAwait(false);
+                            await DwellAsync(page, p, st, x, y, bb, options.Dwell).ConfigureAwait(false);
                         }
                         finally
                         {
@@ -706,7 +721,16 @@ public static partial class Humanize
                         return;
                     }
                     await GlideAsync(page, p, st, x, y, Math.Max(6, bb.Width)).ConfigureAwait(false);
-                    if (!noClick) await PressAtAsync(page, p, o).ConfigureAwait(false);
+                    if (noClick)
+                    {
+                        // the hand rests on what it hovered (SC 232 lane C)
+                        await DwellAsync(page, p, st, x, y, bb, options.Dwell).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await PressAtAsync(page, p, o).ConfigureAwait(false);
+                        if (moveOff) ScheduleMoveOff(page, p, st);
+                    }
                     return;
                 }
             }
@@ -1057,7 +1081,7 @@ public static partial class Humanize
     public static async Task HumanWheelAsync(this IPage page, float deltaX, float deltaY)
     {
         ArgumentNullException.ThrowIfNull(page);
-        await SerialAsync(page, () => WheelCoreAsync(page, deltaX, deltaY)).ConfigureAwait(false);
+        await SerialAsync(page, () => WheelCoreAsync(page, deltaX, deltaY), coords: true).ConfigureAwait(false);
     }
 
     private static async Task WheelCoreAsync(IPage page, float deltaX, float deltaY)
@@ -1140,7 +1164,7 @@ public static partial class Humanize
     public static async Task HumanScrollAsync(this IPage page, float deltaY)
     {
         ArgumentNullException.ThrowIfNull(page);
-        await SerialAsync(page, () => WheelCoreAsync(page, 0, deltaY)).ConfigureAwait(false);
+        await SerialAsync(page, () => WheelCoreAsync(page, 0, deltaY), coords: true).ConfigureAwait(false);
     }
 
     /// <summary>A few pixels of hand drift, kept inside the viewport so the wheel stays over the content.</summary>
@@ -1725,7 +1749,8 @@ public static partial class Humanize
         var page = loc.Page;
         var p = PersonaFor(page);
         var o = new HumanClickOptions { Position = at };
-        await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()))
+        // moveOff false: the popup is open now and this sequence owns the pointer until the pick lands.
+        await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()), moveOff: false)
             .ConfigureAwait(false);
         await Task.Delay((int)Rand(220, 480)).ConfigureAwait(false);   // the list opens; the eye finds the option
         foreach (var ch in plan.Keys)
@@ -2605,7 +2630,7 @@ public static partial class Humanize
     /// </summary>
     private static Task SetCheckedAsync(ILocator loc, bool want, float? timeout, bool force, Position? position,
         bool trial, bool strict, Func<Task> native)
-        => SerialAsync(loc.Page, async () =>
+        => SerialAsync(loc.Page, after: !trial, body: async () =>
         {
             if (!await RoutableAsync(loc, strict).ConfigureAwait(false))
             {

@@ -18,8 +18,8 @@ namespace Clearcote;
 //   * `>>> 0` coerces to uint32. C# `>>` on int is arithmetic (sign-propagating), so every place the
 //     TS reads `>>> n` uses a uint here.
 //
-// PlanAmbient is deliberately not ported yet — it exists in the other two SDKs for pre-challenge idle
-// entropy and nothing in the .NET surface calls it. Porting it without a caller would be untested code.
+// PlanAmbient is ported (SC 232 lane C) with its caller, Humanize.HumanAmbientMotionAsync, and pinned to the
+// other two SDKs by sdk/testdata/humanize_after_vectors.json.
 
 /// <summary>Deterministic 0..1 generator, matching the other SDKs' mulberry32.</summary>
 public delegate double Rng();
@@ -524,4 +524,179 @@ public static class Motion
         }
         return outSteps;
     }
+
+    // ---- ambient (port of plan_ambient / planAmbient, SC 232 lane C) -----------------------------
+
+    /// <summary>
+    /// Plan ambient / pre-challenge cursor activity: idle drift + a few non-goal moves inside a central band
+    /// of the viewport (12–88 % across, 14–80 % down), so a behavioral collector sees pointer entropy before
+    /// the first goal action. About <paramref name="ms"/> long (it runs past it by whole excursions and rests;
+    /// <see cref="Pacing.TrimTo"/> cuts it). Bit-identical to Python <c>plan_ambient</c> and Node
+    /// <c>planAmbient</c> for the same persona and RNG (sdk/testdata/humanize_after_vectors.json).
+    /// </summary>
+    public static List<Step> PlanAmbient(Point from, double vw, double vh, Persona p, double ms, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        var outSteps = new List<Step>();
+        var cur = from;
+        double elapsed = 0;
+        double budget = Math.Max(200, ms);
+        double bx0 = vw * 0.12, bx1 = vw * 0.88;
+        double by0 = vh * 0.14, by1 = vh * 0.8;
+        while (elapsed < budget && outSteps.Count < 4000)
+        {
+            double tx = Lerp(bx0, bx1, rng());
+            double ty = Lerp(by0, by1, rng());
+            var target = new Point(tx, ty);
+            foreach (var s in PlanMove(cur, target, p, 80, rng: rng))
+            {
+                outSteps.Add(s);
+                elapsed += s.SleepMs;
+            }
+            double restMs = Lerp(120, 600, rng());
+            double d0 = 0, d1 = 0;
+            double stepMs = 1000 / p.DeviceHz;
+            double held = 0;
+            double tphase = rng() * 2 * Math.PI;
+            while (held < restMs)
+            {
+                double k = stepMs / p.DriftTau;
+                d0 += -k * d0 + Math.Sqrt(2 * k) * p.DriftAmp * GaussFrom(rng);
+                d1 += -k * d1 + Math.Sqrt(2 * k) * p.DriftAmp * GaussFrom(rng);
+                double ph = tphase + (2 * Math.PI * p.TremorHz * held) / 1000;
+                outSteps.Add(new Step(target.X + d0 + p.TremorAmp * Math.Sin(ph),
+                                      target.Y + d1 + p.TremorAmp * Math.Sin(ph + Math.PI / 2),
+                                      stepMs * Lerp(0.9, 1.4, rng())));
+                held += stepMs;
+                elapsed += stepMs;
+            }
+            cur = target;
+        }
+        return outSteps;
+    }
+
+    // ---- after-action (SC 232 lane C) ------------------------------------------------------------
+    // Salt for the after-action stream (hover dwell, move-off after a click, the attention model): a separate
+    // Mulberry32(seed ^ salt) stream keeps MakePersona's draw order (every seed's motor identity) unchanged.
+    // Same values in Python _motion.py and Node motion.ts.
+    private const uint AfterSalt = 0xC2B2AE35;
+
+    /// <summary>The pointer keeps within this many px of where a hover arrived while it dwells there.</summary>
+    public const double DwellRadiusPx = 3;
+    /// <summary>A move-off after a click is kept this far inside the viewport.</summary>
+    public const double MoveOffMarginPx = 8;
+
+    /// <summary>
+    /// The persona's after-action traits: the first four draws of its salted after-action stream. Measured on
+    /// r42 / SDK 0.51.0 (SC 232 review): a hover stopped dead on arrival and the pointer never left the pressed
+    /// pixel after a click. Same values as Python <c>after_traits</c> and Node <c>afterTraits</c>.
+    /// </summary>
+    public static AfterTraits AfterTraitsOf(Persona p)
+    {
+        var r = Mulberry32(p.Seed ^ AfterSalt);
+        double dwell = Lerp(250, 700, r());
+        double rate = Lerp(0.60, 0.85, r());
+        double delay = Lerp(300, 600, r());
+        double tempo = Lerp(0.85, 1.15, r());
+        return new AfterTraits(dwell, rate, delay, tempo);
+    }
+
+    /// <summary>The persona's after-action stream positioned after its four trait draws: the per-action draws come
+    /// from here, so a seed answers the same sequence in every SDK.</summary>
+    public static Rng AfterRng(Persona p)
+    {
+        var r = Mulberry32(p.Seed ^ AfterSalt);
+        for (int i = 0; i < 4; i++) r();
+        return r;
+    }
+
+    /// <summary>How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–900 ms.</summary>
+    public static double DwellMs(Persona p, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        return Clamp(AfterTraitsOf(p).DwellMs * Lerp(0.6, 1.4, rng()), 150, 900);
+    }
+
+    /// <summary>
+    /// Plan the pointer's rest on a hover target: OU drift + 8–12 Hz tremor around <paramref name="at"/> for about
+    /// <paramref name="ms"/> (at least 3 samples), every sample within <see cref="DwellRadiusPx"/> of it and inside
+    /// <paramref name="box"/> (1 px in; null: no box). Drift ×2 and tremor ×1.5 of a glide's: a hovering hand is
+    /// not braced the way it is before a press.
+    /// </summary>
+    public static List<Step> PlanDwell(Point at, Box? box, Persona p, double ms, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double stepMs = 1000 / p.DeviceHz;
+        int n = (int)Math.Max(3, JsRound(Math.Max(0, ms) / stepMs));
+        var outSteps = new List<Step>(n);
+        double d0 = 0, d1 = 0;
+        double tphase = rng() * 2 * Math.PI;
+        double t = 0;
+        for (int i = 0; i < n; i++)
+        {
+            double k = stepMs / p.DriftTau;
+            d0 += -k * d0 + Math.Sqrt(2 * k) * p.DriftAmp * 2.0 * GaussFrom(rng);
+            d1 += -k * d1 + Math.Sqrt(2 * k) * p.DriftAmp * 2.0 * GaussFrom(rng);
+            double ph = tphase + (2 * Math.PI * p.TremorHz * t) / 1000;
+            double dx = d0 + p.TremorAmp * 1.5 * Math.Sin(ph);
+            double dy = d1 + p.TremorAmp * 1.5 * Math.Sin(ph + Math.PI / 2);
+            double r = Hypot(dx, dy);
+            if (r > DwellRadiusPx) { dx = dx * DwellRadiusPx / r; dy = dy * DwellRadiusPx / r; }
+            double x = at.X + dx, y = at.Y + dy;
+            if (box is Box b)
+            {
+                x = b.Width >= 2 ? Clamp(x, b.X + 1, b.X + b.Width - 1) : at.X;
+                y = b.Height >= 2 ? Clamp(y, b.Y + 1, b.Y + b.Height - 1) : at.Y;
+            }
+            double sl = stepMs * Lerp(0.9, 1.4, rng());
+            outSteps.Add(new Step(x, y, sl));
+            t += sl;
+        }
+        return outSteps;
+    }
+
+    /// <summary>Does this click get a move-off? In <see cref="AfterTraits.MoveOffRate"/> of clicks: a draw against the
+    /// rate, nudged by how far the page's running share (<paramref name="hits"/> of <paramref name="n"/> earlier clicks)
+    /// has drifted from it.</summary>
+    public static bool MoveOffRoll(Persona p, Rng? rng = null, int hits = 0, int n = 0)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double rate = AfterTraitsOf(p).MoveOffRate;
+        return rng() < Clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98);
+    }
+
+    /// <summary>The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–700 ms.</summary>
+    public static double MoveOffDelayMs(Persona p, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        return Clamp(AfterTraitsOf(p).MoveOffDelayMs * Lerp(0.7, 1.3, rng()), 200, 700);
+    }
+
+    /// <summary>
+    /// Where the hand drifts after a click: 40–200 px from <paramref name="from"/> at an angle in the downward
+    /// half-plane (20–160°, y down: the gateway's moveOnTarget model), kept <see cref="MoveOffMarginPx"/> inside the
+    /// viewport; mirrored upward when the clamp would leave it on the spot (a click near the bottom edge).
+    /// </summary>
+    public static Point PlanMoveOff(Point from, double vw, double vh, Persona p, Rng? rng = null)
+    {
+        _ = p;
+        rng ??= Random.Shared.NextDouble;
+        double m = MoveOffMarginPx;
+        double ang = Lerp(20, 160, rng()) * (Math.PI / 180);   // as Python's math.radians rounds it
+        double dist = Lerp(40, 200, rng());
+        double dx = Math.Cos(ang) * dist, dy = Math.Sin(ang) * dist;
+        double x = Clamp(from.X + dx, m, vw - m);
+        double y = Clamp(from.Y + dy, m, vh - m);
+        if (Hypot(x - from.X, y - from.Y) < 12)
+        {
+            x = Clamp(from.X + dx, m, vw - m);
+            y = Clamp(from.Y - dy, m, vh - m);
+        }
+        return new Point(x, y);
+    }
 }
+
+/// <summary>Per-identity after-action traits (see <see cref="Motion.AfterTraitsOf"/>): the centre of the hover dwell
+/// (250–700 ms), the share of clicks followed by a move-off (0.60–0.85), the centre of the release → move-off gap
+/// (300–600 ms) and the scale on the attention model's read pause (0.85–1.15).</summary>
+public readonly record struct AfterTraits(double DwellMs, double MoveOffRate, double MoveOffDelayMs, double ReadTempo);
