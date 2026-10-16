@@ -549,3 +549,114 @@ export function planAmbient(from: Point, vp: Viewport, p: Persona, ms: number, r
   }
   return out;
 }
+
+// ------------------------------------------------------------------ after-action (SC 232 lane C)
+// Salt for the after-action stream (hover dwell, move-off after a click, the attention model). A separate
+// mulberry32(seed ^ salt) stream keeps makePersona's draw ORDER (every existing seed's motor identity)
+// unchanged. Same values in Python `_motion.py` and .NET `Motion.cs`.
+const AFTER_SALT = 0xc2b2ae35;
+
+/** The pointer keeps within this many px of where a hover arrived while it dwells there. */
+export const DWELL_RADIUS_PX = 3;
+/** A move-off after a click is kept this far inside the viewport. */
+export const MOVE_OFF_MARGIN_PX = 8;
+
+/** Per-identity after-action traits, stable per seed (see afterTraits). */
+export interface AfterTraits {
+  /** Centre of this hand's hover dwell, 250–700 ms (draws stay in 150–900). */
+  dwellMs: number;
+  /** Share of clicks followed by a move-off, 0.60–0.85. */
+  moveOffRate: number;
+  /** Centre of the release → move-off gap, 300–600 ms (draws stay in 200–700). */
+  moveOffDelayMs: number;
+  /** Scale on the attention model's read pause, 0.85–1.15. */
+  readTempo: number;
+}
+
+/** The persona's after-action traits: the first four draws of its salted after-action stream.
+ *
+ * Measured on r42 / SDK 0.51.0 (SC 232 review): a hover stopped dead on arrival (0 samples after the
+ * glide's last one) and the pointer never left the pressed pixel after a click. Same values as Python
+ * `after_traits` and .NET `Motion.AfterTraitsOf`. */
+export function afterTraits(p: Persona): AfterTraits {
+  const r = mulberry32((p.seed ^ AFTER_SALT) >>> 0);
+  const dwellMs = lerp(250, 700, r());
+  const moveOffRate = lerp(0.6, 0.85, r());
+  const moveOffDelayMs = lerp(300, 600, r());
+  const readTempo = lerp(0.85, 1.15, r());
+  return { dwellMs, moveOffRate, moveOffDelayMs, readTempo };
+}
+
+/** The persona's after-action stream positioned AFTER its four trait draws: the per-action draws come
+ * from here, so a seed answers the same sequence in every SDK. */
+export function afterRng(p: Persona): Rng {
+  const r = mulberry32((p.seed ^ AFTER_SALT) >>> 0);
+  for (let i = 0; i < 4; i++) r();
+  return r;
+}
+
+/** How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–900 ms. */
+export function dwellMs(p: Persona, rng: Rng = Math.random): number {
+  return clamp(afterTraits(p).dwellMs * lerp(0.6, 1.4, rng()), 150, 900);
+}
+
+/** Plan the pointer's rest on a hover target: OU drift + 8–12 Hz tremor around `at` for about `ms` (at
+ * least 3 samples), every sample within DWELL_RADIUS_PX of `at` and inside `box` (1 px in; null: no box).
+ * The hand is not braced on a hover the way it is before a press: drift ×2, tremor ×1.5 of a glide's. */
+export function planDwell(at: Point, box: Box | null, p: Persona, ms: number, rng: Rng = Math.random): Step[] {
+  const stepMs = 1000 / p.deviceHz;
+  const n = Math.max(3, jsRound(Math.max(0, ms) / stepMs));
+  const out: Step[] = [];
+  let driftX = 0, driftY = 0;
+  const tphase = rng() * 2 * Math.PI;
+  let t = 0;
+  for (let i = 0; i < n; i++) {
+    const k = stepMs / p.driftTau;
+    driftX += -k * driftX + Math.sqrt(2 * k) * p.driftAmp * 2 * gaussFrom(rng);
+    driftY += -k * driftY + Math.sqrt(2 * k) * p.driftAmp * 2 * gaussFrom(rng);
+    const ph = tphase + (2 * Math.PI * p.tremorHz * t) / 1000;
+    let dx = driftX + p.tremorAmp * 1.5 * Math.sin(ph);
+    let dy = driftY + p.tremorAmp * 1.5 * Math.sin(ph + Math.PI / 2);
+    const r = Math.hypot(dx, dy);
+    if (r > DWELL_RADIUS_PX) { dx = (dx * DWELL_RADIUS_PX) / r; dy = (dy * DWELL_RADIUS_PX) / r; }
+    let x = at.x + dx, y = at.y + dy;
+    if (box) {
+      x = box.width >= 2 ? clamp(x, box.x + 1, box.x + box.width - 1) : at.x;
+      y = box.height >= 2 ? clamp(y, box.y + 1, box.y + box.height - 1) : at.y;
+    }
+    const sleepMs = stepMs * lerp(0.9, 1.4, rng());
+    out.push({ x, y, sleepMs });
+    t += sleepMs;
+  }
+  return out;
+}
+
+/** Does this click get a move-off? In `afterTraits(p).moveOffRate` of clicks: a draw against the rate,
+ * nudged by how far the page's running share (`hits` of `n` earlier clicks) has drifted from it. */
+export function moveOffRoll(p: Persona, rng: Rng = Math.random, hits = 0, n = 0): boolean {
+  const rate = afterTraits(p).moveOffRate;
+  return rng() < clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98);
+}
+
+/** The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–700 ms. */
+export function moveOffDelayMs(p: Persona, rng: Rng = Math.random): number {
+  return clamp(afterTraits(p).moveOffDelayMs * lerp(0.7, 1.3, rng()), 200, 700);
+}
+
+/** Where the hand drifts after a click: 40–200 px from `from` at an angle in the downward half-plane
+ * (20–160°, y down: the gateway's moveOnTarget model), kept MOVE_OFF_MARGIN_PX inside `vp`; mirrored
+ * upward when the clamp would leave it on the spot (a click near the bottom edge). */
+export function planMoveOff(from: Point, vp: Viewport, p: Persona, rng: Rng = Math.random): Point {
+  void p;
+  const m = MOVE_OFF_MARGIN_PX;
+  const ang = lerp(20, 160, rng()) * (Math.PI / 180);   // as Python math.radians rounds it
+  const dist = lerp(40, 200, rng());
+  const dx = Math.cos(ang) * dist, dy = Math.sin(ang) * dist;
+  let x = clamp(from.x + dx, m, vp.width - m);
+  let y = clamp(from.y + dy, m, vp.height - m);
+  if (Math.hypot(x - from.x, y - from.y) < 12) {
+    x = clamp(from.x + dx, m, vp.width - m);
+    y = clamp(from.y - dy, m, vp.height - m);
+  }
+  return { x, y };
+}

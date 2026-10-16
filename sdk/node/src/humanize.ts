@@ -33,6 +33,10 @@ import {
   makePersona, planMove, dragDwell, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
+import {
+  afterRng, dwellMs, moveOffDelayMs, moveOffRoll, planDwell, planMoveOff,
+} from "./motion.js";
+import { ambientMode, exploreNotches, idleDrifts, readPauseMs, IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH } from "./attention.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
 import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
 import {
@@ -314,8 +318,17 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // seeds. Stored on the page so the module-level Locator.dragTo patch can reach it too.
   const persona: Persona = makePersona(opts.seed);
   (page as any)._clearcotePersona = persona;
-  // One input action at a time on this page (see createInputLock).
-  const locked = createInputLock();
+  // One input action at a time on this page (see createInputLock). Inside the lock the outermost action
+  // first runs the lazy after-action step (SC 232 lane C: afterRun). `nextCall` carries what the public
+  // wrapper knew about THIS call to the locked() it reaches synchronously: a trial performs no action (so
+  // nothing after-action either); a coordinate action names a viewport point (no exploratory scroll).
+  const lockRaw = createInputLock();
+  let nextCall: { coords: boolean; after: boolean } | null = null;
+  const locked = <T>(fn: () => Promise<T>): Promise<T> => {
+    const o = nextCall ?? { coords: false, after: true };
+    nextCall = null;
+    return lockRaw(() => afterRun(fn, o));
+  };
 
   // Tracked cursor position so each move continues from where the last one ended.
   // `held` tracks whether a mouse button is currently down — see mouse.move below.
@@ -324,6 +337,11 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // a wheel, a mouse.down that opens a drag, a bare keyboard.type — otherwise happens from a cursor
   // that has never been anywhere. The guarantees below key off this flag.
   const st = { x: rand(140, 380), y: rand(90, 240), held: false, placed: false };
+  // After-action state (SC 232 lane C; see the block at the end of attachHumanize).
+  const af = {
+    rng: afterRng(persona), depth: 0, lastEnd: null as number | null, loadAt: null as number | null,
+    mo: null as { due: number; x: number; y: number } | null, moHits: 0, moN: 0, trace: [] as unknown[][],
+  };
 
   const mouse: any = page.mouse;
   const nativeMove = mouse.move.bind(mouse);
@@ -554,10 +572,13 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
         await prePress(); // the hand confirms the target before it presses
         // delay = the mousedown→mouseup HOLD (human ~60–150 ms); without it Playwright releases in ~2 ms.
         await nativeClick(x, y, { delay: o.delay ?? clickHold(persona), button: o.button, clickCount: o.clickCount });
-        return;
+      } else {
+        await pressAt(o);
       }
-      await pressAt(o);
-    } catch { /* best-effort */ }
+    } catch { return; /* best-effort */ }
+    // Not after an engine click (returned above): a glide the engine does not see would take the next
+    // coordinate click off the engine path (engineInSync).
+    scheduleMoveOff();
   };
   mouse.click = (x: number, y: number, options: any = {}) => locked(() => hclick(x, y, options));
   // Stock dblclick teleported and pressed for ~0 ms: route it through the humanized click.
@@ -582,10 +603,13 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // page._clearcoteAutoAmbient = true to restore the per-load burst.
   (page as any)._clearcoteAutoAmbient = false;
   page.on("load", () => {
-    if ((page as any)._clearcoteAutoAmbient) {
+    // ambient: "load" (lane A's option, read defensively) is the same per-load burst as the flag.
+    if ((page as any)._clearcoteAutoAmbient === true || ambientMode(page) === "load") {
       Promise.resolve((page as any).ambientMotion(rand(450, 950))).catch(() => {});
     }
   });
+  // The attention model's read pause counts from the last load (read lazily by the next action).
+  page.on("load", () => { af.loadAt = Date.now(); });
   // A wheel event carries the pointer position, and until something moves the cursor that position
   // is the default origin — so a scroll right after a page load reported the mouse parked in the
   // corner, over nothing it was scrolling, while the deltas rolled down the middle of the document.
@@ -1442,7 +1466,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // the centre is covered (`at`, a Playwright `position`), so a floating label over the select's centre
   // cannot swallow it and leave the letters to change a closed select one per key.
   const openAndPick = async (selector: string, plan: SelectPlan, at: { x: number; y: number } | null): Promise<void> => {
-    await targetedClick(nativePageClick, selector, at ? { position: at } : {}, false, null);
+    // moveOff false: the popup is open now and this sequence owns the pointer until the pick lands.
+    await targetedClick(nativePageClick, selector, at ? { position: at } : {}, false, null, undefined, false);
     await sleep(rand(220, 480)); // the list opens; the eye finds the option
     for (const ch of plan.keys) {
       await nativeKbPress(ch, { delay: keyDwell(persona) });
@@ -1745,7 +1770,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // no pointer move and no press. The caller's `timeout` is passed through unchanged. No Playwright
   // trial runs before a humanized press either (reachesPoint).
   const targetedClick = async (orig: NativeFn | null, selector: string, options: any, noClick: boolean,
-    nativeOpts: any | null): Promise<any> => {
+    nativeOpts: any | null, dwell: unknown = undefined, moveOff = true): Promise<any> => {
     const opts = options ?? {};
     const o = normalizeClickOptions(opts);
     let aim: Point | null = null; // where Playwright's own click lands, once the box is known (native)
@@ -1808,6 +1833,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
             await sleep(rand(40, 110));
           }
           await glide(x, y);
+          await dwellOn(x, y, box, dwell);
         } finally {
           for (const m of held.reverse()) {
             await sleep(rand(20, 80));
@@ -1817,7 +1843,12 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
         return;
       }
       await glide(x, y);
-      if (!noClick) await pressAt(o);
+      if (noClick) {
+        await dwellOn(x, y, box, dwell); // the hand rests on what it hovered (SC 232 lane C)
+      } else {
+        await pressAt(o);
+        if (moveOff) scheduleMoveOff();
+      }
       return;
     } catch (e) {
       if (isTimeout(e)) throw e;
@@ -1828,8 +1859,11 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
 
   (page as any).click = apiErrors("page.click", (selector: string, options: any = {}) =>
     locked(() => targetedClick(nativePageClick, selector, options, false, null)));
-  (page as any).hover = apiErrors("page.hover", (selector: string, options: any = {}) =>
-    locked(() => targetedClick(nativePageHover, selector, options, true, null)));
+  (page as any).hover = apiErrors("page.hover", (selector: string, options: any = {}) => {
+    // `dwell` (ms; 0: none) is the SDK's, not Playwright's: never forwarded to a native hover
+    const { dwell, ...rest } = options ?? {};
+    return locked(() => targetedClick(nativePageHover, selector, rest, true, null, dwell));
+  });
   // Locator.dragTo({ trial: true }) answers its checks here too (see the Locator patch).
   (page as any)._clearcoteTrial = (selector: string, options: any, noClick: boolean) =>
     locked(() => trial(selector, options, noClick));
@@ -1847,6 +1881,162 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   (page as any)._clearcoteHold = (loc: Locator, o?: PressAndHoldOptions) => locked(() => pressAndHold(loc, o));
   (page as any).pressAndHold = apiErrors("page.pressAndHold", (selector: string, o?: PressAndHoldOptions) =>
     (page as any)._clearcoteHold(page.locator(selector).first(), o));
+
+
+  // ------------------------------------------------------------ after-action (SC 232 lane C)
+  // What the hand does once an action has landed (a port of the Python humanizer's): it rests on a hovered
+  // element (dwellOn), drifts off a clicked one (scheduleMoveOff / runMoveOff), and between actions it
+  // reads and idles (attention.ts). All LAZY: run at the start of the next action inside the page lock
+  // (afterRun), or by page.settle(), never from a timer. The per-action draws come from the persona's
+  // salted after-action stream (motion.afterRng): every existing draw keeps its order.
+  // (Function declarations: hoisted, so locked()/targetedClick above can call them.)
+  // Hidden switch for the attention model until lane A's `ambient: "idle"` / `attention` option lands.
+  (page as any)._clearcoteAttention = false;
+  // Test seam: what the after-action model did, newest last (bounded).
+  (page as any)._clearcoteAfterTrace = af.trace;
+  const wheelInner = mouse.wheel;   // the humanized wheel, before the after-action wrapper below
+
+  // Wrap the UNLOCKED public entry points: mouse.move / wheel run the step first; down / up only mark
+  // activity (a press lands where the pointer is). The locked ones run it inside locked() (afterRun).
+  const unlocked = (fn: (...a: any[]) => Promise<any>) => async (...a: any[]) => {
+    if (af.depth > 0) return fn(...a);
+    await preAction(true);
+    af.depth++;
+    try { return await fn(...a); } finally { af.depth--; af.lastEnd = Date.now(); }
+  };
+  const touch = (fn: (...a: any[]) => Promise<any>) => async (...a: any[]) => {
+    try { return await fn(...a); } finally { af.lastEnd = Date.now(); }
+  };
+  mouse.move = unlocked(mouse.move);
+  mouse.wheel = unlocked(mouse.wheel);
+  mouse.down = touch(mouse.down);
+  mouse.up = touch(mouse.up);
+  // Tell locked() what each public call is (see nextCall): set synchronously, read by the locked() the call
+  // reaches before its first await.
+  const tag = (obj: any, name: string, info: (a: any[]) => { coords: boolean; after: boolean }) => {
+    const fn = obj[name];
+    if (typeof fn !== "function") return;
+    obj[name] = (...a: any[]) => { nextCall = info(a); try { return fn(...a); } finally { nextCall = null; } };
+  };
+  tag(mouse, "click", () => ({ coords: true, after: true }));
+  tag(mouse, "dblclick", () => ({ coords: true, after: true }));
+  for (const [name, at] of [["click", 1], ["hover", 1], ["dblclick", 1], ["check", 1], ["uncheck", 1], ["setChecked", 2]] as const) {
+    tag(page as any, name, (a) => ({ coords: false, after: !a[at]?.trial }));
+  }
+  tag(page as any, "_clearcoteTrial", () => ({ coords: false, after: false }));
+  const ambientInner = (page as any).ambientMotion;
+  (page as any).ambientMotion = (ms = 1200) => locked(() => ambientInner(ms));
+  (page as any).settle = (): Promise<boolean> => { nextCall = { coords: false, after: false }; return locked(settleNow); };
+
+  async function afterRun<T>(fn: () => Promise<T>, o: { coords: boolean; after: boolean }): Promise<T> {
+    if (!o.after || af.depth > 0) return fn();
+    await preAction(o.coords);
+    af.depth++;
+    try { return await fn(); } finally { af.depth--; af.lastEnd = Date.now(); }
+  }
+
+  function attentionOn(): boolean {
+    return (page as any)._clearcoteAttention === true || ambientMode(page) === "idle";
+  }
+
+  async function dwellOn(x: number, y: number, box: Box | null, dwell: unknown): Promise<void> {
+    let ms: number | null = null;
+    if (dwell !== undefined && dwell !== null) {
+      const v = Number(dwell);
+      if (Number.isFinite(v)) {
+        if (v <= 0) return;
+        ms = v;
+      }
+    }
+    if (ms === null) ms = dwellMs(persona, af.rng);
+    const steps = planDwell({ x, y }, box, persona, ms, af.rng);
+    af.trace.push(["dwell", ms, steps.length]);
+    trimTrace();
+    await dispatch(steps);
+    if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
+  }
+
+  function scheduleMoveOff(): void {
+    const hit = moveOffRoll(persona, af.rng, af.moHits, af.moN);
+    af.moN++;
+    af.mo = null;
+    if (hit) {
+      af.moHits++;
+      af.mo = { due: Date.now() + moveOffDelayMs(persona, af.rng), x: st.x, y: st.y };
+    }
+  }
+
+  async function runMoveOff(wait: boolean): Promise<boolean> {
+    const mo = af.mo;
+    af.mo = null;
+    if (!mo || st.held || st.x !== mo.x || st.y !== mo.y) return false;
+    const left = mo.due - Date.now();
+    if (left > 0) {
+      if (!wait) return false;
+      await sleep(left);
+    }
+    const vp = (await viewBounds()) ?? (await viewport());
+    const to = planMoveOff({ x: st.x, y: st.y }, vp, persona, af.rng);
+    af.trace.push(["move_off", [st.x, st.y], [to.x, to.y]]);
+    trimTrace();
+    await glide(to.x, to.y, { targetW: 140 }); // one coarse glide: nothing to acquire
+    return true;
+  }
+
+  async function idleDrift(ms: number): Promise<void> {
+    af.trace.push(["drift", ms]);
+    trimTrace();
+    const vp = (await viewBounds()) ?? (await viewport());
+    const steps = trimTo(planAmbient({ x: st.x, y: st.y }, vp, persona, ms, af.rng), ms);
+    await dispatch(steps);
+    if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
+  }
+
+  async function attend(coords: boolean): Promise<void> {
+    const now = Date.now();
+    const la = af.loadAt;
+    if (la !== null) {
+      af.loadAt = null;
+      let n: unknown = 0;
+      try { n = await worldFor(page).evaluate(ISO_TEXT_LENGTH); } catch { n = 0; }
+      const pause = readPauseMs(n, persona, af.rng);
+      const notches = exploreNotches(af.rng);
+      af.trace.push(["read", pause, n, coords ? 0 : notches]);
+      trimTrace();
+      const left = pause - (now - la);
+      if (left > 350) await idleDrift(Math.min(left * 0.5, IDLE_DRIFT_MAX_MS)); // the eyes read; the hand drifts once
+      const rest = la + pause - Date.now();
+      if (rest > 0) await sleep(rest);
+      // A coordinate action names a point in the current layout: never scroll that away.
+      if (notches && !coords) await wheelInner(0, notches * (await wheelNotchPx()));
+      return;
+    }
+    if (af.lastEnd !== null) {
+      for (const ms of idleDrifts((now - af.lastEnd) / 1000, af.rng)) await idleDrift(ms);
+    }
+  }
+
+  async function preAction(coords: boolean): Promise<void> {
+    if (af.depth > 0 || st.held) return;
+    af.depth++;
+    try {
+      await runMoveOff(false);
+      if (attentionOn()) await attend(coords);
+    } catch { /* the after-action model never stops the action */ } finally { af.depth--; }
+  }
+
+  async function settleNow(): Promise<boolean> {
+    if (af.depth > 0) return false;
+    af.depth++;
+    let done = false;
+    try { done = await runMoveOff(true); } catch { done = false; } finally { af.depth--; }
+    if (done) af.lastEnd = Date.now();
+    return done;
+  }
+
+  function trimTrace(): void {
+    if (af.trace.length > 256) af.trace.splice(0, af.trace.length - 256);
+  }
 
   // Marker the Locator-class patch keys off: humanize is active for THIS page.
   (page as any)._clearcoteHumanized = true;
@@ -1901,7 +2091,7 @@ let locatorPatched = false;
 // method accepts travels with it: the old fwd sent ONLY `timeout`, which turned
 // click({button: "right"}) into a left click and click({trial: true}) into a real one.
 const CLICK_OPTS = ["button", "clickCount", "delay", "force", "modifiers", "noWaitAfter", "position", "timeout", "trial"];
-const HOVER_OPTS = ["force", "modifiers", "noWaitAfter", "position", "timeout", "trial"];
+const HOVER_OPTS = ["force", "modifiers", "noWaitAfter", "position", "timeout", "trial", "dwell"];
 const DBL_OPTS = ["button", "delay", "force", "modifiers", "noWaitAfter", "position", "timeout", "trial"];
 const FILL_OPTS = ["force", "noWaitAfter", "timeout"];
 const TYPE_OPTS = ["timeout"];
@@ -1989,7 +2179,9 @@ function patchLocatorClass(sample: Locator): void {
   });
   proto.hover = apiMethod("locator.hover", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().hover(sel(this), pickOptions(kw, HOVER_OPTS)));
-    return done ? r : oHover.call(this, kw);
+    if (done) return r;
+    const { dwell: _dwell, ...pw } = kw ?? {}; // `dwell` is the SDK's: Playwright's own hover does not take it
+    return oHover.call(this, pw);
   });
   proto.press = apiMethod("locator.press", async function (this: any, key: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().press(sel(this), key, pickOptions(kw, PRESS_OPTS)));
