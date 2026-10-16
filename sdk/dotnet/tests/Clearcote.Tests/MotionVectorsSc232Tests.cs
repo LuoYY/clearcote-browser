@@ -61,22 +61,14 @@ public class MotionVectorsSc232Tests
     [Fact]
     public void PlanAmbient_matches_vectors_when_ported()
     {
-        var m = typeof(Motion).GetMethod("PlanAmbient", BindingFlags.Public | BindingFlags.Static);
-        if (m is null) { Console.WriteLine("SKIP (API missing): Motion.PlanAmbient (lane C)"); return; }
+        // Lane C ported PlanAmbient (Point from, double vw, double vh, Persona, double ms, Rng): called directly now.
         foreach (var c in Vec.GetProperty("ambient").EnumerateArray())
         {
             var f = c.GetProperty("from"); var vp = c.GetProperty("viewport");
-            var args = new List<object?> { new Point(f[0].GetDouble(), f[1].GetDouble()) };
-            // PlanAmbient(Point from, (W,H) viewport | Box | ..., Persona p, double ms, Rng rng): resolve the viewport
-            // parameter by its type so the port's exact viewport type does not matter.
-            var ps = m.GetParameters();
-            object? view = ps[1].ParameterType == typeof(Box) ? new Box(0, 0, vp.GetProperty("width").GetDouble(), vp.GetProperty("height").GetDouble())
-                : Activator.CreateInstance(ps[1].ParameterType, vp.GetProperty("width").GetDouble(), vp.GetProperty("height").GetDouble());
-            args.Add(view);
-            args.Add(Motion.MakePersona(c.GetProperty("persona").GetString()));
-            args.Add(c.GetProperty("ms").GetDouble());
-            args.Add(Motion.Mulberry32((uint)c.GetProperty("rng").GetInt32()));
-            var steps = (IReadOnlyList<Step>)m.Invoke(null, args.ToArray())!;
+            var steps = Motion.PlanAmbient(new Point(f[0].GetDouble(), f[1].GetDouble()),
+                vp.GetProperty("width").GetDouble(), vp.GetProperty("height").GetDouble(),
+                Motion.MakePersona(c.GetProperty("persona").GetString()), c.GetProperty("ms").GetDouble(),
+                Motion.Mulberry32((uint)c.GetProperty("rng").GetInt32()));
             Check(steps, c, "ambient " + c.GetProperty("persona").GetString());
         }
     }
