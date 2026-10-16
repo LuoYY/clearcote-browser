@@ -176,7 +176,8 @@ public static partial class Humanize
         ArgumentNullException.ThrowIfNull(page);
         return SerialAsync(page, async () =>
         {
-            bool done = await RunMoveOffAsync(page, PersonaFor(page), StateFor(page), wait: true).ConfigureAwait(false);
+            if (!Personas.TryGetValue(page, out var p)) return false;   // no persona: nothing was ever scheduled
+            bool done = await RunMoveOffAsync(page, p, StateFor(page), wait: true).ConfigureAwait(false);
             if (done) AfterOf(page).LastEnd = NowMs();
             return done;
         }, after: false);
@@ -291,9 +292,11 @@ public static partial class Humanize
     /// <summary>The lazy after-action step, run by SerialAsync for the outermost action once the gate is held.</summary>
     private static async Task PreActionAsync(IPage page, bool coords)
     {
+        // Only on a page that has a persona: PersonaFor would CREATE one, and that changes what other humanized
+        // paths do on a page that never had one (press-and-hold walks raw moves there).
+        if (!Personas.TryGetValue(page, out var p)) return;
         try
         {
-            var p = PersonaFor(page);
             var st = StateFor(page);
             long now = NowMs();
             await RunMoveOffAsync(page, p, st, wait: false).ConfigureAwait(false);
