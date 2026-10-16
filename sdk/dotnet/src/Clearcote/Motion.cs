@@ -44,14 +44,16 @@ public sealed class Persona
     public double Overshoot { get; init; }
     public int MaxCorrections { get; init; }
     public double ApproachBias { get; init; }
+    /// <summary>The HUMAN BANDS every timing draw is clamped to (ms); the per-identity medians inside them come
+    /// from the salted timing stream (<see cref="Motion.TimingTraitsOf"/>). Grab hesitation after mouse down:</summary>
     public double GrabMinMs { get; init; } = 130;
     public double GrabMaxMs { get; init; } = 360;
     public double ReleaseMinMs { get; init; } = 90;
     public double ReleaseMaxMs { get; init; } = 230;
-    /// <summary>Click press-hold (mousedown→mouseup). Human ~60–150ms; a scripted click is ~2ms.</summary>
-    public double ClickHoldMinMs { get; init; } = 60;
-    public double ClickHoldMaxMs { get; init; } = 150;
-    /// <summary>Per-key dwell (keydown→keyup). Human ~45–120ms; scripted typing ~2–3ms.</summary>
+    /// <summary>Click press-hold band (mousedown→mouseup), 55–230 ms; a scripted click is ~2ms.</summary>
+    public double ClickHoldMinMs { get; init; } = 55;
+    public double ClickHoldMaxMs { get; init; } = 230;
+    /// <summary>Per-key dwell band (keydown→keyup), 45–120 ms; scripted typing ~2–3ms.</summary>
     public double KeyDwellMinMs { get; init; } = 45;
     public double KeyDwellMaxMs { get; init; } = 120;
 }
@@ -62,6 +64,11 @@ public readonly record struct Step(double X, double Y, double SleepMs);
 public readonly record struct Box(double X, double Y, double Width, double Height);
 /// <summary>Per-identity path-shape traits (see Motion.ShapeTraitsOf).</summary>
 public readonly record struct ShapeTraits(double OvershootRate, double Curve, double DragTempo);
+/// <summary>Per-identity timing medians (ms) and tempo (see Motion.TimingTraitsOf).</summary>
+public readonly record struct TimingTraits(double ClickHoldMs, double KeyDwellMs, double GrabMs, double ReleaseMs,
+    double DblclickGapMs, double PauseScale, double TypoRate);
+/// <summary>Per-identity aiming traits (see Motion.AimTraitsOf).</summary>
+public readonly record struct AimTraits(double Spread, double Undershoot, double SideBias);
 
 public static class Motion
 {
@@ -164,25 +171,71 @@ public static class Motion
         };
     }
 
-    /// <summary>A human mousedown→mouseup hold (ms), right-skewed. Fixes the ~2ms instant-press tell.</summary>
+    // Salt for the timing stream. Like the rollover and shape salts, a separate Mulberry32(seed ^ salt) stream keeps
+    // MakePersona's draw ORDER (and so every existing seed's motor identity) unchanged.
+    private const uint TimingSalt = 0xC2B2AE35;
+
+    /// <summary>
+    /// The persona's timing traits, drawn from a salted stream of its seed: the median click hold (70–140 ms), key
+    /// dwell (60–95), drag grab (180–280) and release (120–180), double-click gap (90–140), a tempo on deliberation
+    /// pauses (0.8–1.25) and the typo rate (0.5–4 %). Before this every identity shared one fixed window per timing.
+    /// Same values as Python <c>timing_traits</c> and Node <c>timingTraits</c>.
+    /// </summary>
+    public static TimingTraits TimingTraitsOf(Persona p)
+    {
+        Rng r = Mulberry32(p.Seed ^ TimingSalt);
+        double clickHold = Lerp(70, 140, r());
+        double keyDwell = Lerp(60, 95, r());
+        double grab = Lerp(180, 280, r());
+        double release = Lerp(120, 180, r());
+        double dbl = Lerp(90, 140, r());
+        double pause = Lerp(0.8, 1.25, r());
+        double typo = Lerp(0.005, 0.04, r());
+        return new TimingTraits(clickHold, keyDwell, grab, release, dbl, pause, typo);
+    }
+
+    /// <summary><c>median * exp(sigma * N(0,1))</c> clamped to [lo, hi]: a right-skewed human timing.</summary>
+    public static double LognormalMs(double median, double sigma, double lo, double hi, Rng rng)
+        => Clamp(median * Math.Exp(sigma * GaussFrom(rng)), lo, hi);
+
+    /// <summary>A human mousedown→mouseup hold (ms): log-normal (σ 0.25) around the persona's median, clamped to its band.</summary>
     public static double ClickHold(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return p.ClickHoldMinMs + Math.Min(1, Math.Abs(GaussFrom(rng)) * 0.5) * (p.ClickHoldMaxMs - p.ClickHoldMinMs);
+        return LognormalMs(TimingTraitsOf(p).ClickHoldMs, 0.25, p.ClickHoldMinMs, p.ClickHoldMaxMs, rng);
     }
 
-    /// <summary>A human per-key keydown→keyup dwell (ms), right-skewed. Fixes the ~2–3ms tell.</summary>
+    /// <summary>A human per-key keydown→keyup dwell (ms): log-normal (σ 0.22) around the persona's median, clamped to its band.</summary>
     public static double KeyDwell(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return p.KeyDwellMinMs + Math.Min(1, Math.Abs(GaussFrom(rng)) * 0.45) * (p.KeyDwellMaxMs - p.KeyDwellMinMs);
+        return LognormalMs(TimingTraitsOf(p).KeyDwellMs, 0.22, p.KeyDwellMinMs, p.KeyDwellMaxMs, rng);
     }
 
-    /// <summary>Grab/release dwell times (ms) for a held-button drag.</summary>
+    /// <summary>Grab/release dwell times (ms) for a held-button drag: log-normal (σ 0.2) around the persona's medians.</summary>
     public static (double GrabMs, double ReleaseMs) DragDwell(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return (Lerp(p.GrabMinMs, p.GrabMaxMs, rng()), Lerp(p.ReleaseMinMs, p.ReleaseMaxMs, rng()));
+        var tt = TimingTraitsOf(p);
+        double grab = LognormalMs(tt.GrabMs, 0.2, p.GrabMinMs, p.GrabMaxMs, rng);
+        double release = LognormalMs(tt.ReleaseMs, 0.2, p.ReleaseMinMs, p.ReleaseMaxMs, rng);
+        return (grab, release);
+    }
+
+    /// <summary>The gap between the two presses of a double click (ms): log-normal (σ 0.15) around the persona's
+    /// median, clamped to 70–170.</summary>
+    public static double DblclickGap(Persona p, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        return LognormalMs(TimingTraitsOf(p).DblclickGapMs, 0.15, 70, 170, rng);
+    }
+
+    /// <summary>A deliberation pause (ms) from [lo, hi], scaled by the persona's tempo; without a persona the plain window.</summary>
+    public static double PauseMs(Persona? p, double lo, double hi, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double v = Lerp(lo, hi, rng());
+        return p is null ? v : v * TimingTraitsOf(p).PauseScale;
     }
 
     // Salt for the rollover stream. Drawing from Mulberry32(seed ^ salt) instead of adding a field to
@@ -235,23 +288,43 @@ public static class Motion
         return null;
     }
 
-    /// <summary>
-    /// A human click point inside <paramref name="box"/>: a 2D gaussian around centre, nudged toward
-    /// the approach side (people undershoot toward where the cursor came from), clamped inside the edges.
-    /// This is what defeats a landing-dispersion check — a driver that clicks the computed centre lands
-    /// on the identical sub-pixel point every time, which aiming never does.
-    /// </summary>
-    public static Point ClickPoint(Box box, Point from, Persona p, Rng? rng = null)
+    // Salt for the aim traits (ClickPoint): the persona's landing dispersion, undershoot and handedness.
+    private const uint AimSalt = 0x27D4EB2F;
+    /// <summary>The persona's aiming traits from a salted stream of its seed: dispersion (sd 0.10–0.20 of the box),
+    /// undershoot toward the approach side (0.06–0.16) and handedness (ApproachBias × 0.4). Same values as Python
+    /// <c>aim_traits</c> and Node <c>aimTraits</c>.</summary>
+    public static AimTraits AimTraitsOf(Persona p)
     {
+        Rng r = Mulberry32(p.Seed ^ AimSalt);
+        double spread = Lerp(0.10, 0.20, r());
+        double under = Lerp(0.06, 0.16, r());
+        return new AimTraits(spread, under, p.ApproachBias * 0.4);
+    }
+
+    /// <summary>
+    /// A human click point inside <paramref name="box"/>: a 2D gaussian toward the centre with the persona's
+    /// dispersion, nudged toward the approach side (undershoot) and sideways by its handedness, clamped inside the
+    /// edges. The SEED fixes the persona's spread, undershoot and handedness (it was one dispersion for everyone); each
+    /// click's draw is unseeded (Random.Shared unless <paramref name="rng"/> is given), like every per-action draw, so
+    /// no two visits of one identity replay the same landing sequence. Without a persona: sd 0.15, 12 % undershoot,
+    /// no handedness.
+    /// </summary>
+    public static Point ClickPoint(Box box, Point from, Persona? p, Rng? rng = null)
+    {
+        double spread = 0.15, under = 0.12, side = 0;
+        if (p is not null)
+        {
+            var at = AimTraitsOf(p);
+            spread = at.Spread; under = at.Undershoot; side = at.SideBias;
+        }
         rng ??= Random.Shared.NextDouble;
         double cx = box.X + box.Width / 2, cy = box.Y + box.Height / 2;
         double dx = cx - from.X, dy = cy - from.Y;
         double d = Hypot(dx, dy);
         if (d == 0) d = 1;
         double ux = -dx / d, uy = -dy / d;
-        double bx = ux * box.Width * 0.12, by = uy * box.Height * 0.12;
-        double x = cx + bx + GaussFrom(rng) * box.Width * 0.16;
-        double y = cy + by + GaussFrom(rng) * box.Height * 0.16;
+        double x = cx + ux * box.Width * under + side * box.Width + GaussFrom(rng) * box.Width * spread;
+        double y = cy + uy * box.Height * under + GaussFrom(rng) * box.Height * spread;
         // Below the 4px inset the clamp bounds invert and would return a point OUTSIDE the element.
         return new Point(
             box.Width >= 4 ? Clamp(x, box.X + 2, box.X + box.Width - 2) : cx,

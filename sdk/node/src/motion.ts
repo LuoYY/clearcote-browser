@@ -88,21 +88,23 @@ export interface Persona {
   maxCorrections: number;
   /** Handedness/approach curvature bias (signed, radians-ish) applied to path bow. */
   approachBias: number;
-  /** Grab hesitation window after mouse.down (ms). */
+  /** The HUMAN BANDS every timing draw is clamped to (ms); the per-identity medians inside them come from
+   * the salted timing stream ({@link timingTraits}). Grab hesitation after mouse.down: */
   grabMinMs: number;
   grabMaxMs: number;
-  /** Pre-release settle window before mouse.up (ms). */
+  /** Pre-release settle before mouse.up (ms). */
   releaseMinMs: number;
   releaseMaxMs: number;
-  /** Click press-hold window — mousedown→mouseup (ms). Human ~60–150; a scripted click is ~2 ms. */
+  /** Click press-hold band — mousedown→mouseup (ms), 55–230; a scripted click is ~2 ms. */
   clickHoldMinMs: number;
   clickHoldMaxMs: number;
-  /** Per-key dwell window — keydown→keyup (ms). Human ~45–120 (right-skewed); scripted typing ~2–3 ms. */
+  /** Per-key dwell band — keydown→keyup (ms), 45–120; scripted typing ~2–3 ms. */
   keyDwellMinMs: number;
   keyDwellMaxMs: number;
 }
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const clampV = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 /** Derive a stable motor persona from a fingerprint seed (or random when unseeded). */
 export function makePersona(seed?: string | number): Persona {
@@ -126,23 +128,80 @@ export function makePersona(seed?: string | number): Persona {
     grabMaxMs: 360,
     releaseMinMs: 90,
     releaseMaxMs: 230,
-    clickHoldMinMs: 60,
-    clickHoldMaxMs: 150,
+    clickHoldMinMs: 55,
+    clickHoldMaxMs: 230,
     keyDwellMinMs: 45,
     keyDwellMaxMs: 120,
   };
 }
 
-/** A human mousedown→mouseup click hold (ms), right-skewed (most clicks brief, some linger). Fixes
- * the ~2 ms instant-press tell shared by clicks. */
-export function clickHold(p: Persona, rng: Rng = Math.random): number {
-  return p.clickHoldMinMs + Math.min(1, Math.abs(gaussFrom(rng)) * 0.5) * (p.clickHoldMaxMs - p.clickHoldMinMs);
+// Salt for the timing stream. Like the rollover and shape salts, a separate mulberry32(seed ^ salt) stream
+// keeps makePersona's draw ORDER (and so every existing seed's motor identity) unchanged.
+const TIMING_SALT = 0xc2b2ae35;
+
+/** Per-identity timing medians (ms) and tempo, stable per seed (see timingTraits). */
+export interface TimingTraits {
+  /** Median mousedown→mouseup hold, 70–140. */
+  clickHoldMs: number;
+  /** Median keydown→keyup dwell, 60–95. */
+  keyDwellMs: number;
+  /** Median grab hesitation after a drag's mousedown, 180–280. */
+  grabMs: number;
+  /** Median settle before a drag's mouseup, 120–180. */
+  releaseMs: number;
+  /** Median gap between the two presses of a double click, 90–140. */
+  dblclickGapMs: number;
+  /** Scale on deliberation pauses (select popup, datetime segments), 0.8–1.25. */
+  pauseScale: number;
+  /** Per-character fat-finger rate, 0.005–0.04. */
+  typoRate: number;
 }
 
-/** A human per-key keydown→keyup dwell (ms), right-skewed (a floor + occasional longer holds — the
- * empirical human dwell shape). Fixes the ~2–3 ms instant-keystroke tell. */
+/** The persona's timing traits, drawn from a salted stream of its seed. Before this every identity shared
+ * ONE fixed window per timing (click hold 60–150, key dwell 45–120, grab 130–360, release 90–230,
+ * double-click gap 70–170, select-popup pauses, datetime gaps, the 2 % typo rate). Each value is the
+ * identity's MEDIAN; samples around it are log-normal and clamped to the persona's human band. Same values
+ * as Python `_motion.timing_traits` and .NET `Motion.TimingTraitsOf`. */
+export function timingTraits(p: Persona): TimingTraits {
+  const r = mulberry32((p.seed ^ TIMING_SALT) >>> 0);
+  const clickHoldMs = lerp(70, 140, r());
+  const keyDwellMs = lerp(60, 95, r());
+  const grabMs = lerp(180, 280, r());
+  const releaseMs = lerp(120, 180, r());
+  const dblclickGapMs = lerp(90, 140, r());
+  const pauseScale = lerp(0.8, 1.25, r());
+  const typoRate = lerp(0.005, 0.04, r());
+  return { clickHoldMs, keyDwellMs, grabMs, releaseMs, dblclickGapMs, pauseScale, typoRate };
+}
+
+/** `median * exp(sigma * N(0,1))` clamped to [lo, hi]: a right-skewed human timing around a per-identity median. */
+export function lognormalMs(median: number, sigma: number, lo: number, hi: number, rng: Rng): number {
+  return clampV(median * Math.exp(sigma * gaussFrom(rng)), lo, hi);
+}
+
+/** A human mousedown→mouseup click hold (ms): log-normal (σ 0.25) around the persona's own median
+ * (70–140 ms), clamped to its band (55–230 ms). */
+export function clickHold(p: Persona, rng: Rng = Math.random): number {
+  return lognormalMs(timingTraits(p).clickHoldMs, 0.25, p.clickHoldMinMs, p.clickHoldMaxMs, rng);
+}
+
+/** A human per-key keydown→keyup dwell (ms): log-normal (σ 0.22) around the persona's own median
+ * (60–95 ms), clamped to its band (45–120 ms). */
 export function keyDwell(p: Persona, rng: Rng = Math.random): number {
-  return p.keyDwellMinMs + Math.min(1, Math.abs(gaussFrom(rng)) * 0.45) * (p.keyDwellMaxMs - p.keyDwellMinMs);
+  return lognormalMs(timingTraits(p).keyDwellMs, 0.22, p.keyDwellMinMs, p.keyDwellMaxMs, rng);
+}
+
+/** The gap between the two presses of a double click (ms): log-normal (σ 0.15) around the persona's
+ * median (90–140), clamped to 70–170. */
+export function dblclickGap(p: Persona, rng: Rng = Math.random): number {
+  return lognormalMs(timingTraits(p).dblclickGapMs, 0.15, 70, 170, rng);
+}
+
+/** A deliberation pause (ms) from [lo, hi], scaled by the persona's tempo (pauseScale 0.8–1.25).
+ * Without a persona: the plain window. */
+export function pauseMs(p: Persona | null | undefined, lo: number, hi: number, rng: Rng = Math.random): number {
+  const v = lerp(lo, hi, rng());
+  return p ? v * timingTraits(p).pauseScale : v;
 }
 
 // Salt for the rollover stream. Drawing from mulberry32(seed ^ salt) instead of adding a field to
@@ -479,27 +538,57 @@ export function planDrag(from: Point, to: Point, p: Persona, opts: { settle?: bo
   return out;
 }
 
-/** Grab/release dwell times (ms) for a held-button drag, drawn from the persona window. */
+/** Grab/release dwell times (ms) for a held-button drag: log-normal (σ 0.2) around the persona's medians,
+ * inside its grab/release bands. */
 export function dragDwell(p: Persona, rng: Rng = Math.random): { grabMs: number; releaseMs: number } {
-  return {
-    grabMs: lerp(p.grabMinMs, p.grabMaxMs, rng()),
-    releaseMs: lerp(p.releaseMinMs, p.releaseMaxMs, rng()),
-  };
+  const tt = timingTraits(p);
+  const grabMs = lognormalMs(tt.grabMs, 0.2, p.grabMinMs, p.grabMaxMs, rng);
+  const releaseMs = lognormalMs(tt.releaseMs, 0.2, p.releaseMinMs, p.releaseMaxMs, rng);
+  return { grabMs, releaseMs };
 }
 
 export interface Box { x: number; y: number; width: number; height: number; }
 
-/** A human click point inside `box`: a 2D gaussian around center, nudged toward the approach side
- * (people undershoot toward where the cursor came from), clamped a couple px inside the edges. */
-export function clickPoint(box: Box, from: Point, p: Persona, rng: Rng = Math.random): Point {
+// Salt for the aim traits (clickPoint): the persona's landing dispersion, undershoot and handedness.
+const AIM_SALT = 0x27d4eb2f;
+
+/** Per-identity aiming traits, stable per seed (see aimTraits). */
+export interface AimTraits {
+  /** Landing dispersion, sd as a share of the box, 0.10–0.20. */
+  spread: number;
+  /** Pull toward the side the cursor came from, share of the box, 0.06–0.16. */
+  undershoot: number;
+  /** Handedness: lateral offset as a share of the box width (approachBias × 0.4, −0.1–0.1). */
+  sideBias: number;
+}
+
+/** The persona's aiming traits from a salted stream of its seed. Same values as Python `aim_traits` and
+ * .NET `Motion.AimTraitsOf`. */
+export function aimTraits(p: Persona): AimTraits {
+  const r = mulberry32((p.seed ^ AIM_SALT) >>> 0);
+  const spread = lerp(0.10, 0.20, r());
+  const undershoot = lerp(0.06, 0.16, r());
+  return { spread, undershoot, sideBias: p.approachBias * 0.4 };
+}
+
+/** A human click point inside `box`: a 2D gaussian toward the centre with the persona's dispersion
+ * (sd 0.10–0.20 of the box), nudged toward the approach side (undershoot 6–16 %) and sideways by its
+ * handedness (approachBias), clamped a couple px inside the edges. The SEED fixes the persona's spread,
+ * undershoot and handedness (it was one dispersion for everyone); each click's draw is unseeded (Math.random
+ * unless `rng` is given), like every per-action draw, so no two visits of one identity replay the same
+ * landing sequence. Without a persona: sd 0.15, 12 % undershoot, no handedness. */
+export function clickPoint(box: Box, from: Point, p?: Persona | null, rng: Rng = Math.random): Point {
+  let spread = 0.15, under = 0.12, side = 0;
+  if (p) {
+    const at = aimTraits(p);
+    spread = at.spread; under = at.undershoot; side = at.sideBias;
+  }
   const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
   const dx = cx - from.x, dy = cy - from.y;
   const d = Math.hypot(dx, dy) || 1;
-  // undershoot bias: pull ~12% of the half-width back toward the approach direction
   const ux = -dx / d, uy = -dy / d;
-  const bx = ux * box.width * 0.12, by = uy * box.height * 0.12;
-  const x = cx + bx + gaussFrom(rng) * box.width * 0.16;
-  const y = cy + by + gaussFrom(rng) * box.height * 0.16;
+  const x = cx + ux * box.width * under + side * box.width + gaussFrom(rng) * box.width * spread;
+  const y = cy + uy * box.height * under + gaussFrom(rng) * box.height * spread;
   // For a box narrower/shorter than the 4 px inset the clamp bounds would invert (lo > hi) and return
   // a point OUTSIDE the element — just use the center for such tiny targets.
   return {

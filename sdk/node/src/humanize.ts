@@ -31,6 +31,7 @@ import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { errors as pwErrors } from "playwright-core";
 import {
   makePersona, planMove, dragDwell, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
+  dblclickGap, pauseMs, timingTraits,
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
@@ -196,12 +197,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** @internal */
 export const NEARBY: Readonly<Record<string, string>> = NEARBY_LETTERS;
 
-/** @internal exported for tests. Per-character fat-finger rate. CLEARCOTE_HUMANIZE_TYPO_RATE
- * overrides it (0 disables typos; the test suites raise it to exercise the correction paths). Read at
- * call time, like Python's typo_rate(). */
-export function typoRate(): number {
+/** @internal exported for tests. Per-character fat-finger rate: the persona's own (timingTraits, 0.5–4 %
+ * per identity; the global 2 % without a persona). CLEARCOTE_HUMANIZE_TYPO_RATE overrides it when set (0
+ * disables typos; the test suites raise it to exercise the correction paths). Read at call time, like
+ * Python's typo_rate(). */
+export function typoRate(persona?: Persona | null): number {
   const v = process.env.CLEARCOTE_HUMANIZE_TYPO_RATE;
-  if (v === undefined || v === "") return DEFAULT_TYPO_RATE;
+  if (v === undefined || v === "") return persona ? timingTraits(persona).typoRate : DEFAULT_TYPO_RATE;
   const f = pyFloat(v);
   if (f === null || Number.isNaN(f)) return DEFAULT_TYPO_RATE;
   return Math.min(1.0, Math.max(0.0, f));
@@ -579,15 +581,15 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     const o = normalizeClickOptions(options);
     if (enginePathOk(o) && engineModeFor(page, engineClicksMode) !== "off" && await engineGlide(x, y, false)) return;
     await glide(x, y);
-    try {
-      if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) {
-        await prePress(); // the hand confirms the target before it presses
-        // delay = the mousedown→mouseup HOLD (human ~60–150 ms); without it Playwright releases in ~2 ms.
-        await nativeClick(x, y, { delay: o.delay ?? clickHold(persona), button: o.button, clickCount: o.clickCount });
-        return;
-      }
-      await pressAt(o);
-    } catch { /* best-effort */ }
+    // A press that rejects REJECTS (it was swallowed here: a click whose press failed reported success).
+    // Only the pin before a press (mouse.down) stays best-effort.
+    if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) {
+      await prePress(); // the hand confirms the target before it presses
+      // delay = the mousedown→mouseup HOLD (the persona's); without it Playwright releases in ~2 ms.
+      await nativeClick(x, y, { delay: o.delay ?? clickHold(persona), button: o.button, clickCount: o.clickCount });
+      return;
+    }
+    await pressAt(o);
   };
   mouse.click = (x: number, y: number, options: any = {}) => locked(() => hclick(x, y, options));
   // Stock dblclick teleported and pressed for ~0 ms: route it through the humanized click.
@@ -712,7 +714,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   const key = async (k: string, n = 1, gap: [number, number] = [60, 150]): Promise<void> => {
     for (let j = 0; j < n; j++) {
       await nativeKbPress(k, { delay: keyDwell(persona) });
-      if (j < n - 1) await sleep(rand(gap[0], gap[1]));
+      if (j < n - 1) await sleep(pauseMs(persona, gap[0], gap[1]));
     }
   };
 
@@ -740,7 +742,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
         } finally {
           await nativeUp({ button: o.button, clickCount: i }); // never leave the button down
         }
-        if (i < n) await sleep(rand(70, 170)); // the gap inside a double click
+        if (i < n) await sleep(dblclickGap(persona)); // the gap inside a double click: the persona's
       }
     } finally {
       for (const m of held.reverse()) {
@@ -849,7 +851,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     const chars = Array.from(text);
     const n = chars.length;
     let shift = false;
-    const rate = typos ? typoRateFor(page, typoRate) : 0;
+    const rate = typos ? typoRateFor(page, () => typoRate(persona)) : 0;
     const allow = rate > 0 && typosAllowed(await typingField(field));
     try {
       for (let i = 0; i < n; i++) {
@@ -958,6 +960,24 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // Points tried when resolving a control through the browser's hit test: a floating label or an icon
   // often sits over a field's CENTRE, so the edges get a chance too.
   const probePoints: [number, number][] = [[0.5, 0.5], [0.82, 0.5], [0.18, 0.5], [0.5, 0.8], [0.5, 0.2]];
+
+  // The Fitts target width of a glide onto `box`: its smaller side (floor 6 px). Every targeted glide passed
+  // 24 whatever the box, so duration did not follow the target's size.
+  const aimW = (box: Rect): number => Math.max(6, Math.min(box.width, box.height));
+
+  // When the persona's point is covered (a badge, a floating label over the centre): the first probe point
+  // (edges, then bottom/top) the isolated hit test proves reaches the element, as a whole pixel inside the
+  // box; null when none does (the caller falls back).
+  const provenClickPoint = async (box: Rect, sel: string | null = null): Promise<Point | null> => {
+    for (const [fx, fy] of probePoints.slice(1)) {
+      // spread around the probe (3 % of the width, 8 % of the height): a fixed probe pixel would land every
+      // covered click on the same spot
+      const x = roundHalfEven(clamp(box.x + box.width * fx + gauss() * Math.max(1.5, box.width * 0.03), box.x + 1, box.x + box.width - 1));
+      const y = roundHalfEven(clamp(box.y + box.height * fy + gauss() * Math.max(1.0, box.height * 0.08), box.y + 1, box.y + box.height - 1));
+      if ((await hitInBox(box, x, y, sel)) === true) return { x, y };
+    }
+    return null;
+  };
 
   // The control filling `box` (Playwright's resolved box for a locator), read in the isolated world
   // through the browser's own hit test: works for every Playwright selector (getByRole, getByLabel,
@@ -1157,7 +1177,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     }
     const p0 = at ? { x: at[0], y: at[1] } : clickPoint(box, st, persona); // 2D gaussian toward the centre
     const pt = { x: roundHalfEven(p0.x), y: roundHalfEven(p0.y) };      // the pixel the hit test answered for
-    await glide(pt.x, pt.y);
+    await glide(pt.x, pt.y, { targetW: aimW(box) });
     await pressHere(pt.x, pt.y);
     return true;
   };
@@ -1391,7 +1411,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     }
     await glide(px, py, { targetW: fw });
     await pressHere(px, py);
-    await sleep(rand(150, 350));
+    await sleep(pauseMs(persona, 150, 350));
     for (const a of plan) {
       if (a[0] === "type") {
         // The same typing model as text (persona dwell, gaussian gaps, thinking pauses, rollover): the
@@ -1402,7 +1422,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       } else {
         await key(a[1], a.length > 2 ? (a as [string, string, number])[2] : 1, [70, 170]);
       }
-      await sleep(rand(60, 220)); // between fields: the eye checks what it typed
+      await sleep(pauseMs(persona, 60, 220)); // between fields: the eye checks what it typed
     }
     return datetimeEqual(kind, await loc.inputValue(), value);
   };
@@ -1486,19 +1506,22 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // cannot swallow it and leave the letters to change a closed select one per key.
   const openAndPick = async (selector: string, plan: SelectPlan, at: { x: number; y: number } | null): Promise<void> => {
     await targetedClick(nativePageClick, selector, at ? { position: at } : {}, false, null);
-    await sleep(rand(220, 480)); // the list opens; the eye finds the option
+    // Every pause here is the persona's (timingTraits.pauseScale): the windows were one fixed set for
+    // every identity.
+    await sleep(pauseMs(persona, 220, 480)); // the list opens; the eye finds the option
+    const tempo = timingTraits(persona).pauseScale;
     for (const ch of plan.keys) {
       await nativeKbPress(ch, { delay: keyDwell(persona) });
-      await sleep(Math.max(40, 100 + gauss() * 35)); // well inside type-ahead's 1 s window
+      await sleep(Math.max(40, (100 + gauss() * 35) * tempo)); // well inside type-ahead's 1 s window
     }
     const n = plan.arrows;
     if (n) {
-      await sleep(rand(120, 300));
+      await sleep(pauseMs(persona, 120, 300));
       await arrowRun(n > 0 ? "ArrowDown" : "ArrowUp", Math.abs(n));
     }
-    await sleep(rand(150, 400));
+    await sleep(pauseMs(persona, 150, 400));
     await key("Enter");
-    await sleep(rand(80, 160));
+    await sleep(pauseMs(persona, 80, 160));
   };
 
   // `n` presses of an arrow key in an OPEN drop-down. A long run is HELD, the way a person crosses a
@@ -1837,8 +1860,16 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
         // flight does not) and own the click point -- no trusted press at a point some overlay owns.
         // Either failing goes native: Playwright waits for it.
         await sleep(50);
-        const reach = await reachesPoint(box, x, y, selector);
-        if (!reach) throw new NativeSignal(reach === null ? "the hit test cannot run here"
+        const hit = await reachesPoint(box, x, y, selector);
+        if (hit === false && !o.position) {
+          // The persona's point is covered (a badge, an icon, a floating label over the centre). Before
+          // giving the click to Playwright -- which waited out its timeout on 5-7 of 16 badge-covered
+          // buttons (EVAL B) -- aim at the first probe point the hit test proves reaches the element.
+          const alt = await provenClickPoint(box, selector);
+          if (!alt) throw new NativeSignal("the click point does not reach the element (covered, moving or clipped)");
+          ({ x, y } = alt);
+          aim = { x, y };
+        } else if (!hit) throw new NativeSignal(hit === null ? "the hit test cannot run here"
           : "the click point does not reach the element (covered, moving or clipped)");
       }
       if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) throw new NativeSignal("modifiers need keyboard.down");
@@ -1857,7 +1888,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
             held.push(m);
             await sleep(rand(40, 110));
           }
-          await glide(x, y);
+          await glide(x, y, { targetW: aimW(box) });
         } finally {
           for (const m of held.reverse()) {
             await sleep(rand(20, 80));
@@ -1866,7 +1897,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
         }
         return;
       }
-      await glide(x, y);
+      await glide(x, y, { targetW: aimW(box) });
       if (!noClick) await pressAt(o);
       return;
     } catch (e) {
@@ -1892,6 +1923,16 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   (page as any)._clearcoteBoxOf = (loc: Locator, timeout: number | undefined, selector: string | null = null) =>
     boxOf(loc, timeout, false, selector);
   (page as any)._clearcotePointer = (): Point => ({ x: st.x, y: st.y });
+  // ... and for its press point: a glide with the box's own Fitts width, the covered-point check (the same
+  // isolated hit test as a click, retried COVER_CHECK_MS), the probe-proven point when the chosen one is
+  // covered, and the border widths that make `position` padding-box relative like click's.
+  (page as any)._clearcoteAimGlide = (x: number, y: number, box: Rect) => glide(x, y, { targetW: aimW(box) });
+  (page as any)._clearcoteReachesPoint = reachesPoint;
+  (page as any)._clearcoteProvenPoint = provenClickPoint;
+  (page as any)._clearcoteBorderOf = async (box: Rect): Promise<[number, number]> => {
+    const info = await describe(box, null);
+    return info ? [info.bl || 0, info.bt || 0] : [0, 0];
+  };
   (page as any)._clearcoteNudge = async (x: number, y: number): Promise<void> => {
     await nativeMove(x, y);
     st.x = x; st.y = y; st.placed = true;

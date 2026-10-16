@@ -12,7 +12,15 @@
  * option forwarding, error propagation), the caller's timeout, `force`, focus through `:focus`, and the
  * per-page lock. page.evaluate throws throughout: no read may use the page's world.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as Motion from "../src/motion.js";
+import { pressAndHold } from "../src/hold.js";
+
+// planMove as a pass-through spy: lane B (SC 232) reads the Fitts width each targeted glide asked for.
+vi.mock("../src/motion.js", async (importOriginal) => {
+  const m = await importOriginal<typeof import("../src/motion.js")>();
+  return { ...m, planMove: vi.fn(m.planMove) };
+});
 import {
   apiErrors, asApiError, attachHumanize, createInputLock, isTimeout, pickOptions, sdkPlaywrightError, selectWants, typoRate,
   wantIndex,
@@ -1271,6 +1279,66 @@ describe("paths stay in the viewport; whole-pixel presses (SC 210 fix 2)", () =>
       const m = f.of("move");
       const last = m[m.length - 1].a;
       expect(Number.isInteger(last.x) && Number.isInteger(last.y), JSON.stringify(last)).toBe(true);
+    }
+  }, 60_000);
+});
+
+// ------------------------------------------------------------------ lane B (SC 232): aim + press point
+describe("lane B: aim, covered centre, mouse.click errors, press-and-hold point", () => {
+  const lastMoveBeforeDown = (f: Fake) => {
+    const evs = f.events;
+    const i = evs.findIndex((e) => e.t === "down");
+    const m = evs.slice(0, i).filter((e) => e.t === "move");
+    return m[m.length - 1].a as { x: number; y: number };
+  };
+  const coveredCentre = (b: Box, x: number) => x > b.x + b.width * 0.25 && x < b.x + b.width * 0.75;
+
+  it("targeted glides use the box's smaller side as the Fitts width (was 24)", async () => {
+    process.env[ENV] = "0";
+    const spy = vi.mocked(Motion.planMove);
+    const f = await attached({ fields: { "#a": { box: { x: 100, y: 100, width: 160, height: 40 } },
+      "#b": { box: { x: 100, y: 300, width: 300, height: 90 } } } });
+    spy.mockClear();
+    await f.page.click("#a");
+    const a = spy.mock.calls.at(-1)![3]?.targetW;
+    spy.mockClear();
+    await f.page.hover("#b");
+    const b = spy.mock.calls.at(-1)![3]?.targetW;
+    expect([a, b]).toEqual([40, 90]);
+  }, SLOW);
+
+  it("a badge over the centre: the click aims at a proven probe point, no native fallback", async () => {
+    for (let k = 0; k < 16; k++) {
+      const f = await attached({ coveredCentre: true });
+      await f.page.click("#btn");
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(1);
+      expect(f.of("overlay-click")).toEqual([]);
+      const pt = lastMoveBeforeDown(f);
+      expect(coveredCentre(f.box, pt.x), JSON.stringify(pt)).toBe(false);
+    }
+  }, 60_000);
+
+  it("mouse.click rejects when the press fails (it was swallowed)", async () => {
+    const f = makeFake();
+    (f.page as any).mouse.down = async () => { throw new Error("press failed: target closed"); };
+    await attachHumanize({} as never, f.page, { humanize: true, seed: "raise" });
+    await expect(f.page.mouse.click(150, 210, { button: "right" })).rejects.toThrow(/press failed/);
+  }, SLOW);
+
+  it("pressAndHold position is padding-box relative, like click's", async () => {
+    const f = await attached();
+    await pressAndHold(f.page.locator("#btn"), { duration: 120, position: { x: 10, y: 5 }, tremor: false });
+    // box (100, 200) + border (2, 3) + position; 0.51.0 pressed (110, 205)
+    expect(lastMoveBeforeDown(f)).toEqual({ x: 112, y: 208 });
+  }, SLOW);
+
+  it("pressAndHold on a covered centre presses a proven point", async () => {
+    for (let k = 0; k < 8; k++) {
+      const f = await attached({ coveredCentre: true });
+      await pressAndHold(f.page.locator("#btn"), { duration: 100, tremor: false });
+      const pt = lastMoveBeforeDown(f);
+      expect(coveredCentre(f.box, pt.x), JSON.stringify(pt)).toBe(false);
     }
   }, 60_000);
 });
