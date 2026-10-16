@@ -32,6 +32,8 @@ import asyncio
 import math
 import time
 
+from . import _trace
+
 MAX_JUMP_PX = 40.0
 # A single dispatch slower than this is a STALL (the page or the box was busy), not latency: nothing
 # reached the page while it lasted, so the plan pauses with it instead of skipping ahead afterwards.
@@ -81,15 +83,21 @@ def _jump_cap(max_jump, dt_ms):
     return max_jump if dt_ms < IDLE_MS else min(max_jump, IDLE_HOP_PX)
 
 
-def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned):
+def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned, kind="glide"):
     """Dispatch ``steps`` through ``move(x, y)`` against a wall clock (see module doc). Stops at the
-    first ``move`` that raises. Returns the number of samples dispatched."""
+    first ``move`` that raises. Returns the number of samples dispatched.
+
+    ``kind`` names the action for the score hook (``_trace``: ``glide`` | ``drag`` | ``ambient``); with
+    ``CLEARCOTE_HUMANIZE_SCORE`` set, the dispatched samples and their actual dispatch times are scored
+    and appended to the score file after the walk. Read-only: it changes nothing about the walk."""
     clock = clock or time.perf_counter
     sleep = sleep or time.sleep
     if not steps:
         return 0
+    trace = [] if _trace.enabled() else None
     due, total = schedule(steps)
     t0 = clock()
+    t_start = t0
     n = len(steps)
     i = 0
     last = None
@@ -106,25 +114,32 @@ def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_defa
         try:
             move(x, y)
         except Exception:  # noqa: BLE001 - page gone / navigating: stop walking
+            _trace.record(kind, trace, {"planned_n": n, "sent": sent, "aborted": True}) if trace else None
             return sent
         sent += 1
+        if trace is not None:
+            trace.append({"x": x, "y": y, "t": (tb - t_start) * 1000.0})
         t0 += _stall_s(tb, clock())
         last, t_last = (x, y), tb
         i += 1
     el = (clock() - t0) * 1000.0
     if el < total:
         sleep((total - el) / 1000.0)   # the last sample's own dwell (a settle hold, a frame)
+    if trace:
+        _trace.record(kind, trace, {"planned_n": n, "planned_ms": total, "sent": sent})
     return sent
 
 
-async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned):
+async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned, kind="glide"):
     """``walk`` for the async API: ``move`` and ``sleep`` are awaited."""
     clock = clock or time.perf_counter
     sleep = sleep or asyncio.sleep
     if not steps:
         return 0
+    trace = [] if _trace.enabled() else None
     due, total = schedule(steps)
     t0 = clock()
+    t_start = t0
     n = len(steps)
     i = 0
     last = None
@@ -141,14 +156,19 @@ async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, 
         try:
             await move(x, y)
         except Exception:  # noqa: BLE001
+            _trace.record(kind, trace, {"planned_n": n, "sent": sent, "aborted": True}) if trace else None
             return sent
         sent += 1
+        if trace is not None:
+            trace.append({"x": x, "y": y, "t": (tb - t_start) * 1000.0})
         t0 += _stall_s(tb, clock())
         last, t_last = (x, y), tb
         i += 1
     el = (clock() - t0) * 1000.0
     if el < total:
         await sleep((total - el) / 1000.0)
+    if trace:
+        _trace.record(kind, trace, {"planned_n": n, "planned_ms": total, "sent": sent})
     return sent
 
 
