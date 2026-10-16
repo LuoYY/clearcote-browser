@@ -367,7 +367,14 @@ def report_fallback(page, api, reason, selector=None):
     hook = getattr(page, "_report_fallback", None) or getattr(page, "_clearcote_report_fallback", None)
     if callable(hook):
         try:
-            hook(event)
+            res = hook(event)
+            if hasattr(res, "__await__"):   # an async hook (the async API): run it, never leave it unawaited
+                try:
+                    import asyncio
+                    asyncio.ensure_future(res)
+                except Exception:  # noqa: BLE001
+                    if hasattr(res, "close"):
+                        res.close()
             return event
         except Exception:  # noqa: BLE001
             pass
