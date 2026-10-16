@@ -427,12 +427,14 @@ HESITATION_MS = (100.0, 300.0)
 HESITATION_MAX_PX = 8.0
 
 
-def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None):
+def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Optional[float] = None):
     """Plan the still-but-not-frozen moment between the grab and the drag leg frm->to: (x, y, sleep_ms)
     samples spanning 100-300 ms (centred per persona), the pointer creeping < 8 px toward ``to`` with a
     little sideways wobble. The last sample is where :func:`plan_drag` then starts. The samples are
     drawn from ``rng`` AFTER nothing: a caller plans the leg from the returned end point, so the leg's
-    own draws keep their order. Same numbers in motion.ts dragHesitation and Motion.DragHesitation."""
+    own draws keep their order. ``dur_ms``: the caller's grab window (the persona's grab dwell), clamped
+    to 100-300 ms, in place of this persona's own draw (which is still drawn, so the order holds).
+    Same numbers in motion.ts dragHesitation and Motion.DragHesitation."""
     if rng is None:
         rng = random.random
     r = mulberry32((p.seed ^ _HESITATION_SALT) & _MASK)
@@ -444,6 +446,8 @@ def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None):
     d = math.hypot(tx - fx, ty - fy)
     ux, uy = ((tx - fx) / d, (ty - fy) / d) if d >= 1e-6 else (1.0, 0.0)
     dur = _clamp(centre * _lerp(0.8, 1.2, rng()), HESITATION_MS[0], HESITATION_MS[1])
+    if dur_ms is not None:
+        dur = _clamp(float(dur_ms), HESITATION_MS[0], HESITATION_MS[1])
     reach = amp * _lerp(0.6, 1.0, rng())
     step_ms = 1000.0 / p.device_hz
     n = int(max(3, _js_round(dur / step_ms)))

@@ -277,6 +277,24 @@ def plan_trackpad(dx, dy, rng: Optional[Callable[[], float]] = None):
     return out
 
 
+# ---------------------------------------------------------------- isolated-world read
+# The nearest scrollable ancestor of a plain-CSS selector's first match (read in the isolated world, like
+# every humanize read): the visible client rect of the container and which axes it scrolls, or null
+# when the window is what scrolls it. A container with overflow:hidden is not scrollable by a wheel.
+SCROLLER = """(a) => { let e;
+  try { e = document.querySelector(a.sel); } catch (x) { return null; }
+  if (!e) return null;
+  const top = document.scrollingElement || document.documentElement;
+  for (let p = e.parentElement; p && p !== top && p !== document.body; p = p.parentElement) {
+    const s = getComputedStyle(p), sc = v => v === 'auto' || v === 'scroll' || v === 'overlay';
+    const y = sc(s.overflowY) && p.scrollHeight > p.clientHeight + 1;
+    const x = sc(s.overflowX) && p.scrollWidth > p.clientWidth + 1;
+    if (x || y) { const r = p.getBoundingClientRect();
+      return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y }; }
+  }
+  return null; }"""
+
+
 # ---------------------------------------------------------------- the I/O loop
 class ScrollIO:
     """What :func:`bring_into_view` needs from a humanizer (duck-typed; this class only documents it):
