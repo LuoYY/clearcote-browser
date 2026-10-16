@@ -53,7 +53,7 @@ from ._motion import (
 )
 from ._scroll import (
     ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, anchor_needed, anchor_point, bring_into_view, in_view as _box_in,
-    input_device as _input_device, plan_trackpad, wheel_drift,
+    input_device as _input_device, paced_wheel, plan_trackpad, wheel_drift,
 )
 from ._hold import press_and_hold
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk as _paced_walk
@@ -745,10 +745,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         sees deltaMode 0 either way; a notch persona's deltas are whole multiples of its notch."""
         _wheel_anchor()
         if _device() == "trackpad":
-            for ex, ey, sl in plan_trackpad(delta_x, delta_y):
-                native_wheel(ex, ey)
-                if sl:
-                    time.sleep(sl / 1000.0)
+            paced_wheel(plan_trackpad(delta_x, delta_y), native_wheel, time.sleep)
             return
         notch = _notch_px()
         plan = ([(0, notch if delta_y > 0 else -notch)] * wheel_notches(delta_y, notch)

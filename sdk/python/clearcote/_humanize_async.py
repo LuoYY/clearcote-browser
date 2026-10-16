@@ -38,7 +38,7 @@ from ._motion import (
 )
 from ._scroll import (
     ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, anchor_needed, anchor_point, bring_into_view_async,
-    in_view as _box_in, input_device as _input_device, plan_trackpad, wheel_drift,
+    in_view as _box_in, input_device as _input_device, paced_wheel_async, plan_trackpad, wheel_drift,
 )
 from ._hold import press_and_hold_async
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk_async as _paced_walk
@@ -516,10 +516,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # persona swipes the exact distance instead (_scroll.plan_trackpad).
         await _wheel_anchor()
         if await _device() == "trackpad":
-            for ex, ey, sl in plan_trackpad(delta_x, delta_y):
-                await native_wheel(ex, ey)
-                if sl:
-                    await asyncio.sleep(sl / 1000.0)
+            await paced_wheel_async(plan_trackpad(delta_x, delta_y), native_wheel, asyncio.sleep)
             return
         notch = await _notch_px()
         plan = ([(0, notch if delta_y > 0 else -notch)] * wheel_notches(delta_y, notch)

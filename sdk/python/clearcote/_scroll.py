@@ -290,6 +290,32 @@ def plan_trackpad(dx, dy, rng: Optional[Callable[[], float]] = None):
     return out
 
 
+def paced_wheel(events, wheel, sleep):
+    """Send planned wheel events at their planned TIMES (a wall clock, like _pacing.walk), not "send, then
+    sleep the gap": a CDP wheel waits for the renderer's ack (~30 ms measured on r42 headless), so the
+    gaps on top of it put a 60-120 events/s trackpad stream on the page at ~30/s."""
+    t0 = time.monotonic()
+    due = 0.0
+    for ex, ey, sl in events:
+        wheel(ex, ey)
+        due += sl
+        wait = due / 1000.0 - (time.monotonic() - t0)
+        if wait > 0:
+            sleep(wait)
+
+
+async def paced_wheel_async(events, wheel, sleep):
+    """:func:`paced_wheel`, awaited (``wheel`` and ``sleep`` are coroutine functions)."""
+    t0 = time.monotonic()
+    due = 0.0
+    for ex, ey, sl in events:
+        await wheel(ex, ey)
+        due += sl
+        wait = due / 1000.0 - (time.monotonic() - t0)
+        if wait > 0:
+            await sleep(wait)
+
+
 # ---------------------------------------------------------------- isolated-world read
 # The nearest scrollable ancestor of a plain-CSS selector's first match (read in the isolated world, like
 # every humanize read): the visible client rect of the container and which axes it scrolls, or null
@@ -357,10 +383,7 @@ def _send_notches(io, n, axis, sign, rng):
 
 
 def _send_trackpad(io, dx, dy, rng):
-    for ex, ey, sl in plan_trackpad(dx, dy, rng):
-        io.wheel(ex, ey)
-        if sl:
-            io.sleep(sl / 1000.0)
+    paced_wheel(plan_trackpad(dx, dy, rng), io.wheel, io.sleep)
 
 
 def _view_of(io, scroller):
@@ -518,10 +541,7 @@ async def _send_notches_async(io, n, axis, sign, rng):
 
 
 async def _send_trackpad_async(io, dx, dy, rng):
-    for ex, ey, sl in plan_trackpad(dx, dy, rng):
-        await io.wheel(ex, ey)
-        if sl:
-            await io.sleep(sl / 1000.0)
+    await paced_wheel_async(plan_trackpad(dx, dy, rng), io.wheel, io.sleep)
 
 
 async def _view_of_async(io, scroller):
