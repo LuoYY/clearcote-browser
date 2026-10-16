@@ -1768,14 +1768,40 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             raise _Native("the click did not put the caret in the field")
         await asyncio.sleep(_rand(40, 120) / 1000.0)
 
+    async def _tab_via_field(loc, info, selector, td):
+        """See _humanize._tab_via_field: a click into the text stop 1-3 before the control (or 1 after),
+        then Tab across; True once focus is verified on it."""
+        near = (td or {}).get("near")
+        if not near or not near.get("rect") or native_kb_press is None:
+            return False
+        r = near["rect"]
+        nbox = {"x": float(r[0]), "y": float(r[1]), "width": float(r[2]), "height": float(r[3])}
+        if not await _focus_click(nbox):
+            return False
+        await asyncio.sleep(_rand(40, 120) / 1000.0)
+        return await _tab_into(loc, info, selector, force=True)
+
+    async def _tab_from_start(loc, info, selector):
+        """See _humanize._tab_from_start: nothing focused -- one Tab enters the page, then the control is
+        reached when it is within 3 stops of the focus ring."""
+        if native_kb_press is None:
+            return False
+        await _press_key("Tab")
+        await asyncio.sleep(_rand(110, 260) / 1000.0)   # the eye finds the focus ring
+        if await _focused(loc):
+            return True
+        return await _tab_into(loc, info, selector, force=True)
+
     async def _focus_target(selector, timeout):
         """Give ``selector`` -- any focusable element, a button or a link as well as a field -- the
         keyboard focus the way a person does. Tab when it is 1-3 stops from the focused element (always
         for something a click would ACTIVATE: a button, a link, a checkbox); otherwise a humanized click
-        (glide + press) for what a click only focuses (a field, a tabindex container). True when focus
-        is verified there. False for an activatable target out of Tab reach: the pointer has glided
-        onto it and the caller gives it the focus natively (a reported fallback), never the 0 ms
-        native press."""
+        (glide + press) for what a click only focuses (a field, a tabindex container). An activatable
+        target out of Tab reach is reached as a keyboard user reaches it: a click into the text field
+        next to it and Tab across (_tab_via_field), or, with nothing focused, Tab in from the top and
+        follow the focus ring (_tab_from_start). True when focus is verified there. False when none of
+        that reached it: the pointer has glided onto it and the caller gives it the focus natively (a
+        reported fallback), never the 0 ms native press."""
         loc = page.locator(selector).first
         if await _focused(loc):
             return True
@@ -1794,6 +1820,12 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 await asyncio.sleep(_rand(40, 120) / 1000.0)
                 return True
             raise _Native("the focus click did not focus it")
+        if act and td and not info.get("disabled"):
+            # SC 232 lab triage (10-16): see _humanize._focus_target
+            if await _tab_via_field(loc, info, selector, td):
+                return True
+            if td.get("noAnchor") and await _tab_from_start(loc, info, selector):
+                return True
         x, y = click_point(box, st["pos"], persona)
         await _glide(float(round(x)), float(round(y)))   # the hand goes to it; the focus has to be given
         return False
@@ -2418,7 +2450,12 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 return None
             r = lab["label"].get("text") or lab["label"]["rect"]
             lbox = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
-            return lbox if lbox["width"] >= 2 and lbox["height"] >= 2 else None
+            if lbox["width"] < 2 or lbox["height"] < 2:
+                return None
+            # aim inside the text, hit-test the LABEL ELEMENT's box (see _humanize._label_aim; SC 232 triage)
+            lr = lab["label"]["rect"]
+            lbox["hit"] = {"x": lr[0], "y": lr[1], "width": lr[2], "height": lr[3]}
+            return lbox
         if not isinstance(selector, str) or not selector:
             return None
         lab = await w.evaluate(ISO_LABEL_BY_SEL, {"sel": selector})
@@ -2443,7 +2480,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         x, y = click_point(lbox, st["pos"], persona)
         x, y = float(round(x)), float(round(y))
         await asyncio.sleep(0.05)
-        if await _hit_in_box(lbox, x, y) is False:
+        if await _hit_in_box(lbox.get("hit") or lbox, x, y) is False:   # the label element's box
             return False
         await _glide(x, y)
         await _press_at(x, y, normalize_click_options({}, await _platform()))

@@ -2185,7 +2185,10 @@ public static partial class Humanize
 
     /// <summary>Where <paramref name="info"/> sits in the page's Tab order relative to the focused element
     /// (Keys.TabDistance, read in the isolated world), or null.</summary>
-    private sealed record TabInfo(int? Dist, bool FromText, bool Focused, bool Activatable);
+    /// <c>NoAnchor</c>: nothing (in the Tab order) has the focus. <c>Near</c>: the text-entry stop 1-3 before the
+    /// control (or 1 after) a hand can click into and Tab from, with the presses it is away (<c>NearOff</c>).
+    private sealed record TabInfo(int? Dist, bool FromText, bool Focused, bool Activatable, bool NoAnchor = false,
+        LocatorBoundingBoxResult? Near = null, int NearOff = 0);
 
     private static async Task<TabInfo?> TabDistanceAsync(IPage page, FieldInfo? info)
     {
@@ -2199,7 +2202,15 @@ public static partial class Humanize
             if (r is not { ValueKind: JsonValueKind.Object } o) return null;
             int? dist = o.TryGetProperty("dist", out var d) && d.ValueKind == JsonValueKind.Number ? d.GetInt32() : null;
             static bool B(JsonElement o, string n) => o.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.True;
-            return new TabInfo(dist, B(o, "fromText"), B(o, "focused"), B(o, "activatable"));
+            LocatorBoundingBoxResult? near = null;
+            int off = 0;
+            if (o.TryGetProperty("near", out var nr) && nr.ValueKind == JsonValueKind.Object
+                && nr.TryGetProperty("rect", out var rect) && nr.TryGetProperty("off", out var ofs) && ofs.ValueKind == JsonValueKind.Number)
+            {
+                near = Quad(rect);
+                off = ofs.GetInt32();
+            }
+            return new TabInfo(dist, B(o, "fromText"), B(o, "focused"), B(o, "activatable"), B(o, "noAnchor"), near, off);
         }
         catch (Exception)
         {
@@ -2262,12 +2273,42 @@ public static partial class Humanize
             }
             throw new NativeRouteException("focus: the click did not focus it");
         }
+        if (act && td is not null && !info.Disabled)
+        {
+            // SC 232 lab triage (10-16): an activatable target out of Tab reach -- the usual case for a button when the
+            // focus is far away or nowhere -- got the pointer over it and Playwright's focus (reported): 0 of 4 presses
+            // on verifier B's buttons, 6 of 12 in the lab, on d2b9ab6. A person reaches it as a keyboard user does.
+            if (await TabViaFieldAsync(loc, info, td).ConfigureAwait(false)) return true;
+            if (td.NoAnchor && await TabFromStartAsync(loc, info).ConfigureAwait(false)) return true;
+        }
         var p = PersonaFor(page);
         var st = StateFor(page);
         var from = st.Known ? new Point(st.X, st.Y) : new Point(box.X - 120, box.Y - 90);
         var pt = Motion.ClickPoint(new Box(box.X, box.Y, box.Width, box.Height), from, p);
         await GlideAsync(page, p, st, Math.Round(pt.X), Math.Round(pt.Y), Math.Max(6, box.Width)).ConfigureAwait(false);
         return false;
+    }
+
+    /// <summary>Reach the activatable control <paramref name="info"/>, out of Tab reach of the focus, the way a
+    /// keyboard user does: a click into the text-entry stop 1-3 before it (or 1 after; TabDistance's <c>near</c>),
+    /// then Tab across. True once focus is verified on it; false = the caller's next route.</summary>
+    private static async Task<bool> TabViaFieldAsync(ILocator loc, FieldInfo info, TabInfo td)
+    {
+        if (td.Near is null || td.NearOff == 0) return false;
+        if (!await FocusClickAsync(loc.Page, td.Near, null, null).ConfigureAwait(false)) return false;
+        await KeySleep(Rand(40, 120)).ConfigureAwait(false);
+        return await TabIntoAsync(loc, info, force: true).ConfigureAwait(false);
+    }
+
+    /// <summary>Nothing has the focus: one Tab enters the page (its first stop, or the one after whatever had the
+    /// focus last), then the control is reached when it is within 3 stops of the focus ring.</summary>
+    private static async Task<bool> TabFromStartAsync(ILocator loc, FieldInfo info)
+    {
+        var page = loc.Page;
+        await PressKeyAsync(page, PersonaFor(page), "Tab").ConfigureAwait(false);
+        await KeySleep(Rand(110, 260)).ConfigureAwait(false);   // the eye finds the focus ring
+        if (await FocusedAsync(loc).ConfigureAwait(false)) return true;
+        return await TabIntoAsync(loc, info, force: true).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -3630,8 +3671,8 @@ public static partial class Humanize
             {
                 try
                 {
-                    var lbox = await LabelAimAsync(loc, timeout).ConfigureAwait(false);
-                    clicked = lbox is not null && await ClickLabelAsync(loc.Page, lbox).ConfigureAwait(false);
+                    var lt = await LabelAimAsync(loc, timeout).ConfigureAwait(false);
+                    clicked = lt is not null && await ClickLabelAsync(loc.Page, lt.Aim, lt.Hit).ConfigureAwait(false);
                 }
                 catch (Exception e) when (!Propagates(e))
                 {
@@ -3667,8 +3708,11 @@ public static partial class Humanize
 
     /// <summary>Where a person clicks a checkbox / radio when not on its own box: its &lt;label&gt;. A HIDDEN input
     /// (a custom checkbox) has no box to click at all, so its label is the only target; a visible one gets its
-    /// label TEXT <see cref="LabelShare"/> of the time. Null = aim at the input itself, as before.</summary>
-    private static async Task<LocatorBoundingBoxResult?> LabelAimAsync(ILocator loc, float? timeout)
+    /// label TEXT <see cref="LabelShare"/> of the time. Null = aim at the input itself, as before.
+    /// <c>Aim</c> is the box the click lands in; <c>Hit</c> the LABEL ELEMENT's box the hit test is asked about.</summary>
+    private sealed record LabelTarget(LocatorBoundingBoxResult Aim, LocatorBoundingBoxResult Hit);
+
+    private static async Task<LabelTarget?> LabelAimAsync(ILocator loc, float? timeout)
     {
         var page = loc.Page;
         var w = IsolatedWorld.For(page);
@@ -3683,7 +3727,13 @@ public static partial class Humanize
                 return null;
             if (!LabelDraw(PersonaFor(page))) return null;   // the persona's share; THIS click's choice is unseeded
             var r = lb.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.Array ? Quad(tx) : Quad(lb.GetProperty("rect"));
-            return r is { Width: >= 2, Height: >= 2 } ? r : null;
+            if (r is not { Width: >= 2, Height: >= 2 }) return null;
+            // The click AIMS inside the label's text, but the hit test must be asked about the LABEL ELEMENT's box:
+            // HitInBox proves "the node at (x, y) is the element filling box b", and no element fills the text's
+            // own rect. Asked with the text rect it failed on every visible label, so the click went to the input
+            // (0 of 20, verifier B; 0 of 18, the lab; SC 232 triage 10-16).
+            var full = Quad(lb.GetProperty("rect")) ?? r;
+            return new LabelTarget(r, full);
         }
         var css = CssOf(loc);
         if (css is null) return null;
@@ -3700,11 +3750,12 @@ public static partial class Humanize
         var lbox = Quad(lab2.GetProperty("rect"));
         if (lbox is null || lbox.Width < 2 || lbox.Height < 2) return null;
         if (!await InViewAsync(page, lbox).ConfigureAwait(false)) lbox = await ScrollWindowToAsync(page, lbox).ConfigureAwait(false) ?? lbox;
-        return await InViewAsync(page, lbox).ConfigureAwait(false) ? lbox : null;
+        return await InViewAsync(page, lbox).ConfigureAwait(false) ? new LabelTarget(lbox, lbox) : null;
     }
 
-    /// <summary>One humanized click inside a label's box, where the hit test proves the label owns the point.</summary>
-    private static async Task<bool> ClickLabelAsync(IPage page, LocatorBoundingBoxResult lbox)
+    /// <summary>One humanized click inside a label's box (<paramref name="lbox"/>), where the hit test proves the
+    /// label element (<paramref name="hit"/>, its own box) owns the point.</summary>
+    private static async Task<bool> ClickLabelAsync(IPage page, LocatorBoundingBoxResult lbox, LocatorBoundingBoxResult hit)
     {
         var p = PersonaFor(page);
         var st = StateFor(page);
@@ -3712,7 +3763,7 @@ public static partial class Humanize
         var pt = Motion.ClickPoint(new Box(lbox.X, lbox.Y, lbox.Width, lbox.Height), from, p);
         double x = Math.Round(pt.X), y = Math.Round(pt.Y);
         await Task.Delay(50).ConfigureAwait(false);
-        if (await HitInBoxAsync(page, lbox, x, y).ConfigureAwait(false) == false) return false;
+        if (await HitInBoxAsync(page, hit, x, y).ConfigureAwait(false) == false) return false;
         await GlideAsync(page, p, st, x, y, Math.Max(6, Math.Min(lbox.Width, lbox.Height))).ConfigureAwait(false);
         await PressAtAsync(page, p, new HumanClickOptions().Normalize()).ConfigureAwait(false);
         return true;

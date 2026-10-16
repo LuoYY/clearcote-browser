@@ -179,9 +179,17 @@ export const TAB_DISTANCE = `function (b) {
   const act = ['BUTTON', 'A', 'SUMMARY', 'SELECT'].indexOf(t.tagName) >= 0 ||
     (t.tagName === 'INPUT' && VALUE_TYPES.indexOf(t.type) >= 0) ||
     ['button', 'link', 'checkbox', 'radio', 'switch', 'tab', 'menuitem', 'option'].indexOf(role) >= 0;
+  let near = null;
+  if (tix >= 0) for (const off of [1, 2, 3, -1]) {
+    const c = order[tix - off];
+    if (!c || c === a || !text(c) || c.disabled) continue;
+    const q = c.getBoundingClientRect();
+    if (q.width >= 2 && q.height >= 2 && q.left >= 0 && q.top >= 0 && q.right <= innerWidth && q.bottom <= innerHeight) {
+      near = { off, rect: [q.x, q.y, q.width, q.height] }; break; }
+  }
   return { dist: ai >= 0 && tix >= 0 ? tix - ai : null, fromText: text(a), focused: a === t,
     activatable: act, text: text(t), tag: t.tagName.toLowerCase(), type: t.tagName === 'INPUT' ? t.type : '',
-    n: order.length }; }`;
+    n: order.length, noAnchor: ai < 0, near }; }`;
 
 export const BLANK_POINT = `(a) => { const b = a.box, FOC = '${FOCUSABLE}, label, [onclick], [role]';
   const cands = [];
@@ -211,4 +219,6 @@ export const SELECTION_STATE = `() => { let e = document.activeElement;
 export interface TabInfo {
   dist: number | null; fromText: boolean; focused: boolean; activatable: boolean; text: boolean;
   tag: string; type: string; n: number;
+  noAnchor?: boolean;                                  // nothing (in the Tab order) has the focus
+  near?: { off: number; rect: number[] } | null;       // the text stop 1-3 before the target (or 1 after) and its presses away
 }

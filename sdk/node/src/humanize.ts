@@ -1830,9 +1830,35 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       }
       throw new NativeSignal("the focus click did not focus it");
     }
+    if (act && td && !info.disabled) {
+      // SC 232 lab triage (10-16): an activatable target out of Tab reach -- the usual case for a button when the
+      // focus is far away or nowhere -- got the pointer over it and Playwright's focus (reported): 0 of 4 presses
+      // on verifier B's buttons, 6 of 12 in the lab, on d2b9ab6. A person reaches it as a keyboard user does.
+      if (await tabViaField(loc, info, selector, td)) return true;
+      if (td.noAnchor && await tabFromStart(loc, info, selector)) return true;
+    }
     const p0 = clickPoint(box, st, persona);
     await glide(roundHalfEven(p0.x), roundHalfEven(p0.y)); // the hand goes to it; the focus has to be given
     return false;
+  };
+  // Reach the activatable control `info`, out of Tab reach of the focus, the way a keyboard user does: a click
+  // into the text-entry stop 1-3 before it (or 1 after; `td.near` from TAB_DISTANCE), then Tab across. True once
+  // focus is verified on it; false (nothing pressed, or the click or the Tabs went elsewhere) = the next route.
+  const tabViaField = async (loc: Locator, info: DescribedElement, selector: string | null, td: TabInfo | null): Promise<boolean> => {
+    const near = td?.near;
+    if (!near || !near.rect) return false;
+    const [x, y, width, height] = near.rect;
+    if (!(await focusClick({ x, y, width, height }))) return false;
+    await sleep(rand(40, 120));
+    return tabInto(loc, info, selector, false, true);
+  };
+  // Nothing has the focus: one Tab enters the page (its first stop, or the one after whatever had the focus
+  // last), then the control is reached when it is within 3 stops of the focus ring.
+  const tabFromStart = async (loc: Locator, info: DescribedElement, selector: string | null): Promise<boolean> => {
+    await pressKey("Tab");
+    await sleep(rand(110, 260)); // the eye finds the focus ring
+    if (await focused(loc)) return true;
+    return tabInto(loc, info, selector, false, true);
   };
 
   const htype = async (selector: string, text: string, options: any): Promise<any> => {
@@ -2458,8 +2484,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     throw sdkPlaywrightError("Clicking the checkbox did not change its state");
   };
   type LabelRead = { n?: number; hidden?: boolean; label?: { rect: number[]; text: number[] | null } | null } | null;
+  // The box a label click aims at, plus (a visible label) the LABEL ELEMENT's box the hit test is asked about.
+  type LabelBox = Rect & { hit?: Rect };
   // Where a person clicks a checkbox / radio when not on its own box: its <label> (see Python _label_aim).
-  const labelAim = async (selector: string, loc: Locator, timeout: number | undefined): Promise<Rect | null> => {
+  const labelAim = async (selector: string, loc: Locator, timeout: number | undefined): Promise<LabelBox | null> => {
     const w = worldFor(page);
     if (await loc.isVisible()) {
       const box = await boxOf(loc, timeout, false, selector);
@@ -2469,7 +2497,13 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       if (!lab || !lab.label || lab.hidden) return null;
       if (!labelDraw(persona)) return null; // the persona's share; THIS click's choice is unseeded
       const r = lab.label.text ?? lab.label.rect;
-      return r[2] >= 2 && r[3] >= 2 ? { x: r[0], y: r[1], width: r[2], height: r[3] } : null;
+      if (!(r[2] >= 2 && r[3] >= 2)) return null;
+      // The click AIMS inside the label's text, but the hit test must be asked about the LABEL ELEMENT's box:
+      // HIT_IN_BOX proves "the node at (x, y) is the element filling box b", and no element fills the text's own
+      // rect. Asked with the text rect it failed on every visible label, so the click went to the input (0 of 20,
+      // verifier B; 0 of 18, the lab; SC 232 triage 10-16).
+      const lr = lab.label.rect;
+      return { x: r[0], y: r[1], width: r[2], height: r[3], hit: { x: lr[0], y: lr[1], width: lr[2], height: lr[3] } };
     }
     if (!selector) return null;
     const lab = await w.evaluate<LabelRead>(ISO_LABEL_BY_SEL, { sel: selector });
@@ -2482,11 +2516,11 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     return (await inView(lbox)) ? lbox : null;
   };
   // One humanized click inside a label's box where the hit test proves the label owns the point.
-  const clickLabel = async (lbox: Rect): Promise<boolean> => {
+  const clickLabel = async (lbox: LabelBox): Promise<boolean> => {
     const p = clickPoint(lbox, st, persona);
     const x = roundHalfEven(p.x), y = roundHalfEven(p.y);
     await sleep(50);
-    if ((await hitInBox(lbox, x, y)) === false) return false;
+    if ((await hitInBox(lbox.hit ?? lbox, x, y)) === false) return false; // the label element's box (labelAim)
     await glide(x, y);
     await pressAt(normalizeClickOptions({}));
     return true;

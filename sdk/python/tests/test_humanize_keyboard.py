@@ -415,9 +415,16 @@ class KWorld(World):
             order = self.p.fields
             a = self.p.focused
             text = lambda g: g is not None and (g.tag == "textarea" or (g.tag == "input" and g.type in ("text", "search", "")))  # noqa: E731
-            return {"dist": order.index(f) - order.index(a) if a in order else None, "fromText": text(a),
+            ti = order.index(f)
+            near = None   # the text-entry stop 1-3 before f (or 1 after) a hand can click into and Tab from
+            for off in (1, 2, 3, -1):
+                j = ti - off
+                if 0 <= j < len(order) and order[j] is not a and text(order[j]):
+                    near = {"off": off, "rect": list(order[j].rect)}
+                    break
+            return {"dist": ti - order.index(a) if a in order else None, "fromText": text(a),
                     "focused": a is f, "activatable": f.tag in ("button", "select") or f.type == "checkbox",
-                    "text": text(f), "tag": f.tag, "type": f.type, "n": len(order)}
+                    "text": text(f), "tag": f.tag, "type": f.type, "n": len(order), "noAnchor": a not in order, "near": near}
         return await super().call_on_node(nid, src, arg)
 
 
@@ -440,8 +447,11 @@ class KPage(Page):
             if self.focused in self.fields:
                 i = self.fields.index(self.focused) + (-1 if "Shift" in self.mods else 1)
                 self.focused = self.fields[i] if 0 <= i < len(self.fields) else None
-                if self.focused is not None and self.focused.tag == "input":
-                    self.focused.all = True   # Tab into a field selects its text
+            elif self.fields:
+                # nothing focused: Tab enters the page at its first stop (Shift+Tab at the last), as the browser does
+                self.focused = self.fields[-1 if "Shift" in self.mods else 0]
+            if self.focused is not None and self.focused.tag == "input":
+                self.focused.all = True   # Tab into a field selects its text
             return
         if k == "Home" and "Shift" in self.mods and self.focused is not None:
             self.focused.all = True
@@ -537,6 +547,42 @@ def test_press_on_a_button_within_tab_reach_tabs_to_it(fast):
         assert len(kinds(p, "down")) == downs_before, "no click on the button"
         keys = [e[1] for e in kinds(p, "press")]
         assert keys[-2:] == ["Tab", "Enter"] and p.focused is btn
+    run(go())
+
+
+def test_press_on_a_button_out_of_tab_reach_clicks_the_field_before_it_and_tabs(fast):
+    # SC 232 lab triage (10-16): an activatable target out of Tab reach of the focused element -- the common case
+    # for a button on a page where the focus is far away -- got the pointer over it and Playwright's focus (a
+    # reported fallback): 0 of 4 presses on verifier B's buttons, 6 of 12 in the lab on d2b9ab6. A person reaches
+    # it the way a keyboard user does: a click into the text field next to it, then Tab across.
+    async def go():
+        btn = Field(tag="button", type="", rect=(100.0, 400.0, 160.0, 40.0))
+        q = Field(rect=(100.0, 300.0, 200.0, 24.0))
+        p = await kattached("ha-1", ("#far", Field(rect=(100.0, 50.0, 200.0, 24.0))),
+                            ("#b1", Field(tag="button", type="", rect=(100.0, 100.0, 60.0, 30.0))),
+                            ("#b2", Field(tag="button", type="", rect=(100.0, 150.0, 60.0, 30.0))),
+                            ("#b3", Field(tag="button", type="", rect=(100.0, 200.0, 60.0, 30.0))),
+                            ("#q", q), ("#go", btn))
+        await p.fill("#far", "x")          # the focus sits 5 stops before #go
+        downs = len(kinds(p, "down"))
+        await p.press("#go", "Enter")
+        assert not p.native, p.native
+        ds = kinds(p, "down")[downs:]
+        assert len(ds) == 1 and q.inside(*ds[0][4]), ("one click, into the field before the button", ds)
+        assert [e[1] for e in kinds(p, "press")][-2:] == ["Tab", "Enter"] and p.focused is btn
+    run(go())
+
+
+def test_press_on_a_button_with_nothing_focused_tabs_in_from_the_top(fast):
+    # Nothing focused (a fresh page, or after a blur): one Tab enters the page, and the button is reached once it is
+    # within 3 stops of the focus ring. No click, no native focus.
+    async def go():
+        btn = Field(tag="button", type="", rect=(100.0, 200.0, 160.0, 40.0))
+        p = await kattached("ha-2", ("#b1", Field(tag="button", type="", rect=(100.0, 100.0, 60.0, 30.0))), ("#go", btn))
+        assert p.focused is None
+        await p.press("#go", "Enter")
+        assert not p.native and not kinds(p, "down"), (p.native, kinds(p, "down"))
+        assert [e[1] for e in kinds(p, "press")] == ["Tab", "Tab", "Enter"] and p.focused is btn
     run(go())
 
 

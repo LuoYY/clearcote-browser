@@ -639,18 +639,22 @@ describe("type / press", () => {
   }, SLOW);
 
   it("a press on a button is never clicked first: the pointer goes to it, the focus is given, the key is held", async () => {
-    // Lane D (SC 232): no Tab order in this fake, so the button is out of Tab reach -- Playwright's focus,
-    // reported -- and the key is a HELD press; never a click (it activated the button twice) and never
-    // Playwright's 0 ms focus-and-press.
+    // Lane D (SC 232): a button out of Tab reach gets Playwright's focus, reported, and the key is a HELD press;
+    // never a click (it activated the button twice) and never Playwright's 0 ms focus-and-press. SC 232 triage:
+    // with nothing focused the SDK now Tabs in from the top and reaches a button within 3 stops of the ring, and
+    // clicks into a text stop within 3 of it -- so the fallback case is a button 5 stops from the top with only
+    // buttons before it (one probing Tab lands on #b1, out of reach, then the fallback).
     const seen: any[] = [];
-    const f = makeFake({ field: { tag: "button", type: "" } });   // lane A's onFallback hears the reported focus
+    const b = (y: number) => ({ tag: "button", type: "", box: { x: 100, y, width: 60, height: 30 } });
+    const f = makeFake({ fields: { "#b1": b(100), "#b2": b(140), "#b3": b(180), "#b4": b(220),
+      "#counter": { tag: "button", type: "", box: { x: 100, y: 300, width: 160, height: 40 } } } });   // lane A's onFallback hears the reported focus
     await attachHumanize({} as never, f.page, { humanize: { onFallback: (e: any) => seen.push(e) }, seed: "forms-unit" });
     await f.page.press("#counter", "Enter");
     expect(f.natives.map((n) => n.m)).toEqual(["focus"]);
     expect(f.of("click")).toEqual([]);
     expect(f.of("down")).toEqual([]);
-    expect(f.of("press").map((e) => e.a.k)).toEqual(["Enter"]);
-    expect(f.of("press")[0].a.delay).toBeGreaterThanOrEqual(45);
+    expect(f.of("press").map((e) => e.a.k)).toEqual(["Tab", "Enter"]);
+    expect(f.of("press")[1].a.delay).toBeGreaterThanOrEqual(45);
     expect(seen[0]?.api).toBe("page.press");
   }, SLOW);
 
@@ -1044,6 +1048,26 @@ describe("label-aware checkbox aim", () => {
     expect(onLabel).toBeGreaterThanOrEqual(6);
     expect(onLabel).toBeLessThanOrEqual(26);
   }, 120_000);
+
+  it("a visible label's click is hit-tested on the label element, not its text rect (SC 232 triage)", async () => {
+    // The click AIMS inside the label's TEXT rect, but ISO_HIT_IN_BOX proves "the node at (x, y) is the element
+    // filling box b" -- and no element fills the text's own rect; only the <label> fills the label's. Asked with
+    // the text rect the test failed on every visible label and the click went to the input: 0 of 20 label clicks
+    // on verifier B's fixture, 0 of 18 in the lab, on d2b9ab6. The fake answers the hit test the way the browser
+    // does: the hit node's own box against the asked box.
+    const fk = makeFake({ fields: {
+      "#cb": { type: "checkbox", box: { x: 100, y: 100, width: 16, height: 16 } },
+      "#lab": { tag: "label", type: "", control: "#cb", box: { x: 96, y: 96, width: 420, height: 24 }, textRect: { x: 124, y: 100, width: 110, height: 16 } },
+    } as any });
+    await attachHumanize({} as never, fk.page, { humanize: true, seed: "label-hit" });
+    (fk.page as any)._clearcotePersona.labelShare = 1; // this click: the label (the trait is not the question)
+    await fk.page.check("#cb");
+    expect(fk.fields["#cb"].checked).toBe(true);
+    expect(fk.of("label-click").length).toBe(1);
+    const moves = fk.of("move");
+    const last = moves[moves.length - 1].a;
+    expect(last.x >= 124 && last.x <= 234 && last.y >= 100 && last.y <= 116, JSON.stringify(last)).toBe(true);
+  });
 });
 
 describe("label draws: the seed fixes the trait, each click is unseeded", () => {
@@ -1141,6 +1165,44 @@ describe("lane D: Tab between fields, presses on buttons, focus / blur / selectT
       expect(f.natives).toEqual([]);
       expect(f.of("down").length).toBe(downs);
       expect(f.of("press").map((e) => e.a.k).slice(-2)).toEqual(["Tab", "Enter"]);
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("a press on a button out of Tab reach clicks into the field before it and Tabs (SC 232 triage)", async () => {
+    // With the focus far away, a button got the pointer over it and Playwright's focus (a reported fallback):
+    // 0 of 4 on verifier B's buttons, 6 of 12 in the lab. A person clicks into the field next to it and Tabs.
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const b = (y: number) => ({ tag: "button", type: "", box: { x: 100, y, width: 60, height: 30 } });
+      const f = await seeded("ha-1", { fields: {
+        "#far": { box: { x: 100, y: 50, width: 200, height: 24 } }, "#b1": b(100), "#b2": b(150), "#b3": b(200),
+        "#q": { box: { x: 100, y: 300, width: 200, height: 24 } }, "#go": { tag: "button", type: "", box: { x: 100, y: 400, width: 160, height: 40 } },
+      } });
+      await drive(f.page.fill("#far", "x"));   // the focus sits 5 stops before #go
+      const downs = f.of("down").length;
+      await drive(f.page.press("#go", "Enter"));
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(downs + 1);
+      const moves = f.of("move");
+      const at = moves[moves.length - 1].a;   // the one click: into #q, the field before the button
+      expect(at.x >= 100 && at.x <= 300 && at.y >= 300 && at.y <= 324, JSON.stringify(at)).toBe(true);
+      expect(f.of("press").map((e) => e.a.k).slice(-2)).toEqual(["Tab", "Enter"]);
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("a press on a button with nothing focused Tabs in from the top (SC 232 triage)", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const f = await seeded("ha-2", { fields: {
+        "#b1": { tag: "button", type: "", box: { x: 100, y: 100, width: 60, height: 30 } },
+        "#go": { tag: "button", type: "", box: { x: 100, y: 200, width: 160, height: 40 } },
+      } });
+      await drive(f.page.press("#go", "Enter"));
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(0);
+      expect(f.of("press").map((e) => e.a.k)).toEqual(["Tab", "Tab", "Enter"]);
     } finally { vi.useRealTimers(); }
   }, 60_000);
 

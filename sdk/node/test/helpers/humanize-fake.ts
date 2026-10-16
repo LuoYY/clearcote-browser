@@ -44,6 +44,7 @@ export interface Field {
   scrollTop?: number;
   appearAfterWait?: boolean;           // not visible until something waited for it
   control?: string;                    // a <label>: the selector of the checkbox its click is passed on to
+  textRect?: Box;                      // a <label>: its TEXT's rect (ISO_LABEL_OF `text`), when it is not the whole box
 }
 
 export interface FakeOpts {
@@ -114,7 +115,8 @@ export function makeFake(opts: FakeOpts = {}) {
     const lab = allFields().find((g) => g.tag === "label" && g.control === sel);
     return { tag: "input", type: f.type, rect: [f.box.x, f.box.y, f.box.width, f.box.height],
       hidden: f.visible === false || f.box.width <= 1, checked: !!f.checked, disabled: false,
-      label: lab ? { rect: [lab.box.x, lab.box.y, lab.box.width, lab.box.height], text: null, contains: false } : null };
+      label: lab ? { rect: [lab.box.x, lab.box.y, lab.box.width, lab.box.height],
+        text: lab.textRect ? [lab.textRect.x, lab.textRect.y, lab.textRect.width, lab.textRect.height] : null, contains: false } : null };
   };
   const labels = (f: Field) => (f.options ?? []).map((o) => (o.disabled ? null : o.label));
   const isSelect = (f: Field) => f.tag === "select";
@@ -165,7 +167,8 @@ export function makeFake(opts: FakeOpts = {}) {
     if (k === "End") { selAll = false; return; }
     if (k === "Tab") {   // lane D: Tab moves the focus along the fields (Shift: back) and selects a field's text
       const order = allFields();
-      const i = focus ? order.indexOf(focus) + (mods.has("Shift") ? -1 : 1) : -1;
+      // nothing focused: Tab enters the page at its first stop (Shift+Tab at the last), as the browser does
+      const i = focus ? order.indexOf(focus) + (mods.has("Shift") ? -1 : 1) : (mods.has("Shift") ? order.length - 1 : 0);
       focus = i >= 0 && i < order.length ? order[i] : null;
       selAll = !!focus && focus.tag === "input" && focus.value !== "";
       return;
@@ -337,9 +340,15 @@ export function makeFake(opts: FakeOpts = {}) {
             const order = allFields();
             const text = (g: Field | null) => !!g && (g.tag === "textarea" || (g.tag === "input" && ["text", "search", ""].includes(g.type)));
             const ai = focus ? order.indexOf(focus) : -1;
-            return { result: { value: { dist: ai >= 0 ? order.indexOf(f) - ai : null, fromText: text(focus), focused: focus === f,
+            const ti = order.indexOf(f);
+            let near: { off: number; rect: number[] } | null = null;   // the text stop 1-3 before f (or 1 after) a hand clicks into and Tabs from
+            for (const off of [1, 2, 3, -1]) {
+              const c = order[ti - off];
+              if (c && c !== focus && text(c)) { near = { off, rect: [c.box.x, c.box.y, c.box.width, c.box.height] }; break; }
+            }
+            return { result: { value: { dist: ai >= 0 ? ti - ai : null, fromText: text(focus), focused: focus === f,
               activatable: f.tag === "button" || f.tag === "select" || f.type === "checkbox", text: text(f), tag: f.tag,
-              type: f.type, n: order.length } } };
+              type: f.type, n: order.length, noAnchor: ai < 0, near } } };
           }
           if (params.functionDeclaration !== ISO_DESCRIBE) return { exceptionDetails: { text: "unknown call" } };
           return { result: { value: f ? describeInfo(f, arg?.want ?? null) : null } };

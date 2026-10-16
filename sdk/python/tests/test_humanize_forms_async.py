@@ -40,9 +40,10 @@ class Field:
                  maxlength=-1, autocomplete=None, inputmode=None, bl=2.0, bt=2.0, options=None,
                  selected_index=0, multiple=False, size=0, no_select_all=False, never_commit=False,
                  stubborn=False, visible=True, covered=False, fmt=None, rmin=None, rmax=None, rstep=None,
-                 cover_center=False, in_frame=False, appear_on_wait=False, control=None):
+                 cover_center=False, in_frame=False, appear_on_wait=False, control=None, text_rect=None):
         self.tag, self.type, self.value, self.rect = tag, type, value, rect
         self.control = control                    # a <label>: the checkbox its click is passed on to
+        self.text_rect = text_rect                # a <label>: its TEXT's rect (LABEL_OF `text`), when it is not the whole box
         self.label = None                         # a checkbox: its <label> Field (set by the label)
         if control is not None:
             control.label = self
@@ -121,7 +122,8 @@ class Field:
              "hidden": (not self.visible) or w <= 1 or h <= 1, "checked": self.checked, "disabled": False,
              "label": None}
         if self.label is not None:
-            o["label"] = {"rect": list(self.label.rect), "text": None, "contains": False}
+            tr = getattr(self.label, "text_rect", None)
+            o["label"] = {"rect": list(self.label.rect), "text": list(tr) if tr else None, "contains": False}
         return o
 
     def click(self, x, y, mods):
@@ -2221,6 +2223,28 @@ def test_a_visible_checkbox_is_clicked_on_its_label_text_about_40_percent_of_the
         share = sum(on_label) / len(on_label)
         assert 0.2 <= share <= 0.6, share
         assert any(on_label) and not all(on_label)
+    run(go())
+
+
+def test_a_visible_labels_click_is_hit_tested_on_the_label_element_not_its_text_rect(fast, monkeypatch):
+    # SC 232 lab triage (10-16): the click AIMS inside the label's TEXT rect, but HIT_IN_BOX proves "the node at
+    # (x, y) is the element filling box b" -- and no element fills the text's own rect; only the <label> fills the
+    # label's. Asked with the text rect, the test failed on every visible label and the click went to the input:
+    # 0 of 20 label clicks on verifier B's fixture, 0 of 18 in the lab, on d2b9ab6. The simulator answers
+    # HIT_IN_BOX the way the browser does: the hit node's own rect against the asked box.
+    async def go():
+        monkeypatch.setattr(H, "label_draw", lambda *a, **k: True)   # this click: the label (the trait is not the question)
+        cb = Field(type="checkbox", rect=(100.0, 100.0, 16.0, 16.0))
+        lab = Field(tag="label", type="", rect=(96.0, 96.0, 420.0, 24.0), control=cb, text_rect=(124.0, 100.0, 110.0, 16.0))
+        p = Page(("#cb", cb), ("#lab", lab))
+        await H.attach_humanize(None, p, humanize=True, seed="label-hit")
+        await p.check("#cb")
+        assert cb.checked and not non_trial(p)
+        downs = kinds(p, "down")
+        assert len(downs) == 1
+        x, y = downs[0][4]
+        assert lab.inside(x, y) and not cb.inside(x, y), (x, y)
+        assert 124.0 <= x <= 234.0 and 100.0 <= y <= 116.0, "the press lands in the label's text"
     run(go())
 
 

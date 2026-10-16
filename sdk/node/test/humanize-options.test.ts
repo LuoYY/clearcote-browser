@@ -108,7 +108,12 @@ describe("fallback report and strict mode", () => {
 
   it("onFallback for a forced hidden fill and a press on a button", async () => {
     const events: any[] = [];
-    const f = await attached({ fields: { "#t": { visible: false }, "#b": { tag: "button", type: "" } } },
+    // SC 232 triage: a button is now also reached by a click into a text stop within 3 of it or, with nothing
+    // focused, by Tab from the top when it comes within 3 stops of the ring -- so the fallback case needs a button
+    // with no text stop near it and 4 stops from the top (b1-b3 are buttons; #t is the fake's first stop)
+    const b = (y: number) => ({ tag: "button", type: "", box: { x: 100, y, width: 60, height: 30 } });
+    const f = await attached({ fields: { "#t": { visible: false }, "#b1": b(120), "#b2": b(160), "#b3": b(200),
+      "#b": { tag: "button", type: "", box: { x: 100, y: 260, width: 160, height: 40 } } } },
       { onFallback: (e: any) => events.push(e) });
     await f.page.fill("#t", "x", { force: true });
     await f.page.press("#b", "Enter");

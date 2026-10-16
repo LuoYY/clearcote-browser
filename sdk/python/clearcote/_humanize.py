@@ -2217,14 +2217,43 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             raise _Native("the click did not put the caret in the field")
         time.sleep(_rand(40, 120) / 1000.0)
 
+    def _tab_via_field(loc, info, selector, td):
+        """Reach the activatable control ``info``, out of Tab reach of the focus, the way a keyboard user
+        does: a click into the text-entry stop 1-3 before it (or 1 after) -- ``td["near"]`` from
+        TAB_DISTANCE -- then Tab across. True once focus is verified on it; False (nothing pressed, or the
+        click or the Tabs went elsewhere) = the caller's next route."""
+        near = (td or {}).get("near")
+        if not near or not near.get("rect") or native_kb_press is None:
+            return False
+        r = near["rect"]
+        nbox = {"x": float(r[0]), "y": float(r[1]), "width": float(r[2]), "height": float(r[3])}
+        if not _focus_click(nbox):
+            return False
+        time.sleep(_rand(40, 120) / 1000.0)
+        return _tab_into(loc, info, selector, force=True)
+
+    def _tab_from_start(loc, info, selector):
+        """Nothing has the focus: one Tab enters the page (its first stop, or the one after whatever had
+        the focus last), then the control is reached when it is within 3 stops of the focus ring. True
+        once focus is verified on it."""
+        if native_kb_press is None:
+            return False
+        _press_key("Tab")
+        time.sleep(_rand(110, 260) / 1000.0)   # the eye finds the focus ring
+        if _focused(loc):
+            return True
+        return _tab_into(loc, info, selector, force=True)
+
     def _focus_target(selector, timeout):
         """Give ``selector`` -- any focusable element, a button or a link as well as a field -- the
         keyboard focus the way a person does. Tab when it is 1-3 stops from the focused element (always
         for something a click would ACTIVATE: a button, a link, a checkbox); otherwise a humanized click
-        (glide + press) for what a click only focuses (a field, a tabindex container). True when focus
-        is verified there. False for an activatable target out of Tab reach: the pointer has glided
-        onto it and the caller gives it the focus natively (a reported fallback), never the 0 ms
-        native press."""
+        (glide + press) for what a click only focuses (a field, a tabindex container). An activatable
+        target out of Tab reach is reached as a keyboard user reaches it: a click into the text field
+        next to it and Tab across (_tab_via_field), or, with nothing focused, Tab in from the top and
+        follow the focus ring (_tab_from_start). True when focus is verified there. False when none of
+        that reached it: the pointer has glided onto it and the caller gives it the focus natively (a
+        reported fallback), never the 0 ms native press."""
         loc = page.locator(selector).first
         if _focused(loc):
             return True
@@ -2243,6 +2272,14 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 time.sleep(_rand(40, 120) / 1000.0)
                 return True
             raise _Native("the focus click did not focus it")
+        if act and td and not info.get("disabled"):
+            # SC 232 lab triage (10-16): an activatable target out of Tab reach -- the usual case for a button
+            # when the focus is far away or nowhere -- got the pointer over it and Playwright's focus (reported):
+            # 0 of 4 presses on verifier B's buttons, 6 of 12 in the lab, on d2b9ab6.
+            if _tab_via_field(loc, info, selector, td):
+                return True
+            if td.get("noAnchor") and _tab_from_start(loc, info, selector):
+                return True
         x, y = click_point(box, st["pos"], persona)
         _glide(float(round(x)), float(round(y)))   # the hand goes to it; the focus has to be given
         return False
@@ -2886,7 +2923,15 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 return None
             r = lab["label"].get("text") or lab["label"]["rect"]
             lbox = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
-            return lbox if lbox["width"] >= 2 and lbox["height"] >= 2 else None
+            if lbox["width"] < 2 or lbox["height"] < 2:
+                return None
+            # The click AIMS inside the label's text, but the hit test is asked about the LABEL ELEMENT's box:
+            # HIT_IN_BOX proves "the node at (x, y) is the element filling box b", and no element fills the text's
+            # own rect. Asked with the text rect it failed on every visible label, so the click went to the input:
+            # 0 of 20 label clicks (verifier B) and 0 of 18 (the lab) on d2b9ab6 (SC 232 triage, 10-16).
+            lr = lab["label"]["rect"]
+            lbox["hit"] = {"x": lr[0], "y": lr[1], "width": lr[2], "height": lr[3]}
+            return lbox
         # Not visible: Playwright would wait for it and time out. A plain-CSS selector can still be
         # resolved in the isolated world (Playwright must count the same elements, as _css_box).
         if not isinstance(selector, str) or not selector:
@@ -2913,7 +2958,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         x, y = click_point(lbox, st["pos"], persona)
         x, y = float(round(x)), float(round(y))
         time.sleep(0.05)
-        if _hit_in_box(lbox, x, y) is False:
+        if _hit_in_box(lbox.get("hit") or lbox, x, y) is False:   # the label element's box (see _label_aim)
             return False
         _glide(x, y)
         _press_at(x, y, normalize_click_options({}, _platform()))
