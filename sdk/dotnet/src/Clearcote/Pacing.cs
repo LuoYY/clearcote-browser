@@ -81,13 +81,14 @@ internal static class Pacing
     /// </summary>
     public static async Task<int> WalkAsync(IReadOnlyList<Step> steps, Func<double, double, Task> move,
         Func<double>? now = null, Func<double, Task>? sleep = null, double maxJump = MaxJumpPx,
-        Func<int, bool>? pinned = null, string kind = "glide")
+        Func<int, bool>? pinned = null, string kind = "glide", int buttons = 0)
     {
         now ??= RealNow;
         sleep ??= RealSleep;
         if (steps.Count == 0) return 0;
         // Score hook (HumanizeTrace, SC 232): with CLEARCOTE_HUMANIZE_SCORE set the dispatched samples and their
-        // ACTUAL dispatch times are scored after the walk, as `kind`. Read-only: it changes nothing here.
+        // ACTUAL dispatch times are scored after the walk, as `kind` (glide | drag | ambient | hover); `buttons`
+        // (a drag leg: 1) is carried on every sample. Read-only: it changes nothing here.
         var trace = HumanizeTrace.Enabled ? new List<MotionSample>() : null;
         var (due, total) = Schedule(steps);
         double t0 = now(), tLast = t0, tStart = t0;
@@ -107,7 +108,7 @@ internal static class Pacing
                 throw;
             }
             sent++;
-            trace?.Add(new MotionSample(s.X, s.Y, tb - tStart));
+            trace?.Add(new MotionSample(s.X, s.Y, tb - tStart, buttons));
             // Measured on PRO r38 under load: one move answered after 523 ms. Catching that up by skipping
             // coarsened the rest of the glide to maximum hops, and across the fixture's iframe the page saw
             // a 110 px jump. A stall pauses the plan; only StallMs of it is caught up.

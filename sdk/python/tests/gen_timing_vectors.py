@@ -38,7 +38,8 @@ def main():
                     "grab_ms": t.grab_ms, "release_ms": t.release_ms, "dblclick_gap_ms": t.dblclick_gap_ms,
                     "pause_scale": t.pause_scale, "typo_rate": t.typo_rate})
         a = aim_traits(p)
-        aim.append({"persona": pid, "spread": a.spread, "undershoot": a.undershoot, "side_bias": a.side_bias})
+        aim.append({"persona": pid, "spread": a.spread, "undershoot": a.undershoot, "side_bias": a.side_bias,
+                    "label_share": a.label_share})
         r = mulberry32(100 + k)
         g, rel = drag_dwell(p, r)
         d = {"persona": pid, "rng": 100 + k, "click_hold": click_hold(p, r), "key_dwell": key_dwell(p, r),

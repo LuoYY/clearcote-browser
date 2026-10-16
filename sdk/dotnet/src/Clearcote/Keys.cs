@@ -20,7 +20,7 @@ public sealed record RepeatPlan(double FirstMs, double GapMs, double ReleaseMs);
 
 public static class Keys
 {
-    private const uint KeysSalt = 0x27D4EB2F;
+    private const uint KeysSalt = 0xD3A2646C; // own stream (was 0x27D4EB2F = the aim salt)
     private const double NominalDwellMs = 80;
     public const double MinFlightMs = 25;
     /// <summary>Share of whole-word slip corrections made with the word-delete chord and a retype.</summary>

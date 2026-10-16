@@ -46,9 +46,11 @@ export interface WalkOpts<S extends PacedStep> {
   sleep?: (ms: number) => Promise<unknown>;
   maxJump?: number;
   pinned?: (s: S, i: number) => boolean;    // a step that changes button state: never skipped
-  /** The action kind for the score hook (trace.ts: glide | drag | ambient). With CLEARCOTE_HUMANIZE_SCORE
+  /** The action kind for the score hook (trace.ts: glide | drag | ambient | hover). With CLEARCOTE_HUMANIZE_SCORE
    *  set, the dispatched samples and their actual dispatch times are scored after the walk. Read-only. */
   kind?: string;
+  /** The button bitmask held through the walk (a drag leg: 1), carried on every recorded sample. */
+  buttons?: number;
 }
 
 const realNow = (): number => performance.now();
@@ -86,8 +88,9 @@ export async function walk<S extends PacedStep>(
   const maxJump = o.maxJump ?? MAX_JUMP_PX;
   const pinned = o.pinned ?? (() => false);
   if (!steps.length) return 0;
-  const trace: { x: number; y: number; t: number }[] | null = traceEnabled() ? [] : null;
+  const trace: { x: number; y: number; t: number; buttons?: number }[] | null = traceEnabled() ? [] : null;
   const kind = o.kind ?? "glide";
+  const buttons = o.buttons ?? 0;
   const { due, total } = schedule(steps);
   let t0 = now();
   const tStart = t0;
@@ -105,7 +108,7 @@ export async function walk<S extends PacedStep>(
       return sent;
     }
     sent++;
-    trace?.push({ x: s.x, y: s.y, t: tb - tStart });
+    trace?.push(buttons ? { x: s.x, y: s.y, t: tb - tStart, buttons } : { x: s.x, y: s.y, t: tb - tStart });
     t0 += stallMs(now() - tb);
     last = { x: s.x, y: s.y };
     tLast = tb;

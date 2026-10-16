@@ -186,6 +186,7 @@ public class TimingAimTests
             Assert.True(Close(a.Spread, t.GetProperty("spread").GetDouble(), 1e-12));
             Assert.True(Close(a.Undershoot, t.GetProperty("undershoot").GetDouble(), 1e-12));
             Assert.True(Close(a.SideBias, t.GetProperty("side_bias").GetDouble(), 1e-12));
+            Assert.True(Close(a.LabelShare, t.GetProperty("label_share").GetDouble(), 1e-12));
         }
     }
 

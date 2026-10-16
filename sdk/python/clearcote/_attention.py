@@ -20,7 +20,7 @@ import random
 from typing import Callable, Optional
 
 from ._hzoptions import options_of
-from ._motion import Persona, _clamp, _lerp, after_traits
+from ._motion import Persona, _clamp, _lerp, _tempo, after_traits
 
 Rng = Callable[[], float]
 
@@ -52,8 +52,9 @@ def read_pause_ms(text_len, p: Persona, rng: Optional[Rng] = None) -> float:
     except (TypeError, ValueError):
         n = 0.0
     frac = math.sqrt(_clamp(n / READ_CAP_CHARS, 0.0, 1.0))
-    ms = (READ_MIN_MS + (READ_MAX_MS - READ_MIN_MS) * frac) * after_traits(p).read_tempo * _lerp(0.85, 1.15, rng())
-    return _clamp(ms, READ_MIN_MS, READ_MAX_MS)
+    t = _tempo(p)   # the preset (careful / quick) scales the read pause and its band
+    ms = (READ_MIN_MS + (READ_MAX_MS - READ_MIN_MS) * frac) * after_traits(p).read_tempo * t * _lerp(0.85, 1.15, rng())
+    return _clamp(ms, READ_MIN_MS * t, READ_MAX_MS * t)
 
 
 def explore_notches(rng: Optional[Rng] = None) -> int:

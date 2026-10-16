@@ -200,6 +200,11 @@ export function applyToPersona<P extends object>(persona: P, r: ResolvedHumanize
   p.tempo = t;
   p.pauseScale = t;
   p.handedness = r.handedness;
+  if ((r.handedness === "left" || r.handedness === "right") && typeof p.approachBias === "number") {
+    // the persona's handedness is the sign of its approach bias (path bow side, click side bias): the option fixes
+    // the sign and keeps the drawn magnitude ("right" = positive)
+    p.approachBias = r.handedness === "right" ? Math.abs(p.approachBias) : -Math.abs(p.approachBias);
+  }
   p.inputDevice = r.inputDevice;
   if (t !== 1) {
     for (const k of ["grabMinMs", "grabMaxMs", "releaseMinMs", "releaseMaxMs", "clickHoldMinMs", "clickHoldMaxMs", "keyDwellMinMs", "keyDwellMaxMs"]) {

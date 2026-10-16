@@ -25,7 +25,10 @@ public class HumanizeCoverageTests : IClassFixture<FormsLiveBrowser>
         var db = Enumerable.Range(0, 20).Select(_ => Humanize.LabelDraw(b)).ToList();
         Assert.NotEqual(da, db);
         var share = Enumerable.Range(0, 4000).Count(_ => Humanize.LabelDraw(a)) / 4000.0;
-        Assert.InRange(share, Humanize.LabelShare - 0.05, Humanize.LabelShare + 0.05);
+        // a persona trait now (lane B's aim traits, 0.25-0.55), not one 0.4 for every identity
+        Assert.Equal(Humanize.LabelShareOf(a), Humanize.LabelShareOf(b));
+        Assert.InRange(Humanize.LabelShareOf(a), 0.25, 0.55);
+        Assert.InRange(share, Humanize.LabelShareOf(a) - 0.05, Humanize.LabelShareOf(a) + 0.05);
         Assert.Equal(Enumerable.Range(0, 20).Select(_ => Humanize.LabelDraw(a, new Random(7))),
                      Enumerable.Range(0, 20).Select(_ => Humanize.LabelDraw(a, new Random(7))));
     }

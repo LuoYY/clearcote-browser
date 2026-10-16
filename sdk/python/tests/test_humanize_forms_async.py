@@ -1908,7 +1908,10 @@ def test_same_seed_same_label_trait_but_unseeded_per_click_choices():
     from clearcote import _humanize
     from clearcote._motion import make_persona
     a, b = make_persona("same-identity"), make_persona("same-identity")
-    assert _humanize.label_share(a) == _humanize.label_share(b) == _humanize.LABEL_SHARE
+    from clearcote._motion import aim_traits
+    # a persona trait now (lane B's aim traits, 0.25-0.55), not one 0.4 for every identity
+    assert _humanize.label_share(a) == _humanize.label_share(b) == aim_traits(a).label_share
+    assert 0.25 <= _humanize.label_share(a) <= 0.55
     da = [_humanize.label_draw(a) for _ in range(20)]
     db = [_humanize.label_draw(b) for _ in range(20)]
     assert da != db, "two sessions of one identity made the same 20 choices"

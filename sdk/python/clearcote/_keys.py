@@ -24,7 +24,7 @@ import math
 from ._motion import _MASK, _lerp, gauss_from, mulberry32
 
 # Salt for the typing-identity stream (see the module docstring).
-_KEYS_SALT = 0x27D4EB2F
+_KEYS_SALT = 0xD3A2646C   # own stream (was 0x27D4EB2F = the aim salt: WPM moved with the aim spread)
 
 # Nominal keydown->keyup dwell subtracted from the WPM interval to get the keyup->keydown flight (the
 # wrappers add the persona's own dwell on every key).

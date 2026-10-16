@@ -1,18 +1,25 @@
-// A copy of the fake page of humanize-forms.test.ts (lines 27-389 of 0.51.0), exported for the options tests
-// (humanize-options.test.ts). Kept separate so neither test file imports the other (vitest would run both).
+// The fake page every humanize unit test shares (SC 232 integration): humanize-forms.test.ts (lanes B-F),
+// humanize-options.test.ts (lane A) and humanize-trace-taps.test.ts. It was duplicated here from the forms test by
+// lane A and drifted (lanes D/E/F extended the forms copy); now the forms test imports this one. No vitest imports:
+// the test files own their mocks (humanize-forms.test.ts mocks ../src/motion.js, which reaches this module's
+// attachHumanize too).
 import { attachHumanize } from "../../src/humanize.js";
+import * as ISO from "../../src/isolated.js";
 import {
-  ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL,
-  ISO_SCROLL_BY, ISO_VIEWPORT,
+  ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL, ISO_SCROLL_BY, ISO_VIEWPORT,
 } from "../../src/isolated.js";
+// lane F names, read through the module so this file still loads against an SDK without them
+const ISO_LABEL_OF: string = (ISO as any).ISO_LABEL_OF ?? "<no ISO_LABEL_OF>";
+const ISO_LABEL_BY_SEL: string = (ISO as any).ISO_LABEL_BY_SEL ?? "<no ISO_LABEL_BY_SEL>";
 import { typeaheadSimulate } from "../../src/forms.js";
+import { BLANK_POINT, FOCUSABLE, SELECTION_STATE, TAB_DISTANCE } from "../../src/keys.js";
 
-const SLOW = 30_000; // glides and holds use real sleeps
+export const SLOW = 30_000; // glides and holds use real sleeps
 
-type Ev = { t: string; a?: any; ts: number };
-type Box = { x: number; y: number; width: number; height: number };
+export type Ev = { t: string; a?: any; ts: number };
+export type Box = { x: number; y: number; width: number; height: number };
 
-interface Field {
+export interface Field {
   tag: string;
   type: string;
   value: string;
@@ -36,6 +43,7 @@ interface Field {
   rowH?: number;                       // a list box: each row is rowH px, scrolled by scrollTop
   scrollTop?: number;
   appearAfterWait?: boolean;           // not visible until something waited for it
+  control?: string;                    // a <label>: the selector of the checkbox its click is passed on to
 }
 
 export interface FakeOpts {
@@ -60,12 +68,12 @@ export const timeoutError = (msg = "Timeout 1500ms exceeded.") => Object.assign(
 export const protoCalls: { m: string; args: any[] }[] = [];
 const ORIG = ["fill", "click", "type", "dblclick", "hover", "press", "pressSequentially", "clear", "tap", "check",
   "uncheck", "setChecked", "selectOption", "dragTo"];
-const locatorProto: Record<string, any> = {};
+export const locatorProto: Record<string, any> = {};
 for (const m of ORIG) locatorProto[m] = async function (...args: any[]) { protoCalls.push({ m, args }); return `proto-${m}`; };
 
-const MAIN_FRAME = { name: "main" };
-const allExpressions: string[] = [];
-const FOCUS_QUERY = { focusQuery: true };
+export const MAIN_FRAME = { name: "main" };
+export const allExpressions: string[] = [];
+export const FOCUS_QUERY = { focusQuery: true };
 
 export function makeFake(opts: FakeOpts = {}) {
   const defBox: Box = opts.box ?? { x: 100, y: 200, width: 160, height: 40 };
@@ -96,7 +104,16 @@ export function makeFake(opts: FakeOpts = {}) {
   const inBox = (b: Box, x: number, y: number) => x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height;
   const overlayAt = (f: Field, x: number, y: number) =>
     opts.covered || (opts.coveredCentre && x > f.box.x + f.box.width * 0.25 && x < f.box.x + f.box.width * 0.75);
-  const fieldAt = (x: number, y: number) => allFields().find((f) => inBox(f.box, x, y)) ?? null;
+  const fieldAt = (x: number, y: number) => allFields().find((f) => f.visible !== false && inBox(f.box, x, y)) ?? null;
+  // what ISO_LABEL_OF reads from a checkbox: its label is the field whose `control` names it
+  const labelOf = (f: Field) => {
+    if (f.tag !== "input" || !["checkbox", "radio"].includes(f.type)) return null;
+    const sel = Object.keys(fields).find((k) => fields[k] === f);
+    const lab = allFields().find((g) => g.tag === "label" && g.control === sel);
+    return { tag: "input", type: f.type, rect: [f.box.x, f.box.y, f.box.width, f.box.height],
+      hidden: f.visible === false || f.box.width <= 1, checked: !!f.checked, disabled: false,
+      label: lab ? { rect: [lab.box.x, lab.box.y, lab.box.width, lab.box.height], text: null, contains: false } : null };
+  };
   const labels = (f: Field) => (f.options ?? []).map((o) => (o.disabled ? null : o.label));
   const isSelect = (f: Field) => f.tag === "select";
   const listbox = (f: Field) => isSelect(f) && (f.multiple || (f.size ?? 0) > 1);
@@ -144,6 +161,14 @@ export function makeFake(opts: FakeOpts = {}) {
       return;
     }
     if (k === "End") { selAll = false; return; }
+    if (k === "Tab") {   // lane D: Tab moves the focus along the fields (Shift: back) and selects a field's text
+      const order = allFields();
+      const i = focus ? order.indexOf(focus) + (mods.has("Shift") ? -1 : 1) : -1;
+      focus = i >= 0 && i < order.length ? order[i] : null;
+      selAll = !!focus && focus.tag === "input" && focus.value !== "";
+      return;
+    }
+    if (k === "Home" && mods.has("Shift")) { selAll = true; return; }
     if (Array.from(k).length === 1) typeChar(k);
   };
   // a list box: rows of rowH px inside the box's client area, scrolled by scrollTop
@@ -166,6 +191,12 @@ export function makeFake(opts: FakeOpts = {}) {
     const f = fieldAt(x, y);
     if (f && overlayAt(f, x, y)) { focus = opts.labelPassesFocus ? f : null; rec("overlay-click", { x, y }); return; }
     if (!f) return;
+    if (f.tag === "label" && f.control) {
+      const c = fieldFor(f.control);
+      rec("label-click", f.control);
+      if (c && !c.stubborn) { c.checked = !c.checked; rec("toggle", c.checked); }
+      return;
+    }
     focus = f;
     if (f.type === "checkbox") {
       if (f.stubborn) { rec("toggle-cancelled"); return; }
@@ -186,7 +217,12 @@ export function makeFake(opts: FakeOpts = {}) {
     move: async (x: number, y: number) => { pos = { x, y }; rec("move", { x, y }); },
     click: async (x: number, y: number, o: any = {}) => { pos = { x, y }; rec("click", { x, y, ...o }); pressed(x, y, false); },
     down: async (o: any = {}) => { rec("down", o); },
-    up: async (o: any = {}) => { rec("up", o); pressed(pos.x, pos.y, mods.has("ControlOrMeta") || mods.has("Control")); },
+    up: async (o: any = {}) => {
+      rec("up", o);
+      if (o.clickCount === 3 && focus && fieldAt(pos.x, pos.y) === focus) { selAll = true; return; } // a triple click selects
+      if (o.clickCount > 1) return;
+      pressed(pos.x, pos.y, mods.has("ControlOrMeta") || mods.has("Control"));
+    },
     wheel: async (dx: number, dy: number) => {
       rec("wheel", { dx, dy });
       const f = fieldAt(pos.x, pos.y);
@@ -214,7 +250,7 @@ export function makeFake(opts: FakeOpts = {}) {
 
   const describeInfo = (f: Field, want: string | null) => {
     if (want === "select" && !isSelect(f)) return null;
-    if (want && want !== "select" && !["input", "textarea", "select"].includes(f.tag)) return null;
+    if (want && want !== "select" && want !== FOCUSABLE && !["input", "textarea", "select"].includes(f.tag)) return null;
     const o: any = {
       tag: f.tag, type: f.tag === "input" ? f.type : "", ce: false,
       rect: [f.box.x, f.box.y, f.box.width, f.box.height], focused: focus === f, value: f.value, min: f.min ?? null, max: f.max ?? null,
@@ -248,6 +284,22 @@ export function makeFake(opts: FakeOpts = {}) {
           if (e.startsWith(`(${ISO_PLATFORM})`)) return { result: { value: "Win32" } };
           if (e.startsWith(`(${ISO_VIEWPORT})`)) return { result: { value: [1280, 800] } };
           if (e.startsWith(`(${ISO_SCROLL_BY})`)) return { result: { value: [0, 0] } };
+          if (e.startsWith(`(${ISO_LABEL_BY_SEL})`)) {
+            const a = argOf(e, ISO_LABEL_BY_SEL);
+            const f = fieldFor(a.sel);
+            if (!f) return { result: { value: { n: 0 } } };
+            const o = labelOf(f);
+            return { result: { value: o ? { ...o, n: 1 } : { n: 1 } } };
+          }
+          if (e.startsWith(`(${SELECTION_STATE})`)) {   // lane D: select-all is the selection the fake knows
+            if (!focus) return { result: { value: null } };
+            const n = Array.from(focus.value).length;
+            return { result: { value: selAll ? [0, n, n] : [n, n, n] } };
+          }
+          if (e.startsWith(`(${BLANK_POINT})`)) {      // lane D: a blank point under the field
+            const a = argOf(e, BLANK_POINT);
+            return { result: { value: [a.box.x + a.box.width / 2, a.box.y + a.box.height + 200] } };
+          }
           if (e.startsWith(`(${ISO_CSS_BOX})`)) {
             const a = argOf(e, ISO_CSS_BOX);
             if (/internal:|>>/.test(a.sel)) return { result: { value: null } }; // not CSS the browser accepts
@@ -276,6 +328,17 @@ export function makeFake(opts: FakeOpts = {}) {
               && Math.abs(b.width - arg.width) <= 1.5 && Math.abs(b.height - arg.height) <= 1.5 } };
           }
           if (params.functionDeclaration === ISO_LISTBOX_ROW) return { result: { value: f ? listboxState(f, arg.i) : null } };
+          if (params.functionDeclaration === ISO_LABEL_OF) return { result: { value: f ? labelOf(f) : null } };
+          if (params.functionDeclaration === TAB_DISTANCE) {
+            // lane D: the Tab order is the fields' order; text = an input of a text type or a textarea
+            if (!f) return { result: { value: null } };
+            const order = allFields();
+            const text = (g: Field | null) => !!g && (g.tag === "textarea" || (g.tag === "input" && ["text", "search", ""].includes(g.type)));
+            const ai = focus ? order.indexOf(focus) : -1;
+            return { result: { value: { dist: ai >= 0 ? order.indexOf(f) - ai : null, fromText: text(focus), focused: focus === f,
+              activatable: f.tag === "button" || f.tag === "select" || f.type === "checkbox", text: text(f), tag: f.tag,
+              type: f.type, n: order.length } } };
+          }
           if (params.functionDeclaration !== ISO_DESCRIBE) return { exceptionDetails: { text: "unknown call" } };
           return { result: { value: f ? describeInfo(f, arg?.want ?? null) : null } };
         }
@@ -307,7 +370,9 @@ export function makeFake(opts: FakeOpts = {}) {
     click: nativeFn("click"), hover: nativeFn("hover"), dblclick: nativeFn("dblclick"), fill: nativeFn("fill"),
     press: nativeFn("press"), type: nativeFn("type"), selectOption: nativeFn("selectOption"),
     check: nativeFn("check"), uncheck: nativeFn("uncheck"), setChecked: nativeFn("setChecked"),
-    focus: async () => undefined, on: () => undefined, mainFrame: () => MAIN_FRAME, waitForTimeout: async () => undefined,
+    // Playwright's focus (what a press on an activatable target out of Tab reach falls back to): recorded
+    focus: async (sel: string, ...args: any[]) => { natives.push({ m: "focus", args: [sel, ...args] }); focus = fields[sel] ?? single; },
+    on: () => undefined, mainFrame: () => MAIN_FRAME, waitForTimeout: async () => undefined,
     viewportSize: () => ({ width: 1280, height: 800 }),
     evaluate: () => { throw new Error("humanize must not evaluate in the page's world"); },
     context: () => ({ newCDPSession: async () => cdp, browser: () => null }),
@@ -358,8 +423,8 @@ export function makeFake(opts: FakeOpts = {}) {
 }
 
 export type Fake = ReturnType<typeof makeFake>;
-export const attached = async (o: FakeOpts = {}, humanize: any = true): Promise<Fake> => {
+export const attached = async (o: FakeOpts = {}, humanize: unknown = true): Promise<Fake> => {
   const f = makeFake(o);
-  await attachHumanize({} as never, f.page, { humanize, seed: "forms-unit" });
+  await attachHumanize({} as never, f.page, { humanize: humanize as any, seed: "forms-unit" });
   return f;
 };

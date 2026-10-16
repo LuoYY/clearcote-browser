@@ -43,8 +43,9 @@ public static class Attention
         rng ??= Random.Shared.NextDouble;
         double n = double.IsFinite(textLen) ? textLen : 0;
         double frac = Math.Sqrt(Clamp(n / ReadCapChars, 0, 1));
-        double ms = (ReadMinMs + (ReadMaxMs - ReadMinMs) * frac) * Motion.AfterTraitsOf(p).ReadTempo * Lerp(0.85, 1.15, rng());
-        return Clamp(ms, ReadMinMs, ReadMaxMs);
+        double t = Humanize.TempoOf(p);   // the preset (careful / quick) scales the read pause and its band
+        double ms = (ReadMinMs + (ReadMaxMs - ReadMinMs) * frac) * Motion.AfterTraitsOf(p).ReadTempo * t * Lerp(0.85, 1.15, rng());
+        return Clamp(ms, ReadMinMs * t, ReadMaxMs * t);
     }
 
     /// <summary>0 (most loads) or 1–3 exploratory wheel notches down, in <see cref="ExploreRate"/> of loads.</summary>
@@ -186,12 +187,16 @@ public static partial class Humanize
         }, after: false);
     }
 
-    private static async Task WalkStepsAsync(IPage page, PointerState st, IReadOnlyList<Step> steps)
+    /// <summary>Walk planned after-action steps (ambient drift, hover dwell): the preset's tempo scales the sample gaps
+    /// as GlideAsync does, and the score hook (HumanizeTrace) sees them as <paramref name="kind"/>.</summary>
+    private static async Task WalkStepsAsync(IPage page, PointerState st, IReadOnlyList<Step> steps, string kind = "ambient")
     {
         if (steps.Count == 0) return;
         var vp = await ViewBoundsAsync(page, st).ConfigureAwait(false);
+        double t = Tempo(page);   // HumanizeOptions.Preset: every planned duration x1.4 / x1.0 / x0.7 (as GlideAsync)
+        if (t != 1.0) steps = steps.Select(s => s with { SleepMs = s.SleepMs * t }).ToList();
         await Pacing.WalkAsync(vp is { } v ? Pacing.KeepInView(steps, v.W, v.H) : steps,
-            (x, y) => page.Mouse.MoveAsync((float)x, (float)y)).ConfigureAwait(false);
+            (x, y) => page.Mouse.MoveAsync((float)x, (float)y), kind: kind).ConfigureAwait(false);
         st.X = steps[^1].X;
         st.Y = steps[^1].Y;
         st.Known = true;
@@ -212,7 +217,7 @@ public static partial class Humanize
         else ms = Motion.DwellMs(p, rng);
         var steps = Motion.PlanDwell(new Point(x, y), new Box(bb.X, bb.Y, bb.Width, bb.Height), p, ms, rng);
         Trace(AfterOf(page), "dwell", ms, steps.Count);
-        await WalkStepsAsync(page, st, steps).ConfigureAwait(false);
+        await WalkStepsAsync(page, st, steps, kind: "hover").ConfigureAwait(false);
     }
 
     /// <summary>After a press: in the persona's 60–85 % of clicks a move-off comes due 200–700 ms after the release.

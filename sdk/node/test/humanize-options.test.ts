@@ -8,9 +8,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { attached, protoCalls } from "./helpers/humanize-fake.js";
-import { ClearcoteStrictError, humanizePayload, resolveHumanize } from "../src/hzoptions.js";
+import { ClearcoteStrictError, applyToPersona, humanizePayload, resolveHumanize } from "../src/hzoptions.js";
 import { perCallOff } from "../src/humanize.js";
-import { hashSeed, makePersona, mulberry32 } from "../src/motion.js";
+import { clickHold, dblclickGap, dragDwell, hashSeed, keyDwell, makePersona, moveOffDelayMs, mulberry32, pauseMs } from "../src/motion.js";
+import { readPauseMs } from "../src/attention.js";
 import { prepareLaunch } from "../src/cloud.js";
 
 const SLOW = 60_000;
@@ -112,9 +113,10 @@ describe("fallback report and strict mode", () => {
     await f.page.fill("#t", "x", { force: true });
     await f.page.press("#b", "Enter");
     expect(events.map((e) => [e.api, e.reason])).toEqual([
-      // lane D: a button press focuses by Tab / a focus click; this fake cannot describe its focusables
-      ["page.fill", "forced on a hidden target"], ["page.press", "the target cannot be described (no box)"]]);
-    expect(f.natives.map((n) => n.m)).toEqual(["fill", "press"]);
+      // lane D: a button press focuses by Tab (within 3 stops) or a focus click; on this fake the button is out of
+      // Tab reach, so the pointer glides onto it and Playwright's focus is used -- reported -- then the key is held
+      ["page.fill", "forced on a hidden target"], ["page.press", "focus: an activatable target out of Tab reach"]]);
+    expect(f.natives.map((n) => n.m)).toEqual(["fill", "focus"]);
   }, SLOW);
 
   it("a throwing onFallback stops the stock call", async () => {
@@ -168,14 +170,20 @@ describe("presets", () => {
   // The PLANNED time of one glide + one typed sentence on the fake page: every timer the humanizer asks for
   // is summed (and fired at once), so the measure does not depend on how loaded the machine is. Math.random
   // is seeded so every preset plans the same path; a preset also changes which thinking pauses are drawn,
-  // so several runs are summed.
+  // so several runs are summed. The pacer (pacing.ts walk) asks for `due - elapsed`, so performance.now is a
+  // VIRTUAL clock that only the summed timers advance: under full-suite load the real clock made the pacer
+  // ask for less (and skip samples) by an amount that differed between the presets (SC 232 integration).
   const planned = async (humanize: unknown): Promise<number> => {
     process.env[ENV] = "0";
     const realRandom = Math.random;
     const realTimeout = globalThis.setTimeout;
+    const realPerfNow = performance.now;
     let total = 0;
+    let vt = realPerfNow.call(performance);
+    performance.now = () => vt;
     (globalThis as any).setTimeout = (fn: (...a: any[]) => void, ms?: number, ...a: any[]) => {
       total += Number(ms) || 0;
+      vt += Number(ms) || 0;
       return realTimeout(fn, 0, ...a);
     };
     try {
@@ -189,6 +197,7 @@ describe("presets", () => {
     } finally {
       Math.random = realRandom;
       (globalThis as any).setTimeout = realTimeout;
+      performance.now = realPerfNow;
     }
     return total;
   };
@@ -201,6 +210,26 @@ describe("presets", () => {
     expect(Math.abs(quick / base - 0.7)).toBeLessThanOrEqual(0.7 * 0.15);
     expect(Math.abs(careful / base - 1.4)).toBeLessThanOrEqual(1.4 * 0.15);
   }, 120_000);
+
+  // Integration (lanes A x B/C/E; mirrors test_presets_scale_the_timing_medians_and_the_after_action_pauses): the
+  // preset's tempo scales the persona's timing MEDIANS (click hold, key dwell, grab/release, double-click gap,
+  // deliberation pauses) and the after-action pauses (move-off delay, read pause), not only the glide samples. The
+  // same draw (rng 0.5 = the median) on the default and on the careful / quick copies gives an exact ratio.
+  it("scales the timing medians and the after-action pauses, not only the glide samples", () => {
+    const mid = () => 0.5;
+    const plannedMs = (h: unknown): number[] => {
+      const p = applyToPersona(makePersona("tempo"), resolveHumanize(h)!);
+      const d = dragDwell(p, mid);
+      return [clickHold(p, mid), keyDwell(p, mid), d.grabMs, d.releaseMs, dblclickGap(p, mid), pauseMs(p, 200, 400, mid),
+        moveOffDelayMs(p, mid), readPauseMs(5000, p, mid)];
+    };
+    const base = plannedMs(true);
+    expect(base[0]).toBeGreaterThan(0);
+    expect(base[7]).toBeGreaterThan(0);
+    for (const [preset, t] of [["quick", 0.7], ["careful", 1.4]] as const) {
+      plannedMs({ preset }).forEach((v, i) => expect(v, `${preset} #${i}`).toBeCloseTo(base[i] * t, 9));
+    }
+  });
 });
 
 describe("same seed, same persona", () => {
@@ -225,7 +254,10 @@ describe("same seed, same persona", () => {
   it("no option changes the persona's draws", async () => {
     for (const h of [true, "strict", { preset: "careful", handedness: "right", typoRate: 0.1, ambient: "idle", engine: "all" }]) {
       const f = await attached({}, h);
-      expect(pick(f.page._clearcotePersona)).toEqual(pick(makePersona("forms-unit")));
+      // handedness fixes the SIGN of the drawn approach bias (integration of lanes A + B); the draw is unchanged
+      const abs = (v: number[]) => v.map((x, i) => (BASE[i] === "approachBias" ? Math.abs(x) : x));
+      expect(abs(pick(f.page._clearcotePersona))).toEqual(abs(pick(makePersona("forms-unit"))));
+      if (typeof h === "object" && h.handedness === "right") expect(f.page._clearcotePersona.approachBias).toBeGreaterThanOrEqual(0);
     }
   });
 });

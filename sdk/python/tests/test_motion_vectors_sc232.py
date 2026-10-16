@@ -5,9 +5,9 @@ node/test/motion-vectors-sc232.test.ts and MotionVectorsSc232Tests.cs read the s
 The vectors pin what origin/main ceb7983 plans; a planner change regenerates them with
 tests/gen_motion_vectors.py together with the matching change in all three SDKs.
 
-wheel_anchor: the anchor is inside the humanize closures today (and differs per SDK, see the generator).
-These tests check a pure ``_motion.wheel_anchor_point(vw, vh, rng)`` once lane E adds it, and skip with
-"API missing" until then.
+wheel_anchor: the anchor used to live inside the humanize closures and differed per SDK (see the generator);
+lane E (SC 232) made it one pure ``_motion.wheel_anchor_point(vw, vh, rng)`` in all three SDKs, so these
+tests call it directly (they skipped with "API missing" before the merge).
 """
 import json
 import os

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -323,7 +324,20 @@ public static partial class Humanize
     {
         public long? Typed;
         public readonly Dictionary<string, (long At, double Dwell)> Held = new();
+        /// <summary>The score hook's record of the typed run in progress (HumanizeTrace, lane G), else null.</summary>
+        public List<KeySample>? Rec;
     }
+
+    /// <summary>Score hook (HumanizeTrace, lane G): one key the typing path sent, while a typed run is being traced.
+    /// Modifiers are left out (their down/up brackets the real keys; the scorer rates the characters' cadence).</summary>
+    private static void RecKey(IPage page, string key, long t0)
+    {
+        var rec = KeysOf(page).Rec;
+        if (rec is null || key is "Shift" or "Control" or "Alt" or "Meta" or "ControlOrMeta") return;
+        double down = Stopwatch.GetElapsedTime(KeyRecEpoch, t0).TotalMilliseconds;
+        rec.Add(new KeySample(key, down, Stopwatch.GetElapsedTime(KeyRecEpoch).TotalMilliseconds));
+    }
+    private static readonly long KeyRecEpoch = Stopwatch.GetTimestamp();
     private static readonly ConditionalWeakTable<IPage, KeyState> KeyStates = new();
     private static KeyState KeysOf(IPage page) => KeyStates.GetValue(page, _ => new KeyState());
     private static readonly ConditionalWeakTable<IPage, TypingTraits> Traits = new();
@@ -1082,7 +1096,9 @@ public static partial class Humanize
     {
         for (int j = 0; j < n; j++)
         {
+            long t0 = Stopwatch.GetTimestamp();
             await page.Keyboard.PressAsync(key, new KeyboardPressOptions { Delay = (float)Motion.KeyDwell(p) }).ConfigureAwait(false);
+            RecKey(page, key, t0);
             if (j < n - 1) await Task.Delay((int)Motion.PauseMs(p, gapLo, gapHi)).ConfigureAwait(false);
         }
     }
@@ -1151,7 +1167,7 @@ public static partial class Humanize
         try
         {
             await page.Mouse.DownAsync().ConfigureAwait(false);
-            await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(sx, sy), to, p, grabMs).Steps).ConfigureAwait(false);
+            await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(sx, sy), to, p, grabMs / Tempo(page)).Steps).ConfigureAwait(false);
             st.X = to.X; st.Y = to.Y;
             await Task.Delay((int)Math.Round(releaseMs)).ConfigureAwait(false);     // settle before letting go
         }
@@ -1167,8 +1183,12 @@ public static partial class Humanize
     private static async Task WalkHeldAsync(IPage page, PointerState st, List<Step> steps)
     {
         var vp = await ViewBoundsAsync(page, st).ConfigureAwait(false);
+        // the preset scales the held walk like a glide (the hesitation window is passed in / Tempo(page))
+        double t = Tempo(page);
+        if (t != 1.0) steps = steps.Select(s => s with { SleepMs = s.SleepMs * t }).ToList();
+        // scored as a drag by the hook (HumanizeTrace): the held button on every sample
         await Pacing.WalkAsync(vp is { } v ? Pacing.KeepInView(steps, v.W, v.H) : steps,
-            (x, y) => page.Mouse.MoveAsync((float)x, (float)y)).ConfigureAwait(false);
+            (x, y) => page.Mouse.MoveAsync((float)x, (float)y), kind: "drag", buttons: 1).ConfigureAwait(false);
         if (steps.Count > 0) { st.X = steps[^1].X; st.Y = steps[^1].Y; }
     }
 
@@ -1301,13 +1321,13 @@ public static partial class Humanize
             await page.Mouse.DownAsync().ConfigureAwait(false);
             if (tp is (double, double) t0)
             {
-                await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(s.X, s.Y), new Point(t0.X, t0.Y), p, grabMs).Steps)
+                await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(s.X, s.Y), new Point(t0.X, t0.Y), p, grabMs / Tempo(page)).Steps)
                     .ConfigureAwait(false);
             }
             else
             {
                 await WalkHeldAsync(page, st, Motion.DragHesitation(new Point(s.X, s.Y),
-                    new Point(tb.X + tb.Width / 2.0, tb.Y + tb.Height / 2.0), p, null, grabMs)).ConfigureAwait(false);
+                    new Point(tb.X + tb.Width / 2.0, tb.Y + tb.Height / 2.0), p, null, grabMs / Tempo(page))).ConfigureAwait(false);
                 // the drop zone is out of view: the free hand scrolls it in while the other holds
                 async Task<Box?> TFn() => await PeekBoxAsync(target).ConfigureAwait(false) is { } r ? new Box(r.X, r.Y, r.Width, r.Height) : null;
                 var res = await Scroll.BringIntoViewAsync(new PageScrollIO(page), TFn).ConfigureAwait(false);
@@ -1411,7 +1431,7 @@ public static partial class Humanize
         if (d < 0.5) { st.DragLegs = 0; return await Settled().ConfigureAwait(false); }
         double ux = dx / d, uy = dy / d, past = Rand(3, 8);
         var to = new Point(px + dx + ux * past, py + dy + uy * past);
-        await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(px, py), to, p, grabMs, settle: false).Steps).ConfigureAwait(false);
+        await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(px, py), to, p, grabMs / Tempo(page), settle: false).Steps).ConfigureAwait(false);
         st.X = to.X; st.Y = to.Y;
         int legs = 1;
         (double X, double Y) got;
@@ -1452,6 +1472,27 @@ public static partial class Humanize
 
     private static async Task WheelCoreAsync(IPage page, float deltaX, float deltaY)
     {
+        // Score hook (HumanizeTrace, lane G): every wheel event this call sends, with its send time, scored as "wheel".
+        var wrec = HumanizeTrace.Enabled ? new List<WheelSample>() : null;
+        long wt0 = Stopwatch.GetTimestamp();
+        async Task SendWheel(float a, float b)
+        {
+            await page.Mouse.WheelAsync(a, b).ConfigureAwait(false);
+            wrec?.Add(new WheelSample(Stopwatch.GetElapsedTime(wt0).TotalMilliseconds, b, a));
+        }
+        try
+        {
+            await WheelRunAsync(page, deltaX, deltaY, SendWheel).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (wrec is { Count: > 0 })
+                HumanizeTrace.Record("wheel", wrec, new Dictionary<string, object?> { ["device"] = StateFor(page).Device, ["dx"] = (double)deltaX, ["dy"] = (double)deltaY });
+        }
+    }
+
+    private static async Task WheelRunAsync(IPage page, float deltaX, float deltaY, Func<float, float, Task> sendWheel)
+    {
         var p = PersonaFor(page);
         var st = StateFor(page);
         int notch = await NotchPxAsync(page, st).ConfigureAwait(false);
@@ -1478,7 +1519,7 @@ public static partial class Humanize
             // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then an
             // inertia tail (Scroll.PlanTrackpad). Playwright sends pixel deltas either way (deltaMode 0).
             await Scroll.PacedWheelAsync(Scroll.PlanTrackpad(deltaX, deltaY),
-                (a, b) => page.Mouse.WheelAsync((float)a, (float)b), ms => Task.Delay((int)Math.Round(ms))).ConfigureAwait(false);
+                (a, b) => sendWheel((float)a, (float)b), ms => Task.Delay((int)Math.Round(ms))).ConfigureAwait(false);
             return;
         }
 
@@ -1493,18 +1534,18 @@ public static partial class Humanize
             int burstLeft = Rnd.Next(2, 6);
             while (next < plan.Count)
             {
-                await page.Mouse.WheelAsync(plan[next].X, plan[next].Y).ConfigureAwait(false);
+                await sendWheel(plan[next].X, plan[next].Y).ConfigureAwait(false);
                 if (++next == plan.Count) break;
                 // Local sleep, never WaitForTimeoutAsync: that is a CDP round-trip per call, so it emits
                 // protocol traffic a detector can score — a self-inflicted tell inside the humanize path.
                 if (--burstLeft == 0)
                 {
-                    await Task.Delay((int)Rand(110, 320)).ConfigureAwait(false);
+                    await Task.Delay((int)(Rand(110, 320) * Tempo(page))).ConfigureAwait(false);
                     burstLeft = Rnd.Next(2, 6);
                 }
                 else await Task.Delay((int)Rand(18, 55)).ConfigureAwait(false);
                 if (Rnd.NextDouble() < 0.07)
-                    await Task.Delay((int)Rand(150, 450)).ConfigureAwait(false);   // mid-scroll reading pause
+                    await Task.Delay((int)(Rand(150, 450) * Tempo(page))).ConfigureAwait(false);   // mid-scroll reading pause
                 // A hand resting on the mouse does not hold it still through a long scroll, and a run of
                 // wheel events on byte-identical coordinates is not what a hand produces.
                 if (plan.Count >= 6 && Rnd.NextDouble() < 0.06) await DriftAsync(page, st).ConfigureAwait(false);
@@ -1515,7 +1556,7 @@ public static partial class Humanize
             // Deliver the rest plainly: humanize must never lose scroll the caller asked for. Whole
             // notches and no sleeps — a sub-notch remainder would be the very event this method avoids.
             for (; next < plan.Count; next++)
-                await page.Mouse.WheelAsync(plan[next].X, plan[next].Y).ConfigureAwait(false);
+                await sendWheel(plan[next].X, plan[next].Y).ConfigureAwait(false);
         }
     }
 
@@ -1559,7 +1600,7 @@ public static partial class Humanize
         public bool Held => _st.Held;
         public Task GlideAsync(double x, double y, double targetW) => Humanize.GlideAsync(_page, _p, _st, x, y, targetW);
         public Task WheelAsync(double dx, double dy) => _page.Mouse.WheelAsync((float)dx, (float)dy);
-        public Task SleepAsync(double ms) => Task.Delay((int)Math.Round(ms));
+        public Task SleepAsync(double ms) => Task.Delay((int)Math.Round(ms * Humanize.Tempo(_page)));   // the preset scales the pauses
         public Task<int> NotchPxAsync() => Humanize.NotchPxAsync(_page, _st);
         public Task<string> DeviceAsync() => Humanize.DeviceAsync(_page, _st);
         public async Task<double[]?> ScrollRangeAsync()
@@ -1724,6 +1765,9 @@ public static partial class Humanize
         bool search = allow && !exact && string.Equals(fld?.Type, "search", StringComparison.OrdinalIgnoreCase);
         double floor = Math.Max(0, floorMs);
         bool extShift = ks.Held.ContainsKey("Shift");
+        // the score hook records this run's keys (RecKey at the press sites) and scores it as "typed" at the end
+        bool outerRec = ks.Rec is not null;
+        if (!outerRec && HumanizeTrace.Enabled) ks.Rec = new List<KeySample>();
         // Capitals and shifted symbols are typed the way a person types them: ShiftLeft goes down a
         // moment before the key (35-120 ms) and comes up just after it (10-70 ms), held across a run of
         // them. PressAsync("A") alone sent the key with shiftKey=false and no Shift key at all
@@ -1793,6 +1837,11 @@ public static partial class Humanize
                 catch (PlaywrightException) { /* best-effort */ }
             }
             if (chars.Length > 0) ks.Typed = Environment.TickCount64;   // a following Enter / Tab waits (AfterTypingAsync)
+            if (!outerRec && ks.Rec is { } rec)
+            {
+                ks.Rec = null;
+                HumanizeTrace.Record("typed", rec, new Dictionary<string, object?> { ["n"] = chars.Length, ["typos"] = allow, ["floor_ms"] = floor });
+            }
         }
     }
 
@@ -1816,13 +1865,17 @@ public static partial class Humanize
         double overlap = Rand(12, Math.Min(55, d1 - 8));
         try
         {
+            long ta = Stopwatch.GetTimestamp();
             await page.Keyboard.DownAsync(a).ConfigureAwait(false);
             await Task.Delay((int)Math.Round(d1 - overlap)).ConfigureAwait(false);
+            long tb = Stopwatch.GetTimestamp();
             await page.Keyboard.DownAsync(b).ConfigureAwait(false);
             await Task.Delay((int)Math.Round(overlap)).ConfigureAwait(false);
             await page.Keyboard.UpAsync(a).ConfigureAwait(false);
+            RecKey(page, a, ta);
             await Task.Delay((int)Math.Round(Math.Max(5, d2 - overlap))).ConfigureAwait(false);
             await page.Keyboard.UpAsync(b).ConfigureAwait(false);
+            RecKey(page, b, tb);
             return true;
         }
         catch
@@ -1844,8 +1897,10 @@ public static partial class Humanize
     {
         try
         {
+            long t0 = Stopwatch.GetTimestamp();
             await page.Keyboard.PressAsync(ch,
                 new KeyboardPressOptions { Delay = (float)Motion.KeyDwell(p) }).ConfigureAwait(false);
+            RecKey(page, ch, t0);
             return;
         }
         catch (PlaywrightException) { /* below */ }
@@ -3596,7 +3651,11 @@ public static partial class Humanize
     public const double LabelShare = 0.4;
 
     /// <summary>This click: on the label? An unseeded draw (Random.Shared, or a test's own) against the share.</summary>
-    internal static bool LabelDraw(Persona p, Random? rng = null) => (rng ?? Rnd).NextDouble() < LabelShare;
+    internal static bool LabelDraw(Persona p, Random? rng = null) => (rng ?? Rnd).NextDouble() < LabelShareOf(p);
+
+    /// <summary>The persona's trait (lane B's aim traits, a salted stream of its seed, 0.25-0.55): the share of
+    /// visible-checkbox clicks that land on the label text. <see cref="LabelShare"/> is the old single value.</summary>
+    internal static double LabelShareOf(Persona p) => Motion.AimTraitsOf(p).LabelShare;
 
     private static LocatorBoundingBoxResult? Quad(JsonElement e)
         => e.ValueKind == JsonValueKind.Array && e.GetArrayLength() == 4

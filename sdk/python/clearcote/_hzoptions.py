@@ -229,6 +229,11 @@ def apply_to_persona(persona, o: HumanizeOptions):
     persona.tempo = t
     persona.pause_scale = t
     persona.handedness = o.handedness
+    if o.handedness in HANDEDNESS and hasattr(persona, "approach_bias"):
+        # the persona's handedness is the sign of its approach bias (path bow side, click side bias): the option
+        # fixes the sign and keeps the drawn magnitude ("right" = positive, as a right hand's bias)
+        b = abs(float(persona.approach_bias))
+        persona.approach_bias = b if o.handedness == "right" else -b
     persona.input_device = o.input_device
     if t != 1.0:
         for name in ("grab_min_ms", "grab_max_ms", "release_min_ms", "release_max_ms", "click_hold_min_ms",

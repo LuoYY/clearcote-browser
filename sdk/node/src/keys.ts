@@ -15,7 +15,7 @@
 
 import { gaussFrom, mulberry32, type Rng } from "./motion.js";
 
-const KEYS_SALT = 0x27d4eb2f;
+const KEYS_SALT = 0xd3a2646c; // own stream (was 0x27d4eb2f = the aim salt: WPM moved with the aim spread)
 const NOMINAL_DWELL_MS = 80;
 export const MIN_FLIGHT_MS = 25;
 

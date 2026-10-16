@@ -30,7 +30,7 @@
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { errors as pwErrors } from "playwright-core";
 import {
-  makePersona, planMove, dragDwell, dragHesitation, hesitateThenDrag, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
+  makePersona, planMove, aimTraits, dragDwell, dragHesitation, hesitateThenDrag, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
   dblclickGap, pauseMs, timingTraits,
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
@@ -43,6 +43,7 @@ import {
 } from "./motion.js";
 import { ambientMode, exploreNotches, idleDrifts, readPauseMs, IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH } from "./attention.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
+import { record as traceRecord, traceEnabled } from "./trace.js";
 import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
 import {
   BLANK_POINT, FOCUSABLE, SEARCH_SLIP_RATE, SELECTION_STATE, TAB_DISTANCE, WORD_FIX_RATE, flightMs, modifierLagMs,
@@ -67,8 +68,10 @@ export const TAP_NOT_HUMANIZED = "tap is not humanized for touch contexts yet";
 export const LABEL_SHARE = 0.4;
 /** The persona's trait: the share of visible-checkbox clicks that land on the label text. */
 export function labelShare(persona: Persona): number {
-  const v = (persona as any).labelShare;
-  return typeof v === "number" && v >= 0 && v <= 1 ? v : LABEL_SHARE;
+  const v = (persona as any)?.labelShare; // an explicit override (tests)
+  if (typeof v === "number" && v >= 0 && v <= 1) return v;
+  // lane B's aim traits (salted stream of the seed, 0.25-0.55); LABEL_SHARE without a persona
+  return persona && typeof (persona as any).seed === "number" ? aimTraits(persona).labelShare : LABEL_SHARE;
 }
 /** This click: on the label? An unseeded draw against the persona's trait (`rng`: a test's own). */
 export function labelDraw(persona: Persona, rng: () => number = Math.random): boolean {
@@ -435,10 +438,12 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // dispatched for 40 ms: MAX_JUMP_PX / IDLE_HOP_PX). "Move, then sleep the planned gap" added the
   // ~27 ms mouse.move round trip to every 6-8 ms sample: a 1.05 s planned glide took 3.5-5.4 s on
   // PRO r38 (SC 209), ambient motion 5.7x as long.
-  const dispatch = async (steps: Step[]): Promise<void> => {
+  // `kind` / `buttons` name the walk for the score hook (trace.ts, lane G): glide | drag (buttons 1) | ambient | hover.
+  const dispatch = async (steps: Step[], kind = "glide", buttons = 0): Promise<void> => {
     const vp = await viewBounds();
     if (tempo !== 1) steps = steps.map((s) => ({ ...s, sleepMs: s.sleepMs * tempo }));
-    await walk(vp ? keepInView(steps, vp.width, vp.height) : steps, async (x, y) => { await nativeMove(x, y); st.placed = true; });
+    await walk(vp ? keepInView(steps, vp.width, vp.height) : steps, async (x, y) => { await nativeMove(x, y); st.placed = true; },
+      { kind, buttons });
   };
   // The viewport a planned path is kept inside (keepInView: the planner's overshoot arcs left the window
   // near its edges, verifier B), read in the isolated world at most every 2 s; null when it cannot be read.
@@ -459,7 +464,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective homing)
   // with colored sub-pixel noise and Fitts-scaled duration. `settle` adds a seating jiggle (drag).
   const glide = async (x: number, y: number, o: { settle?: boolean; targetW?: number; held?: boolean } = {}): Promise<void> => {
-    await dispatch(planMove(st, { x, y }, persona, { settle: o.settle, targetW: o.targetW, held: o.held }));
+    await dispatch(planMove(st, { x, y }, persona, { settle: o.settle, targetW: o.targetW, held: o.held }),
+      o.held ? "drag" : "glide", o.held ? 1 : 0);
     st.x = x; st.y = y;
     st.typed = null; // the hand left the keyboard: no submit / Tab pause owed
   };
@@ -545,7 +551,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       // planAmbient overruns its budget (whole excursions, rests drawn at 0.9-1.4x a frame): cut the
       // plan at a slow sample near ms so ambientMotion(ms) lasts about ms.
       const steps = trimTo(planAmbient(st, await viewport(), persona, ms), ms);
-      await dispatch(steps);
+      await dispatch(steps, "ambient");
       if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
     } catch { /* best-effort ambient */ }
   };
@@ -748,7 +754,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     held: () => st.held,
     glide: (x, y, w) => glide(x, y, { targetW: w }),
     wheel: async (dx, dy) => { await nativeWheel(dx, dy); },
-    sleep: async (ms) => { await sleep(ms); },
+    sleep: async (ms) => { await sleep(ms * tempo); }, // the preset scales the scroll-into-view pauses
     notchPx: () => wheelNotchPx(),
     device: () => inputDev(),
     scrollRange: async () => {
@@ -766,11 +772,26 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
    * macOS. One axis per event, like a real wheel or tilt, and the notches come in finger-flick bursts. */
   mouse.wheel = async (dx: number, dy: number) => {
     await scrollAnchor();
-    if ((await inputDev()) === "trackpad") {
+    // Score hook (trace.ts, lane G): every wheel event this call sends, with its send time, scored as "wheel".
+    const wrec: { t: number; dx: number; dy: number; mode: number }[] | null = traceEnabled() ? [] : null;
+    const wt0 = performance.now();
+    const sendWheel = async (a: number, b: number): Promise<void> => {
+      await nativeWheel(a, b);
+      wrec?.push({ t: performance.now() - wt0, dx: a, dy: b, mode: 0 });
+    };
+    const device = await inputDev();
+    try {
+      await wheelRun(device, dx, dy, sendWheel);
+    } finally {
+      if (wrec?.length) traceRecord("wheel", wrec, { device, dx, dy });
+    }
+  };
+  const wheelRun = async (device: string, dx: number, dy: number, sendWheel: (a: number, b: number) => Promise<void>): Promise<void> => {
+    if (device === "trackpad") {
       // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then
       // an inertia tail (scroll.ts planTrackpad). Playwright sends pixel deltas either way (deltaMode 0);
       // a notch persona's deltas are whole multiples of its notch.
-      await pacedWheel(planTrackpad(dx, dy), async (a, b) => { await nativeWheel(a, b); }, async (ms) => { await sleep(ms); });
+      await pacedWheel(planTrackpad(dx, dy), sendWheel, async (ms) => { await sleep(ms); });
       return;
     }
     const notch = await wheelNotchPx();
@@ -779,18 +800,18 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     for (let k = wheelNotches(dx, notch); k > 0; k--) plan.push([Math.sign(dx) * notch, 0]);
     let burst = randInt(2, 5);
     for (let i = 0; i < plan.length; i++) {
-      await nativeWheel(plan[i][0], plan[i][1]);
+      await sendWheel(plan[i][0], plan[i][1]);
       if (i === plan.length - 1) break;
       // local sleep, NOT page.waitForTimeout: the latter is a CDP round-trip per call, so it
       // emits protocol traffic bot-detectors (e.g. reCAPTCHA) can score — a self-inflicted tell
       // inside the humanize path. setTimeout is off-protocol.
       if (--burst === 0) {
-        await sleep(rand(110, 320)); // the finger resets for the next flick
+        await sleep(rand(110, 320) * tempo); // the finger resets for the next flick
         burst = randInt(2, 5);
       } else {
         await sleep(rand(18, 55));
       }
-      if (Math.random() < 0.07) await sleep(rand(150, 450)); // occasional mid-scroll pause (reading)
+      if (Math.random() < 0.07) await sleep(rand(150, 450) * tempo); // occasional mid-scroll pause (reading)
       // A hand resting on the mouse does not hold it perfectly still through a long scroll. Without
       // this a wheel burst is the one input where the pointer coordinate never changes at all. Never
       // while a button is down, where a move is a drag leg.
@@ -809,13 +830,41 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // ----------------------------------------------------------------- keyboard
   const keyboard: any = page.keyboard;
   const nativeKbType = keyboard.type.bind(keyboard);
-  const nativeKbPress = keyboard.press.bind(keyboard);
+  const nativeKbPress0 = keyboard.press.bind(keyboard);
   // A bulk fill's paste (Input.insertText).
   const nativeKbInsert = typeof keyboard.insertText === "function" ? keyboard.insertText.bind(keyboard) : undefined;
   // A page-like keyboard without down/up still gets every other humanization; it just types
   // capitals without the Shift key, as before.
-  const nativeKbDown = typeof keyboard.down === "function" ? keyboard.down.bind(keyboard) : undefined;
-  const nativeKbUp = typeof keyboard.up === "function" ? keyboard.up.bind(keyboard) : undefined;
+  const nativeKbDown0 = typeof keyboard.down === "function" ? keyboard.down.bind(keyboard) : undefined;
+  const nativeKbUp0 = typeof keyboard.up === "function" ? keyboard.up.bind(keyboard) : undefined;
+  // Score hook (trace.ts, lane G): while a typed run is being traced (keyRec is a list), every key the natives
+  // send is recorded as {key, down, up} (ms; modifiers left out), and humanTypeText scores the run as "typed".
+  // Off (keyRec null, the default) the wrappers only forward.
+  let keyRec: { key: string; down: number; up: number }[] | null = null;
+  const keyPend = new Map<string, number>();
+  const MOD_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "ControlOrMeta"]);
+  const kbNow = (): number => performance.now();
+  const kbRec = (key: string, down: number, up: number): void => {
+    if (keyRec !== null && !MOD_KEYS.has(key)) keyRec.push({ key, down, up });
+  };
+  const nativeKbPress = async (key: string, o?: any): Promise<unknown> => {
+    const t0 = kbNow();
+    const r = await nativeKbPress0(key, o);
+    kbRec(key, t0, kbNow());
+    return r;
+  };
+  const nativeKbDown = nativeKbDown0 === undefined ? undefined : async (key: string, o?: any): Promise<unknown> => {
+    const t0 = kbNow();
+    const r = await nativeKbDown0(key, o);
+    if (keyRec !== null) keyPend.set(key, t0);
+    return r;
+  };
+  const nativeKbUp = nativeKbUp0 === undefined ? undefined : async (key: string, o?: any): Promise<unknown> => {
+    const r = await nativeKbUp0(key, o);
+    const t0 = keyPend.get(key);
+    if (t0 !== undefined) { keyPend.delete(key); kbRec(key, t0, kbNow()); }
+    return r;
+  };
 
   // Emit one character with a human keydown→keyup DWELL. keyboard.press's `delay` IS the hold
   // (keyboard.type's delay is only inter-key flight), so per-char press gives the missing dwell.
@@ -1013,6 +1062,9 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     const allow = rate > 0 && typosAllowed(fld);
     const search = allow && !exact && !!fld && String((fld as any).type || "").toLowerCase() === "search";
     const floor = Math.max(0, Number(floorMs) || 0);
+    // the score hook records this run's keys (nativeKb* wrappers) and scores it as "typed" at the end
+    const outerRec = keyRec;
+    if (outerRec === null && traceEnabled()) { keyRec = []; keyPend.clear(); }
     try {
       for (let i = 0; i < n; i++) {
         let ch = chars[i];
@@ -1074,6 +1126,11 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       // never leave Shift held for the caller's next keystroke
       if (shift) { try { await nativeKbUp!("Shift"); } catch { /* best-effort */ } }
       if (n) st.typed = Date.now(); // a following Enter / Tab waits (afterTyping)
+      if (outerRec === null && keyRec !== null) {
+        const rec = keyRec;
+        keyRec = null;
+        traceRecord("typed", rec, { n, typos: allow, floor_ms: floor });
+      }
     }
   };
 
@@ -2018,10 +2075,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     // Every pause here is the persona's (timingTraits.pauseScale): the windows were one fixed set for
     // every identity.
     await sleep(pauseMs(persona, 220, 480)); // the list opens; the eye finds the option
-    const tempo = timingTraits(persona).pauseScale;
+    const pace = timingTraits(persona).pauseScale * tempo; // the persona's deliberation x the preset
     for (const ch of plan.keys) {
       await nativeKbPress(ch, { delay: kdwell() });
-      await sleep(Math.max(40, (100 + gauss() * 35) * tempo)); // well inside type-ahead's 1 s window
+      await sleep(Math.max(40, (100 + gauss() * 35) * pace)); // well inside type-ahead's 1 s window
     }
     const n = plan.arrows;
     if (n) {
@@ -2522,15 +2579,15 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     return null;
   };
   const creep = async (from: Point, toward: Point, grabMs: number): Promise<void> => {
-    const steps = dragHesitation(from, toward, persona, Math.random, grabMs);
-    await dispatch(steps);
+    const steps = dragHesitation(from, toward, persona, Math.random, grabMs / tempo); // dispatch scales by tempo
+    await dispatch(steps, "drag", 1);
     if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
   };
   // Hesitation + the held leg in one walk (motion.ts hesitateThenDrag): inside 8 px of the press for the
   // persona's grab window (100-300 ms), then the drag leg.
   const heldDrag = async (from: Point, to: Point, grabMs: number, settle = true): Promise<void> => {
-    const { steps } = hesitateThenDrag(from, to, persona, grabMs, settle);
-    await dispatch(steps);
+    const { steps } = hesitateThenDrag(from, to, persona, grabMs / tempo, settle); // dispatch scales by tempo
+    await dispatch(steps, "drag", 1);
     st.x = to.x; st.y = to.y;
   };
   const locSel = (loc: any): string | null => { try { return loc._selector ?? null; } catch { return null; } };
@@ -2763,7 +2820,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     const steps = planDwell({ x, y }, box, persona, ms, af.rng);
     af.trace.push(["dwell", ms, steps.length]);
     trimTrace();
-    await dispatch(steps);
+    await dispatch(steps, "hover");
     if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
   }
 
@@ -2799,7 +2856,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     trimTrace();
     const vp = (await viewBounds()) ?? (await viewport());
     const steps = trimTo(planAmbient({ x: st.x, y: st.y }, vp, persona, ms, af.rng), ms);
-    await dispatch(steps);
+    await dispatch(steps, "ambient");
     if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
   }
 

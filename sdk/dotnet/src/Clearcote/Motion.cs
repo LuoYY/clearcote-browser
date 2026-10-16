@@ -68,7 +68,7 @@ public readonly record struct ShapeTraits(double OvershootRate, double Curve, do
 public readonly record struct TimingTraits(double ClickHoldMs, double KeyDwellMs, double GrabMs, double ReleaseMs,
     double DblclickGapMs, double PauseScale, double TypoRate);
 /// <summary>Per-identity aiming traits (see Motion.AimTraitsOf).</summary>
-public readonly record struct AimTraits(double Spread, double Undershoot, double SideBias);
+public readonly record struct AimTraits(double Spread, double Undershoot, double SideBias, double LabelShare);
 
 public static class Motion
 {
@@ -202,14 +202,15 @@ public static class Motion
     public static double ClickHold(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return LognormalMs(TimingTraitsOf(p).ClickHoldMs, 0.25, p.ClickHoldMinMs, p.ClickHoldMaxMs, rng);
+        // the preset scales the median (Humanize.TempoOf); ApplyOptions already scaled the band
+        return LognormalMs(TimingTraitsOf(p).ClickHoldMs * Humanize.TempoOf(p), 0.25, p.ClickHoldMinMs, p.ClickHoldMaxMs, rng);
     }
 
     /// <summary>A human per-key keydown→keyup dwell (ms): log-normal (σ 0.22) around the persona's median, clamped to its band.</summary>
     public static double KeyDwell(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return LognormalMs(TimingTraitsOf(p).KeyDwellMs, 0.22, p.KeyDwellMinMs, p.KeyDwellMaxMs, rng);
+        return LognormalMs(TimingTraitsOf(p).KeyDwellMs * Humanize.TempoOf(p), 0.22, p.KeyDwellMinMs, p.KeyDwellMaxMs, rng);
     }
 
     /// <summary>
@@ -227,7 +228,7 @@ public static class Motion
 
     // Salt for the drag-start hesitation traits (Python _HESITATION_SALT, motion.ts HESITATION_SALT): a
     // salted stream keeps MakePersona's draw ORDER, and PlanDrag itself is untouched.
-    private const uint HesitationSalt = 0xC2B2AE35;
+    private const uint HesitationSalt = 0xFD7046C5; // own stream (was the timing salt)
     /// <summary>The drag-start hesitation window (ms): a hand that has just closed on a handle holds 100-300 ms.</summary>
     public const double HesitationMinMs = 100, HesitationMaxMs = 300;
     /// <summary>... creeping a few px, never this far, before the leg proper.</summary>
@@ -325,8 +326,9 @@ public static class Motion
     {
         rng ??= Random.Shared.NextDouble;
         var tt = TimingTraitsOf(p);
-        double grab = LognormalMs(tt.GrabMs, 0.2, p.GrabMinMs, p.GrabMaxMs, rng);
-        double release = LognormalMs(tt.ReleaseMs, 0.2, p.ReleaseMinMs, p.ReleaseMaxMs, rng);
+        double t = Humanize.TempoOf(p);
+        double grab = LognormalMs(tt.GrabMs * t, 0.2, p.GrabMinMs, p.GrabMaxMs, rng);
+        double release = LognormalMs(tt.ReleaseMs * t, 0.2, p.ReleaseMinMs, p.ReleaseMaxMs, rng);
         return (grab, release);
     }
 
@@ -335,7 +337,8 @@ public static class Motion
     public static double DblclickGap(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return LognormalMs(TimingTraitsOf(p).DblclickGapMs, 0.15, 70, 170, rng);
+        double t = Humanize.TempoOf(p);
+        return LognormalMs(TimingTraitsOf(p).DblclickGapMs * t, 0.15, 70 * t, 170 * t, rng);
     }
 
     /// <summary>A deliberation pause (ms) from [lo, hi], scaled by the persona's tempo; without a persona the plain window.</summary>
@@ -343,7 +346,7 @@ public static class Motion
     {
         rng ??= Random.Shared.NextDouble;
         double v = Lerp(lo, hi, rng());
-        return p is null ? v : v * TimingTraitsOf(p).PauseScale;
+        return p is null ? v : v * TimingTraitsOf(p).PauseScale * Humanize.TempoOf(p);
     }
 
     // Salt for the rollover stream. Drawing from Mulberry32(seed ^ salt) instead of adding a field to
@@ -406,7 +409,8 @@ public static class Motion
         Rng r = Mulberry32(p.Seed ^ AimSalt);
         double spread = Lerp(0.10, 0.20, r());
         double under = Lerp(0.06, 0.16, r());
-        return new AimTraits(spread, under, p.ApproachBias * 0.4);
+        double label = Lerp(0.25, 0.55, r());   // SC 232 integration: lane F's label aim, a trait (was one 0.4 for all)
+        return new AimTraits(spread, under, p.ApproachBias * 0.4, label);
     }
 
     /// <summary>
@@ -760,7 +764,7 @@ public static class Motion
     // Salt for the after-action stream (hover dwell, move-off after a click, the attention model): a separate
     // Mulberry32(seed ^ salt) stream keeps MakePersona's draw order (every seed's motor identity) unchanged.
     // Same values in Python _motion.py and Node motion.ts.
-    private const uint AfterSalt = 0xC2B2AE35;
+    private const uint AfterSalt = 0x165667B1; // own stream (was the timing salt)
 
     /// <summary>The pointer keeps within this many px of where a hover arrived while it dwells there.</summary>
     public const double DwellRadiusPx = 3;
@@ -852,7 +856,8 @@ public static class Motion
     public static double MoveOffDelayMs(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return Clamp(AfterTraitsOf(p).MoveOffDelayMs * Lerp(0.7, 1.3, rng()), 200, 660);
+        double t = Humanize.TempoOf(p);
+        return Clamp(AfterTraitsOf(p).MoveOffDelayMs * t * Lerp(0.7, 1.3, rng()), 200 * t, 660 * t);
     }
 
     /// <summary>

@@ -122,14 +122,16 @@ public static partial class Humanize
 
     private static double Tempo(IPage page) => Options.TryGetValue(page, out var o) ? o.Tempo : 1.0;
 
-    private static double TempoOf(Persona p) => PersonaTempo.TryGetValue(p, out var t) ? t.Value : 1.0;
+    /// <summary>The preset's tempo on a persona copy made by <see cref="ApplyOptions"/> (1.0 on any other persona,
+    /// so every vector is unchanged): Motion's timing medians and Attention's read pause are scaled by it.</summary>
+    internal static double TempoOf(Persona p) => PersonaTempo.TryGetValue(p, out var t) ? t.Value : 1.0;
 
     /// <summary>A copy of <paramref name="p"/> with the options applied: no RNG draw, so the seed's persona is unchanged
     /// apart from what the options say (the timing windows scaled by the preset, DeviceHz replaced).</summary>
     internal static Persona ApplyOptions(Persona p, HumanizeOptions o)
     {
         double t = o.Tempo;
-        if (t == 1.0 && o.DeviceHz is null) return p;
+        if (t == 1.0 && o.DeviceHz is null && o.Handedness is null) return p;
         var copy = (Persona)typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic)!
             .Invoke(p, null)!;
         void Set(string name, double v) => typeof(Persona).GetProperty(name)!.SetValue(copy, v);
@@ -142,6 +144,10 @@ public static partial class Humanize
             PersonaTempo.AddOrUpdate(copy, new StrongBox<double>(t));
         }
         if (o.DeviceHz is { } hz) Set(nameof(Persona.DeviceHz), hz);
+        // the persona's handedness is the sign of its approach bias (path bow side, click side bias): the option
+        // fixes the sign and keeps the drawn magnitude ("right" = positive)
+        if (o.Handedness is "left" or "right")
+            Set(nameof(Persona.ApproachBias), o.Handedness == "right" ? Math.Abs(copy.ApproachBias) : -Math.Abs(copy.ApproachBias));
         return copy;
     }
 

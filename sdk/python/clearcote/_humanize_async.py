@@ -26,7 +26,7 @@ from ._forms import (
 from ._humanize import (
     CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _engine_clicks_mode, _host_platform,
     FRAMES_WAIT_MS, _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, as_api_error,
-    default_timeout_ms, engine_path_memo, trial_timeout_error, typo_rate,
+    default_timeout_ms, engine_path_memo, trial_timeout_error, typo_rate, _MOD_KEYS,
     TAP_NOT_HUMANIZED, label_draw, native_select_args, report_fallback, select_wants, strict_mode, want_index,
 )
 from ._isolated import (
@@ -56,6 +56,7 @@ from ._hzoptions import (
     report_fallback as _report_fallback, resolve as _hz_resolve, tempo_of as _hz_tempo, typo_rate_for as _hz_typo_rate,
 )
 from . import _frames as _fr
+from . import _trace
 from ._keys import (
     BLANK_POINT, FOCUSABLE, SEARCH_SLIP_RATE, SELECTION_STATE, TAB_DISTANCE, WORD_FIX_RATE, flight_ms,
     modifier_lag_ms, modifier_lead_ms, plan_gap, plan_repeat, split_chord, submit_pause_ms, tab_pause_ms,
@@ -203,9 +204,41 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # types capitals without the Shift key, as before.
     native_kb_down, native_kb_up = getattr(kb, "down", None), getattr(kb, "up", None)
 
-    async def _dispatch(steps):
+    # Score hook (_trace, lane G): see the sync file -- the typed run's keys are recorded while st["keyrec"]
+    # is a list; off (the default) these wrappers only forward.
+    _kb_press0, _kb_down0, _kb_up0 = native_kb_press, native_kb_down, native_kb_up
+    _kb_pend = {}
+
+    def _kb_rec(key, t0, t1):
+        rec = st.get("keyrec")
+        if rec is not None and key not in _MOD_KEYS:
+            rec.append({"key": key, "down": t0, "up": t1})
+
+    async def native_kb_press(key, **kw):
+        t0 = time.perf_counter() * 1000.0
+        r = await _kb_press0(key, **kw)
+        _kb_rec(key, t0, time.perf_counter() * 1000.0)
+        return r
+
+    if _kb_down0 is not None and _kb_up0 is not None:
+        async def native_kb_down(key, **kw):
+            t0 = time.perf_counter() * 1000.0
+            r = await _kb_down0(key, **kw)
+            if st.get("keyrec") is not None:
+                _kb_pend[key] = t0
+            return r
+
+        async def native_kb_up(key, **kw):
+            r = await _kb_up0(key, **kw)
+            t0 = _kb_pend.pop(key, None)
+            if t0 is not None:
+                _kb_rec(key, t0, time.perf_counter() * 1000.0)
+            return r
+
+    async def _dispatch(steps, kind="glide", buttons=0):
         """Walk a planned trajectory (list of (x, y, sleep_ms)) via native trusted mouse.move +
-        off-protocol asyncio.sleep. Native input carries button state (held-button drag works).
+        off-protocol asyncio.sleep. ``kind`` / ``buttons`` name the walk for the score hook (_trace, lane G:
+        glide | drag (buttons 1) | ambient | hover). Native input carries button state (held-button drag works).
         Paced against a wall clock (_pacing.walk_async): samples go out at their planned time, late
         ones are skipped (never the last; no skip hops more than 40 px, or 20 px once nothing has been
         dispatched for 40 ms: _pacing.MAX_JUMP_PX / IDLE_HOP_PX), so the dispatch round trip no
@@ -216,7 +249,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         vp = await _view_bounds()
         if tempo != 1.0:
             steps = [(sx, sy, sl * tempo) for sx, sy, sl in steps]
-        await _paced_walk(_keep_in_view(steps, *vp) if vp else steps, mv)
+        await _paced_walk(_keep_in_view(steps, *vp) if vp else steps, mv, kind=kind, buttons=buttons)
 
     async def _view_bounds():
         """The viewport (innerWidth, innerHeight) a planned path is kept inside (_pacing.keep_in_view),
@@ -234,7 +267,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
 
     async def _glide(x, y, settle=False, target_w=24, held=False):
         # minimum-jerk sum-of-submovements path with colored noise + Fitts duration (_motion.plan_move)
-        await _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle, held=held))
+        await _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle, held=held),
+                        kind="drag" if held else "glide", buttons=1 if held else 0)
         st["pos"] = (x, y)
         st["typed"] = None   # the hand left the keyboard: no submit / Tab pause owed (_after_typing)
 
@@ -486,7 +520,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             # cut the plan at a slow sample near ms so ambient_motion(ms) lasts about ms.
             steps = _trim_ambient(plan_ambient(st["pos"], {"width": vp["width"], "height": vp["height"]},
                                                persona, ms), ms)
-            await _dispatch(steps)
+            await _dispatch(steps, kind="ambient")
             if steps:
                 st["pos"] = (steps[-1][0], steps[-1][1])
         except Exception:  # noqa: BLE001
@@ -546,7 +580,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             ms = dwell_ms(persona, arng)
         steps = plan_dwell((x, y), box, persona, ms, arng)
         trace.append(("dwell", ms, len(steps)))
-        await _dispatch(steps)
+        await _dispatch(steps, kind="hover")
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])
 
@@ -579,7 +613,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         trace.append(("drift", ms))
         vw, vh = (await _view_bounds()) or (await _viewport())
         steps = _trim_ambient(plan_ambient(st["pos"], {"width": vw, "height": vh}, persona, ms, arng), ms)
-        await _dispatch(steps)
+        await _dispatch(steps, kind="ambient")
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])
 
@@ -742,6 +776,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             st["device"] = _input_device(await _platform(), opt if isinstance(opt, str) else None)
         return st["device"]
 
+    async def _tsleep(sec):
+        await asyncio.sleep(sec * tempo)
+
     def _scroll_io():
         """The humanizer, as _scroll.bring_into_view_async sees it."""
         class _IO:
@@ -752,7 +789,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             held = staticmethod(lambda: st["held"])
             glide = staticmethod(lambda x, y, w: _glide(x, y, target_w=w))
             wheel = staticmethod(lambda dx, dy: native_wheel(dx, dy))
-            sleep = staticmethod(asyncio.sleep)
+            sleep = staticmethod(_tsleep)   # the preset scales the scroll-into-view pauses
             notch_px = staticmethod(_notch_px)
             device = staticmethod(_device)
 
@@ -762,30 +799,30 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 return r if isinstance(r, list) and len(r) == 4 else None
         return _IO
 
-    async def hwheel(delta_x, delta_y):
+    async def _hwheel_run(delta_x, delta_y, send_wheel):
         # Whole notches only: a CDP wheel event always reports wheelDelta +-120, so the eased
         # sub-notch slices this replaced were events no mouse emits (see _humanize.hwheel). A trackpad
         # persona swipes the exact distance instead (_scroll.plan_trackpad).
         await _wheel_anchor()
         if await _device() == "trackpad":
-            await paced_wheel_async(plan_trackpad(delta_x, delta_y), native_wheel, asyncio.sleep)
+            await paced_wheel_async(plan_trackpad(delta_x, delta_y), send_wheel, asyncio.sleep)
             return
         notch = await _notch_px()
         plan = ([(0, notch if delta_y > 0 else -notch)] * wheel_notches(delta_y, notch)
                 + [(notch if delta_x > 0 else -notch, 0)] * wheel_notches(delta_x, notch))
         burst = random.randint(2, 5)
         for k, (ex, ey) in enumerate(plan):
-            await native_wheel(ex, ey)
+            await send_wheel(ex, ey)
             if k == len(plan) - 1:
                 break
             burst -= 1
             if burst == 0:
-                await asyncio.sleep(_rand(110, 320) / 1000.0)  # the finger resets for the next flick
+                await asyncio.sleep(_rand(110, 320) * tempo / 1000.0)  # the finger resets for the next flick
                 burst = random.randint(2, 5)
             else:
                 await asyncio.sleep(_rand(18, 55) / 1000.0)
             if random.random() < 0.07:
-                await asyncio.sleep(_rand(150, 450) / 1000.0)
+                await asyncio.sleep(_rand(150, 450) * tempo / 1000.0)
             # A hand resting on the mouse does not hold it perfectly still through a long scroll, so
             # wheel events sharing one identical clientX/clientY are a script signature. A couple
             # of px, so the scroll stays over the same element (and never while a button is down,
@@ -797,6 +834,23 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                     st["pos"] = (st["pos"][0] + dx, st["pos"][1] + dy)
                 except Exception:  # noqa: BLE001
                     pass
+
+    async def hwheel(delta_x, delta_y):
+        """mouse.wheel: _hwheel_run, with the score hook (_trace, lane G) recording every wheel event this call
+        sends and its send time, scored as "wheel" (off: the natives only)."""
+        rec = [] if _trace.enabled() else None
+        if rec is None:
+            return await _hwheel_run(delta_x, delta_y, native_wheel)
+        t0 = time.perf_counter()
+
+        async def send_wheel(ex, ey):
+            await native_wheel(ex, ey)
+            rec.append({"t": (time.perf_counter() - t0) * 1000.0, "dx": ex, "dy": ey, "mode": 0})
+        try:
+            return await _hwheel_run(delta_x, delta_y, send_wheel)
+        finally:
+            if rec:
+                _trace.record("wheel", rec, {"device": st.get("device"), "dx": delta_x, "dy": delta_y})
 
     mouse.move, mouse.click, mouse.wheel = hmove, _serial(hclick, coords=True), hwheel
     if getattr(mouse, "dblclick", None) is not None:
@@ -978,6 +1032,11 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         allow = rate > 0 and typos_allowed(fld)
         search = bool(allow and not exact and fld and (fld.get("type") or "").lower() == "search")
         floor = max(0.0, float(floor_ms or 0.0))
+        # the score hook records this run's keys (the native_kb_* wrappers) and scores it as "typed" at the end
+        outer_rec = st.get("keyrec")
+        if outer_rec is None and _trace.enabled():
+            st["keyrec"] = []
+            _kb_pend.clear()
         i = 0
         try:
             while i < n:
@@ -1066,6 +1125,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                     pass
             if n:
                 st["typed"] = time.monotonic()   # a following Enter / Tab waits (_after_typing)
+            if outer_rec is None and st.get("keyrec") is not None:
+                _trace.record("typed", st.pop("keyrec"), {"n": n, "typos": allow, "floor_ms": floor})
 
     async def _after_typing(key):
         """The pause a person makes between the last typed character and Enter (250-900 ms) or Tab
@@ -2032,10 +2093,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # Every pause here is the persona's (timing_traits.pause_scale): the windows were one fixed
         # set for every identity.
         await asyncio.sleep(pause_ms(persona, 220, 480) / 1000.0)        # the list opens; the eye finds the option
-        tempo = timing_traits(persona).pause_scale
+        pace = timing_traits(persona).pause_scale * tempo   # the persona's deliberation x the preset
         for ch in plan["keys"]:
             await native_kb_press(ch, delay=_kdwell())
-            await asyncio.sleep(max(0.04, random.gauss(0.10, 0.035) * tempo))   # well inside type-ahead's 1 s window
+            await asyncio.sleep(max(0.04, random.gauss(0.10, 0.035) * pace))   # well inside type-ahead's 1 s window
         n = plan["arrows"]
         if n:
             await asyncio.sleep(pause_ms(persona, 120, 300) / 1000.0)
@@ -2572,14 +2633,14 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         return None
 
     async def _creep(frm, toward, grab_ms):
-        steps = drag_hesitation(frm, toward, persona, dur_ms=grab_ms)
-        await _dispatch(steps)
+        steps = drag_hesitation(frm, toward, persona, dur_ms=grab_ms / tempo)   # _dispatch scales by tempo
+        await _dispatch(steps, kind="drag", buttons=1)
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])
 
     async def _held_drag(frm, to, grab_ms, settle=True):
-        steps, _ = hesitate_then_drag(frm, to, persona, grab_ms, settle=settle)
-        await _dispatch(steps)
+        steps, _ = hesitate_then_drag(frm, to, persona, grab_ms / tempo, settle=settle)   # _dispatch scales by tempo
+        await _dispatch(steps, kind="drag", buttons=1)
         st["pos"] = (to[0], to[1])
 
     async def _drag(src, dst, opts):

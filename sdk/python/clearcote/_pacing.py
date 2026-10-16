@@ -83,13 +83,15 @@ def _jump_cap(max_jump, dt_ms):
     return max_jump if dt_ms < IDLE_MS else min(max_jump, IDLE_HOP_PX)
 
 
-def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned, kind="glide"):
+def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned, kind="glide",
+         buttons=0):
     """Dispatch ``steps`` through ``move(x, y)`` against a wall clock (see module doc). Stops at the
     first ``move`` that raises. Returns the number of samples dispatched.
 
-    ``kind`` names the action for the score hook (``_trace``: ``glide`` | ``drag`` | ``ambient``); with
-    ``CLEARCOTE_HUMANIZE_SCORE`` set, the dispatched samples and their actual dispatch times are scored
-    and appended to the score file after the walk. Read-only: it changes nothing about the walk."""
+    ``kind`` names the action for the score hook (``_trace``: ``glide`` | ``drag`` | ``ambient`` | ``hover``);
+    with ``CLEARCOTE_HUMANIZE_SCORE`` set, the dispatched samples and their actual dispatch times are scored
+    and appended to the score file after the walk. ``buttons`` (a drag leg: 1) is carried on every recorded
+    sample. Read-only: it changes nothing about the walk."""
     clock = clock or time.perf_counter
     sleep = sleep or time.sleep
     if not steps:
@@ -118,7 +120,8 @@ def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_defa
             return sent
         sent += 1
         if trace is not None:
-            trace.append({"x": x, "y": y, "t": (tb - t_start) * 1000.0})
+            trace.append({"x": x, "y": y, "t": (tb - t_start) * 1000.0, "buttons": buttons} if buttons
+                         else {"x": x, "y": y, "t": (tb - t_start) * 1000.0})
         t0 += _stall_s(tb, clock())
         last, t_last = (x, y), tb
         i += 1
@@ -130,7 +133,8 @@ def walk(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_defa
     return sent
 
 
-async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned, kind="glide"):
+async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, pinned=_default_pinned, kind="glide",
+                     buttons=0):
     """``walk`` for the async API: ``move`` and ``sleep`` are awaited."""
     clock = clock or time.perf_counter
     sleep = sleep or asyncio.sleep
@@ -160,7 +164,8 @@ async def walk_async(steps, move, clock=None, sleep=None, max_jump=MAX_JUMP_PX, 
             return sent
         sent += 1
         if trace is not None:
-            trace.append({"x": x, "y": y, "t": (tb - t_start) * 1000.0})
+            trace.append({"x": x, "y": y, "t": (tb - t_start) * 1000.0, "buttons": buttons} if buttons
+                         else {"x": x, "y": y, "t": (tb - t_start) * 1000.0})
         t0 += _stall_s(tb, clock())
         last, t_last = (x, y), tb
         i += 1

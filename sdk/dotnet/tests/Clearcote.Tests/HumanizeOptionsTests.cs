@@ -183,7 +183,10 @@ public class HumanizeOptionsTests
         Humanize.Attach(page, o, "opts");
         var p = Humanize.PersonaFor(page);
         var plain = Motion.MakePersona("opts");
-        Assert.Equal(Pick(plain), Pick(p));
+        // handedness fixes the SIGN of the drawn approach bias (integration of lanes A + B); the draw is unchanged
+        static double[] Abs(double[] v) => v.Select((x, i) => Base[i] == nameof(Persona.ApproachBias) ? Math.Abs(x) : x).ToArray();
+        Assert.Equal(Abs(Pick(plain)), Abs(Pick(p)));
+        Assert.True(p.ApproachBias >= 0, "right-handed: a positive approach bias");
         Assert.Equal(plain.KeyDwellMaxMs * 0.7, p.KeyDwellMaxMs, 9);
         Assert.Equal(plain.ClickHoldMinMs * 0.7, p.ClickHoldMinMs, 9);
         Assert.Same(o, Humanize.OptionsFor(page));
@@ -221,5 +224,36 @@ public class HumanizeOptionsTests
         Assert.True(b > 3000, $"default {b} ms");
         Assert.InRange(q / b, 0.7 * 0.85, 0.7 * 1.15);
         Assert.InRange(c / b, 1.4 * 0.85, 1.4 * 1.15);
+    }
+}
+
+public class HumanizePresetPlannerTests
+{
+    // Integration (lanes A x B/C/E; mirrors test_presets_scale_the_timing_medians_and_the_after_action_pauses): the
+    // preset's tempo scales the persona's timing MEDIANS (click hold, key dwell, grab/release, double-click gap,
+    // deliberation pauses) and the after-action pauses (move-off delay, read pause), not only the glide samples. The
+    // same draw (rng 0.5 = the median) on the default and on the careful / quick copies gives an exact ratio.
+    [Fact]
+    public void Presets_scale_the_timing_medians_and_the_after_action_pauses()
+    {
+        Rng mid = () => 0.5;
+        static double[] Planned(HumanizeOptions o, Rng mid)
+        {
+            var p = Humanize.ApplyOptions(Motion.MakePersona("tempo"), o);
+            var (grab, release) = Motion.DragDwell(p, mid);
+            return new[]
+            {
+                Motion.ClickHold(p, mid), Motion.KeyDwell(p, mid), grab, release, Motion.DblclickGap(p, mid),
+                Motion.PauseMs(p, 200, 400, mid), Motion.MoveOffDelayMs(p, mid), Attention.ReadPauseMs(5000, p, mid),
+            };
+        }
+        var b = Planned(new HumanizeOptions(), mid);
+        Assert.True(b[0] > 0 && b[7] > 0);
+        foreach (var (preset, t) in new[] { ("quick", 0.7), ("careful", 1.4) })
+        {
+            var got = Planned(new HumanizeOptions { Preset = preset }, mid);
+            for (int i = 0; i < b.Length; i++)
+                Assert.True(Math.Abs(got[i] - b[i] * t) <= 1e-9 * Math.Max(1, b[i]), $"{preset} #{i}: {got[i]} vs {b[i] * t}");
+        }
     }
 }

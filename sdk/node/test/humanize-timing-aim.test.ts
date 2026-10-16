@@ -125,7 +125,8 @@ describe("shared timing vectors (Python, Node and .NET agree)", () => {
   });
   it.each((VEC.aim_traits as any[]).map((t) => [t.persona, t]))("aimTraits %s", (_, t: any) => {
     const a = M.aimTraits(M.makePersona(t.persona));
-    expect(close(a.spread, t.spread, 1e-12) && close(a.undershoot, t.undershoot, 1e-12) && close(a.sideBias, t.side_bias, 1e-12)).toBe(true);
+    expect(close(a.spread, t.spread, 1e-12) && close(a.undershoot, t.undershoot, 1e-12) && close(a.sideBias, t.side_bias, 1e-12)
+      && close(a.labelShare, t.label_share, 1e-12)).toBe(true);
   });
   it.each((VEC.draws as any[]).map((d) => [d.persona, d]))("draws %s", (_, d: any) => {
     const p = M.makePersona(d.persona);

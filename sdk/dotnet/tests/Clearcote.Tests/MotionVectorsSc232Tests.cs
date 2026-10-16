@@ -8,9 +8,8 @@ namespace Clearcote.Tests;
 /// <summary>
 /// SC 232 lane G (mirrors sdk/python/tests/test_motion_vectors_sc232.py): PlanDrag, the persona timings, PlanAmbient
 /// and the wheel scroll-anchor model are pinned across the three SDKs by sdk/testdata/humanize_motion_vectors.json.
-/// PlanAmbient is not ported to .NET on ceb7983 (lane C ports it) and the anchor has no pure function in any SDK
-/// yet (lane E): those cases are checked through reflection once the method exists, and pass vacuously (logged
-/// "API missing") until then.
+/// PlanAmbient (ported by lane C) and the pure anchor Motion.WheelAnchorPoint (lane E) are called directly since the
+/// SC 232 merge; before it those cases passed vacuously (logged "API missing").
 /// </summary>
 public class MotionVectorsSc232Tests
 {

@@ -350,7 +350,13 @@ def test_the_seed_to_persona_map_is_pinned(pin):
 def test_options_never_change_the_persona_draws(fast, mode, humanize):
     sim, page = mode.page(_btn(), humanize=humanize)
     want = make_persona("opts")
-    assert {k: getattr(page._clearcote_persona, k) for k in _BASE} == {k: getattr(want, k) for k in _BASE}
+    got = {k: getattr(page._clearcote_persona, k) for k in _BASE}
+    exp = {k: getattr(want, k) for k in _BASE}
+    if isinstance(humanize, dict) and humanize.get("handedness"):
+        # handedness fixes the SIGN of the drawn approach bias (integration of lanes A + B); the draw is unchanged
+        assert abs(got.pop("approach_bias")) == abs(exp.pop("approach_bias"))
+        assert page._clearcote_persona.approach_bias >= 0 if humanize["handedness"] == "right" else True
+    assert got == exp
 
 
 # --------------------------------------------------------------------------------- cloud payload
@@ -369,3 +375,29 @@ def test_cloud_launch_forwards_the_options_object():
     assert body == {"humanize": False}
     with pytest.raises(TypeError):
         _prepare_launch({"humanize": {"bogus": 1}})
+
+
+def test_presets_scale_the_timing_medians_and_the_after_action_pauses():
+    """Integration (lanes A x B/C/E): the preset's tempo scales the persona's timing MEDIANS (click hold, key
+    dwell, grab/release, double-click gap, deliberation pauses) and the after-action pauses (move-off delay, read
+    pause) -- not only the glide samples. The same draw (rng 0.5 = the median) on the default and on the
+    careful / quick copies gives an exact ratio."""
+    from clearcote._attention import read_pause_ms
+    from clearcote._hzoptions import apply_to_persona, resolve
+    from clearcote._motion import click_hold, dblclick_gap, drag_dwell, key_dwell, move_off_delay_ms, pause_ms
+
+    def mid():
+        return 0.5
+
+    def planned(humanize):
+        p = apply_to_persona(make_persona("tempo"), resolve(humanize))
+        grab, release = drag_dwell(p, mid)
+        return {"click_hold": click_hold(p, mid), "key_dwell": key_dwell(p, mid), "grab": grab, "release": release,
+                "dblclick_gap": dblclick_gap(p, mid), "pause_ms": pause_ms(p, 200, 400, mid),
+                "move_off_delay": move_off_delay_ms(p, mid), "read_pause": read_pause_ms(5000, p, mid)}
+    base = planned(True)
+    assert base["click_hold"] > 0 and base["read_pause"] > 0
+    for preset, t in (("quick", 0.7), ("careful", 1.4)):
+        got = planned({"preset": preset})
+        for name, b in base.items():
+            assert got[name] == pytest.approx(b * t, rel=1e-9), (preset, name, b, got[name])

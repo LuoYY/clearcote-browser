@@ -11,7 +11,7 @@
  * OFF by default: on with lane A's `ambient: "idle"` / `attention: true`, or `page._clearcoteAttention = true`.
  */
 import { optionsOf } from "./hzoptions.js";
-import { afterTraits, type Persona, type Rng } from "./motion.js";
+import { afterTraits, tempoOf, type Persona, type Rng } from "./motion.js";
 
 export const READ_MIN_MS = 800;
 export const READ_MAX_MS = 4000;
@@ -35,8 +35,9 @@ export function readPauseMs(textLen: unknown, p: Persona, rng: Rng = Math.random
   let n = Number(textLen ?? 0);
   if (!Number.isFinite(n)) n = 0;
   const frac = Math.sqrt(clamp(n / READ_CAP_CHARS, 0, 1));
-  const ms = (READ_MIN_MS + (READ_MAX_MS - READ_MIN_MS) * frac) * afterTraits(p).readTempo * lerp(0.85, 1.15, rng());
-  return clamp(ms, READ_MIN_MS, READ_MAX_MS);
+  const t = tempoOf(p); // the preset (careful / quick) scales the read pause and its band
+  const ms = (READ_MIN_MS + (READ_MAX_MS - READ_MIN_MS) * frac) * afterTraits(p).readTempo * t * lerp(0.85, 1.15, rng());
+  return clamp(ms, READ_MIN_MS * t, READ_MAX_MS * t);
 }
 
 /** 0 (most loads) or 1–3 exploratory wheel notches down, in EXPLORE_RATE of loads. */

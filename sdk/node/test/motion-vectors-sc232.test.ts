@@ -1,9 +1,9 @@
 /**
  * SC 232 lane G (mirrors sdk/python/tests/test_motion_vectors_sc232.py): planDrag, planAmbient, the persona
  * timings and the wheel scroll-anchor model are pinned across the three SDKs by
- * sdk/testdata/humanize_motion_vectors.json (drags / ambient / timings / wheel_anchor). The anchor is inside
- * the humanize closures today and differs per SDK; its test checks a pure wheelAnchorPoint(vw, vh, rng) once
- * lane E exports one from motion.ts and is skipped ("API missing") until then.
+ * sdk/testdata/humanize_motion_vectors.json (drags / ambient / timings / wheel_anchor). The anchor used to live
+ * inside the humanize closures and differed per SDK; lane E (SC 232) exports one pure wheelAnchorPoint(vw, vh, rng)
+ * from motion.ts, which these tests call directly (they skipped with "API missing" before the merge).
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";

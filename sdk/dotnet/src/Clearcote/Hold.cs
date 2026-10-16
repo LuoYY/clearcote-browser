@@ -135,7 +135,10 @@ public static partial class Humanize
     /// Press and hold this element: one long button press, for controls that act only while the button stays down
     /// (a hold-to-confirm button, a long-press menu, a "press and hold" verification button). Not a Playwright method.
     /// <list type="number">
-    /// <item>waits for the element to be visible (<see cref="PressAndHoldOptions.Timeout"/>) and brings it into view;</item>
+    /// <item>waits for the element to be visible (<see cref="PressAndHoldOptions.Timeout"/>) and brings it into view -- on a
+    /// humanized page with the WHEEL (<see cref="Scroll.BringIntoViewAsync"/>: whole notches or a trackpad swipe to 25-60 % of
+    /// the viewport; before 0.52 this was a programmatic scroll), falling back to the programmatic scroll -- reported -- only
+    /// for a container the wheel cannot move; Playwright's scroll on any other page;</item>
     /// <item>moves the pointer to a point inside it (<see cref="PressAndHoldOptions.Position"/>, else a persona-shaped
     /// point near the centre on a humanized page, the centre otherwise);</item>
     /// <item>presses and holds for <see cref="PressAndHoldOptions.Duration"/> ms, or until
