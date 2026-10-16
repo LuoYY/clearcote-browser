@@ -179,6 +179,19 @@ public static class Motion
     }
 
     /// <summary>Grab/release dwell times (ms) for a held-button drag.</summary>
+    /// <summary>
+    /// Where a reading hand parks the pointer before a wheel: x ~ 0.5w ± 0.10w clamped [0.12w, 0.88w], y ~ 0.34h
+    /// ± 0.09h clamped [0.10h, 0.62h] (two gaussians, x first). One model in all three SDKs (Python
+    /// <c>wheel_anchor_point</c>, motion.ts <c>wheelAnchorPoint</c>); before 0.52 .NET used 0.5/0.38, sd 0.12/0.10.
+    /// </summary>
+    public static (double X, double Y) WheelAnchorPoint(double vw, double vh, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double x = Clamp(vw * 0.5 + GaussFrom(rng) * vw * 0.10, vw * 0.12, vw * 0.88);
+        double y = Clamp(vh * 0.34 + GaussFrom(rng) * vh * 0.09, vh * 0.10, vh * 0.62);
+        return (x, y);
+    }
+
     // Salt for the drag-start hesitation traits (Python _HESITATION_SALT, motion.ts HESITATION_SALT): a
     // salted stream keeps MakePersona's draw ORDER, and PlanDrag itself is untouched.
     private const uint HesitationSalt = 0xC2B2AE35;

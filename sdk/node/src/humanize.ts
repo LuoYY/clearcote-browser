@@ -36,7 +36,7 @@ import {
 } from "./motion.js";
 import {
   ANCHOR_TARGET_W, ISO_SCROLLER, anchorNeeded, anchorPoint, bringIntoView, inView as boxIn, inputDevice,
-  planTrackpad, wheelDrift, type ScrollBox, type ScrollIO, type Scroller,
+  pacedWheel, planTrackpad, wheelDrift, type ScrollBox, type ScrollIO, type Scroller,
 } from "./scroll.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
 import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
@@ -682,10 +682,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then
       // an inertia tail (scroll.ts planTrackpad). Playwright sends pixel deltas either way (deltaMode 0);
       // a notch persona's deltas are whole multiples of its notch.
-      for (const e of planTrackpad(dx, dy)) {
-        await nativeWheel(e.dx, e.dy);
-        if (e.sleepMs) await sleep(e.sleepMs);
-      }
+      await pacedWheel(planTrackpad(dx, dy), async (a, b) => { await nativeWheel(a, b); }, async (ms) => { await sleep(ms); });
       return;
     }
     const notch = await wheelNotchPx();

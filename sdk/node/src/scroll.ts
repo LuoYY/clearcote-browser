@@ -15,7 +15,7 @@
  * trackpad persona 2-40 px events at 60-120 events/s on a min-jerk bell, then an inertia tail that decays
  * exponentially for at least 300 ms.
  */
-import { gaussFrom, minJerk, wheelNotches, type Rng } from "./motion.js";
+import { gaussFrom, minJerk, wheelAnchorPoint, wheelNotches, type Rng } from "./motion.js";
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -61,12 +61,9 @@ export const TRACKPAD_NUDGE_PX = 60;
 
 /** The wheel anchor for a vw x vh viewport (two gaussians from `rng`, x first). */
 export function anchorPoint(vw: number, vh: number, rng: Rng = Math.random): [number, number] {
-  const [cx, sx, lx, hx] = ANCHOR_X;
-  const [cy, sy, ly, hy] = ANCHOR_Y;
-  const x = clamp(vw * cx + gaussFrom(rng) * vw * sx, vw * lx, vw * hx);
-  const y = clamp(vh * cy + gaussFrom(rng) * vh * sy, vh * ly, vh * hy);
-  return [x, y];
+  return wheelAnchorPoint(vw, vh, rng);
 }
+export { wheelAnchorPoint };
 
 /** Should the pointer be re-homed before a wheel? Never with a button down; not when placed and inside. */
 export function anchorNeeded(pos: [number, number], vw: number, vh: number, placed: boolean, held: boolean): boolean {
@@ -285,11 +282,22 @@ async function sendNotches(io: ScrollIO, n: number, axis: "x" | "y", sign: numbe
   }
 }
 
-async function sendTrackpad(io: ScrollIO, dx: number, dy: number, rng: Rng): Promise<void> {
-  for (const e of planTrackpad(dx, dy, rng)) {
-    await io.wheel(e.dx, e.dy);
-    if (e.sleepMs) await io.sleep(e.sleepMs);
+/** Send planned wheel events at their planned TIMES (a wall clock), not "send, then sleep the gap": a CDP
+ * wheel returns after the renderer's ack (~26 ms on r42 headless), which would otherwise stack on every gap. */
+export async function pacedWheel(events: WheelEv[], wheel: (dx: number, dy: number) => Promise<void>,
+  sleep: (ms: number) => Promise<void>): Promise<void> {
+  const t0 = Date.now();
+  let due = 0;
+  for (const e of events) {
+    await wheel(e.dx, e.dy);
+    due += e.sleepMs;
+    const wait = due - (Date.now() - t0);
+    if (wait > 0) await sleep(wait);
   }
+}
+
+async function sendTrackpad(io: ScrollIO, dx: number, dy: number, rng: Rng): Promise<void> {
+  await pacedWheel(planTrackpad(dx, dy, rng), (a, b) => io.wheel(a, b), (ms) => io.sleep(ms));
 }
 
 async function viewOf(io: ScrollIO, scroller: Scroller | null): Promise<View> {

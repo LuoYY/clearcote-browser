@@ -77,13 +77,10 @@ public static class Scroll
     public const double TrackpadStrokePx = 900, TrackpadPeakPx = 38, TrackpadNudgePx = 60;
 
     /// <summary>The wheel anchor for a vw x vh viewport (two gaussians from <paramref name="rng"/>, x first).</summary>
-    public static (double X, double Y) AnchorPoint(double vw, double vh, Rng? rng = null)
-    {
-        rng ??= Random.Shared.NextDouble;
-        double x = Clamp(vw * AnchorX.C + Motion.GaussFrom(rng) * vw * AnchorX.Sd, vw * AnchorX.Lo, vw * AnchorX.Hi);
-        double y = Clamp(vh * AnchorY.C + Motion.GaussFrom(rng) * vh * AnchorY.Sd, vh * AnchorY.Lo, vh * AnchorY.Hi);
-        return (x, y);
-    }
+    public static (double X, double Y) AnchorPoint(double vw, double vh, Rng? rng = null) => Motion.WheelAnchorPoint(vw, vh, rng);
+
+    /// <summary>The unified wheel anchor (<see cref="Motion.WheelAnchorPoint"/>), under the name lane G's vectors use.</summary>
+    public static (double X, double Y) WheelAnchorPoint(double vw, double vh, Rng? rng = null) => Motion.WheelAnchorPoint(vw, vh, rng);
 
     /// <summary>Should the pointer be re-homed before a wheel? Never with a button down; not when placed and inside.</summary>
     public static bool AnchorNeeded(double x, double y, double vw, double vh, bool placed, bool held)
@@ -315,14 +312,23 @@ public static class Scroll
         }
     }
 
-    private static async Task SendTrackpadAsync(IScrollIO io, double dx, double dy, Rng rng)
+    /// <summary>Send planned wheel events at their planned TIMES (a wall clock), not "send, then sleep the gap": a
+    /// CDP wheel returns after the renderer's ack (~26 ms on r42 headless), which would otherwise stack on every gap.</summary>
+    internal static async Task PacedWheelAsync(IEnumerable<WheelEvent> events, Func<double, double, Task> wheel, Func<double, Task> sleep)
     {
-        foreach (var e in PlanTrackpad(dx, dy, rng))
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        double due = 0;
+        foreach (var e in events)
         {
-            await io.WheelAsync(e.Dx, e.Dy).ConfigureAwait(false);
-            if (e.SleepMs > 0) await io.SleepAsync(e.SleepMs).ConfigureAwait(false);
+            await wheel(e.Dx, e.Dy).ConfigureAwait(false);
+            due += e.SleepMs;
+            double wait = due - sw.Elapsed.TotalMilliseconds;
+            if (wait > 0) await sleep(wait).ConfigureAwait(false);
         }
     }
+
+    private static Task SendTrackpadAsync(IScrollIO io, double dx, double dy, Rng rng)
+        => PacedWheelAsync(PlanTrackpad(dx, dy, rng), io.WheelAsync, io.SleepAsync);
 
     private static async Task<Box> ViewOfAsync(IScrollIO io, Scroller? sc)
     {

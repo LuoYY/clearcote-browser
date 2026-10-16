@@ -551,6 +551,15 @@ export function hesitateThenDrag(from: Point, to: Point, p: Persona, windowMs: n
   return { steps: creep.concat(leg), creep: creep.length };
 }
 
+/** Where a reading hand parks the pointer before a wheel: x ~ 0.5w ± 0.10w clamped [0.12w, 0.88w], y ~ 0.34h
+ * ± 0.09h clamped [0.10h, 0.62h] (two gaussians, x first). One model in all three SDKs (Python
+ * `wheel_anchor_point`, .NET `Motion.WheelAnchorPoint`); before 0.52 Node used 0.48/0.36 and other clamps. */
+export function wheelAnchorPoint(vw: number, vh: number, rng: Rng = Math.random): [number, number] {
+  const x = clamp(vw * 0.5 + gaussFrom(rng) * vw * 0.10, vw * 0.12, vw * 0.88);
+  const y = clamp(vh * 0.34 + gaussFrom(rng) * vh * 0.09, vh * 0.10, vh * 0.62);
+  return [x, y];
+}
+
 /** Grab/release dwell times (ms) for a held-button drag, drawn from the persona window. */
 export function dragDwell(p: Persona, rng: Rng = Math.random): { grabMs: number; releaseMs: number } {
   return {

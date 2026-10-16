@@ -1387,11 +1387,8 @@ public static partial class Humanize
         {
             // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then an
             // inertia tail (Scroll.PlanTrackpad). Playwright sends pixel deltas either way (deltaMode 0).
-            foreach (var e in Scroll.PlanTrackpad(deltaX, deltaY))
-            {
-                await page.Mouse.WheelAsync((float)e.Dx, (float)e.Dy).ConfigureAwait(false);
-                if (e.SleepMs > 0) await Task.Delay((int)Math.Round(e.SleepMs)).ConfigureAwait(false);
-            }
+            await Scroll.PacedWheelAsync(Scroll.PlanTrackpad(deltaX, deltaY),
+                (a, b) => page.Mouse.WheelAsync((float)a, (float)b), ms => Task.Delay((int)Math.Round(ms))).ConfigureAwait(false);
             return;
         }
 

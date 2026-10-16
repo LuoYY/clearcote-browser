@@ -25,7 +25,7 @@ import random
 import time
 from typing import Callable, Optional
 
-from ._motion import _clamp, _js_round, _lerp, gauss_from, min_jerk, wheel_notches
+from ._motion import _clamp, _js_round, _lerp, gauss_from, min_jerk, wheel_anchor_point, wheel_notches  # noqa: F401
 
 # ---------------------------------------------------------------- the anchor (one set of numbers)
 # Where a reading hand parks the pointer before scrolling: upper-middle of the viewport, gaussian
@@ -64,13 +64,7 @@ TRACKPAD_PAUSE_MS = (120.0, 400.0)
 def anchor_point(vw, vh, rng: Optional[Callable[[], float]] = None):
     """The wheel anchor for a vw x vh viewport: x ~ 0.5w +- 0.10w clamped to [0.12w, 0.88w],
     y ~ 0.34h +- 0.09h clamped to [0.10h, 0.62h]. Two gaussians from ``rng`` (x first)."""
-    if rng is None:
-        rng = random.random
-    cx, sx, lx, hx = ANCHOR_X
-    cy, sy, ly, hy = ANCHOR_Y
-    x = _clamp(vw * cx + gauss_from(rng) * vw * sx, vw * lx, vw * hx)
-    y = _clamp(vh * cy + gauss_from(rng) * vh * sy, vh * ly, vh * hy)
-    return x, y
+    return wheel_anchor_point(vw, vh, rng)
 
 
 def anchor_needed(pos, vw, vh, placed, held):

@@ -507,6 +507,18 @@ def hesitate_then_drag(frm, to, p: Persona, window_ms: float, settle: bool = Tru
     return creep + leg, len(creep)
 
 
+def wheel_anchor_point(vw: float, vh: float, rng: Optional[Rng] = None):
+    """Where a reading hand parks the pointer before a wheel: x ~ 0.5w +- 0.10w clamped to [0.12w, 0.88w],
+    y ~ 0.34h +- 0.09h clamped to [0.10h, 0.62h] (two gaussians from ``rng``, x first). One model in all
+    three SDKs (motion.ts wheelAnchorPoint, Motion.WheelAnchorPoint / Scroll.WheelAnchorPoint); before 0.52
+    Node and .NET used other centres, spreads and clamps. _scroll.anchor_point is this function."""
+    if rng is None:
+        rng = random.random
+    x = _clamp(vw * 0.5 + gauss_from(rng) * vw * 0.10, vw * 0.12, vw * 0.88)
+    y = _clamp(vh * 0.34 + gauss_from(rng) * vh * 0.09, vh * 0.10, vh * 0.62)
+    return x, y
+
+
 def drag_dwell(p: Persona, rng: Optional[Rng] = None):
     """(grab_ms, release_ms) for a held-button drag, from the persona window."""
     if rng is None:
