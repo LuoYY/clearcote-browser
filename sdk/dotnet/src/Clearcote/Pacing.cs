@@ -80,13 +80,16 @@ internal static class Pacing
     /// </summary>
     public static async Task<int> WalkAsync(IReadOnlyList<Step> steps, Func<double, double, Task> move,
         Func<double>? now = null, Func<double, Task>? sleep = null, double maxJump = MaxJumpPx,
-        Func<int, bool>? pinned = null)
+        Func<int, bool>? pinned = null, string kind = "glide")
     {
         now ??= RealNow;
         sleep ??= RealSleep;
         if (steps.Count == 0) return 0;
+        // Score hook (HumanizeTrace, SC 232): with CLEARCOTE_HUMANIZE_SCORE set the dispatched samples and their
+        // ACTUAL dispatch times are scored after the walk, as `kind`. Read-only: it changes nothing here.
+        var trace = HumanizeTrace.Enabled ? new List<MotionSample>() : null;
         var (due, total) = Schedule(steps);
-        double t0 = now(), tLast = t0;
+        double t0 = now(), tLast = t0, tStart = t0;
         int i = 0, sent = 0;
         (double X, double Y)? last = null;
         while (i < steps.Count)
@@ -96,8 +99,14 @@ internal static class Pacing
             else i = NextIndex(steps, due, i, last, el, JumpCap(maxJump, now() - tLast), pinned);
             var s = steps[i];
             double tb = now();
-            await move(s.X, s.Y).ConfigureAwait(false);
+            try { await move(s.X, s.Y).ConfigureAwait(false); }
+            catch
+            {
+                if (trace is { Count: > 0 }) HumanizeTrace.Record(kind, trace, new Dictionary<string, object?> { ["planned_n"] = steps.Count, ["sent"] = sent, ["aborted"] = true });
+                throw;
+            }
             sent++;
+            trace?.Add(new MotionSample(s.X, s.Y, tb - tStart));
             // Measured on PRO r38 under load: one move answered after 523 ms. Catching that up by skipping
             // coarsened the rest of the glide to maximum hops, and across the fixture's iframe the page saw
             // a 110 px jump. A stall pauses the plan; only StallMs of it is caught up.
@@ -109,6 +118,8 @@ internal static class Pacing
         }
         double end = now() - t0;
         if (end < total) await sleep(total - end).ConfigureAwait(false);   // the last sample's own dwell
+        if (trace is { Count: > 0 })
+            HumanizeTrace.Record(kind, trace, new Dictionary<string, object?> { ["planned_n"] = steps.Count, ["planned_ms"] = total, ["sent"] = sent });
         return sent;
     }
 

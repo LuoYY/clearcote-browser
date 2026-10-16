@@ -123,6 +123,11 @@ export { DEFAULT_IGNORED_ARGS, gpuBlocklistArgs, gpuBackendArgs, xDisplayAvailab
 export { serveMultiplex, type MultiplexOptions, type MultiplexServer } from "./multiplex.js";
 export type { HumanizeOptions } from "./humanize.js";
 export { pressAndHold, type PressAndHoldOptions, type HoldButton } from "./hold.js";
+export {
+  scoreAction, scoreMotion, scoreTyped, scoreWheel, scoreDrag, scoreHover, scoreAmbient, extractFeatures, stepsToSamples, fingerOf,
+  type ActionScore, type ActionKind, type MotionScore, type MotionFeatures, type Sample as MotionSample, type KeySample, type WheelSample,
+} from "./motionscore.js";
+export { record as recordHumanizeAction, traceEnabled as humanizeScoreEnabled } from "./trace.js";
 export { Profile, listProfiles, loadProfile, PROFILE_DIR, type ProfileOptions } from "./profile.js";
 // Profile library: real captured personas, selected for coherence with THIS host.
 export {

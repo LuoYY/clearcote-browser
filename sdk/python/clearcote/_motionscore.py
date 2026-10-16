@@ -122,8 +122,10 @@ def extract_features(s: Sequence[Sample]) -> MotionFeatures:
 
     # velocity skewness (positive for a human's fast-rise/slow-decay profile; ~0 for a symmetric curve)
     vmean = _mean(sv)
-    vstd = _std(sv) or 1e-9
-    vel_skew = _mean([((x - vmean) / vstd) ** 3 for x in sv])
+    vstd = _std(sv)
+    # A constant-speed stream has std 0 up to float noise (a walk on an accumulated clock gives dt's of
+    # 8.000000001): the skew of that noise is meaningless and differed between SDKs, so it reads as 0.
+    vel_skew = _mean([((x - vmean) / vstd) ** 3 for x in sv]) if vstd > 1e-9 * max(1.0, abs(vmean)) else 0.0
 
     # corrective submovements: prominent interior local minima below 0.5*vmax, a true valley between two
     # higher shoulders, with a minimum index separation so one correction isn't counted several times.
