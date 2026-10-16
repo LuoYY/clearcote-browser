@@ -1525,7 +1525,10 @@ public static partial class Humanize
                 // Keys.WordFixRate of the cases, when the field can be read to put it back exactly
                 int ws = 0;
                 for (int j = i - 1; j >= 0; j--) if (text[j] is " " or "\n") { ws = j + 1; break; }
-                if (before is not null && i - ws + typed >= 2 && Rnd.NextDouble() < Keys.WordFixRate)
+                // a WORD (letters only: no word delete in a code, a zip or a number), two keys of it on screen
+                if (before is not null && i - ws + typed >= 2
+                    && text.Skip(ws).Take(i + 1 - ws).All(c => c.Length > 0 && char.IsLetter(c[0]))
+                    && Rnd.NextDouble() < Keys.WordFixRate)
                 {
                     await PressKeyAsync(page, p, (OperatingSystem.IsMacOS() ? "Alt" : "Control") + "+Backspace").ConfigureAwait(false);
                     await Task.Delay((int)Rand(120, 260)).ConfigureAwait(false);

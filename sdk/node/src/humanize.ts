@@ -821,7 +821,9 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       await sleep(rand(140, 340)); // noticing
       let ws = 0;
       for (let j = i - 1; j >= 0; j--) if (chars[j] === " " || chars[j] === "\n") { ws = j + 1; break; }
-      if (before !== null && i - ws + typed >= 2 && nativeKbDown && Math.random() < WORD_FIX_RATE) {
+      // a WORD (letters only: no word delete in a code, a zip or a number), two keys of it on screen
+      if (before !== null && i - ws + typed >= 2 && nativeKbDown && /^\p{L}+$/u.test(chars.slice(ws, i + 1).join(""))
+          && Math.random() < WORD_FIX_RATE) {
         await wordDelete();
         await sleep(rand(120, 260));
         await restore(before);

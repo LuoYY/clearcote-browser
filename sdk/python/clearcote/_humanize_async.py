@@ -682,8 +682,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 typed += 1
             await asyncio.sleep(_rand(140, 340) / 1000.0)  # noticing
             ws = max(text.rfind(" ", 0, i), text.rfind("\n", 0, i)) + 1
+            # a WORD (letters only: no word delete in a code, a zip or a number), two keys of it on screen
             if (before is not None and i - ws + typed >= 2 and native_kb_down is not None
-                    and random.random() < WORD_FIX_RATE):
+                    and all(c.isalpha() for c in text[ws:i + 1]) and random.random() < WORD_FIX_RATE):
                 await _word_delete()
                 await asyncio.sleep(_rand(120, 260) / 1000.0)
                 await _restore(before)
