@@ -628,11 +628,14 @@ def plan_dwell(at, box, p: Persona, ms: float, rng: Optional[Rng] = None):
     return out
 
 
-def move_off_roll(p: Persona, rng: Optional[Rng] = None) -> bool:
-    """Does this click get a move-off? True in ``after_traits(p).move_off_rate`` of draws."""
+def move_off_roll(p: Persona, rng: Optional[Rng] = None, hits: int = 0, n: int = 0) -> bool:
+    """Does this click get a move-off? In ``after_traits(p).move_off_rate`` of clicks: a draw against
+    the rate, nudged by how far the page's running share (``hits`` of ``n`` earlier clicks) has drifted
+    from it, so 40 clicks land near the persona's rate instead of anywhere a coin allows (+-15 %)."""
     if rng is None:
         rng = random.random
-    return rng() < after_traits(p).move_off_rate
+    rate = after_traits(p).move_off_rate
+    return rng() < _clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98)
 
 
 def move_off_delay_ms(p: Persona, rng: Optional[Rng] = None) -> float:
