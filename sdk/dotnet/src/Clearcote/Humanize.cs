@@ -207,10 +207,12 @@ public static partial class Humanize
     /// call, else <see cref="Forms.DefaultTypoRate"/>. Same parsing as the Python SDK's typo_rate(): an
     /// unparsable value or NaN is the default.
     /// </summary>
-    internal static double TypoRate()
+    internal static double TypoRate(Persona? persona = null)
     {
+        // The persona's own rate (Motion.TimingTraitsOf, 0.5-4 % per identity; the global 2 % without one); the
+        // environment variable overrides it when set.
         var v = Environment.GetEnvironmentVariable(TypoRateEnv);
-        if (string.IsNullOrEmpty(v)) return Forms.DefaultTypoRate;
+        if (string.IsNullOrEmpty(v)) return persona is null ? Forms.DefaultTypoRate : Motion.TimingTraitsOf(persona).TypoRate;
         if (!double.TryParse(v.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var f)) return Forms.DefaultTypoRate;
         return double.IsNaN(f) ? Forms.DefaultTypoRate : Math.Min(1.0, Math.Max(0.0, f));
     }
@@ -241,8 +243,11 @@ public static partial class Humanize
     private static Task SerialAsync(IPage page, Func<Task> body)
         => SerialAsync<bool>(page, async () => { await body().ConfigureAwait(false); return true; });
 
-    private static double TypoRateFor(IPage page)
-        => TypoRateOverride.TryGetValue(page, out var forced) ? forced.Value : TypoRate();
+    private static double TypoRateFor(IPage page, Persona? p = null)
+        => TypoRateOverride.TryGetValue(page, out var forced) ? forced.Value : TypoRate(p);
+
+    /// <summary>The Fitts target width of a glide onto a box: its smaller side (floor 6 px).</summary>
+    private static double AimW(LocatorBoundingBoxResult bb) => Math.Max(6, Math.Min(bb.Width, bb.Height));
 
     // How long a covered click point is re-checked (an overlay fading out) before the native path takes over.
     internal const float CoverCheckMs = 400;
@@ -674,7 +679,16 @@ public static partial class Humanize
                     // flight does not) and own the click point -- no trusted press at a point some overlay
                     // owns. Either failing goes native: Playwright waits for it.
                     await Task.Delay(50).ConfigureAwait(false);
-                    if (await ReachesPointAsync(page, bb, x, y, CssOf(loc)).ConfigureAwait(false) != true)
+                    var hit = await ReachesPointAsync(page, bb, x, y, CssOf(loc)).ConfigureAwait(false);
+                    if (hit == false && o.Position is null
+                        && await ProvenClickPointAsync(page, bb, CssOf(loc)).ConfigureAwait(false) is { } alt)
+                    {
+                        // The persona's point is covered (a badge, an icon, a floating label over the centre): aim at the
+                        // first probe point the hit test proves reaches the element before giving the click to Playwright,
+                        // which waited out its timeout on 5-7 of 16 badge-covered buttons (EVAL B).
+                        (x, y) = (alt.X, alt.Y);
+                    }
+                    else if (hit != true)
                         goNative = Fallback("click: the point does not reach the element (covered, moving or clipped)");
                 }
                 if (!goNative)
@@ -691,7 +705,7 @@ public static partial class Humanize
                                 held.Add(m);
                                 await Task.Delay((int)Rand(40, 110)).ConfigureAwait(false);
                             }
-                            await GlideAsync(page, p, st, x, y, Math.Max(6, bb.Width)).ConfigureAwait(false);
+                            await GlideAsync(page, p, st, x, y, AimW(bb)).ConfigureAwait(false);
                         }
                         finally
                         {
@@ -705,7 +719,7 @@ public static partial class Humanize
                         }
                         return;
                     }
-                    await GlideAsync(page, p, st, x, y, Math.Max(6, bb.Width)).ConfigureAwait(false);
+                    await GlideAsync(page, p, st, x, y, AimW(bb)).ConfigureAwait(false);
                     if (!noClick) await PressAtAsync(page, p, o).ConfigureAwait(false);
                     return;
                 }
@@ -769,6 +783,23 @@ public static partial class Humanize
         }
         if (hit is null) FallbackTrace?.Invoke("click: the hit test cannot run here");
         return hit;
+    }
+
+    /// <summary>
+    /// When the persona's point is covered (a badge, a floating label over the centre): the first probe point (edges,
+    /// then bottom/top) the isolated hit test proves reaches the element, as a whole pixel inside the box; null when
+    /// none does (the caller falls back).
+    /// </summary>
+    internal static async Task<Point?> ProvenClickPointAsync(IPage page, LocatorBoundingBoxResult bb, string? sel)
+    {
+        for (int i = 1; i < ProbePoints.Length; i++)
+        {
+            var (fx, fy) = ProbePoints[i];
+            double x = Math.Round(Math.Min(Math.Max(bb.X + bb.Width * fx + Gauss(0, 1.5), bb.X + 1), bb.X + bb.Width - 1));
+            double y = Math.Round(Math.Min(Math.Max(bb.Y + bb.Height * fy + Gauss(0, 1.0), bb.Y + 1), bb.Y + bb.Height - 1));
+            if (await HitInBoxAsync(page, bb, x, y, sel).ConfigureAwait(false) == true) return new Point(x, y);
+        }
+        return null;
     }
 
     /// The viewport point of Playwright's <c>Position</c> (relative to the PADDING box: the border widths are added).
@@ -885,7 +916,7 @@ public static partial class Humanize
                     // never leave the button down: every later move would be a drag
                     await page.Mouse.UpAsync(new MouseUpOptions { Button = button, ClickCount = i }).ConfigureAwait(false);
                 }
-                if (i < o.ClickCount) await Task.Delay((int)Rand(70, 170)).ConfigureAwait(false);   // the gap inside a double click
+                if (i < o.ClickCount) await Task.Delay((int)Motion.DblclickGap(p)).ConfigureAwait(false);   // the gap inside a double click: the persona's
             }
         }
         finally
@@ -939,7 +970,7 @@ public static partial class Humanize
         for (int j = 0; j < n; j++)
         {
             await page.Keyboard.PressAsync(key, new KeyboardPressOptions { Delay = (float)Motion.KeyDwell(p) }).ConfigureAwait(false);
-            if (j < n - 1) await Task.Delay((int)Rand(gapLo, gapHi)).ConfigureAwait(false);
+            if (j < n - 1) await Task.Delay((int)Motion.PauseMs(p, gapLo, gapHi)).ConfigureAwait(false);
         }
     }
 
@@ -1274,7 +1305,7 @@ public static partial class Humanize
         // One key per code point (a surrogate pair is one character, not two half keys).
         var chars = Forms.Chars(text);
         double rollover = RolloverOverride.TryGetValue(page, out var forced) ? forced.Value : Motion.RolloverRate(p);
-        double rate = typos ? TypoRateFor(page) : 0.0;
+        double rate = typos ? TypoRateFor(page, p) : 0.0;
         bool allow = rate > 0 && Forms.TyposAllowed(field ?? await ActiveFieldAsync(page).ConfigureAwait(false));
         // Capitals and shifted symbols are typed the way a person types them: ShiftLeft goes down a
         // moment before the key (35-120 ms) and comes up just after it (10-70 ms), held across a run of
@@ -1727,21 +1758,23 @@ public static partial class Humanize
         var o = new HumanClickOptions { Position = at };
         await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()))
             .ConfigureAwait(false);
-        await Task.Delay((int)Rand(220, 480)).ConfigureAwait(false);   // the list opens; the eye finds the option
+        // Every pause here is the persona's (TimingTraits.PauseScale): the windows were one fixed set for every identity.
+        await Task.Delay((int)Motion.PauseMs(p, 220, 480)).ConfigureAwait(false);   // the list opens; the eye finds the option
+        double tempo = Motion.TimingTraitsOf(p).PauseScale;
         foreach (var ch in plan.Keys)
         {
             await page.Keyboard.PressAsync(ch.ToString(), new KeyboardPressOptions { Delay = (float)Motion.KeyDwell(p) })
                 .ConfigureAwait(false);
-            await Task.Delay((int)Math.Max(40, Gauss(100, 35))).ConfigureAwait(false);   // well inside type-ahead's 1 s window
+            await Task.Delay((int)Math.Max(40, Gauss(100, 35) * tempo)).ConfigureAwait(false);   // well inside type-ahead's 1 s window
         }
         if (plan.Arrows != 0)
         {
-            await Task.Delay((int)Rand(120, 300)).ConfigureAwait(false);
+            await Task.Delay((int)Motion.PauseMs(p, 120, 300)).ConfigureAwait(false);
             await ArrowRunAsync(page, p, plan.Arrows > 0 ? "ArrowDown" : "ArrowUp", Math.Abs(plan.Arrows)).ConfigureAwait(false);
         }
-        await Task.Delay((int)Rand(150, 400)).ConfigureAwait(false);
+        await Task.Delay((int)Motion.PauseMs(p, 150, 400)).ConfigureAwait(false);
         await KeyAsync(page, p, "Enter").ConfigureAwait(false);
-        await Task.Delay((int)Rand(80, 160)).ConfigureAwait(false);
+        await Task.Delay((int)Motion.PauseMs(p, 80, 160)).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -2228,7 +2261,7 @@ public static partial class Humanize
         var from = st.Known ? new Point(st.X, st.Y) : new Point(bb.X - 120, bb.Y - 90);
         var p0 = at ?? Motion.ClickPoint(new Box(bb.X, bb.Y, bb.Width, bb.Height), from, p);
         var pt = new Point(Math.Round(p0.X), Math.Round(p0.Y));   // the pixel the hit test answered for
-        await GlideAsync(page, p, st, pt.X, pt.Y, Math.Max(6, bb.Width)).ConfigureAwait(false);
+        await GlideAsync(page, p, st, pt.X, pt.Y, AimW(bb)).ConfigureAwait(false);
         await ClickAtAsync(page, p, pt.X, pt.Y).ConfigureAwait(false);
         return true;
     }
@@ -2494,7 +2527,7 @@ public static partial class Humanize
         }
         await GlideAsync(page, p, st, px.Value, py!.Value, fw).ConfigureAwait(false);
         await ClickAtAsync(page, p, px.Value, py.Value).ConfigureAwait(false);
-        await Task.Delay((int)Rand(150, 350)).ConfigureAwait(false);
+        await Task.Delay((int)Motion.PauseMs(p, 150, 350)).ConfigureAwait(false);
         foreach (var a in plan)
         {
             if (a.Op == "type")
@@ -2506,7 +2539,7 @@ public static partial class Humanize
                 await TypeTextAsync(page, p, a.Arg, null, typos: false).ConfigureAwait(false);
             }
             else await KeyAsync(page, p, a.Arg, a.Count ?? 1, 70, 170).ConfigureAwait(false);
-            await Task.Delay((int)Rand(60, 220)).ConfigureAwait(false);   // between fields: the eye checks what it typed
+            await Task.Delay((int)Motion.PauseMs(p, 60, 220)).ConfigureAwait(false);   // between fields: the eye checks what it typed
         }
         return Forms.DatetimeEqual(kind, await loc.InputValueAsync().ConfigureAwait(false), value);
     }
