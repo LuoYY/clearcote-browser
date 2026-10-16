@@ -163,31 +163,38 @@ describe("per-call { humanize: false }", () => {
 });
 
 describe("presets", () => {
-  // Wall time of one glide + one typed sentence on the fake page, with Math.random seeded so every preset
-  // plans the same path. A preset also changes which thinking pauses are drawn, so several runs are summed.
-  const timed = async (humanize: unknown): Promise<number> => {
+  // The PLANNED time of one glide + one typed sentence on the fake page: every timer the humanizer asks for
+  // is summed (and fired at once), so the measure does not depend on how loaded the machine is. Math.random
+  // is seeded so every preset plans the same path; a preset also changes which thinking pauses are drawn,
+  // so several runs are summed.
+  const planned = async (humanize: unknown): Promise<number> => {
     process.env[ENV] = "0";
-    const real = Math.random;
+    const realRandom = Math.random;
+    const realTimeout = globalThis.setTimeout;
     let total = 0;
+    (globalThis as any).setTimeout = (fn: (...a: any[]) => void, ms?: number, ...a: any[]) => {
+      total += Number(ms) || 0;
+      return realTimeout(fn, 0, ...a);
+    };
     try {
-      for (let i = 0; i < 4; i++) {
+      for (let i = 0; i < 6; i++) {
         Math.random = mulberry32(1000 + i);
         const f = await attached({}, humanize);
-        const t0 = performance.now();
         await f.page.mouse.move(700, 500);
-        await f.page.keyboard.type("the quick brown fox jumps");
-        total += performance.now() - t0;
+        await f.page.keyboard.type("the quick brown fox jumps over the lazy dog");
+        total += f.of("press").reduce((a, e) => a + (Number(e.a?.delay) || 0), 0);   // key holds go to Playwright
       }
     } finally {
-      Math.random = real;
+      Math.random = realRandom;
+      (globalThis as any).setTimeout = realTimeout;
     }
     return total;
   };
 
   it("quick is ~0.7x and careful ~1.4x the default's durations (+-15 %)", async () => {
-    const base = await timed(true);
-    const quick = await timed({ preset: "quick" });
-    const careful = await timed({ preset: "careful" });
+    const base = await planned(true);
+    const quick = await planned({ preset: "quick" });
+    const careful = await planned({ preset: "careful" });
     expect(base).toBeGreaterThan(1000);
     expect(Math.abs(quick / base - 0.7)).toBeLessThanOrEqual(0.7 * 0.15);
     expect(Math.abs(careful / base - 1.4)).toBeLessThanOrEqual(1.4 * 0.15);
