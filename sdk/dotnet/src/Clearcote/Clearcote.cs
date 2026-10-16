@@ -15,7 +15,7 @@ namespace Clearcote;
 public static class Clearcote
 {
     /// This SDK's version (kept in lockstep with the npm/PyPI SDKs).
-    public const string Version = "0.50.1";
+    public const string Version = "0.51.0";
 
     private static readonly SemaphoreSlim PwLock = new(1, 1);
     private static IPlaywright? _pw;
@@ -128,7 +128,8 @@ public static class Clearcote
         LaunchWarnings.EmitOnce(LaunchWarnings.ForPersonaHost(options), options.Quiet);   // a Linux persona on Windows
 
         var licVersion = options.Version ?? Environment.GetEnvironmentVariable("CLEARCOTE_BROWSER_VERSION");
-        var licKey = License.ResolveLicenseKey(options.LicenseKey);
+        // Offline mode: no licence key in play, so nothing below reaches the network (Offline.cs).
+        var licKey = Offline.OfflineKeyPath(options.OfflineKey) is null ? License.ResolveLicenseKey(options.LicenseKey) : null;
         // Widevine: on by default for a licensed launch (licKey: the key that selects the PRO build, which claims
         // the Google Chrome brand) on an engine with --widevine-cdm-path, which loads the CDM without a profile;
         // opt-in for a free one. Bounded + fail-soft by default; before the lease, so a slow fetch holds no slot.
@@ -263,7 +264,8 @@ public static class Clearcote
         LaunchWarnings.EmitOnce(LaunchWarnings.ForPersonaHost(options), options.Quiet);   // a Linux persona on Windows
 
         var licVersion = options.Version ?? Environment.GetEnvironmentVariable("CLEARCOTE_BROWSER_VERSION");
-        var licKey = License.ResolveLicenseKey(options.LicenseKey);
+        // Offline mode: no licence key in play, so nothing below reaches the network (Offline.cs).
+        var licKey = Offline.OfflineKeyPath(options.OfflineKey) is null ? License.ResolveLicenseKey(options.LicenseKey) : null;
         // Widevine: on by default for a licensed launch (licKey selects the PRO build) on an r32+ engine; asked for,
         // best-effort as always. Before the lease, so a slow fetch holds no slot.
         args.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
@@ -392,7 +394,8 @@ public static class Clearcote
         if (geometry is not null) cdpArgs.AddRange(geometry.Args);
 
         var licVersion = options.Version ?? Environment.GetEnvironmentVariable("CLEARCOTE_BROWSER_VERSION");
-        var licKey = License.ResolveLicenseKey(options.LicenseKey);
+        // Offline mode: no licence key in play, so nothing below reaches the network (Offline.cs).
+        var licKey = Offline.OfflineKeyPath(options.OfflineKey) is null ? License.ResolveLicenseKey(options.LicenseKey) : null;
         // Widevine: as LaunchAsync (on by default for a licensed launch on an r32+ engine, opt-in otherwise).
         cdpArgs.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
         var lease = await License.AcquireLeaseAsync(
