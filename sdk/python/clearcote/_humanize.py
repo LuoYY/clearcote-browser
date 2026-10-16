@@ -1483,7 +1483,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         if info is None:
             raise _Native()
         td = _tab_distance(info, selector)
-        act = bool(td and td.get("activatable"))
+        act = td is None or bool(td.get("activatable"))   # unknown: never risk an activating click
         if td and td.get("dist") is not None and 1 <= abs(td["dist"]) <= 3:
             if act or random.random() < _tab_pref():
                 if _tab_into(loc, info, selector, force=True):
