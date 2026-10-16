@@ -170,7 +170,7 @@ public class AfterActionTests
             Assert.True(end - at.T >= 140, $"{seed}: dwelt {end - at.T:F0} ms");
             var d = Trace(f.Page).Last(e => (string)e[0] == "dwell");
             double ms = (double)d[1];
-            Assert.InRange(ms, 150, 900);
+            Assert.InRange(ms, 150, 800);
             planned.Add(ms);
         }
         Assert.True(planned.Select(v => Math.Round(v)).Distinct().Count() >= 4, string.Join(",", planned));

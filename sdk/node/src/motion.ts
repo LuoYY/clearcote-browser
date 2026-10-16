@@ -596,10 +596,10 @@ export function afterRng(p: Persona): Rng {
   return r;
 }
 
-/** How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–850 ms (150–900 as the page
+/** How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–800 ms (150–900 as the page
  * measures it, with the glide's slow tail). */
 export function dwellMs(p: Persona, rng: Rng = Math.random): number {
-  return clamp(afterTraits(p).dwellMs * lerp(0.6, 1.4, rng()), 150, 850);
+  return clamp(afterTraits(p).dwellMs * lerp(0.6, 1.4, rng()), 150, 800);
 }
 
 /** Plan the pointer's rest on a hover target: OU drift + 8–12 Hz tremor around `at` for about `ms` (at

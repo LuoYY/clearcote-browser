@@ -611,12 +611,12 @@ public static class Motion
         return r;
     }
 
-    /// <summary>How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–850 ms (150–900 as the
+    /// <summary>How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–800 ms (150–900 as the
     /// page measures it, with the glide's slow tail).</summary>
     public static double DwellMs(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return Clamp(AfterTraitsOf(p).DwellMs * Lerp(0.6, 1.4, rng()), 150, 850);
+        return Clamp(AfterTraitsOf(p).DwellMs * Lerp(0.6, 1.4, rng()), 150, 800);
     }
 
     /// <summary>

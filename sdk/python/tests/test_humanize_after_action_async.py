@@ -207,7 +207,7 @@ def test_async_hover_dwells_on_arrival_inside_the_box(clock, seed):
         for _, _, x, y in rest:
             assert math.hypot(x - ax, y - ay) <= 3.0 + 1e-9
             assert BOX["x"] < x < BOX["x"] + BOX["width"] and BOX["y"] < y < BOX["y"] + BOX["height"]
-        assert 150.0 <= (end - ta) * 1000.0 <= 900.0 * 1.4 + 20
+        assert 150.0 <= (end - ta) * 1000.0 <= 900.0
     asyncio.run(go())
 
 

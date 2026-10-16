@@ -211,9 +211,9 @@ def test_hover_dwells_on_arrival_inside_the_box(clock, seed):
         assert math.hypot(x - ax, y - ay) <= 3.0 + 1e-9
         assert BOX["x"] < x < BOX["x"] + BOX["width"] and BOX["y"] < y < BOX["y"] + BOX["height"]
     dwell = (end - ta) * 1000.0
-    assert 150.0 <= dwell <= 900.0 * 1.4 + 20, dwell   # planned 150-900 ms; rest gaps run 0.9-1.4 frame
+    assert 150.0 <= dwell <= 900.0, dwell   # the EVAL band (planned 150-800 ms, walked at the planned frame rate)
     planned = [e for e in trace(p) if e[0] == "dwell"][-1][1]
-    assert 150.0 <= planned <= 900.0
+    assert 150.0 <= planned <= 800.0
 
 
 def test_hover_dwell_is_per_persona(clock):
@@ -400,7 +400,7 @@ def test_attention_idle_drifts_after_a_long_gap_only(clock):
 
 def test_explore_scroll_happens_in_some_loads_never_before_a_coordinate_action(clock):
     wheels = 0
-    for i in range(30):
+    for i in range(60):
         p = attach(clock, f"ex-{i}")
         p._clearcote_attention = True
         p.fire("load")
@@ -409,7 +409,7 @@ def test_explore_scroll_happens_in_some_loads_never_before_a_coordinate_action(c
         p.fire("load")
         p.click("#t")
         wheels += bool([e for e in p.log if e[0] == "wheel"])
-    assert 3 <= wheels <= 18, wheels
+    assert 6 <= wheels <= 32, wheels   # EXPLORE_RATE 0.30 of 60 loads (unseeded draws)
 
 
 # ----------------------------------------------------------------------------------- ambient option

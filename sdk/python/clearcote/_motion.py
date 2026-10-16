@@ -588,11 +588,11 @@ def after_rng(p: Persona) -> Rng:
 
 
 def dwell_ms(p: Persona, rng: Optional[Rng] = None) -> float:
-    """How long a hover dwells on arrival: the persona's centre x 0.6..1.4, kept in 150..850 ms (the band is
-    150-900 ms as the page measures it: the glide's slow tail inside 3 px adds a few tens of ms)."""
+    """How long a hover dwells on arrival: the persona's centre x 0.6..1.4, kept in 150..800 ms (the band is
+    150-900 ms as the page measures it: the glide's slow tail inside 3 px adds up to ~70 ms)."""
     if rng is None:
         rng = random.random
-    return _clamp(after_traits(p).dwell_ms * _lerp(0.6, 1.4, rng()), 150.0, 850.0)
+    return _clamp(after_traits(p).dwell_ms * _lerp(0.6, 1.4, rng()), 150.0, 800.0)
 
 
 def plan_dwell(at, box, p: Persona, ms: float, rng: Optional[Rng] = None):

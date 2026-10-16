@@ -128,7 +128,7 @@ describe("hover dwell", () => {
       expect(e.x! > BOX.x && e.x! < BOX.x + BOX.width && e.y! > BOX.y && e.y! < BOX.y + BOX.height).toBe(true);
     }
     expect(end - at.t).toBeGreaterThanOrEqual(150);
-    expect(end - at.t).toBeLessThanOrEqual(900 * 1.4 + 20);
+    expect(end - at.t).toBeLessThanOrEqual(900);
   }, 60_000);
 
   it("dwell: 0 disables, a number overrides, and it never reaches a native hover", async () => {
