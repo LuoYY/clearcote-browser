@@ -9,7 +9,10 @@ What it does, in order:
   1. waits for the element to be visible and brings it into view (the humanized wheel scroll on a
      humanized main-frame page, Playwright's scroll otherwise);
   2. moves the pointer to a point inside it (a persona-shaped point near the centre, or the
-     caller's ``position``) -- a humanized glide when humanize is on;
+     caller's ``position``, relative to the PADDING box like Playwright's and click's) -- a humanized
+     glide (Fitts width = the element's smaller side) when humanize is on. On a humanized page the
+     point is first put to the same isolated hit test a click uses (retried COVER_CHECK_MS); a covered
+     persona point moves to the first probe point (edges, top, bottom) the hit test proves;
   3. presses (after the humanized pre-press pause) and holds for ``duration`` ms, or until
      ``until()`` is true -- then lets go after a human reaction delay (160-350 ms), not on the
      same tick the condition flipped;
@@ -83,11 +86,14 @@ def reaction_ms(rng=None):
     return REACTION_MS[0] + rng() * (REACTION_MS[1] - REACTION_MS[0])
 
 
-def hold_point(box, frm=None, persona=None, position=None):
-    """The viewport point to press: ``position`` (relative to the element's top-left, as Playwright's
-    `position`), else the persona's click point when there is one, else the centre."""
+def hold_point(box, frm=None, persona=None, position=None, border=(0.0, 0.0)):
+    """The viewport point to press: ``position`` (relative to the element's PADDING box, as Playwright's
+    `position` and the humanized click's: ``border`` = (left, top) border widths, added), else the
+    persona's click point when there is one, else the centre. Before 0.52 ``position`` was taken from
+    the border box here while click took it from the padding box; the two now agree."""
     if position:
-        return box["x"] + float(position["x"]), box["y"] + float(position["y"])
+        bl, bt = border
+        return box["x"] + bl + float(position["x"]), box["y"] + bt + float(position["y"])
     if persona is not None and frm is not None:
         from ._motion import click_point
         return click_point(box, frm, persona)
@@ -118,6 +124,55 @@ def _selector_of(loc):
         return None
 
 
+def _border(page, box, position, iso):
+    """(left, top) border widths of the element in ``box`` on a humanized page (its isolated-world
+    read), so a caller's ``position`` is padding-box relative like click's; (0, 0) otherwise."""
+    border_of = getattr(page, "_clearcote_border_of", None)
+    if not (position and iso and border_of is not None):
+        return (0.0, 0.0)
+    try:
+        return tuple(border_of(box))
+    except Exception:  # noqa: BLE001
+        return (0.0, 0.0)
+
+
+async def _border_async(page, box, position, iso):
+    border_of = getattr(page, "_clearcote_border_of", None)
+    if not (position and iso and border_of is not None):
+        return (0.0, 0.0)
+    try:
+        return tuple(await border_of(box))
+    except Exception:  # noqa: BLE001
+        return (0.0, 0.0)
+
+
+def _checked_point(page, box, x, y, position, iso, sel):
+    """The press point after the covered-point check (the humanized click's isolated hit test, retried
+    COVER_CHECK_MS): the point itself when it reaches the element or the check cannot run; the first
+    probe point the hit test proves when the PERSONA's point is covered (a caller's ``position`` is
+    kept: it asked for that pixel); the point itself when nothing proves -- there is no native hold to
+    fall back to, so the press goes where a person would press."""
+    reaches = getattr(page, "_clearcote_reaches_point", None)
+    if not iso or reaches is None:
+        return x, y
+    if reaches(box, x, y, sel) is not False or position:
+        return x, y
+    proven = getattr(page, "_clearcote_proven_point", None)
+    alt = proven(box, sel) if proven is not None else None
+    return alt if alt else (x, y)
+
+
+async def _checked_point_async(page, box, x, y, position, iso, sel):
+    reaches = getattr(page, "_clearcote_reaches_point", None)
+    if not iso or reaches is None:
+        return x, y
+    if (await reaches(box, x, y, sel)) is not False or position:
+        return x, y
+    proven = getattr(page, "_clearcote_proven_point", None)
+    alt = (await proven(box, sel)) if proven is not None else None
+    return alt if alt else (x, y)
+
+
 # --- sync ---------------------------------------------------------------------------------------
 
 def press_and_hold(target, duration=None, *, position=None, button="left", timeout=None,
@@ -142,6 +197,7 @@ def press_and_hold(target, duration=None, *, position=None, button="left", timeo
             if "Timeout" in type(e).__name__:
                 raise
             box = None
+    iso = bool(box)   # the humanizer's own box: its hit test, probe points and aimed glide apply
     if not box:
         loc.wait_for(state="visible", timeout=timeout)
         loc.scroll_into_view_if_needed(timeout=timeout)
@@ -150,11 +206,16 @@ def press_and_hold(target, duration=None, *, position=None, button="left", timeo
         raise RuntimeError("press_and_hold: the element has no box (not rendered)")
     persona = getattr(page, "_clearcote_persona", None)
     pos_of = getattr(page, "_clearcote_pointer", None)
-    x, y = hold_point(box, pos_of() if pos_of else None, persona, position)
+    x, y = hold_point(box, pos_of() if pos_of else None, persona, position, _border(page, box, position, iso))
     x, y = float(round(x)), float(round(y))
+    x, y = _checked_point(page, box, x, y, position, iso, _selector_of(loc))
     nudge = getattr(page, "_clearcote_nudge", None) or page.mouse.move
 
-    page.mouse.move(x, y)           # a humanized glide when humanize is on
+    aim = getattr(page, "_clearcote_aim_glide", None)
+    if iso and aim is not None:
+        aim(x, y, box)              # the humanized glide, Fitts width = the element's smaller side
+    else:
+        page.mouse.move(x, y)       # a humanized glide when humanize is on
     page.mouse.down(button=btn)     # humanized: the pre-press pause first
     t0 = time.monotonic()
     done = until is None
@@ -209,6 +270,7 @@ async def press_and_hold_async(target, duration=None, *, position=None, button="
             if "Timeout" in type(e).__name__:
                 raise
             box = None
+    iso = bool(box)
     if not box:
         await loc.wait_for(state="visible", timeout=timeout)
         await loc.scroll_into_view_if_needed(timeout=timeout)
@@ -217,11 +279,16 @@ async def press_and_hold_async(target, duration=None, *, position=None, button="
         raise RuntimeError("press_and_hold: the element has no box (not rendered)")
     persona = getattr(page, "_clearcote_persona", None)
     pos_of = getattr(page, "_clearcote_pointer", None)
-    x, y = hold_point(box, pos_of() if pos_of else None, persona, position)
+    x, y = hold_point(box, pos_of() if pos_of else None, persona, position, await _border_async(page, box, position, iso))
     x, y = float(round(x)), float(round(y))
+    x, y = await _checked_point_async(page, box, x, y, position, iso, _selector_of(loc))
     nudge = getattr(page, "_clearcote_nudge", None) or page.mouse.move
 
-    await page.mouse.move(x, y)
+    aim = getattr(page, "_clearcote_aim_glide", None)
+    if iso and aim is not None:
+        await aim(x, y, box)
+    else:
+        await page.mouse.move(x, y)
     await page.mouse.down(button=btn)
     t0 = time.monotonic()
     done = until is None

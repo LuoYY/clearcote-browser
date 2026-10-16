@@ -49,6 +49,7 @@ from ._isolated import (
 )
 from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
+    dblclick_gap, pause_ms, timing_traits,
     platform_from_navigator, rollover_rate, wheel_notches,
 )
 from ._hold import press_and_hold
@@ -128,12 +129,13 @@ def _rand(a, b):
     return a + random.random() * (b - a)
 
 
-def typo_rate():
-    """Per-character fat-finger rate. CLEARCOTE_HUMANIZE_TYPO_RATE overrides it (0 disables typos;
-    the test suites raise it to exercise the correction paths)."""
+def typo_rate(persona=None):
+    """Per-character fat-finger rate: the persona's own (timing_traits, 0.5-4 % per identity; the
+    global 2 % without a persona). CLEARCOTE_HUMANIZE_TYPO_RATE overrides it when set (0 disables
+    typos; the test suites raise it to exercise the correction paths)."""
     v = os.environ.get("CLEARCOTE_HUMANIZE_TYPO_RATE")
     if v is None or v == "":
-        return DEFAULT_TYPO_RATE
+        return timing_traits(persona).typo_rate if persona is not None else DEFAULT_TYPO_RATE
     try:
         f = float(v)
     except ValueError:
@@ -569,7 +571,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 finally:
                     native_up(button=o["button"], click_count=i)   # never leave the button down
                 if i < n:
-                    time.sleep(_rand(70, 170) / 1000.0)   # the gap inside a double click
+                    time.sleep(dblclick_gap(persona) / 1000.0)   # the gap inside a double click: the persona's
         finally:
             for m in reversed(held):
                 time.sleep(_rand(20, 80) / 1000.0)
@@ -586,15 +588,14 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         if engine_path_ok(o) and _engine_clicks_mode() != "off" and _engine_glide(x, y, no_click=False):
             return
         _glide(x, y)
-        try:
-            if native_down is None or native_up is None or (o["modifiers"] and native_kb_down is None):
-                _pre_press()
-                native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
-                             **_sel_kw(kw, "button", "click_count"))
-                return
-            _press_at(x, y, o)
-        except Exception:  # noqa: BLE001
-            pass
+        # A press that raises RAISES (it was swallowed here: a click whose press failed reported
+        # success). Only the pin before a press (hdown) stays best-effort.
+        if native_down is None or native_up is None or (o["modifiers"] and native_kb_down is None):
+            _pre_press()
+            native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
+                         **_sel_kw(kw, "button", "click_count"))
+            return
+        _press_at(x, y, o)
 
     def hdblclick_xy(x, y, **kw):
         kw = dict(kw)
@@ -877,7 +878,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         n = len(text)
         shift = False
         roll_rate = rollover_rate(persona)
-        rate = typo_rate() if typos else 0.0
+        rate = typo_rate(persona) if typos else 0.0
         allow = rate > 0 and typos_allowed(_typing_field(field))
         i = 0
         try:
@@ -981,6 +982,24 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # Points tried when resolving a control through the browser's hit test: a floating label or an
     # icon often sits over a field's CENTRE, so the edges get a chance too.
     probe_points = ((0.5, 0.5), (0.82, 0.5), (0.18, 0.5), (0.5, 0.8), (0.5, 0.2))
+
+    def _aim_w(box):
+        """The Fitts target width of a glide onto ``box``: its smaller side (floor 6 px). Every targeted
+        glide passed 24 whatever the box, so duration did not follow the target's size."""
+        return max(6.0, min(float(box["width"]), float(box["height"])))
+
+    def _proven_click_point(box, sel=None):
+        """When the persona's point is covered (a badge, a floating label over the centre): the first
+        probe point (edges, then top/bottom) the isolated hit test proves reaches the element, as a
+        whole pixel inside the box; None when none does (the caller falls back)."""
+        for fx, fy in probe_points[1:]:
+            x = box["x"] + box["width"] * fx + random.gauss(0, 1.5)
+            y = box["y"] + box["height"] * fy + random.gauss(0, 1.0)
+            x = float(round(min(max(x, box["x"] + 1), box["x"] + box["width"] - 1)))
+            y = float(round(min(max(y, box["y"] + 1), box["y"] + box["height"] - 1)))
+            if _hit_in_box(box, x, y, sel) is True:
+                return (x, y)
+        return None
 
     def _describe(box, want=FORM_CONTROL):
         """The control filling ``box`` (Playwright's resolved box for a locator), read in the isolated
@@ -1168,7 +1187,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return False
         pt = at if at is not None else click_point(box, st["pos"], persona)  # 2D gaussian toward centre
         pt = (float(round(pt[0])), float(round(pt[1])))   # the pixel the hit test answered for
-        _glide(pt[0], pt[1])
+        _glide(pt[0], pt[1], target_w=_aim_w(box))
         _press_here(pt[0], pt[1])
         return True
 
@@ -1176,7 +1195,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         for j in range(n):
             native_kb_press(k, delay=key_dwell(persona))
             if j < n - 1:
-                time.sleep(_rand(*gap) / 1000.0)
+                time.sleep(pause_ms(persona, *gap) / 1000.0)
 
     def _select_all():
         """Ctrl+A (Cmd+A on a Mac engine) the way a hand does it: the modifier goes down a moment
@@ -1408,7 +1427,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             py = box["y"] + box["height"] / 2
         _glide(px, py, target_w=fw)
         _press_here(px, py)
-        time.sleep(_rand(150, 350) / 1000.0)
+        time.sleep(pause_ms(persona, 150, 350) / 1000.0)
         for a in plan:
             if a[0] == "type":
                 # The same typing model as text (persona dwell, gaussian gaps, thinking pauses,
@@ -1419,7 +1438,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 _human_type_text(a[1], typos=False)
             else:
                 _key(a[1], a[2] if len(a) > 2 else 1, gap=(70, 170))
-            time.sleep(_rand(60, 220) / 1000.0)   # between fields: the eye checks what it typed
+            time.sleep(pause_ms(persona, 60, 220) / 1000.0)   # between fields: the eye checks what it typed
         return datetime_equal(kind, loc.input_value(), value)
 
     def _classify_tag(loc):
@@ -1500,17 +1519,20 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         closed select one per key."""
         _targeted_click(native_page_click, selector, {"position": at} if at else {}, no_click=False,
                         native_opts=None)
-        time.sleep(_rand(220, 480) / 1000.0)        # the list opens; the eye finds the option
+        # Every pause here is the persona's (timing_traits.pause_scale): the windows were one fixed
+        # set for every identity.
+        time.sleep(pause_ms(persona, 220, 480) / 1000.0)        # the list opens; the eye finds the option
+        tempo = timing_traits(persona).pause_scale
         for ch in plan["keys"]:
             native_kb_press(ch, delay=key_dwell(persona))
-            time.sleep(max(0.04, random.gauss(0.10, 0.035)))   # well inside type-ahead's 1 s window
+            time.sleep(max(0.04, random.gauss(0.10, 0.035) * tempo))   # well inside type-ahead's 1 s window
         n = plan["arrows"]
         if n:
-            time.sleep(_rand(120, 300) / 1000.0)
+            time.sleep(pause_ms(persona, 120, 300) / 1000.0)
             _arrow_run("ArrowDown" if n > 0 else "ArrowUp", abs(n))
-        time.sleep(_rand(150, 400) / 1000.0)
+        time.sleep(pause_ms(persona, 150, 400) / 1000.0)
         _key("Enter")
-        time.sleep(_rand(80, 160) / 1000.0)
+        time.sleep(pause_ms(persona, 80, 160) / 1000.0)
 
     def _arrow_run(key, n):
         """``n`` presses of an arrow key in an OPEN drop-down. A long run is HELD, the way a person
@@ -1870,7 +1892,18 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 # animation in flight does not) and own the click point -- no trusted press at a
                 # point some overlay owns. Either failing goes native: Playwright waits for it.
                 time.sleep(0.05)
-                if not _reaches_point(box, x, y, selector):
+                hit = _reaches_point(box, x, y, selector)
+                if hit is False and not o["position"]:
+                    # The persona's point is covered (a badge, an icon, a floating label over the
+                    # centre). Before giving the click to Playwright -- which waited out its timeout on
+                    # 5-7 of 16 badge-covered buttons (EVAL B) -- aim at the first probe point the hit
+                    # test proves reaches the element, the way _describe finds a covered field.
+                    alt = _proven_click_point(box, selector)
+                    if alt is None:
+                        raise _Native()
+                    x, y = alt
+                    aim.append((x, y))
+                elif not hit:
                     raise _Native()
             if o["modifiers"] and native_kb_down is None:
                 raise _Native()
@@ -1888,7 +1921,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                         native_kb_down(m)
                         held.append(m)
                         time.sleep(_rand(40, 110) / 1000.0)
-                    _glide(x, y)
+                    _glide(x, y, target_w=_aim_w(box))
                 finally:
                     for m in reversed(held):
                         time.sleep(_rand(20, 80) / 1000.0)
@@ -1897,7 +1930,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                         except Exception:  # noqa: BLE001
                             pass
                 return None
-            _glide(x, y)
+            _glide(x, y, target_w=_aim_w(box))
             if not no_click:
                 if native_down is None or native_up is None:
                     _pre_press()
@@ -1930,6 +1963,17 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # the held hand's one-pixel drift, which a planned drag leg would turn into a walk.
     page._clearcote_box_of = lambda loc, timeout, selector=None: _box_of(loc, timeout, False, selector)
     page._clearcote_pointer = lambda: st["pos"]
+    # ... and for its press point: a glide with the box's own Fitts width, the covered-point check
+    # (the same isolated hit test as a click, retried COVER_CHECK_MS), the probe-proven point when the
+    # chosen one is covered, and the border widths that make `position` padding-box relative like click's.
+    page._clearcote_aim_glide = lambda x, y, box: _glide(x, y, target_w=_aim_w(box))
+    page._clearcote_reaches_point = _reaches_point
+    page._clearcote_proven_point = _proven_click_point
+
+    def _border_of(box):
+        info = _describe(box, None)
+        return (float(info.get("bl", 0) or 0), float(info.get("bt", 0) or 0)) if info else (0.0, 0.0)
+    page._clearcote_border_of = _border_of
 
     def _nudge(x, y):
         native_move(x, y)

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 
 Rng = Callable[[], float]
@@ -102,15 +102,20 @@ class Persona:
     overshoot: float
     max_corrections: int
     approach_bias: float
+    # The HUMAN BANDS every timing draw is clamped to (ms). The per-identity medians inside them come
+    # from the salted timing stream (timing_traits): grab 130-360, release 90-230, click hold 55-230,
+    # key dwell 45-120.
     grab_min_ms: float = 130.0
     grab_max_ms: float = 360.0
     release_min_ms: float = 90.0
     release_max_ms: float = 230.0
-    # click press-hold (mousedown->mouseup) and per-key dwell (keydown->keyup) windows, ms.
-    click_hold_min_ms: float = 60.0
-    click_hold_max_ms: float = 150.0
+    click_hold_min_ms: float = 55.0
+    click_hold_max_ms: float = 230.0
     key_dwell_min_ms: float = 45.0
     key_dwell_max_ms: float = 120.0
+    # The persona's own aim stream (click_point): created on first use, so the SEQUENCE of landing
+    # points is reproducible per seed. Not part of the identity (compare=False).
+    aim_rng: Optional[Rng] = field(default=None, repr=False, compare=False)
 
 
 def make_persona(seed: Optional[Union[str, int, float]] = None) -> Persona:
@@ -416,25 +421,94 @@ def plan_drag(frm, to, p: Persona, settle: bool = False, rng: Optional[Rng] = No
     return out
 
 
+# Salt for the timing stream. Like the rollover and shape salts, a separate mulberry32(seed ^ salt)
+# stream keeps make_persona's draw ORDER (and so every existing seed's motor identity) unchanged.
+_TIMING_SALT = 0xC2B2AE35
+
+
+@dataclass(frozen=True)
+class TimingTraits:
+    """Per-identity timing medians (ms) and tempo, stable per seed (see timing_traits)."""
+
+    click_hold_ms: float     # median mousedown->mouseup hold, 70..140
+    key_dwell_ms: float      # median keydown->keyup dwell, 60..95
+    grab_ms: float           # median grab hesitation after a drag's mousedown, 180..280
+    release_ms: float        # median settle before a drag's mouseup, 120..180
+    dblclick_gap_ms: float   # median gap between the two presses of a double click, 90..140
+    pause_scale: float       # scale on deliberation pauses (select popup, datetime segments), 0.8..1.25
+    typo_rate: float         # per-character fat-finger rate, 0.005..0.04
+
+
+def timing_traits(p: Persona) -> TimingTraits:
+    """The persona's timing traits, drawn from a salted stream of its seed.
+
+    Before this every identity shared ONE fixed window for each timing (click hold 60-150, key dwell
+    45-120, grab 130-360, release 90-230, double-click gap 70-170, the select popup pauses, the
+    datetime gaps, the 2 % typo rate), so two personas were told apart by nothing in their timing.
+    Each draw below is the identity's MEDIAN; the samples around it are log-normal (click_hold,
+    key_dwell, drag_dwell, dblclick_gap) and clamped to the human band on the Persona. Same values in
+    motion.ts timingTraits and Motion.TimingTraitsOf."""
+    r = mulberry32((p.seed ^ _TIMING_SALT) & _MASK)
+    click_hold_ms = _lerp(70, 140, r())
+    key_dwell_ms = _lerp(60, 95, r())
+    grab_ms = _lerp(180, 280, r())
+    release_ms = _lerp(120, 180, r())
+    dblclick_gap_ms = _lerp(90, 140, r())
+    pause_scale = _lerp(0.8, 1.25, r())
+    typo_rate = _lerp(0.005, 0.04, r())
+    return TimingTraits(click_hold_ms=click_hold_ms, key_dwell_ms=key_dwell_ms, grab_ms=grab_ms,
+                        release_ms=release_ms, dblclick_gap_ms=dblclick_gap_ms, pause_scale=pause_scale,
+                        typo_rate=typo_rate)
+
+
+def lognormal_ms(median: float, sigma: float, lo: float, hi: float, rng: Rng) -> float:
+    """``median * exp(sigma * N(0,1))`` clamped to [lo, hi]: a right-skewed human timing around a
+    per-identity median (the shape of measured hold and dwell distributions)."""
+    return _clamp(median * math.exp(sigma * gauss_from(rng)), lo, hi)
+
+
 def drag_dwell(p: Persona, rng: Optional[Rng] = None):
-    """(grab_ms, release_ms) for a held-button drag, from the persona window."""
+    """(grab_ms, release_ms) for a held-button drag: log-normal (sigma 0.2) around the persona's
+    medians, inside its grab/release bands."""
     if rng is None:
         rng = random.random
-    return (_lerp(p.grab_min_ms, p.grab_max_ms, rng()), _lerp(p.release_min_ms, p.release_max_ms, rng()))
+    tt = timing_traits(p)
+    return (lognormal_ms(tt.grab_ms, 0.2, p.grab_min_ms, p.grab_max_ms, rng),
+            lognormal_ms(tt.release_ms, 0.2, p.release_min_ms, p.release_max_ms, rng))
 
 
 def click_hold(p: Persona, rng: Optional[Rng] = None) -> float:
-    """A human mousedown->mouseup click hold (ms), right-skewed. Fixes the ~2 ms instant-press tell."""
+    """A human mousedown->mouseup click hold (ms): log-normal (sigma 0.25) around the persona's own
+    median (70-140 ms), clamped to its band (55-230 ms). Fixes the ~2 ms instant-press tell, and the
+    one-window-for-everyone tell that replaced it."""
     if rng is None:
         rng = random.random
-    return p.click_hold_min_ms + min(1.0, abs(gauss_from(rng)) * 0.5) * (p.click_hold_max_ms - p.click_hold_min_ms)
+    return lognormal_ms(timing_traits(p).click_hold_ms, 0.25, p.click_hold_min_ms, p.click_hold_max_ms, rng)
 
 
 def key_dwell(p: Persona, rng: Optional[Rng] = None) -> float:
-    """A human per-key keydown->keyup dwell (ms), right-skewed. Fixes the ~2-3 ms instant-keystroke tell."""
+    """A human per-key keydown->keyup dwell (ms): log-normal (sigma 0.22) around the persona's own
+    median (60-95 ms), clamped to its band (45-120 ms)."""
     if rng is None:
         rng = random.random
-    return p.key_dwell_min_ms + min(1.0, abs(gauss_from(rng)) * 0.45) * (p.key_dwell_max_ms - p.key_dwell_min_ms)
+    return lognormal_ms(timing_traits(p).key_dwell_ms, 0.22, p.key_dwell_min_ms, p.key_dwell_max_ms, rng)
+
+
+def dblclick_gap(p: Persona, rng: Optional[Rng] = None) -> float:
+    """The gap between the two presses of a double click (ms): log-normal (sigma 0.15) around the
+    persona's median (90-140 ms), clamped to 70-170 ms (the band the engine's clickCount:2 walk uses)."""
+    if rng is None:
+        rng = random.random
+    return lognormal_ms(timing_traits(p).dblclick_gap_ms, 0.15, 70.0, 170.0, rng)
+
+
+def pause_ms(p: Optional[Persona], lo: float, hi: float, rng: Optional[Rng] = None) -> float:
+    """A deliberation pause (ms) from the window [lo, hi], scaled by the persona's tempo
+    (timing_traits.pause_scale, 0.8-1.25). Without a persona: the plain window."""
+    if rng is None:
+        rng = random.random
+    v = _lerp(lo, hi, rng())
+    return v * timing_traits(p).pause_scale if p is not None else v
 
 
 # Salt for the rollover stream. Drawing from mulberry32(seed ^ salt) instead of adding a field to
@@ -486,20 +560,61 @@ def platform_from_navigator(value: Optional[str]) -> Optional[str]:
     return None
 
 
-def click_point(box, frm, p: Persona, rng: Optional[Rng] = None):
-    """A human click point inside ``box`` (dict with x/y/width/height): 2D gaussian toward center,
-    nudged toward the approach side (undershoot), clamped a couple px inside the edges."""
-    if rng is None:
-        rng = random.random
+# Salt for the aim stream (click_point): the persona's landing-point sequence and its dispersion.
+_AIM_SALT = 0x27D4EB2F
+
+
+@dataclass(frozen=True)
+class AimTraits:
+    """Per-identity aiming traits, stable per seed (see aim_traits)."""
+
+    spread: float       # landing dispersion, sd as a share of the box, 0.10..0.20
+    undershoot: float   # pull toward the side the cursor came from, share of the box, 0.06..0.16
+    side_bias: float    # handedness: lateral offset as a share of the box width, -0.1..0.1 (approach_bias * 0.4)
+
+
+def aim_traits(p: Persona) -> AimTraits:
+    """The persona's aiming traits, drawn from a salted stream of its seed. Same values in motion.ts
+    aimTraits and Motion.AimTraitsOf."""
+    r = mulberry32((p.seed ^ _AIM_SALT) & _MASK)
+    spread = _lerp(0.10, 0.20, r())
+    undershoot = _lerp(0.06, 0.16, r())
+    return AimTraits(spread=spread, undershoot=undershoot, side_bias=p.approach_bias * 0.4)
+
+
+def _aim_stream(p: Persona) -> Rng:
+    """The persona's own RNG for landing points: mulberry32(seed ^ salt ^ 1), created on first use
+    and kept on the persona, so the same seed lands on the same sequence of points."""
+    if p.aim_rng is None:
+        p.aim_rng = mulberry32((p.seed ^ _AIM_SALT ^ 1) & _MASK)
+    return p.aim_rng
+
+
+def click_point(box, frm, p: Optional[Persona], rng: Optional[Rng] = None):
+    """A human click point inside ``box`` (dict with x/y/width/height): a 2D gaussian toward the
+    centre with the persona's dispersion (sd 0.10-0.20 of the box), nudged toward the approach side
+    (undershoot, 6-16 %) and sideways by its handedness (approach_bias), clamped a couple px inside
+    the edges. Drawn from the persona's own aim stream unless ``rng`` is given, so the landing
+    sequence is reproducible per seed (it was random.random: unseeded, one dispersion for everyone).
+    Without a persona: sd 0.15, 12 % undershoot, no handedness, random.random."""
+    if p is None:
+        spread, under, side = 0.15, 0.12, 0.0
+        if rng is None:
+            rng = random.random
+    else:
+        at = aim_traits(p)
+        spread, under, side = at.spread, at.undershoot, at.side_bias
+        if rng is None:
+            rng = _aim_stream(p)
     cx = box["x"] + box["width"] / 2
     cy = box["y"] + box["height"] / 2
     dx, dy = cx - frm[0], cy - frm[1]
     d = math.hypot(dx, dy) or 1.0
     ux, uy = -dx / d, -dy / d
-    x = cx + ux * box["width"] * 0.12 + gauss_from(rng) * box["width"] * 0.16
-    y = cy + uy * box["height"] * 0.12 + gauss_from(rng) * box["height"] * 0.16
+    x = cx + ux * box["width"] * under + side * box["width"] + gauss_from(rng) * box["width"] * spread
+    y = cy + uy * box["height"] * under + gauss_from(rng) * box["height"] * spread
     # For a box narrower/shorter than the 4px inset the clamp bounds invert (lo > hi) and would return
-    # a point OUTSIDE the element — use the center for such tiny targets.
+    # a point OUTSIDE the element -- use the center for such tiny targets.
     return (_clamp(x, box["x"] + 2, box["x"] + box["width"] - 2) if box["width"] >= 4 else cx,
             _clamp(y, box["y"] + 2, box["y"] + box["height"] - 2) if box["height"] >= 4 else cy)
 
