@@ -156,6 +156,15 @@ def plan_gap(traits, prev, ch, rng):
     return ms
 
 
+# ------------------------------------------------------------------------------------- slips
+# Share of whole-word slip corrections made with the word-delete chord (Ctrl+Backspace; Alt+Backspace on
+# macOS) and a retype of the word, instead of one Backspace per wrong key.
+WORD_FIX_RATE = 0.30
+# Share of fat-finger substitutions in a type=search field that are never corrected (the search runs
+# with the slip in it, as people's do). Never on fill(), whose value must come out exact.
+SEARCH_SLIP_RATE = 0.10
+
+
 # ------------------------------------------------------------------------------------- chords
 MODIFIERS = frozenset(["Shift", "Control", "Alt", "Meta", "ControlOrMeta"])
 
