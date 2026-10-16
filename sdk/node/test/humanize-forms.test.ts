@@ -15,13 +15,21 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   apiErrors, asApiError, attachHumanize, createInputLock, isTimeout, pickOptions, sdkPlaywrightError, selectWants, typoRate,
-  wantIndex, labelDraw, labelShare, LABEL_SHARE,
+  wantIndex,
 } from "../src/humanize.js";
 import { errors as pwErrors } from "playwright-core";
 import {
-  ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX, ISO_LABEL_BY_SEL, ISO_LABEL_OF,
+  ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX,
   ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL, ISO_SCROLL_BY, ISO_VIEWPORT,
 } from "../src/isolated.js";
+// lane F names, read through the modules so this file still loads against an SDK without them
+import * as ISO from "../src/isolated.js";
+import * as HZ from "../src/humanize.js";
+const ISO_LABEL_OF: string = (ISO as any).ISO_LABEL_OF ?? "<no ISO_LABEL_OF>";
+const ISO_LABEL_BY_SEL: string = (ISO as any).ISO_LABEL_BY_SEL ?? "<no ISO_LABEL_BY_SEL>";
+const labelDraw = (p: any, r?: () => number): boolean => (HZ as any).labelDraw(p, r);
+const labelShare = (p: any): number => (HZ as any).labelShare(p);
+const LABEL_SHARE: number = (HZ as any).LABEL_SHARE;
 import { typeaheadSimulate } from "../src/forms.js";
 import { makePersona } from "../src/motion.js";
 
