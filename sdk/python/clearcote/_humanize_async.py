@@ -39,6 +39,7 @@ from ._motion import (
     platform_from_navigator, rollover_rate, wheel_notches,
 )
 from ._hold import press_and_hold_async
+from . import _frames as _fr
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk_async as _paced_walk
 
 
@@ -1756,6 +1757,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         st["pos"] = (x, y)
         st["placed"] = True
     page._clearcote_nudge = _nudge
+    # the frame route (_frames) clears a field with the same held chord as the page routes
+    page._clearcote_select_all = _select_all
     page._clearcote_hold = _serial(press_and_hold_async)
     page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: page._clearcote_hold(
         page.locator(selector).first, duration, **kw))
@@ -1780,6 +1783,7 @@ def _patch_locator_class():
     if _async_locator_patched:
         return
     _async_locator_patched = True
+    _fr.patch_frame_class(is_async=True)   # child-frame selector actions -> the frame route
     try:
         from playwright.async_api._generated import Locator
     except Exception:  # noqa: BLE001
@@ -1843,6 +1847,16 @@ def _patch_locator_class():
     def _fwd(kw, names=("timeout",)):
         return {k: kw[k] for k in names if k in kw and kw[k] is not None}
 
+    async def _froute(self, action, args, kw):
+        """A locator inside a child frame (FrameLocator, Frame.locator) on a humanized page: through the
+        frame route (_frames.aroute: the frame's own isolated world for the hit test, the page's humanized
+        mouse and keyboard for the input). (False, None) when it does not apply -- the native method
+        runs, and the route has reported why."""
+        if not (_fr.humanized(self.page) and _fr.frame_locator_of(self)) or not await _strict(self):
+            return False, None
+        r = await _fr.aroute(self, action, args, kw)
+        return (False, None) if r is _fr.NATIVE else (True, r)
+
     async def _route(self, fn):
         # Once routed, every error propagates: the page-level wrappers own the native fallback, so
         # retrying the original locator method here ran the action a second (or third) time -- a
@@ -1853,34 +1867,58 @@ def _patch_locator_class():
 
     async def fill(self, value, **kw):
         done, r = await _route(self, lambda: self.page.fill(_sel(self), value, **_fwd(kw, _FILL)))
+        if done:
+            return r
+        done, r = await _froute(self, 'fill', (value,), kw)
         return r if done else await o_fill(self, value, **kw)
 
     async def click(self, **kw):
         done, r = await _route(self, lambda: self.page.click(_sel(self), **_fwd(kw, _CLICK)))
+        if done:
+            return r
+        done, r = await _froute(self, 'click', (), kw)
         return r if done else await o_click(self, **kw)
 
     async def type_(self, text, **kw):
         done, r = await _route(self, lambda: self.page.type(_sel(self), text, **_fwd(kw, _TYPE)))
+        if done:
+            return r
+        done, r = await _froute(self, 'type', (text,), kw)
         return r if done else await o_type(self, text, **kw)
 
     async def dblclick(self, **kw):
         done, r = await _route(self, lambda: self.page.dblclick(_sel(self), **_fwd(kw, _DBL)))
+        if done:
+            return r
+        done, r = await _froute(self, 'dblclick', (), kw)
         return r if done else await o_dblclick(self, **kw)
 
     async def hover(self, **kw):
         done, r = await _route(self, lambda: self.page.hover(_sel(self), **_fwd(kw, _HOVER)))
+        if done:
+            return r
+        done, r = await _froute(self, 'hover', (), kw)
         return r if done else await o_hover(self, **kw)
 
     async def press(self, key, **kw):
         done, r = await _route(self, lambda: self.page.press(_sel(self), key, **_fwd(kw, _PRESS)))
+        if done:
+            return r
+        done, r = await _froute(self, 'press', (key,), kw)
         return r if done else await o_press(self, key, **kw)
 
     async def press_sequentially(self, text, **kw):
         done, r = await _route(self, lambda: self.page.type(_sel(self), text, **_fwd(kw, _TYPE)))
+        if done:
+            return r
+        done, r = await _froute(self, 'press_sequentially', (text,), kw)
         return r if done else await o_press_seq(self, text, **kw)
 
     async def clear(self, **kw):
         done, r = await _route(self, lambda: self.page.fill(_sel(self), "", **_fwd(kw, _FILL)))
+        if done:
+            return r
+        done, r = await _froute(self, 'clear', (), kw)
         return r if done else await o_clear(self, **kw)
 
     async def tap(self, **kw):
@@ -1897,20 +1935,32 @@ def _patch_locator_class():
 
     async def check(self, **kw):
         done, r = await _route(self, lambda: self.page.check(_sel(self), **_fwd(kw, _CHECK)))
+        if done:
+            return r
+        done, r = await _froute(self, 'check', (), kw)
         return r if done else await o_check(self, **kw)
 
     async def uncheck(self, **kw):
         done, r = await _route(self, lambda: self.page.uncheck(_sel(self), **_fwd(kw, _CHECK)))
+        if done:
+            return r
+        done, r = await _froute(self, 'uncheck', (), kw)
         return r if done else await o_uncheck(self, **kw)
 
     async def set_checked(self, checked, **kw):
         done, r = await _route(self, lambda: self.page.set_checked(_sel(self), checked, **_fwd(kw, _CHECK)))
+        if done:
+            return r
+        done, r = await _froute(self, 'set_checked', (checked,), kw)
         return r if done else await o_set_checked(self, checked, **kw)
 
     async def select_option(self, value=None, **kw):
         """Delegate to the humanized page.select_option, like every other method here: one
         implementation behind the page method is what stops the two entry points drifting apart."""
         done, r = await _route(self, lambda: self.page.select_option(_sel(self), value, **_fwd(kw, _SELECT)))
+        if done:
+            return r
+        done, r = await _froute(self, "select_option", (value,), kw)
         if done:
             return r
         value, kw = native_select_args(value, kw)   # option dicts: Playwright Python takes none

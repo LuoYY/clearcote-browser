@@ -1444,14 +1444,19 @@ def test_a_routed_locator_action_lets_every_error_through_and_never_reruns_nativ
 
 @pytest.mark.parametrize("kw", [dict(parent=object()),
                                 dict(selector="#fr >> internal:control=enter-frame >> #fi")])
-def test_frame_locators_stay_native(Locator, kw):
-    # A FrameLocator's child keeps the MAIN frame as its _frame; only its selector shows the iframe.
+def test_frame_locators_take_the_frame_route_and_go_native_with_a_report_when_it_cannot_run(Locator, kw):
+    # A FrameLocator's child keeps the MAIN frame as its _frame; only its selector shows the iframe. It
+    # no longer goes through the page-level methods (they act on the main frame); it takes the frame
+    # route (_frames), which cannot run on this stub (no element waits, no CDP) -> Playwright's own
+    # method, with the fallback reported (lane F, SC 232; was: native, silently).
     async def go():
         s = _Self(**kw)
         await Locator.fill(s, "new")
         return s
     s = run(go())
-    assert s.page.calls == [] and [c[0] for c in s._impl_obj.calls] == ["fill"]
+    assert [c[0] for c in s._impl_obj.calls] == ["fill"], "Playwright's own fill, once"
+    assert [c[0] for c in s.page.calls] == ["_report_fallback"], "no page.* method; the fallback reported"
+    assert s.page.calls[0][1]["api"] == "Locator.fill"
 
 
 # ------------------------------------------------------------------- press / type / range targets
