@@ -68,7 +68,7 @@ public class TimingAimTests
             var rng = Motion.Mulberry32(5);   // the same sample stream for every persona: only the persona differs
             return Median(Enumerable.Range(0, 400).Select(_ => Draw(name, p, rng)).ToList());
         }).ToList();
-        Assert.True(med.Select(Math.Round).Distinct().Count() >= 4, $"{name}: {string.Join(",", med)}");
+        Assert.True(med.Select(m => Math.Round(m)).Distinct().Count() >= 4, $"{name}: {string.Join(",", med)}");
         foreach (var m in med) Assert.InRange(m, lo, hi);
         var pb = Motion.MakePersona("band");
         var rb = Motion.Mulberry32(1);
