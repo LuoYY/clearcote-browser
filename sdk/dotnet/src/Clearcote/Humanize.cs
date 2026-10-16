@@ -1470,6 +1470,12 @@ public static partial class Humanize
         public Task SleepAsync(double ms) => Task.Delay((int)Math.Round(ms));
         public Task<int> NotchPxAsync() => Humanize.NotchPxAsync(_page, _st);
         public Task<string> DeviceAsync() => Humanize.DeviceAsync(_page, _st);
+        public async Task<double[]?> ScrollRangeAsync()
+        {
+            var r = await IsolatedWorld.For(_page).EvaluateAsync(Scroll.IsoScrollRange).ConfigureAwait(false);
+            return r is { ValueKind: JsonValueKind.Array } a && a.GetArrayLength() == 4
+                ? a.EnumerateArray().Select(v => v.GetDouble()).ToArray() : null;
+        }
     }
 
     /// <summary>Vertical <see cref="HumanWheelAsync(IPage,float,float)"/>: the common reading scroll.</summary>
@@ -2458,7 +2464,9 @@ public static partial class Humanize
         if (r is not { ValueKind: JsonValueKind.Object } o || !o.TryGetProperty("rect", out var rect)
             || rect.ValueKind != JsonValueKind.Array || rect.GetArrayLength() != 4) return null;
         bool B(string n) => o.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.True;
-        return new Scroller(rect[0].GetDouble(), rect[1].GetDouble(), rect[2].GetDouble(), rect[3].GetDouble(), B("x"), B("y"));
+        double[]? range = o.TryGetProperty("s", out var sv) && sv.ValueKind == JsonValueKind.Array && sv.GetArrayLength() == 4
+            ? sv.EnumerateArray().Select(v => v.GetDouble()).ToArray() : null;
+        return new Scroller(rect[0].GetDouble(), rect[1].GetDouble(), rect[2].GetDouble(), rect[3].GetDouble(), B("x"), B("y"), range);
     }
 
     private static async Task<bool> NeedsScrollAsync(IPage page, LocatorBoundingBoxResult box, string? sel, bool css)

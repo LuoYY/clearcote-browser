@@ -233,12 +233,27 @@ export const ISO_SCROLLER = `(a) => { let e;
     const y = sc(s.overflowY) && oy, x = sc(s.overflowX) && ox;
     const clip = (oy && (s.overflowY === 'hidden' || s.overflowY === 'clip')) || (ox && (s.overflowX === 'hidden' || s.overflowX === 'clip'));
     if (x || y || clip) { const r = p.getBoundingClientRect();
-      return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y }; }
+      return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y,
+        s: [p.scrollLeft, p.scrollTop, p.scrollWidth - p.clientWidth, p.scrollHeight - p.clientHeight] }; }
   }
   return null; }`;
 
 // ------------------------------------------------------------------ the I/O loop
-export interface Scroller { rect: [number, number, number, number]; x: boolean; y: boolean; }
+export interface Scroller { rect: [number, number, number, number]; x: boolean; y: boolean;
+  /** [scrollLeft, scrollTop, maxLeft, maxTop] */
+  s?: [number, number, number, number]; }
+
+/** The window's scroll position and range: [scrollX, scrollY, maxX, maxY] (Python `_scroll.SCROLL_RANGE`). */
+export const ISO_SCROLL_RANGE = `() => { const e = document.scrollingElement || document.documentElement;
+  return [scrollX, scrollY, Math.max(0, e.scrollWidth - innerWidth), Math.max(0, e.scrollHeight - innerHeight)]; }`;
+
+/** (dx, dy) limited to what is left to scroll ([x, y, maxX, maxY]; null = unknown): a wheel cannot take a page
+ * past its ends, so a target out of reach is not wheeled toward for nothing. */
+export function clampNeed(dx: number, dy: number, r: number[] | null | undefined): [number, number] {
+  if (!r || r.length !== 4) return [dx, dy];
+  const [x, y, mx, my] = r.map(Number);
+  return [clamp(dx, -x, Math.max(0, mx - x)), clamp(dy, -y, Math.max(0, my - y))];
+}
 
 /** What bringIntoView needs from the humanizer. */
 export interface ScrollIO {
@@ -253,6 +268,8 @@ export interface ScrollIO {
   sleep(ms: number): Promise<void>;
   notchPx(): Promise<number>;
   device(): Promise<"mouse" | "trackpad">;
+  /** The window's [scrollX, scrollY, maxX, maxY], when it can be read. */
+  scrollRange?(): Promise<number[] | null>;
 }
 
 async function readSettled(boxFn: () => Promise<ScrollBox | null>, io: ScrollIO): Promise<ScrollBox | null> {
@@ -360,7 +377,8 @@ export async function bringIntoView(io: ScrollIO, boxFn: () => Promise<ScrollBox
   const tol = device !== "trackpad" ? notch * 0.5 : 6;
   let shownRounds = 0;
   while (notches < NOTCH_BUDGET) {
-    const [dx, dy] = aimNeed(box!, view, f, ax, ay);
+    let [dx, dy] = aimNeed(box!, view, f, ax, ay);
+    [dx, dy] = clampNeed(dx, dy, scroller ? scroller.s : io.scrollRange ? await io.scrollRange() : null);
     if (inView(box!, view)) {
       if ((Math.abs(dx) < tol && Math.abs(dy) < tol) || shownRounds >= 2) return { box, ok: true, notches };
       shownRounds++;

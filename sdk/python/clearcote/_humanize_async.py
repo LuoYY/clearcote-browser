@@ -37,7 +37,7 @@ from ._motion import (
     click_point, plan_ambient, platform_from_navigator, rollover_rate, wheel_notches,
 )
 from ._scroll import (
-    ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, anchor_needed, anchor_point, bring_into_view_async,
+    ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, SCROLL_RANGE as ISO_SCROLL_RANGE, anchor_needed, anchor_point, bring_into_view_async,
     in_view as _box_in, input_device as _input_device, paced_wheel_async, plan_trackpad, wheel_drift,
 )
 from ._hold import press_and_hold_async
@@ -508,6 +508,11 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             sleep = staticmethod(asyncio.sleep)
             notch_px = staticmethod(_notch_px)
             device = staticmethod(_device)
+
+            @staticmethod
+            async def scroll_range():
+                r = await async_world_for(page).evaluate(ISO_SCROLL_RANGE)
+                return r if isinstance(r, list) and len(r) == 4 else None
         return _IO
 
     async def hwheel(delta_x, delta_y):

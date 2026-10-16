@@ -35,7 +35,7 @@ import {
   type Step, type WheelPlatform,
 } from "./motion.js";
 import {
-  ANCHOR_TARGET_W, ISO_SCROLLER, anchorNeeded, anchorPoint, bringIntoView, inView as boxIn, inputDevice,
+  ANCHOR_TARGET_W, ISO_SCROLLER, ISO_SCROLL_RANGE, anchorNeeded, anchorPoint, bringIntoView, inView as boxIn, inputDevice,
   pacedWheel, planTrackpad, wheelDrift, type ScrollBox, type ScrollIO, type Scroller,
 } from "./scroll.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
@@ -651,6 +651,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     sleep: async (ms) => { await sleep(ms); },
     notchPx: () => wheelNotchPx(),
     device: () => inputDev(),
+    scrollRange: async () => {
+      const r = await worldFor(page).evaluate<unknown>(ISO_SCROLL_RANGE);
+      return Array.isArray(r) && r.length === 4 ? r.map(Number) : null;
+    },
   };
   // A humanized step that had to fall back to a programmatic one: reported through the options' fallback
   // hook when one is installed (`page._clearcoteReportFallback(event)`, lane A), and always left on the

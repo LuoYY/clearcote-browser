@@ -310,6 +310,20 @@ async def paced_wheel_async(events, wheel, sleep):
             await sleep(wait)
 
 
+# The window's scroll position and range, read in the isolated world: [scrollX, scrollY, maxX, maxY].
+SCROLL_RANGE = """() => { const e = document.scrollingElement || document.documentElement;
+  return [scrollX, scrollY, Math.max(0, e.scrollWidth - innerWidth), Math.max(0, e.scrollHeight - innerHeight)]; }"""
+
+
+def clamp_need(dx, dy, rng4):
+    """(dx, dy) limited to what is left to scroll ([x, y, max_x, max_y]; None = unknown, no limit): a
+    wheel cannot take a page past its ends, so a target out of reach is not wheeled toward for nothing."""
+    if not rng4 or len(rng4) != 4:
+        return dx, dy
+    x, y, mx, my = (float(v) for v in rng4)
+    return _clamp(dx, -x, max(0.0, mx - x)), _clamp(dy, -y, max(0.0, my - y))
+
+
 # ---------------------------------------------------------------- isolated-world read
 # The nearest scrollable ancestor of a plain-CSS selector's first match (read in the isolated world, like
 # every humanize read): the visible client rect of the container and which axes it scrolls, or null
@@ -325,7 +339,8 @@ SCROLLER = """(a) => { let e;
     const y = sc(s.overflowY) && oy, x = sc(s.overflowX) && ox;
     const clip = (oy && (s.overflowY === 'hidden' || s.overflowY === 'clip')) || (ox && (s.overflowX === 'hidden' || s.overflowX === 'clip'));
     if (x || y || clip) { const r = p.getBoundingClientRect();
-      return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y }; }
+      return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y,
+        s: [p.scrollLeft, p.scrollTop, p.scrollWidth - p.clientWidth, p.scrollHeight - p.clientHeight] }; }
   }
   return null; }"""
 
@@ -454,6 +469,8 @@ def bring_into_view(io, box_fn, frac=None, rng: Optional[Callable[[], float]] = 
     shown_rounds = 0
     while notches < NOTCH_BUDGET:
         dx, dy = aim_need(box, view, frac, ax, ay)
+        rng4 = scroller.get("s") if scroller else (io.scroll_range() if getattr(io, "scroll_range", None) else None)
+        dx, dy = clamp_need(dx, dy, rng4)
         if in_view(box, view):
             # in view: done once it is about where it was aimed (a whole notch cannot do better than
             # half a notch), or after two corrections
@@ -612,6 +629,8 @@ async def bring_into_view_async(io, box_fn, frac=None, rng: Optional[Callable[[]
     shown_rounds = 0
     while notches < NOTCH_BUDGET:
         dx, dy = aim_need(box, view, frac, ax, ay)
+        rng4 = scroller.get("s") if scroller else (await io.scroll_range() if getattr(io, "scroll_range", None) else None)
+        dx, dy = clamp_need(dx, dy, rng4)
         if in_view(box, view):
             # in view: done once it is about where it was aimed (a whole notch cannot do better than
             # half a notch), or after two corrections

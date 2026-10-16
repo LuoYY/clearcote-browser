@@ -52,7 +52,7 @@ from ._motion import (
     plan_ambient, platform_from_navigator, rollover_rate, wheel_notches,
 )
 from ._scroll import (
-    ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, anchor_needed, anchor_point, bring_into_view, in_view as _box_in,
+    ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, SCROLL_RANGE as ISO_SCROLL_RANGE, anchor_needed, anchor_point, bring_into_view, in_view as _box_in,
     input_device as _input_device, paced_wheel, plan_trackpad, wheel_drift,
 )
 from ._hold import press_and_hold
@@ -728,6 +728,11 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             sleep = staticmethod(time.sleep)
             notch_px = staticmethod(_notch_px)
             device = staticmethod(_device)
+
+            @staticmethod
+            def scroll_range():
+                r = world_for(page).evaluate(ISO_SCROLL_RANGE)
+                return r if isinstance(r, list) and len(r) == 4 else None
         return _IO
 
     def hwheel(delta_x, delta_y):

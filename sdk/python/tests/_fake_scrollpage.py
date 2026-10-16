@@ -149,7 +149,12 @@ class World:
             return {"n": 1, "rect": d.vrect(sel)}
         if S is not None and expr == S.SCROLLER:
             p = d.els.get(arg["sel"], {}).get("parent")
-            return {"rect": d.crect(p), "x": False, "y": True} if p else None
+            if not p:
+                return None
+            c = d.containers[p]
+            return {"rect": d.crect(p), "x": False, "y": True, "s": [0.0, c["st"], 0.0, c["inner"] - c["rect"][3]]}
+        if S is not None and expr == getattr(S, "SCROLL_RANGE", None):
+            return [d.sx, d.sy, 0.0, max(0.0, d.height - d.vh)] if d.scrollable else [0.0, 0.0, 0.0, 0.0]
         if expr == SCROLL_BY:
             d.log.append(("prog", "scroll_by", d.t()))
             before = d.sy

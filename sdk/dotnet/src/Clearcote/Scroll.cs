@@ -12,7 +12,8 @@ public readonly record struct WheelEvent(double Dx, double Dy, double SleepMs);
 public sealed record TrackpadSwipe(List<WheelEvent> Finger, List<WheelEvent> Tail, double GapMs);
 
 /// <summary>The nearest scrollable ancestor of a target: its visible client rect and the axes it scrolls.</summary>
-public sealed record Scroller(double X, double Y, double Width, double Height, bool AxisX, bool AxisY);
+public sealed record Scroller(double X, double Y, double Width, double Height, bool AxisX, bool AxisY,
+    double[]? Range = null);
 
 /// <summary>What <see cref="Scroll.BringIntoViewAsync"/> needs from the humanizer.</summary>
 internal interface IScrollIO
@@ -28,6 +29,8 @@ internal interface IScrollIO
     Task SleepAsync(double ms);
     Task<int> NotchPxAsync();
     Task<string> DeviceAsync();
+    /// <summary>The window's [scrollX, scrollY, maxX, maxY], or null when it cannot be read.</summary>
+    Task<double[]?> ScrollRangeAsync();
 }
 
 /// <summary>
@@ -264,6 +267,17 @@ public static class Scroll
 
     /// <summary>The nearest scrollable ancestor of a plain-CSS selector's first match (isolated world).
     /// Same source as Python <c>_scroll.SCROLLER</c> and scroll.ts <c>ISO_SCROLLER</c>.</summary>
+    /// <summary>The window's scroll position and range: [scrollX, scrollY, maxX, maxY] (Python <c>SCROLL_RANGE</c>).</summary>
+    internal const string IsoScrollRange = @"() => { const e = document.scrollingElement || document.documentElement;
+  return [scrollX, scrollY, Math.max(0, e.scrollWidth - innerWidth), Math.max(0, e.scrollHeight - innerHeight)]; }";
+
+    /// <summary>(dx, dy) limited to what is left to scroll ([x, y, maxX, maxY]; null = unknown).</summary>
+    public static (double Dx, double Dy) ClampNeed(double dx, double dy, double[]? r)
+    {
+        if (r is null || r.Length != 4) return (dx, dy);
+        return (Clamp(dx, -r[0], Math.Max(0, r[2] - r[0])), Clamp(dy, -r[1], Math.Max(0, r[3] - r[1])));
+    }
+
     internal const string IsoScroller = @"(a) => { let e;
   try { e = document.querySelector(a.sel); } catch (x) { return null; }
   if (!e) return null;
@@ -274,7 +288,8 @@ public static class Scroll
     const y = sc(s.overflowY) && oy, x = sc(s.overflowX) && ox;
     const clip = (oy && (s.overflowY === 'hidden' || s.overflowY === 'clip')) || (ox && (s.overflowX === 'hidden' || s.overflowX === 'clip'));
     if (x || y || clip) { const r = p.getBoundingClientRect();
-      return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y }; }
+      return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y,
+        s: [p.scrollLeft, p.scrollTop, p.scrollWidth - p.clientWidth, p.scrollHeight - p.clientHeight] }; }
   }
   return null; }";
 
@@ -394,6 +409,7 @@ public static class Scroll
         while (notches < NotchBudget)
         {
             var (dx, dy) = AimNeed(box.Value, view, f, ax, ay);
+            (dx, dy) = ClampNeed(dx, dy, scroller is not null ? scroller.Range : await io.ScrollRangeAsync().ConfigureAwait(false));
             if (InView(box.Value, view))
             {
                 if ((Math.Abs(dx) < tol && Math.Abs(dy) < tol) || shownRounds >= 2) return (box, true, notches);

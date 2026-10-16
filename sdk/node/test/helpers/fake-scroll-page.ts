@@ -11,8 +11,11 @@ import {
   ISO_CSS_BOX, ISO_DESCRIBE, ISO_FRAMES, ISO_HIT_IN_BOX, ISO_PLATFORM, ISO_SCROLL, ISO_SCROLL_BY, ISO_VIEWPORT,
 } from "../../src/isolated.js";
 
-let SCROLLER = "";
-try { SCROLLER = (await import("../../src/scroll.js") as any).ISO_SCROLLER ?? ""; } catch { /* before 0.52 */ }
+let SCROLLER = "", RANGE = "";
+try {
+  const m: any = await import("../../src/scroll.js");
+  SCROLLER = m.ISO_SCROLLER ?? ""; RANGE = m.ISO_SCROLL_RANGE ?? "";
+} catch { /* before 0.52 */ }
 
 export type Rect = [number, number, number, number];
 interface El { rect: Rect; parent?: string }
@@ -100,8 +103,11 @@ export class Doc {
     }
     if (SCROLLER && fn === SCROLLER) {
       const p = this.els.get(arg.sel)?.parent;
-      return p ? { rect: this.crect(p), x: false, y: true } : null;
+      if (!p) return null;
+      const c = this.containers.get(p)!;
+      return { rect: this.crect(p), x: false, y: true, s: [0, c.st, 0, c.inner - c.rect[3]] };
     }
+    if (RANGE && fn === RANGE) return this.scrollable ? [this.sx, this.sy, 0, Math.max(0, this.height - this.vh)] : [0, 0, 0, 0];
     if (fn === ISO_SCROLL_BY) {
       this.log.push(["prog", "scroll_by", Date.now()]);
       const before = this.sy;
