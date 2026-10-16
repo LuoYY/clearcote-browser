@@ -242,7 +242,8 @@ public static partial class Humanize
         => SerialAsync<bool>(page, async () => { await body().ConfigureAwait(false); return true; });
 
     private static double TypoRateFor(IPage page)
-        => TypoRateOverride.TryGetValue(page, out var forced) ? forced.Value : TypoRate();
+        => TypoRateOverride.TryGetValue(page, out var forced) ? forced.Value
+            : Options.TryGetValue(page, out var o) && o.TypoRate is { } t ? t : TypoRate();
 
     // How long a covered click point is re-checked (an overlay fading out) before the native path takes over.
     internal const float CoverCheckMs = 400;
@@ -356,6 +357,8 @@ public static partial class Humanize
     {
         await SeedPointerAsync(page, st).ConfigureAwait(false);
         var steps = Motion.PlanMove(new Point(st.X, st.Y), new Point(toX, toY), p, targetW, settle);
+        double tempo = Tempo(page);   // HumanizeOptions.Preset: every planned duration x1.4 / x1.0 / x0.7
+        if (tempo != 1.0) steps = steps.ConvertAll(s => s with { SleepMs = s.SleepMs * tempo });
         // Native moves carry button state, so a button held via Mouse.DownAsync stays pressed
         // across the whole path — that is what makes a drag a drag rather than a teleport.
         //
@@ -612,8 +615,12 @@ public static partial class Humanize
 
     /// <summary>May the humanized route act on this locator? Not inside a frame, and (for locator actions)
     /// not when it matches more than one element.</summary>
-    private static async Task<bool> RoutableAsync(ILocator locator, bool strict)
-        => !IsFrameLocator(locator) && (!strict || await StrictOkAsync(locator).ConfigureAwait(false));
+    private static async Task<bool> RoutableAsync(ILocator locator, bool strict, [CallerMemberName] string member = "")
+    {
+        if (IsFrameLocator(locator))
+            return !Report(locator.Page, ApiName(member), "frame locators go to Playwright", SelectorOf(locator));
+        return !strict || await StrictOkAsync(locator).ConfigureAwait(false);
+    }
 
     /// <summary>Internal: the humane route cannot apply here; run Playwright's own call instead.</summary>
     private sealed class NativeRouteException : Exception
@@ -642,13 +649,14 @@ public static partial class Humanize
         var p = PersonaFor(page);
         var st = StateFor(page);
         bool goNative = false;
+        string api = noClick ? "HumanHoverAsync" : o.ClickCount == 2 ? "HumanDblClickAsync" : "HumanClickAsync";
         try
         {
             // Playwright skips actionability with Force: no wait then -- a target it would click hidden goes
             // native at once instead of timing out first.
             var bb = await BoxOfAsync(loc, options.Timeout, o.Force).ConfigureAwait(false);
-            if (bb is null) goNative = Fallback("click: no box");
-            else if (!o.Force && !await loc.IsEnabledAsync().ConfigureAwait(false)) goNative = Fallback("click: not enabled");
+            if (bb is null) goNative = Report(page, api, "the element has no box", SelectorOf(loc));
+            else if (!o.Force && !await loc.IsEnabledAsync().ConfigureAwait(false)) goNative = Report(page, api, "the element is not enabled", SelectorOf(loc));
             else
             {
                 double x, y;
@@ -674,8 +682,10 @@ public static partial class Humanize
                     // flight does not) and own the click point -- no trusted press at a point some overlay
                     // owns. Either failing goes native: Playwright waits for it.
                     await Task.Delay(50).ConfigureAwait(false);
-                    if (await ReachesPointAsync(page, bb, x, y, CssOf(loc)).ConfigureAwait(false) != true)
-                        goNative = Fallback("click: the point does not reach the element (covered, moving or clipped)");
+                    var reach = await ReachesPointAsync(page, bb, x, y, CssOf(loc)).ConfigureAwait(false);
+                    if (reach != true)
+                        goNative = Report(page, api, reach is null ? "the hit test cannot run here"
+                            : "the click point does not reach the element (covered, moving or clipped)", SelectorOf(loc));
                 }
                 if (!goNative)
                 {
@@ -711,9 +721,9 @@ public static partial class Humanize
                 }
             }
         }
-        catch (Exception e) when (!IsTimeoutError(e))
+        catch (Exception e) when (!Propagates(e))
         {
-            goNative = Fallback("click: " + e.Message);
+            goNative = Report(page, api, "error: " + e.Message, SelectorOf(loc));
         }
         if (goNative) await native().ConfigureAwait(false);
     }
@@ -722,11 +732,14 @@ public static partial class Humanize
     // they catch a route falling back where it should not).
     internal static Action<string>? FallbackTrace;
 
-    private static bool Fallback(string why)
+    /// <summary>The public method a private route serves, from its [CallerMemberName] (ClickCoreAsync -> HumanClickAsync).</summary>
+    private static string ApiName(string member) => member switch
     {
-        FallbackTrace?.Invoke(why);
-        return true;
-    }
+        "SelectAsync" => "HumanSelectOptionAsync",
+        "SetCheckedAsync" => "HumanSetCheckedAsync",
+        _ when member.StartsWith("Human", StringComparison.Ordinal) => member,
+        _ => "Human" + member.Replace("CoreAsync", "Async", StringComparison.Ordinal),
+    };
 
     /// <summary>
     /// Does a press at viewport (x, y) reach the element filling <paramref name="box"/>? True / false, or
@@ -924,7 +937,7 @@ public static partial class Humanize
 
     /// <summary>The pause between the pointer coming to rest and the button going down
     /// (<see cref="Forms.PrePressMs"/>: 40-250 ms, right-skewed, centred per identity).</summary>
-    private static Task PrePressAsync(Persona p) => Task.Delay((int)Math.Round(Forms.PrePressMs(p.Seed)));
+    private static Task PrePressAsync(Persona p) => Task.Delay((int)Math.Round(Forms.PrePressMs(p.Seed) * TempoOf(p)));
 
     /// <summary>What is left of a button hold once Mouse.DownAsync has returned. The hold runs from when the
     /// press was SENT: DownAsync returns only after the page has handled the press, and a &lt;select&gt; opens
@@ -971,6 +984,7 @@ public static partial class Humanize
 
         if (!await GlideOntoAsync(source).ConfigureAwait(false))
         {
+            Report(page, "HumanDragToAsync", "the source cannot be aimed at", SelectorOf(source));
             // Nothing to aim at: run Playwright's own drag recipe, whose HoverAsync raises the proper
             // actionability error if the element cannot be used at all.
             await source.HoverAsync().ConfigureAwait(false);
@@ -1035,7 +1049,12 @@ public static partial class Humanize
             // fall through to native
         }
 
-        if (drop is not Point d) { await source.DragToAsync(target).ConfigureAwait(false); return; }
+        if (drop is not Point d)
+        {
+            Report(page, "HumanDragToAsync", "the target has no box", SelectorOf(target));
+            await source.DragToAsync(target).ConfigureAwait(false);
+            return;
+        }
         await DragToCoreAsync(source, d.X, d.Y, dropW).ConfigureAwait(false);
     }
 
@@ -1217,23 +1236,24 @@ public static partial class Humanize
     /// a visible text-entry control, and when the click did not put the caret there (an overlay took it).
     /// A timeout propagates.
     /// </summary>
-    private static async Task<bool> ClickIntoAsync(ILocator loc, float? timeout)
+    private static async Task<bool> ClickIntoAsync(ILocator loc, float? timeout, [CallerMemberName] string member = "")
     {
+        string api = ApiName(member);
         try
         {
             if (await FocusedAsync(loc).ConfigureAwait(false)) return true;
             var te = await TextEntryAsync(loc, timeout).ConfigureAwait(false);
-            if (te is null) return false;
+            if (te is null) return !Report(loc.Page, api, "not a visible text field", SelectorOf(loc));
             var (box, info) = te.Value;
             if (!await FocusClickAsync(loc.Page, box, ProvenPoint(box, info), loc).ConfigureAwait(false)
                 || !await FocusedAsync(loc).ConfigureAwait(false))
-                return !Fallback("type: the click did not put the caret in the field");
+                return !Report(loc.Page, api, "the click did not put the caret in the field", SelectorOf(loc));
             await Task.Delay((int)Rand(40, 120)).ConfigureAwait(false);
             return true;
         }
-        catch (Exception e) when (!IsTimeoutError(e))
+        catch (Exception e) when (!Propagates(e))
         {
-            return !Fallback("type: " + e.Message);
+            return !Report(loc.Page, api, "error: " + e.Message, SelectorOf(loc));
         }
     }
 
@@ -1329,8 +1349,9 @@ public static partial class Humanize
                     // Gaussian inter-key cadence with a floor — a realistic distribution, not a uniform band.
                     double d = Math.Max(25, Gauss(85, 45));
                     if (ch.Length == 1 && char.IsWhiteSpace(ch[0])) d += Rand(20, 100);
-                    if (Rnd.NextDouble() < 0.06) d += Rand(180, 450);   // occasional thinking pause
-                    await Task.Delay((int)d).ConfigureAwait(false);
+                    double tempo = Tempo(page);   // the preset scales the gaps and the rate of thinking pauses
+                    if (Rnd.NextDouble() < 0.06 * tempo) d += Rand(180, 450);   // occasional thinking pause
+                    await Task.Delay((int)(d * tempo)).ConfigureAwait(false);
                 }
             }
         }
@@ -1650,17 +1671,22 @@ public static partial class Humanize
         bool strict, Func<Task<IReadOnlyList<string>>> native)
         => SerialAsync(loc.Page, async () =>
         {
-            if (wants is null || !await RoutableAsync(loc, strict).ConfigureAwait(false))
+            if (wants is null)
+            {
+                Report(loc.Page, "HumanSelectOptionAsync", "option values the humane route cannot match (several fields, or none)", SelectorOf(loc));
+                return await native().ConfigureAwait(false);
+            }
+            if (!await RoutableAsync(loc, strict).ConfigureAwait(false))
                 return await native().ConfigureAwait(false);
             try
             {
                 var res = await SelectHumanizedAsync(loc, wants, timeout, force).ConfigureAwait(false);
                 if (res is not null) return res;
-                Fallback("select: no humane route, or it could not be shown to have worked");
+                Report(loc.Page, "HumanSelectOptionAsync", "no humane route, or the pick could not be shown to have worked", SelectorOf(loc));
             }
-            catch (Exception e) when (!IsTimeoutError(e))
+            catch (Exception e) when (!Propagates(e))
             {
-                Fallback("select: " + e.Message);   // fall through to native
+                Report(loc.Page, "HumanSelectOptionAsync", "error: " + e.Message, SelectorOf(loc));   // fall through to native
             }
             // outside the try: a native call that raises raises ONCE
             return await native().ConfigureAwait(false);
@@ -2030,7 +2056,8 @@ public static partial class Humanize
             var info = await DescribeAsync(page, box, IsolatedWorld.FormControl).ConfigureAwait(false);
             var kind = info is not null ? Forms.ClassifyField(info.Tag, info.Type, info.Ce)
                                         : await ClassifyFallbackAsync(loc).ConfigureAwait(false);
-            if (info is not null && (info.Disabled || info.ReadOnly)) return !Fallback("fill: disabled or read-only");
+            if (info is not null && (info.Disabled || info.ReadOnly))
+                return !Report(page, "HumanFillAsync", "the field is disabled or read-only", SelectorOf(loc));
             bool done = kind switch
             {
                 "text" => await FillTextAsync(loc, box, value, info).ConfigureAwait(false),
@@ -2038,12 +2065,15 @@ public static partial class Humanize
                 "datetime" when box is not null => await FillDatetimeAsync(loc, box, info, value).ConfigureAwait(false),
                 _ => false,   // color and the unfillable types: Playwright by design
             };
-            if (!done && kind is "text" or "range" or "datetime") Fallback($"fill: the {kind} route did not verify");
+            if (!done)
+                Report(page, "HumanFillAsync", kind is "text" or "range" or "datetime" ? $"the {kind} route did not verify"
+                    : $"no humane route for a {kind} field", SelectorOf(loc));
             return done;
         }
-        catch (Exception e) when (!IsTimeoutError(e))
+        catch (Exception e) when (!Propagates(e))
         {
-            Fallback("fill: " + e.Message);   // native: anything the humane route could not prove it did right
+            // native: anything the humane route could not prove it did right
+            Report(loc.Page, "HumanFillAsync", e is NativeRouteException ? e.Message : "error: " + e.Message, SelectorOf(loc));
         }
         return false;
     }
