@@ -1,17 +1,24 @@
 // Offline mode: an Offline Key file replaces every licence call (no checkout, heartbeat, check-in or
 // download); its token goes to the engine as CLEARCOTE_RUN_TOKEN and the binary must be given.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OfflineKeyError, loadOfflineKey, offlineKeyPath, offlineLease, requireOfflineBinary } from "../src/offline.js";
 import { acquireLease, withRunToken } from "../src/license.js";
 
 const NOW = new Date("2026-10-16T12:00:00Z");
+// Every temp dir a test makes is removed after it: CI fails a run that leaves anything in the temp directory.
+const made: string[] = [];
+const tempDir = () => {
+  const d = mkdtempSync(join(tmpdir(), "cc-offline-"));
+  made.push(d);
+  return d;
+};
 const day = 86_400_000;
 
 function keyFile(over: Record<string, unknown> = {}): string {
-  const dir = mkdtempSync(join(tmpdir(), "cc-offline-"));
+  const dir = tempDir();
   const p = join(dir, "key.json");
   writeFileSync(
     p,
@@ -28,6 +35,7 @@ function keyFile(over: Record<string, unknown> = {}): string {
 }
 
 afterEach(() => {
+  for (const d of made.splice(0)) rmSync(d, { recursive: true, force: true });
   delete process.env.CLEARCOTE_OFFLINE_KEY;
   vi.restoreAllMocks();
 });
@@ -57,7 +65,7 @@ describe("offline key", () => {
 
   it("missing and unreadable files", () => {
     expect(() => loadOfflineKey(join(tmpdir(), "nope-cc-offline.json"), NOW)).toThrow(OfflineKeyError);
-    const dir = mkdtempSync(join(tmpdir(), "cc-offline-"));
+    const dir = tempDir();
     writeFileSync(join(dir, "bad.json"), "{not json");
     expect(() => loadOfflineKey(join(dir, "bad.json"), NOW)).toThrow(/JSON/);
   });

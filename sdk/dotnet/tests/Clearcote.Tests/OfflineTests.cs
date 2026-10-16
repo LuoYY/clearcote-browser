@@ -5,11 +5,15 @@ namespace Clearcote.Tests;
 
 // Offline mode: an Offline Key file replaces every licence call (no checkout, heartbeat, check-in or download);
 // its token goes to the engine as CLEARCOTE_RUN_TOKEN and the binary must be given.
-public class OfflineTests
+public class OfflineTests : IDisposable
 {
+    // Every temp file a test writes is removed after it (CI fails a run that leaves files in the temp directory).
+    private readonly List<string> _made = new();
+    public void Dispose() { foreach (var f in _made) try { File.Delete(f); } catch { } }
+
     private static readonly DateTimeOffset Now = new(2026, 10, 16, 12, 0, 0, TimeSpan.Zero);
 
-    private static string KeyFile(Action<Dictionary<string, object>>? edit = null)
+    private string KeyFile(Action<Dictionary<string, object>>? edit = null)
     {
         var data = new Dictionary<string, object>
         {
@@ -22,6 +26,7 @@ public class OfflineTests
         edit?.Invoke(data);
         var path = Path.Combine(Path.GetTempPath(), $"cc-offline-{Guid.NewGuid():N}.json");
         File.WriteAllText(path, JsonSerializer.Serialize(data));
+        _made.Add(path);
         return path;
     }
 
@@ -72,6 +77,7 @@ public class OfflineTests
         Assert.Throws<OfflineKeyError>(() => Offline.LoadOfflineKey(Path.Combine(Path.GetTempPath(), "nope-cc-offline.json"), Now));
         var bad = Path.Combine(Path.GetTempPath(), $"cc-offline-{Guid.NewGuid():N}.json");
         File.WriteAllText(bad, "{not json");
+        _made.Add(bad);
         Assert.Contains("JSON", Assert.Throws<OfflineKeyError>(() => Offline.LoadOfflineKey(bad, Now)).Message);
     }
 
