@@ -49,9 +49,9 @@ describe("SC 232 vectors", () => {
   it("wheel anchor model is the PLAN.md lane E model", () => {
     expect(VEC.wheel_anchor.model).toEqual({ x: { mean: 0.5, sd: 0.1, lo: 0.12, hi: 0.88 }, y: { mean: 0.34, sd: 0.09, lo: 0.1, hi: 0.62 }, target_w: 140 });
   });
-  const anchor = (M as any).wheelAnchorPoint as undefined | ((vw: number, vh: number, rng: () => number) => { x: number; y: number } | [number, number]);
+  const anchor = M.wheelAnchorPoint as (vw: number, vh: number, rng: () => number) => { x: number; y: number } | [number, number];
   for (const c of VEC.wheel_anchor.cases) {
-    it.skipIf(!anchor)(`wheelAnchorPoint rng ${c.rng}${anchor ? "" : " (API missing: motion.wheelAnchorPoint, lane E)"}`, () => {
+    it(`wheelAnchorPoint rng ${c.rng} (lane E: one pure model in all three SDKs)`, () => {
       const r = mulberry32(c.rng);
       for (const [x, y] of c.points) {
         const g = anchor!(c.viewport[0], c.viewport[1], r);

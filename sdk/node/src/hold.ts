@@ -8,8 +8,10 @@
  *
  * What it does, in order:
  *
- *   1. waits for the element to be visible and brings it into view (the humanized wheel scroll on a
- *      humanized main-frame page, Playwright's scroll otherwise);
+ *   1. waits for the element to be visible and brings it into view: on a humanized main-frame page with
+ *      the WHEEL (scroll.ts bringIntoView; before 0.52 this was a programmatic scroll despite what this
+ *      line said), falling back to the programmatic scroll -- reported -- only for a container the wheel
+ *      cannot move; Playwright's scroll on any other page;
  *   2. moves the pointer to a point inside it (a persona-shaped point near the centre, or the
  *      caller's `position`, relative to the PADDING box like Playwright's and click's) -- a humanized
  *      glide (Fitts width = the element's smaller side) when humanize is on. On a humanized page the point

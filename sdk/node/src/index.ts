@@ -133,6 +133,7 @@ export {
   type ActionScore, type ActionKind, type MotionScore, type MotionFeatures, type Sample as MotionSample, type KeySample, type WheelSample,
 } from "./motionscore.js";
 export { record as recordHumanizeAction, traceEnabled as humanizeScoreEnabled } from "./trace.js";
+export type { DragByOptions } from "./humanize.js";
 export { Profile, listProfiles, loadProfile, PROFILE_DIR, type ProfileOptions } from "./profile.js";
 // Profile library: real captured personas, selected for coherence with THIS host.
 export {

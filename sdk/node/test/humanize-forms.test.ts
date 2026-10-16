@@ -41,6 +41,7 @@ const LABEL_SHARE: number = (HZ as any).LABEL_SHARE;
 import { typeaheadSimulate } from "../src/forms.js";
 import { BLANK_POINT, FOCUSABLE, SELECTION_STATE, TAB_DISTANCE, typingTraits } from "../src/keys.js";
 import { makePersona } from "../src/motion.js";
+import { ISO_SCROLLER } from "../src/scroll.js";
 
 const SLOW = 30_000; // glides and holds use real sleeps
 
@@ -1101,9 +1102,10 @@ describe("type / press", () => {
     for (const e of allExpressions) {
       // ISO_LABEL_BY_SEL (lane F): a HIDDEN checkbox has no box to hit-test, so its <label> is found from the
       // plain-CSS selector the same way, again only when Playwright counts the same elements. TAB_DISTANCE
-      // (lane D) walks the document's focusables for the Tab order.
-      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.startsWith(`(${ISO_LABEL_BY_SEL})`) && !e.includes(ISO_HIT_IN_BOX)
-        && !e.includes(TAB_DISTANCE)) {
+      // (lane D) walks the document's focusables for the Tab order. ISO_SCROLLER (lane E, scroll.ts) finds the
+      // scrolling container of the same plain-CSS first match CSS_BOX already counted.
+      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.startsWith(`(${ISO_LABEL_BY_SEL})`) && !e.startsWith(`(${ISO_SCROLLER})`)
+        && !e.includes(ISO_HIT_IN_BOX) && !e.includes(TAB_DISTANCE)) {
         expect(e).not.toContain("querySelector");
       }
     }

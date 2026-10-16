@@ -55,6 +55,11 @@ from ._motion import (
     dblclick_gap, pause_ms, timing_traits,
     platform_from_navigator, rollover_rate, wheel_notches,
     dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
+    drag_hesitation, hesitate_then_drag,
+)
+from ._scroll import (
+    ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, SCROLL_RANGE as ISO_SCROLL_RANGE, anchor_needed, anchor_point, bring_into_view, in_view as _box_in,
+    input_device as _input_device, paced_wheel, plan_trackpad, wheel_drift,
 )
 from ._attention import (
     IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
@@ -1018,7 +1023,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         for name in ("type", "press"):
             setattr(kb, name, _action(getattr(kb, name)))
         for name in ("click", "hover", "dblclick", "type", "fill", "press", "select_option", "check", "uncheck",
-                     "set_checked", "press_and_hold", "ambient_motion"):
+                     "set_checked", "press_and_hold", "ambient_motion", "focus", "drag_and_drop", "drag_by"):
             if getattr(page, name, None) is not None:
                 setattr(page, name, _action(getattr(page, name)))
         page.settle = hsettle
@@ -1057,16 +1062,14 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         """
         try:
             vw, vh = _viewport()
-            x, y = st["pos"]
             # With a button down every move is a DRAG leg, so anchoring mid-drag would haul the
             # grabbed element across the page instead of scrolling under it.
-            if st["held"] or (st["placed"] and 8 <= x <= vw - 8 and 8 <= y <= vh - 8):
+            if not anchor_needed(st["pos"], vw, vh, st["placed"], st["held"]):
                 return
-            # Reading position: upper-middle, gaussian-spread. The exact centre is itself a tell —
-            # nobody parks the pointer on the centre pixel of the viewport.
-            ax = min(max(vw * 0.5 + random.gauss(0, vw * 0.10), vw * 0.12), vw * 0.88)
-            ay = min(max(vh * 0.34 + random.gauss(0, vh * 0.09), vh * 0.10), vh * 0.62)
-            _glide(ax, ay, target_w=140)   # coarse placement, not a target acquisition
+            # Reading position: upper-middle, gaussian-spread (_scroll.anchor_point: the same numbers in
+            # scroll.ts and Scroll.cs). The exact centre is itself a tell.
+            ax, ay = anchor_point(vw, vh)
+            _glide(ax, ay, target_w=ANCHOR_TARGET_W)   # coarse placement, not a target acquisition
         except Exception:  # noqa: BLE001 - never let the anchor stop the scroll
             pass
 
@@ -1081,6 +1084,43 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             st["notch"] = WHEEL_NOTCH_PX[plat or _host_platform()]
         return st["notch"]
 
+    def _device():
+        """"trackpad" or "mouse" for this page: the caller's ``input_device`` option when the options
+        object (lane A) carries one, else a trackpad for a macOS persona. Read once per page."""
+        if "device" not in st:
+            hzo = _hz_options_of(page)   # lane A's HumanizeOptions.input_device first (then the stand-in seams)
+            opt = hzo.input_device if hzo is not None else None
+            for holder in (getattr(page, "_clearcote_options", None), getattr(page, "_clearcote_humanize_options", None)):
+                if opt or holder is None:
+                    continue
+                opt = holder.get("input_device") if isinstance(holder, dict) else getattr(holder, "input_device", None)
+                if opt:
+                    break
+            if not isinstance(opt, str):
+                opt = getattr(page, "_clearcote_input_device", None)
+            st["device"] = _input_device(_platform(), opt if isinstance(opt, str) else None)
+        return st["device"]
+
+    def _scroll_io():
+        """The humanizer, as _scroll.bring_into_view sees it."""
+        class _IO:
+            rng = staticmethod(random.random)
+            viewport = staticmethod(_viewport)
+            pointer = staticmethod(lambda: st["pos"])
+            placed = staticmethod(lambda: st["placed"])
+            held = staticmethod(lambda: st["held"])
+            glide = staticmethod(lambda x, y, w: _glide(x, y, target_w=w))
+            wheel = staticmethod(lambda dx, dy: native_wheel(dx, dy))
+            sleep = staticmethod(time.sleep)
+            notch_px = staticmethod(_notch_px)
+            device = staticmethod(_device)
+
+            @staticmethod
+            def scroll_range():
+                r = world_for(page).evaluate(ISO_SCROLL_RANGE)
+                return r if isinstance(r, list) and len(r) == 4 else None
+        return _IO
+
     def hwheel(delta_x, delta_y):
         """Scroll in WHOLE NOTCHES, the only thing a wheel emits.
 
@@ -1088,8 +1128,16 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         eased slices this replaced (39/28/20/10/3 px for a 100 px scroll, each at wheelDelta 120,
         measured on r32/r33) were events no mouse produces: a real notch moves 100 px on Windows,
         120 on Linux, 40 on macOS. So the total is rounded to the nearest whole notch (at least
-        one), and the notches come in finger-flick bursts."""
+        one), and the notches come in finger-flick bursts.
+
+        A TRACKPAD persona (_device(): the caller's ``input_device``, else macOS) scrolls the exact
+        distance as a two-finger swipe instead: 2-40 px events at 60-120/s on a min-jerk bell, then an
+        inertia tail (_scroll.plan_trackpad). Playwright sends every wheel as pixel deltas, so a page
+        sees deltaMode 0 either way; a notch persona's deltas are whole multiples of its notch."""
         _wheel_anchor()
+        if _device() == "trackpad":
+            paced_wheel(plan_trackpad(delta_x, delta_y), native_wheel, time.sleep)
+            return
         notch = _notch_px()
         plan = ([(0, notch if delta_y > 0 else -notch)] * wheel_notches(delta_y, notch)
                 + [(notch if delta_x > 0 else -notch, 0)] * wheel_notches(delta_x, notch))
@@ -1115,7 +1163,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             # (and never while a button is down, where a move is a drag leg).
             if len(plan) >= 6 and not st["held"] and random.random() < 0.06:
                 try:
-                    dx, dy = random.gauss(0, 1.5), random.gauss(0, 1.2)
+                    dx, dy = wheel_drift()
                     native_move(st["pos"][0] + dx, st["pos"][1] + dy)
                     st["pos"] = (st["pos"][0] + dx, st["pos"][1] + dy)
                 except Exception:  # noqa: BLE001
@@ -1641,37 +1689,111 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return None
         return {"x": box["x"] - moved[0], "y": box["y"] - moved[1], "width": box["width"], "height": box["height"]}
 
-    def _box_of(loc, timeout, force=False, selector=None):
+
+    def _css_plain(selector):
+        """Is ``selector`` plain CSS that the browser's querySelectorAll resolves to exactly the elements
+        Playwright counts (see _css_box)? Then the box and the scroller are read in the isolated world."""
+        if not isinstance(selector, str) or not selector:
+            return False
+        r = world_for(page).evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False})
+        if not r or not r.get("n"):
+            return False
+        try:
+            return page.locator(selector).count() == r["n"]
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _wheel_into_view(loc, selector, css, box):
+        """Bring the target in with the WHEEL (_scroll.bring_into_view): the box it ends at when the
+        target shows and owns its centre, else None and why ("not_scrollable", "notch_budget",
+        "covered"). A plain-CSS target's nearest scrollable ancestor is wheeled over when it is not the
+        window; other selectors scroll the window."""
+        w = world_for(page)
+
+        s0 = w.scroll()
+
+        def box_fn():
+            if css:
+                return _rect_box(w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False}))
+            # no new Playwright handle per read (each one's preview reads textContent in the page's
+            # world): the box the caller already has, moved by how far the window has scrolled since
+            sx, sy = w.scroll()
+            return {"x": box["x"] - (sx - s0[0]), "y": box["y"] - (sy - s0[1]),
+                    "width": box["width"], "height": box["height"]}
+
+        def scroller_fn():
+            r = w.evaluate(ISO_SCROLLER, {"sel": selector})
+            return r if isinstance(r, dict) and r.get("rect") else None
+
+        got, ok, notches = bring_into_view(_scroll_io(), box_fn, scroller_fn=scroller_fn if css else None)
+        if not ok:
+            return None, ("notch_budget" if notches >= 60 else "not_scrollable"), got
+        if not (_in_view(got) and _hit_ok(got, selector)):
+            return None, "covered", got
+        return got, None, got
+
+    def _needs_scroll(box, selector, css):
+        """Is ``box`` out of view -- outside the viewport, or outside the visible part of the scrolling
+        container that holds it?"""
+        if not _in_view(box):
+            return True
+        if css:
+            r = world_for(page).evaluate(ISO_SCROLLER, {"sel": selector})
+            if isinstance(r, dict) and r.get("rect"):
+                x, y, cw, ch = r["rect"]
+                return not _box_in(box, (x, y, cw, ch))
+        return False
+
+    def _box_of(loc, timeout, force=False, selector=None, wheel=True):
         """Wait the way Playwright would, with the CALLER's timeout (None = the page default; a
         hard-coded 30 s used to override set_default_timeout both ways), and return the box, in view.
         With `force` Playwright skips actionability, so nothing is waited for: a hidden target goes
         native at once instead of timing out where the native call would have acted.
 
+        An out-of-view target is brought in with the WHEEL (_wheel_into_view): whole notches (or a
+        trackpad swipe) to 25-60 % of the viewport, an undershoot and a correction, over the nested
+        scrolling container when that is what clips it. The programmatic scroll (isolated
+        scrollIntoViewIfNeeded, an instant window scrollBy, Playwright's scroll) is only the FALLBACK --
+        a container the wheel does not move, the 60-notch budget spent, ``wheel=False`` (a trial, which
+        must not move the pointer) -- and every fallback after a wheel attempt is reported (_fallback).
+        Measured on r42 / 0.51.0: every humanized action on an off-screen target scrolled
+        programmatically, a `scroll` event with no wheel before it, the target at the exact centre.
+
         Each Playwright call that resolves the element to a handle (wait_for,
         scroll_into_view_if_needed, bounding_box) makes a MAIN-world handle whose preview reads the
-        element's textContent where the page can see it: verifier B counted 4 such reads per
-        humanized click and 7 per textarea fill. So each is made only when needed: the wait only for
-        an element not visible yet (is_visible runs in Playwright's utility world), the scroll only
-        for a box not already inside the viewport, and a plain-CSS ``selector`` needs no handle at
-        all (_css_box). What remains, for other selectors, is the one bounding_box."""
+        element's textContent where the page can see it (verifier B: 4 such reads per humanized click,
+        7 per textarea fill). So each is made only when needed, and a plain-CSS ``selector`` is read in
+        the isolated world without a handle."""
         if not loc.is_visible():
             if force:
                 raise _Native("forced on a hidden target")
             loc.wait_for(state="visible", timeout=timeout)
-        box = _css_box(selector)
-        if box is not None:
+        css = _css_plain(selector)
+        w = world_for(page)
+        box = _rect_box(w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False})) if css else loc.bounding_box()
+        if not box:
             return box
-        box = loc.bounding_box()
-        if box and not (_in_view(box) and _hit_ok(box, selector)):
-            # Off-screen: scroll the window to it and prove it shows there (hit test), with no new
-            # handle. Clipped by a scrolling container, covered, or the window scroll did not bring
-            # it out: Playwright's scroll, which also scrolls containers, and a fresh box.
-            moved = _scroll_window_to(box) if not _in_view(box) else None
-            if moved and _in_view(moved) and _hit_ok(moved, selector):
-                return moved
-            loc.scroll_into_view_if_needed(timeout=timeout)
-            box = loc.bounding_box()
-        return box
+        if wheel and _needs_scroll(box, selector, css):
+            got, why, last = _wheel_into_view(loc, selector, css, box)
+            if got is not None:
+                return got
+            if why != "covered":
+                _fallback("scroll_into_view", "scroll into view: " + why)
+            box = last or box
+        if _in_view(box) and _hit_ok(box, selector):
+            return box
+        if css:
+            # scrollIntoViewIfNeeded also scrolls a scrolling container that clips it, and does nothing
+            # when it already shows (then the cover is an overlay: the click's own check)
+            return _rect_box(w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": True}))
+        # Off-screen: scroll the window to it and prove it shows there (hit test), with no new handle.
+        # Clipped by a scrolling container, covered, or the window scroll did not bring it out:
+        # Playwright's scroll, which also scrolls containers, and a fresh box.
+        moved = _scroll_window_to(box) if not _in_view(box) else None
+        if moved and _in_view(moved) and _hit_ok(moved, selector):
+            return moved
+        loc.scroll_into_view_if_needed(timeout=timeout)
+        return loc.bounding_box()
 
     def _focused(loc):
         """Does ``loc`` hold the keyboard focus? Asked through Playwright's utility-world selector
@@ -1996,11 +2118,19 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             _glide(cx, cy, target_w=16)
             _pre_press()
             grab_ms, release_ms = drag_dwell(persona)
+            x0 = range_point(box, range_fraction(cur, lo, hi), rtl)[0]
+            span = abs(range_point(box, 1.0, False)[0] - range_point(box, 0.0, False)[0])
+            step_px = span * (step / (hi - lo)) if (step and hi > lo) else 1.0
+
+            def moved():
+                v = now()
+                return None if v is None else (range_point(box, range_fraction(v, lo, hi), rtl)[0] - x0, 0.0)
+
             native_down()
             st["held"] = True
             try:
-                time.sleep(grab_ms / 1000.0)
-                _glide(tx, ty, settle=True)
+                # closed loop (drag_by): past the value by a few px, read the value, correct
+                _drag_by_core(cx, cy, tx - x0, 0.0, moved, max(1.0, step_px / 2.0), grab_ms)
                 time.sleep(release_ms / 1000.0)
             finally:
                 native_up()
@@ -2654,7 +2784,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return None
         while True:
             why = "element is not visible"
-            box = _box_of(loc, left(), selector=selector)   # waits for visible; raises Playwright's timeout
+            # waits for visible; raises Playwright's timeout. No wheel: a trial must not move the pointer.
+            box = _box_of(loc, left(), selector=selector, wheel=False)
             if box:
                 if not no_click and not loc.is_enabled():
                     why = "element is not enabled"
@@ -2834,6 +2965,243 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: press_and_hold(
         page.locator(selector).first, duration, **kw))
 
+    # ------------------------------------------------------------- drags (drag_to / drag_and_drop / drag_by)
+    def _loc_selector(loc):
+        try:
+            return loc._impl_obj._selector
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _peek_box(loc, selector):
+        """The box where it is now (no wait, no scroll): the isolated CSS read, else bounding_box()."""
+        if _css_plain(selector):
+            return _rect_box(world_for(page).evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False}))
+        return loc.bounding_box()
+
+    def _aim(box, position, force, selector):
+        """The press point inside ``box``: Playwright's ``position`` (padding-box relative, as click),
+        else the persona's click point. Unless ``force``, the browser's hit test must prove it reaches
+        the element (retried like a click for COVER_CHECK_MS); a covered point tries the probe points
+        (an icon over the centre); None when nothing reaches it (the caller goes native)."""
+        if position:
+            x, y = _position_point(box, {"position": position})
+        else:
+            x, y = click_point(box, st["pos"], persona)
+        x, y = float(round(x)), float(round(y))
+        if force:
+            return x, y
+        time.sleep(0.05)   # stable: 50 ms on, still the same box
+        hit = _reaches_point(box, x, y, selector)
+        if hit is None or hit:
+            return x, y
+        if position:
+            return None
+        for fx, fy in probe_points[1:]:
+            px = float(round(box["x"] + box["width"] * fx))
+            py = float(round(box["y"] + box["height"] * fy))
+            if _hit_in_box(box, px, py, selector) is True:
+                return px, py
+        return None
+
+    def _creep(frm, toward, grab_ms):
+        """The drag-start hesitation alone (the drop point not known yet): after the press the hand
+        holds, creeping < 8 px toward where it is about to go (_motion.drag_hesitation)."""
+        steps = drag_hesitation(frm, toward, persona, dur_ms=grab_ms)
+        _dispatch(steps)
+        if steps:
+            st["pos"] = (steps[-1][0], steps[-1][1])
+
+    def _held_drag(frm, to, grab_ms, settle=True):
+        """Hesitation + the held leg in one walk (_motion.hesitate_then_drag): inside 8 px of the press
+        for the persona's grab window (100-300 ms), then the drag leg to ``to``."""
+        steps, _ = hesitate_then_drag(frm, to, persona, grab_ms, settle=settle)
+        _dispatch(steps)
+        st["pos"] = (to[0], to[1])
+
+    def _drag(src, dst, opts):
+        """The humanized drag of locator ``src`` onto locator ``dst`` (Locator.drag_to,
+        page.drag_and_drop). Honours ``source_position`` / ``target_position`` (relative to the padding
+        box, like click), ``force`` (no hit tests) and ``timeout`` (for each end to become visible).
+        Both ends are hit tested like a click; a covered end tries the probe points, then raises
+        _Native for the caller's native fallback. Before 0.52 the drag used the exact box centres, no
+        hit test, and ignored every option. True when done."""
+        timeout = opts.get("timeout")
+        force = bool(opts.get("force"))
+        ssel, dsel = _loc_selector(src), _loc_selector(dst)
+        sbox = _box_of(src, timeout, force, ssel)
+        if not sbox:
+            raise _Native("the source has no box")
+        sp = _aim(sbox, opts.get("source_position"), force, ssel)
+        if sp is None:
+            raise _Native("the source point is covered (no probe point reaches it)")
+        if not dst.is_visible():
+            if force:
+                raise _Native("the target is hidden and force is set")
+            dst.wait_for(state="visible", timeout=timeout)
+        tbox = _peek_box(dst, dsel)
+        if not tbox:
+            raise _Native("the target has no box")
+        tp = None
+        if _in_view(tbox):
+            tp = _aim(tbox, opts.get("target_position"), force, dsel)
+            if tp is None:
+                raise _Native("the target point is covered (no probe point reaches it)")
+        if native_down is None or native_up is None:
+            raise _Native("no mouse.down / mouse.up to drag with")
+        grab_ms, release_ms = drag_dwell(persona)
+        _glide(sp[0], sp[1], target_w=max(6.0, min(sbox["width"], sbox["height"])))
+        _pre_press()
+        st["held"] = True
+        try:
+            native_down()
+            if tp is None:
+                _creep(sp, (tbox["x"] + tbox["width"] / 2, tbox["y"] + tbox["height"] / 2), grab_ms)
+                # the drop zone is out of view: the free hand scrolls it in while the other holds
+                got, ok, _ = bring_into_view(_scroll_io(), lambda: _peek_box(dst, dsel))
+                if not ok or not got:
+                    _fallback("Locator.drag_to", "scroll into view: target_out_of_view")
+                    dst.scroll_into_view_if_needed(timeout=timeout)
+                    got = _peek_box(dst, dsel)
+                if not got:
+                    raise RuntimeError("drag target vanished")
+                pos = opts.get("target_position")
+                tp = _position_point(got, {"position": pos}) if pos else click_point(got, st["pos"], persona)
+                tp = (float(round(tp[0])), float(round(tp[1])))
+                _glide(tp[0], tp[1], settle=True, held=True)
+            else:
+                _held_drag(sp, tp, grab_ms)
+            time.sleep(release_ms / 1000.0)
+        finally:
+            try:
+                native_up()
+            finally:
+                st["held"] = False
+        return True
+
+    def _settled_read(read):
+        """``read()`` once two reads 50 ms apart agree (a widget animating to the pointer has not)."""
+        a = read()
+        for _ in range(12):
+            time.sleep(0.05)
+            b = read()
+            if a is not None and b is not None and abs(a[0] - b[0]) < 0.01 and abs(a[1] - b[1]) < 0.01:
+                return b
+            a = b
+        return a if a is not None else (0.0, 0.0)
+
+    def _drag_by_core(px, py, dx, dy, read, tol=2.0, grab_ms=None):
+        """Closed-loop held drag from (px, py), already pressed: creep, glide PAST the target by 3-8 px
+        (a hand overshoots a slider and comes back), read where the dragged thing actually is (``read()``
+        -> achieved (dx, dy)), correct up to twice with a settle in between, and return the achieved
+        delta. Legs: 1-3 (kept in st["drag_legs"])."""
+        d = (dx * dx + dy * dy) ** 0.5
+        if grab_ms is None:
+            grab_ms = drag_dwell(persona)[0]
+        if d < 0.5:
+            st["drag_legs"] = 0
+            return _settled_read(read)
+        ux, uy = dx / d, dy / d
+        past = _rand(3.0, 8.0)
+        _held_drag((px, py), (px + dx + ux * past, py + dy + uy * past), grab_ms, settle=False)
+        legs = 1
+        got = (0.0, 0.0)
+        while True:
+            time.sleep(_rand(60, 140) / 1000.0)     # the hand settles; the widget catches up
+            got = _settled_read(read)
+            ex, ey = dx - got[0], dy - got[1]
+            if (ex * ex + ey * ey) ** 0.5 <= tol or legs >= 3:
+                break
+            _glide(st["pos"][0] + ex, st["pos"][1] + ey, settle=True, held=True)
+            legs += 1
+        st["drag_legs"] = legs
+        return got
+
+    def _drag_by(loc, dx, dy, opts):
+        """locator.drag_by / page.drag_by: press on the element (``position`` or the persona's point),
+        drag it by (dx, dy) closed-loop (_drag_by_core), release. ``read``: a callable returning the
+        achieved (dx, dy) (or the x delta alone); default: how far the element's own box moved.
+        Returns the final achieved (dx, dy)."""
+        timeout = opts.get("timeout")
+        force = bool(opts.get("force"))
+        sel = _loc_selector(loc)
+        box = _box_of(loc, timeout, force, sel)
+        if not box:
+            raise RuntimeError("drag_by: the element has no box (not rendered)")
+        p0 = _aim(box, opts.get("position"), force, sel)
+        if p0 is None:
+            raise RuntimeError("drag_by: another element would receive the press")
+        user_read = opts.get("read")
+        c0 = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+        def read():
+            if user_read is not None:
+                v = user_read()
+                if v is None:
+                    return None
+                if isinstance(v, (int, float)):
+                    return (float(v), 0.0)
+                return (float(v[0]), float(v[1]))
+            b = _peek_box(loc, sel)
+            if not b:
+                return None
+            return (b["x"] + b["width"] / 2 - c0[0], b["y"] + b["height"] / 2 - c0[1])
+
+        grab_ms, release_ms = drag_dwell(persona)
+        _glide(p0[0], p0[1], target_w=max(6.0, min(box["width"], box["height"])))
+        _pre_press()
+        st["held"] = True
+        try:
+            native_down()
+            got = _drag_by_core(p0[0], p0[1], float(dx), float(dy), read, float(opts.get("tolerance") or 2.0),
+                                grab_ms)
+            page._clearcote_drag_legs = st.get("drag_legs")
+            time.sleep(release_ms / 1000.0)
+        finally:
+            try:
+                native_up()
+            finally:
+                st["held"] = False
+        return got
+
+    page._clearcote_drag = _drag
+    page._clearcote_drag_by = _drag_by
+    native_page_dnd = getattr(page, "drag_and_drop", None)
+
+    def hdrag_and_drop(source, target, **opts):
+        """page.drag_and_drop, humanized like Locator.drag_to (the first match of each selector; more
+        than one match goes to the native call, which raises Playwright's strict-mode error)."""
+        if opts.get("trial"):
+            for sel, pos in ((source, opts.get("source_position")), (target, opts.get("target_position"))):
+                o = {k: opts[k] for k in ("force", "timeout") if opts.get(k) is not None}
+                if pos:
+                    o["position"] = pos
+                _trial(sel, o, True)
+            return None
+        why = None
+        try:
+            src, dst = page.locator(source), page.locator(target)
+            if src.count() <= 1 and dst.count() <= 1:
+                _drag(src.first, dst.first, opts)
+                return None
+        except _Native as e:
+            why = str(e) or "the humane drag cannot apply"
+        except Exception as e:  # noqa: BLE001
+            if _is_timeout(e) or _is_strict(e):
+                raise
+            why = "error: %s" % (e,)
+        if why:   # more than one match is not a fallback: Playwright raises its own strict-mode error
+            _report_fallback(page, "Page.drag_and_drop", why, source)
+        return native_page_dnd(source, target, **opts)
+
+    if native_page_dnd is not None:
+        page.drag_and_drop = api_errors("Page.drag_and_drop", hdrag_and_drop)
+
+    def hdrag_by(selector, dx, dy, **opts):
+        """page.drag_by(selector, dx, dy): see Locator.drag_by."""
+        return _drag_by(page.locator(selector).first, dx, dy, opts)
+
+    page.drag_by = api_errors("Page.drag_by", hdrag_by)
+
     # The after-action step first, then the per-call switch outermost: humanize=False goes straight
     # to the stock call and skips the after-action step too.
     _install_after_action()
@@ -2853,7 +3221,7 @@ def _is_strict(err):
 # Every wrapped page / mouse / keyboard method takes humanize=False: the stock Playwright call, with the
 # keyword stripped. Wired outermost, after attach has wrapped everything (_wire_per_call_off).
 _PAGE_METHODS = ("click", "hover", "dblclick", "type", "fill", "press", "select_option", "check", "uncheck",
-                 "set_checked", "focus")
+                 "set_checked", "focus", "drag_and_drop")
 _MOUSE_METHODS = ("move", "click", "wheel", "dblclick", "down", "up")
 _KB_METHODS = ("type", "press", "down", "up")
 
@@ -2917,11 +3285,37 @@ def _wire_per_call_off(page, st, stock, stock_mouse, stock_kb):
             setattr(mouse, n, _per_call(s_up, cur))
         else:
             setattr(mouse, n, _per_call(s, cur, moved if n in ("move", "click", "dblclick") else None))
+    page._clearcote_stock_mouse = dict(stock_mouse)
+    if getattr(page, "drag_by", None) is not None:   # no Playwright drag_by: humanize=False is the plain stock drag
+        page.drag_by = _per_call(lambda selector, dx, dy, **kw: _stock_drag_by(page.locator(selector).first, dx, dy, **kw),
+                                 page.drag_by)
     kb = page.keyboard
     for n, s in stock_kb.items():
         cur = getattr(kb, n, None)
         if s is not None and cur is not None and cur is not s:
             setattr(kb, n, _per_call(s, cur))
+
+
+def _stock_drag_by(self, dx, dy, **kw):
+    """Locator.drag_by(..., humanize=False): there is no Playwright drag_by, so the stock mouse does the plain
+    thing -- press at ``position`` (else the box centre), one move by (dx, dy), release -- and the asked delta
+    is returned (no read, no correction)."""
+    page = self.page
+    m = getattr(page, "_clearcote_stock_mouse", None) or {}
+    box = self.bounding_box(timeout=kw.get("timeout"))
+    if not box:
+        raise RuntimeError("drag_by: the element has no box (not rendered)")
+    pos = kw.get("position")
+    x = box["x"] + (pos["x"] if pos else box["width"] / 2)
+    y = box["y"] + (pos["y"] if pos else box["height"] / 2)
+    move, down, up = (m.get("move") or page.mouse.move), (m.get("down") or page.mouse.down), (m.get("up") or page.mouse.up)
+    move(x, y)
+    down()
+    try:
+        move(x + dx, y + dy)
+    finally:
+        up()
+    return (float(dx), float(dy))
 
 
 def _locator_off(stock, fn):
@@ -3238,33 +3632,21 @@ def _patch_locator_class():
                 return None
         if not _on(self) and not kw.get("trial") and _frame_why(self):
             _report_fallback(self.page, "Locator.drag_to", _frame_why(self), _sel(self))
-        if _on(self) and not kw.get("trial"):
-            why = "the source or the target has no box"
-            try:
-                page = self.page
-                sb = self.bounding_box()
-                tb = target.bounding_box()
-                if sb and tb:
-                    sx, sy = sb["x"] + sb["width"] / 2, sb["y"] + sb["height"] / 2
-                    tx, ty = tb["x"] + tb["width"] / 2, tb["y"] + tb["height"] / 2
-                    # Human endpoint dynamics (the two worst slider tells): grab hesitation AFTER
-                    # pressing + a settle dwell BEFORE releasing, from the page's motor persona.
-                    persona = getattr(page, "_clearcote_persona", None)
-                    grab_ms, release_ms = drag_dwell(persona) if persona else (_rand(130, 360), _rand(90, 230))
-                    page.mouse.move(sx, sy)
-                    page.mouse.down()                     # pre-press pause, then held across the glide
-                    time.sleep(grab_ms / 1000.0)          # grab hesitation
-                    held_glide = getattr(page, "_clearcote_held_glide", None)
-                    if held_glide:
-                        held_glide(tx, ty)                # humanized held-button drag + seating jiggle (settle)
-                    else:
-                        page.mouse.move(tx, ty)
-                    time.sleep(release_ms / 1000.0)       # pre-release settle before letting go
-                    page.mouse.up()
+        if not kw.get("trial") and _on(self) and _on(target) and _strict(self) and _strict(target):
+            drag = getattr(self.page, "_clearcote_drag", None)
+            if drag is not None:
+                why = "the humane drag cannot apply"
+                try:
+                    drag(self, target, kw)
                     return None
-            except Exception as e:  # noqa: BLE001
-                why = "error: %s" % (e,)
-            _report_fallback(self.page, "Locator.drag_to", why, _sel(self))
+                except _Native as e:
+                    why = str(e) or why
+                except Exception as e:  # noqa: BLE001
+                    if _is_timeout(e) or _is_strict(e):
+                        raise
+                    why = "error: %s" % (e,)
+                # a covered end, no CDP, a vanished element: Playwright's own drag (lane A's report first)
+                _report_fallback(self.page, "Locator.drag_to", why, _sel(self))
         return o_drag_to(self, target, **kw)
 
     # Each worded as Playwright words the Locator method (api_errors): routed through page.*, an
@@ -3281,6 +3663,18 @@ def _patch_locator_class():
     Locator.check = api_errors("Locator.check", _locator_off(o_check, check))
     Locator.uncheck = api_errors("Locator.uncheck", _locator_off(o_uncheck, uncheck))
     Locator.drag_to = api_errors("Locator.drag_to", _locator_off(o_drag_to, drag_to))
+
+    def drag_by(self, dx, dy, **kw):
+        """New, not a Playwright method: drag this element by (dx, dy) px, closed loop (glide past,
+        read where it went, correct up to twice), and return the achieved (dx, dy). ``read``: a
+        callable returning the achieved delta (default: the element's own box movement); ``position``,
+        ``force``, ``timeout``, ``tolerance`` (px, default 2). Needs a humanized page."""
+        fn = getattr(self.page, "_clearcote_drag_by", None)
+        if fn is None:
+            raise RuntimeError("drag_by needs humanize=True")
+        return fn(self, dx, dy, kw)
+
+    Locator.drag_by = api_errors("Locator.drag_by", _locator_off(_stock_drag_by, drag_by))
     Locator.select_option = api_errors("Locator.select_option", _locator_off(o_select_option, select_option))
     # New, not a Playwright method: press and hold this element (_hold.py). Works on frame locators too:
     # it presses at viewport coordinates through page.mouse.

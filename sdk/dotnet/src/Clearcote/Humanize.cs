@@ -152,6 +152,34 @@ public sealed record HumanClickOptions
 /// Every DOM read goes through the isolated world (IsolatedWorld) or Playwright's own utility-world
 /// queries, never the page's main world.
 /// </summary>
+/// <summary>Options of <c>HumanDragToAsync(target, options)</c> / <c>HumanDragAndDropAsync</c>, as Playwright's drag options.</summary>
+public sealed record HumanDragOptions
+{
+    /// <summary>Press here (relative to the source's padding box, like a click's Position) instead of the persona's point.</summary>
+    public Position? SourcePosition { get; init; }
+    /// <summary>Release here (relative to the target's padding box) instead of a persona point inside the target.</summary>
+    public Position? TargetPosition { get; init; }
+    /// <summary>Skip the hit tests (Playwright's actionability checks).</summary>
+    public bool Force { get; init; }
+    /// <summary>For each end to become visible (ms; null = the page default).</summary>
+    public float? Timeout { get; init; }
+}
+
+/// <summary>Options of <c>HumanDragByAsync</c>.</summary>
+public sealed record HumanDragByOptions
+{
+    /// <summary>Press here (relative to the element's padding box) instead of the persona's point.</summary>
+    public Position? Position { get; init; }
+    /// <summary>Skip the hit test at the press point.</summary>
+    public bool Force { get; init; }
+    /// <summary>For the element to become visible (ms).</summary>
+    public float? Timeout { get; init; }
+    /// <summary>Close enough (px), default 2.</summary>
+    public double? Tolerance { get; init; }
+    /// <summary>How far the dragged thing has moved so far (dx, dy); default: the element's own box.</summary>
+    public Func<Task<(double X, double Y)?>>? Read { get; init; }
+}
+
 public static partial class Humanize
 {
     // Persona per page. ConditionalWeakTable so a closed page is collectable — a Dictionary here
@@ -167,6 +195,34 @@ public static partial class Humanize
     {
         public double X; public double Y; public bool Known; public bool Ambient; public int NotchPx;
         public long ViewAt = long.MinValue; public (double W, double H)? View;   // ViewBoundsAsync's cache
+        public bool Held;               // a button is down (a drag): the wheel anchor must not move the pointer
+        public string? Platform;        // the platform the page claims (NotchPxAsync)
+        public string? Device;          // "mouse" | "trackpad" (DeviceAsync)
+        public int DragLegs;            // legs of the last HumanDragByAsync (1-3)
+    }
+
+    /// <summary>
+    /// The input device a page's wheel is: "trackpad" or "mouse" (a test seam; <c>HumanizeOptions.InputDevice</c> from
+    /// <c>Humanize.Attach(page, options)</c> wins); unset, a macOS persona gets a trackpad and every other platform a mouse.
+    /// </summary>
+    internal static readonly ConditionalWeakTable<IPage, string> InputDeviceOverride = new();
+
+    /// <summary>A fallback a humanized step reported (see <see cref="ReportFallback"/>).</summary>
+    public sealed record FallbackEvent(string Api, string Reason);
+
+    private static readonly ConditionalWeakTable<IPage, FallbackEvent> LastFallbacks = new();
+
+    /// <summary>The last humanized step on <paramref name="page"/> that had to fall back to a programmatic one
+    /// (e.g. a scroll-into-view the wheel could not do), or null.</summary>
+    public static FallbackEvent? LastFallback(IPage page) => LastFallbacks.TryGetValue(page, out var e) ? e : null;
+
+    /// <summary>A humanized step fell back to a programmatic one: remembered on the page (<see cref="LastFallback"/>, a
+    /// debugging aid), then lane A's report (<see cref="Report"/>: strict mode throws <see cref="HumanizeStrictException"/>,
+    /// otherwise <c>HumanizeOptions.OnFallback</c> hears it).</summary>
+    private static void ReportFallback(IPage page, string api, string reason)
+    {
+        LastFallbacks.AddOrUpdate(page, new FallbackEvent(api, reason));
+        Report(page, api, reason);
     }
 
     /// <summary>The viewport a planned path is kept inside (<see cref="Pacing.KeepInView"/>: the planner's overshoot
@@ -915,7 +971,8 @@ public static partial class Humanize
         while (true)
         {
             string why = "element is not visible";
-            var bb = await BoxOfAsync(loc, Left(), force: false).ConfigureAwait(false);   // waits for visible; throws Playwright's timeout
+            // waits for visible; throws Playwright's timeout. No wheel: a trial must not move the pointer.
+            var bb = await BoxOfAsync(loc, Left(), force: false, wheel: false).ConfigureAwait(false);
             if (bb is not null)
             {
                 if (!noClick && !await loc.IsEnabledAsync().ConfigureAwait(false))
@@ -1055,8 +1112,16 @@ public static partial class Humanize
         var page = source.Page;
         var p = PersonaFor(page);
         var st = StateFor(page);
-
-        if (!await GlideOntoAsync(source).ConfigureAwait(false))
+        LocatorBoundingBoxResult? sb = null;
+        try
+        {
+            sb = await BoxOfAsync(source, null, force: false).ConfigureAwait(false);   // wheel-scrolled into view
+        }
+        catch (Exception e) when (!IsTimeoutError(e))
+        {
+            sb = null;
+        }
+        if (sb is null)
         {
             Report(page, "HumanDragToAsync", "the source cannot be aimed at", SelectorOf(source));
             // Nothing to aim at: run Playwright's own drag recipe, whose HoverAsync raises the proper
@@ -1068,68 +1133,300 @@ public static partial class Humanize
             st.X = toX; st.Y = toY; st.Known = true;
             return;
         }
+        var from = st.Known ? new Point(st.X, st.Y) : new Point(sb.X - 120, sb.Y - 90);
+        var sp = Motion.ClickPoint(new Box(sb.X, sb.Y, sb.Width, sb.Height), from, p);
+        await HeldDragAsync(page, p, st, Math.Round(sp.X), Math.Round(sp.Y), Math.Max(6, Math.Min(sb.Width, sb.Height)),
+            new Point(toX, toY)).ConfigureAwait(false);
+    }
 
+    /// <summary>Glide to the press point, press, hesitate (inside 8 px for the persona's grab window, 100-300 ms),
+    /// drag to <paramref name="to"/> on one walk (<see cref="Motion.HesitateThenDrag"/>), settle, release.</summary>
+    private static async Task HeldDragAsync(IPage page, Persona p, PointerState st, double sx, double sy, double sourceW, Point to)
+    {
         var (grabMs, releaseMs) = Motion.DragDwell(p);
+        await GlideAsync(page, p, st, sx, sy, sourceW).ConfigureAwait(false);
         await EnsurePointerAsync(page, p, st).ConfigureAwait(false);
         await PrePressAsync(p).ConfigureAwait(false);   // the hand arrives, then the button goes down
-        await page.Mouse.DownAsync().ConfigureAwait(false);
+        st.Held = true;
         try
         {
-            await Task.Delay((int)Math.Round(grabMs)).ConfigureAwait(false);        // grab hesitation
-            await GlideAsync(page, p, st, toX, toY, targetW, settle: true).ConfigureAwait(false);
+            await page.Mouse.DownAsync().ConfigureAwait(false);
+            await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(sx, sy), to, p, grabMs).Steps).ConfigureAwait(false);
+            st.X = to.X; st.Y = to.Y;
             await Task.Delay((int)Math.Round(releaseMs)).ConfigureAwait(false);     // settle before letting go
         }
         finally
         {
+            st.Held = false;
             // A button left down survives into every later action, so the release is unconditional.
             try { await page.Mouse.UpAsync().ConfigureAwait(false); } catch (PlaywrightException) { }
         }
     }
 
-    /// <inheritdoc cref="HumanDragToAsync(ILocator,double,double,double)"/>
-    public static async Task HumanDragToAsync(this ILocator source, ILocator target)
+    /// <summary>Walk planned held samples (native moves carry the button state), paced like a glide.</summary>
+    private static async Task WalkHeldAsync(IPage page, PointerState st, List<Step> steps)
+    {
+        var vp = await ViewBoundsAsync(page, st).ConfigureAwait(false);
+        await Pacing.WalkAsync(vp is { } v ? Pacing.KeepInView(steps, v.W, v.H) : steps,
+            (x, y) => page.Mouse.MoveAsync((float)x, (float)y)).ConfigureAwait(false);
+        if (steps.Count > 0) { st.X = steps[^1].X; st.Y = steps[^1].Y; }
+    }
+
+    /// <summary>
+    /// The press point inside <paramref name="bb"/>: Playwright's <c>Position</c> (padding-box relative, as a
+    /// click), else the persona's click point. Unless <paramref name="force"/>, the browser's hit test must prove
+    /// it reaches the element (retried like a click); a covered point tries the probe points; null when nothing
+    /// reaches it (the caller goes native).
+    /// </summary>
+    private static async Task<(double X, double Y)?> AimAsync(ILocator loc, LocatorBoundingBoxResult bb, Position? position, bool force)
+    {
+        var page = loc.Page;
+        var st = StateFor(page);
+        double x, y;
+        if (position is { } pos)
+            (x, y) = await PositionPointAsync(page, bb, (pos.X, pos.Y)).ConfigureAwait(false);
+        else
+        {
+            var from = st.Known ? new Point(st.X, st.Y) : new Point(bb.X - 120, bb.Y - 90);
+            var pt = Motion.ClickPoint(new Box(bb.X, bb.Y, bb.Width, bb.Height), from, PersonaFor(page));
+            (x, y) = (pt.X, pt.Y);
+        }
+        x = Math.Round(x); y = Math.Round(y);
+        if (force) return (x, y);
+        await Task.Delay(50).ConfigureAwait(false);
+        var sel = CssOf(loc);
+        var hit = await ReachesPointAsync(page, bb, x, y, sel).ConfigureAwait(false);
+        if (hit != false) return (x, y);
+        if (position is not null) return null;
+        foreach (var (fx, fy) in ProbePoints.Skip(1))
+        {
+            double px = Math.Round(bb.X + bb.Width * fx), py = Math.Round(bb.Y + bb.Height * fy);
+            if (await HitInBoxAsync(page, bb, px, py, sel).ConfigureAwait(false) == true) return (px, py);
+        }
+        return null;
+    }
+
+    private static async Task<LocatorBoundingBoxResult?> PeekBoxAsync(ILocator loc)
+    {
+        var sel = CssOf(loc);
+        if (await CssPlainAsync(loc.Page, sel).ConfigureAwait(false))
+            return RectBox(await IsolatedWorld.For(loc.Page).EvaluateAsync(IsolatedWorld.CssBox,
+                new Dictionary<string, object?> { ["sel"] = sel, ["scroll"] = false }).ConfigureAwait(false));
+        return await loc.BoundingBoxAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Drag <paramref name="source"/> onto <paramref name="target"/>, humanized: both ends brought into view with the
+    /// wheel and hit tested like a click (probe points on a covered end), the press at <c>SourcePosition</c> or the
+    /// persona's point, a 100-300 ms hesitation inside 8 px, one held leg, a settle, the release at
+    /// <c>TargetPosition</c> or a persona point inside the target. <c>Force</c> skips the hit tests; <c>Timeout</c>
+    /// bounds each end's wait. A covered end goes to Playwright's <c>DragToAsync</c>. Before 0.52 this ignored every
+    /// option and scrolled with ScrollIntoViewIfNeededAsync.
+    /// </summary>
+    public static async Task HumanDragToAsync(this ILocator source, ILocator target, HumanDragOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(target);
-        await SerialAsync(source.Page, () => DragToLocatorCoreAsync(source, target)).ConfigureAwait(false);
+        var o = options ?? new HumanDragOptions();
+        await SerialAsync(source.Page, () => DragToLocatorCoreAsync(source, target, o)).ConfigureAwait(false);
     }
 
-    private static async Task DragToLocatorCoreAsync(ILocator source, ILocator target)
+    /// <summary>The first matches of <paramref name="source"/> and <paramref name="target"/>, dragged as
+    /// <see cref="HumanDragToAsync(ILocator,ILocator,HumanDragOptions)"/> does: Playwright's
+    /// <c>DragAndDropAsync</c>, humanized.</summary>
+    public static async Task HumanDragAndDropAsync(this IPage page, string source, string target, HumanDragOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        var o = options ?? new HumanDragOptions();
+        await SerialAsync(page, () => DragToLocatorCoreAsync(page.Locator(source).First, page.Locator(target).First, o)).ConfigureAwait(false);
+    }
+
+    private static async Task DragToLocatorCoreAsync(ILocator source, ILocator target, HumanDragOptions o)
     {
         var page = source.Page;
+        var p = PersonaFor(page);
         var st = StateFor(page);
-
-        Point? drop = null;
-        double dropW = 24;
+        LocatorBoundingBoxResult? sb = null, tb = null;
+        (double X, double Y)? sp = null, tp = null;
+        bool native = false;
+        string? why = null;
         try
         {
-            await target.ScrollIntoViewIfNeededAsync().ConfigureAwait(false);
-            var tb = await target.BoundingBoxAsync().ConfigureAwait(false);
-            if (tb is not null)
+            sb = await BoxOfAsync(source, o.Timeout, o.Force).ConfigureAwait(false);
+            if (sb is not null) sp = await AimAsync(source, sb, o.SourcePosition, o.Force).ConfigureAwait(false);
+            if (sp is not null)
             {
-                var from = st.Known ? new Point(st.X, st.Y) : new Point(tb.X - 120, tb.Y - 90);
-                // Disperse the drop point too: releasing on the target's exact centre every time is
-                // the same signature as clicking it.
-                drop = Motion.ClickPoint(new Box(tb.X, tb.Y, tb.Width, tb.Height), from, PersonaFor(page));
-                dropW = Math.Max(6, tb.Width);
+                if (!await target.IsVisibleAsync().ConfigureAwait(false))
+                {
+                    if (o.Force) throw new NativeRouteException("forced on a hidden target");
+                    await target.WaitForAsync(new LocatorWaitForOptions { State = WaitForSelectorState.Visible, Timeout = o.Timeout })
+                        .ConfigureAwait(false);
+                }
+                tb = await PeekBoxAsync(target).ConfigureAwait(false);
+                if (tb is not null && await InViewAsync(page, tb).ConfigureAwait(false))
+                    tp = await AimAsync(target, tb, o.TargetPosition, o.Force).ConfigureAwait(false) is { } t ? t : null;
+                // an out-of-view drop zone is scrolled in while the button is held, below
+                native = tb is null || (tp is null && await InViewAsync(page, tb).ConfigureAwait(false));
             }
+            else native = true;
         }
-        catch (PlaywrightException e) when (IsTimeout(e))
+        catch (Exception e) when (!Propagates(e))
         {
-            throw;   // as in GlideOntoAsync: do not make a missing target wait out two timeouts
+            native = true;
+            why = e is NativeRouteException ? e.Message : "error: " + e.Message;
         }
-        catch (PlaywrightException)
+        if (native || sp is not (double, double) s || tb is null)
         {
-            // fall through to native
-        }
-
-        if (drop is not Point d)
-        {
-            Report(page, "HumanDragToAsync", "the target has no box", SelectorOf(target));
-            await source.DragToAsync(target).ConfigureAwait(false);
+            // the native fallback site: Playwright's own drag (a covered end, no CDP, a vanished element), reported
+            // through lane A first (strict throws, OnFallback hears it)
+            why ??= sb is null ? "the source has no box"
+                : sp is null ? "the source point is covered (no probe point reaches it)"
+                : tb is null ? "the target has no box" : "the target point is covered (no probe point reaches it)";
+            Report(page, "HumanDragToAsync", why, SelectorOf(source));
+            await source.DragToAsync(target, new LocatorDragToOptions
+            {
+                Force = o.Force, Timeout = o.Timeout,
+                SourcePosition = o.SourcePosition is { } sp0 ? new SourcePosition { X = sp0.X, Y = sp0.Y } : null,
+                TargetPosition = o.TargetPosition is { } tp0 ? new TargetPosition { X = tp0.X, Y = tp0.Y } : null,
+            }).ConfigureAwait(false);
             return;
         }
-        await DragToCoreAsync(source, d.X, d.Y, dropW).ConfigureAwait(false);
+
+        var (grabMs, releaseMs) = Motion.DragDwell(p);
+        await GlideAsync(page, p, st, s.X, s.Y, Math.Max(6, Math.Min(sb!.Width, sb.Height))).ConfigureAwait(false);
+        await PrePressAsync(p).ConfigureAwait(false);
+        st.Held = true;
+        try
+        {
+            await page.Mouse.DownAsync().ConfigureAwait(false);
+            if (tp is (double, double) t0)
+            {
+                await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(s.X, s.Y), new Point(t0.X, t0.Y), p, grabMs).Steps)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await WalkHeldAsync(page, st, Motion.DragHesitation(new Point(s.X, s.Y),
+                    new Point(tb.X + tb.Width / 2.0, tb.Y + tb.Height / 2.0), p, null, grabMs)).ConfigureAwait(false);
+                // the drop zone is out of view: the free hand scrolls it in while the other holds
+                async Task<Box?> TFn() => await PeekBoxAsync(target).ConfigureAwait(false) is { } r ? new Box(r.X, r.Y, r.Width, r.Height) : null;
+                var res = await Scroll.BringIntoViewAsync(new PageScrollIO(page), TFn).ConfigureAwait(false);
+                var got = res.Box is Box gb ? Bb(gb.X, gb.Y, gb.Width, gb.Height) : null;
+                if (!res.Ok || got is null)
+                {
+                    ReportFallback(page, "HumanDragToAsync", "scroll into view: target_out_of_view");
+                    await target.ScrollIntoViewIfNeededAsync(new LocatorScrollIntoViewIfNeededOptions { Timeout = o.Timeout }).ConfigureAwait(false);
+                    got = await PeekBoxAsync(target).ConfigureAwait(false);
+                }
+                if (got is null) throw new PlaywrightException("drag target vanished");
+                var q = o.TargetPosition is { } tpos
+                    ? await PositionPointAsync(page, got, (tpos.X, tpos.Y)).ConfigureAwait(false)
+                    : (Motion.ClickPoint(new Box(got.X, got.Y, got.Width, got.Height), new Point(st.X, st.Y), p) is var cp ? (cp.X, cp.Y) : default);
+                await GlideAsync(page, p, st, Math.Round(q.Item1), Math.Round(q.Item2), Math.Max(6, got.Width), settle: true).ConfigureAwait(false);
+            }
+            await Task.Delay((int)Math.Round(releaseMs)).ConfigureAwait(false);
+        }
+        finally
+        {
+            st.Held = false;
+            try { await page.Mouse.UpAsync().ConfigureAwait(false); } catch (PlaywrightException) { }
+        }
+    }
+
+    /// <summary>
+    /// Drag this element by (dx, dy) px, closed loop: press on it (<c>Position</c> or the persona's point), hesitate,
+    /// glide PAST the target by 3-8 px, read where it actually went (<c>Read</c>, else the element's own box), correct
+    /// up to twice with a settle in between, release. Returns the achieved (dx, dy); legs 1-3.
+    /// </summary>
+    public static async Task<(double X, double Y)> HumanDragByAsync(this ILocator locator, double dx, double dy,
+        HumanDragByOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(locator);
+        var o = options ?? new HumanDragByOptions();
+        return await SerialAsync(locator.Page, () => DragByCoreAsync(locator, dx, dy, o)).ConfigureAwait(false);
+    }
+
+    /// <summary>The first match of <paramref name="selector"/>, dragged as <see cref="HumanDragByAsync(ILocator,double,double,HumanDragByOptions)"/>.</summary>
+    public static Task<(double X, double Y)> HumanDragByAsync(this IPage page, string selector, double dx, double dy,
+        HumanDragByOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        return page.Locator(selector).First.HumanDragByAsync(dx, dy, options);
+    }
+
+    /// <summary>The legs (1-3) the last <see cref="HumanDragByAsync(ILocator,double,double,HumanDragByOptions)"/> on this page took.</summary>
+    public static int LastDragLegs(IPage page) => StateFor(page).DragLegs;
+
+    private static async Task<(double X, double Y)> DragByCoreAsync(ILocator loc, double dx, double dy, HumanDragByOptions o)
+    {
+        var page = loc.Page;
+        var p = PersonaFor(page);
+        var st = StateFor(page);
+        var bb = await BoxOfAsync(loc, o.Timeout, o.Force).ConfigureAwait(false)
+            ?? throw new PlaywrightException("HumanDragByAsync: the element has no box (not rendered)");
+        var p0 = await AimAsync(loc, bb, o.Position, o.Force).ConfigureAwait(false)
+            ?? throw new PlaywrightException("HumanDragByAsync: another element would receive the press");
+        double c0x = bb.X + bb.Width / 2.0, c0y = bb.Y + bb.Height / 2.0;
+        async Task<(double X, double Y)?> Read()
+        {
+            if (o.Read is { } rd) return await rd().ConfigureAwait(false);
+            var b = await PeekBoxAsync(loc).ConfigureAwait(false);
+            return b is null ? null : (b.X + b.Width / 2.0 - c0x, b.Y + b.Height / 2.0 - c0y);
+        }
+        var (grabMs, releaseMs) = Motion.DragDwell(p);
+        await GlideAsync(page, p, st, p0.X, p0.Y, Math.Max(6, Math.Min(bb.Width, bb.Height))).ConfigureAwait(false);
+        await PrePressAsync(p).ConfigureAwait(false);
+        st.Held = true;
+        try
+        {
+            await page.Mouse.DownAsync().ConfigureAwait(false);
+            var got = await DragByLoopAsync(page, p, st, p0.X, p0.Y, dx, dy, Read, o.Tolerance ?? 2, grabMs).ConfigureAwait(false);
+            await Task.Delay((int)Math.Round(releaseMs)).ConfigureAwait(false);
+            return got;
+        }
+        finally
+        {
+            st.Held = false;
+            try { await page.Mouse.UpAsync().ConfigureAwait(false); } catch (PlaywrightException) { }
+        }
+    }
+
+    /// <summary>The closed loop of a held drag already pressed at (px, py): see <see cref="HumanDragByAsync(ILocator,double,double,HumanDragByOptions)"/>.</summary>
+    private static async Task<(double X, double Y)> DragByLoopAsync(IPage page, Persona p, PointerState st, double px, double py,
+        double dx, double dy, Func<Task<(double X, double Y)?>> read, double tol, double grabMs)
+    {
+        async Task<(double X, double Y)> Settled()
+        {
+            var a = await read().ConfigureAwait(false);
+            for (int i = 0; i < 12; i++)
+            {
+                await Task.Delay(50).ConfigureAwait(false);
+                var b = await read().ConfigureAwait(false);
+                if (a is { } av && b is { } bv && Math.Abs(av.X - bv.X) < 0.01 && Math.Abs(av.Y - bv.Y) < 0.01) return bv;
+                a = b;
+            }
+            return a ?? (0, 0);
+        }
+        double d = Math.Sqrt(dx * dx + dy * dy);
+        if (d < 0.5) { st.DragLegs = 0; return await Settled().ConfigureAwait(false); }
+        double ux = dx / d, uy = dy / d, past = Rand(3, 8);
+        var to = new Point(px + dx + ux * past, py + dy + uy * past);
+        await WalkHeldAsync(page, st, Motion.HesitateThenDrag(new Point(px, py), to, p, grabMs, settle: false).Steps).ConfigureAwait(false);
+        st.X = to.X; st.Y = to.Y;
+        int legs = 1;
+        (double X, double Y) got;
+        while (true)
+        {
+            await Task.Delay((int)Rand(60, 140)).ConfigureAwait(false);
+            got = await Settled().ConfigureAwait(false);
+            double ex = dx - got.X, ey = dy - got.Y;
+            if (Math.Sqrt(ex * ex + ey * ey) <= tol || legs >= 3) break;
+            var steps = Motion.PlanDrag(new Point(st.X, st.Y), new Point(st.X + ex, st.Y + ey), p, settle: true);
+            await WalkHeldAsync(page, st, steps).ConfigureAwait(false);
+            legs++;
+        }
+        st.DragLegs = legs;
+        return got;
     }
 
     /// <summary>
@@ -1162,20 +1459,27 @@ public static partial class Humanize
         try
         {
             var (w, h) = await ViewportAsync(page).ConfigureAwait(false);
-            bool homeless = !st.Known || st.X < 2 || st.Y < 2 || st.X > w - 2 || st.Y > h - 2;
-            if (homeless)
+            if (Scroll.AnchorNeeded(st.X, st.Y, w, h, st.Known, st.Held))
             {
-                // Upper-middle, gaussian, never the exact centre: landing on (w/2, h/2) to the pixel
-                // is the same dispersion tell as a driver that clicks computed centres.
-                double rx = Math.Clamp(w * 0.5 + Gauss(0, w * 0.12), w * 0.12, w * 0.88);
-                double ry = Math.Clamp(h * 0.38 + Gauss(0, h * 0.10), h * 0.12, h * 0.75);
-                await GlideAsync(page, p, st, rx, ry, 80).ConfigureAwait(false);
-                await Task.Delay((int)Rand(50, 190)).ConfigureAwait(false);   // read a moment before the flick
+                // Upper-middle, gaussian, never the exact centre (Scroll.AnchorPoint: the numbers Python and Node
+                // use too -- this used 0.5/0.38, sd 0.12/0.10, y clamp 0.12-0.75 before 0.52).
+                var (rx, ry) = Scroll.AnchorPoint(w, h);
+                await GlideAsync(page, p, st, rx, ry, Scroll.AnchorTargetW).ConfigureAwait(false);
+                await Task.Delay((int)Rand(60, 180)).ConfigureAwait(false);   // eyes land before the finger rolls the wheel
             }
         }
         catch (PlaywrightException)
         {
             // Placement is best effort; the scroll below still runs.
+        }
+
+        if (await DeviceAsync(page, st).ConfigureAwait(false) == "trackpad")
+        {
+            // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then an
+            // inertia tail (Scroll.PlanTrackpad). Playwright sends pixel deltas either way (deltaMode 0).
+            await Scroll.PacedWheelAsync(Scroll.PlanTrackpad(deltaX, deltaY),
+                (a, b) => page.Mouse.WheelAsync((float)a, (float)b), ms => Task.Delay((int)Math.Round(ms))).ConfigureAwait(false);
+            return;
         }
 
         // One notch per event and one axis per event, like a real wheel or tilt: vertical, then horizontal.
@@ -1226,7 +1530,44 @@ public static partial class Humanize
         var r = await IsolatedWorld.For(page).EvaluateAsync(IsolatedWorld.Platform).ConfigureAwait(false);
         string? platform = r is { ValueKind: JsonValueKind.String } s ? Motion.PlatformFromNavigator(s.GetString()) : null;
         platform ??= OperatingSystem.IsWindows() ? "windows" : OperatingSystem.IsMacOS() ? "macos" : "linux";
+        st.Platform = platform;
         return st.NotchPx = Motion.WheelNotchPx[platform];
+    }
+
+    /// <summary>"trackpad" or "mouse" for this page (<see cref="InputDeviceOverride"/>, else macOS = trackpad).</summary>
+    private static async Task<string> DeviceAsync(IPage page, PointerState st)
+    {
+        if (st.Device is { } d) return d;
+        await NotchPxAsync(page, st).ConfigureAwait(false);
+        // lane A's HumanizeOptions.InputDevice first, then the test seam
+        var opt = OptionsFor(page)?.InputDevice;
+        if (opt is null) InputDeviceOverride.TryGetValue(page, out opt);
+        return st.Device = Scroll.InputDevice(st.Platform, opt);
+    }
+
+    /// <summary>The humanizer, as <see cref="Scroll.BringIntoViewAsync"/> sees it.</summary>
+    private sealed class PageScrollIO : IScrollIO
+    {
+        private readonly IPage _page;
+        private readonly Persona _p;
+        private readonly PointerState _st;
+        public PageScrollIO(IPage page) { _page = page; _p = PersonaFor(page); _st = StateFor(page); }
+        public Rng Rng => Random.Shared.NextDouble;
+        public Task<(double W, double H)> ViewportAsync() => Humanize.ViewportAsync(_page);
+        public (double X, double Y) Pointer => (_st.X, _st.Y);
+        public bool Placed => _st.Known;
+        public bool Held => _st.Held;
+        public Task GlideAsync(double x, double y, double targetW) => Humanize.GlideAsync(_page, _p, _st, x, y, targetW);
+        public Task WheelAsync(double dx, double dy) => _page.Mouse.WheelAsync((float)dx, (float)dy);
+        public Task SleepAsync(double ms) => Task.Delay((int)Math.Round(ms));
+        public Task<int> NotchPxAsync() => Humanize.NotchPxAsync(_page, _st);
+        public Task<string> DeviceAsync() => Humanize.DeviceAsync(_page, _st);
+        public async Task<double[]?> ScrollRangeAsync()
+        {
+            var r = await IsolatedWorld.For(_page).EvaluateAsync(Scroll.IsoScrollRange).ConfigureAwait(false);
+            return r is { ValueKind: JsonValueKind.Array } a && a.GetArrayLength() == 4
+                ? a.EnumerateArray().Select(v => v.GetDouble()).ToArray() : null;
+        }
     }
 
     /// <summary>Vertical <see cref="HumanWheelAsync(IPage,float,float)"/>: the common reading scroll.</summary>
@@ -1239,10 +1580,11 @@ public static partial class Humanize
     /// <summary>A few pixels of hand drift, kept inside the viewport so the wheel stays over the content.</summary>
     private static async Task DriftAsync(IPage page, PointerState st)
     {
-        if (!st.Known) return;
+        if (!st.Known || st.Held) return;
         var (w, h) = await ViewportAsync(page).ConfigureAwait(false);
-        double nx = Math.Clamp(st.X + Gauss(0, 2.2), 2, w - 2);
-        double ny = Math.Clamp(st.Y + Gauss(0, 2.2), 2, h - 2);
+        var (ddx, ddy) = Scroll.WheelDrift();   // N(0,1.5) x N(0,1.2): the numbers Python and Node use
+        double nx = Math.Clamp(st.X + ddx, 2, w - 2);
+        double ny = Math.Clamp(st.Y + ddy, 2, h - 2);
         await page.Mouse.MoveAsync((float)nx, (float)ny).ConfigureAwait(false);
         st.X = nx; st.Y = ny;
     }
@@ -2569,7 +2911,16 @@ public static partial class Humanize
     /// and a plain-CSS locator needs no handle at all (CssBoxAsync). What remains, for other selectors, is
     /// the one BoundingBoxAsync.</para>
     /// </summary>
-    private static async Task<LocatorBoundingBoxResult?> BoxOfAsync(ILocator loc, float? timeout, bool force)
+    /// <summary>
+    /// Wait the way Playwright would and return the box, in view. An out-of-view target is brought in with the
+    /// WHEEL (<see cref="WheelIntoViewAsync"/>): whole notches (or a trackpad swipe) to 25-60 % of the viewport,
+    /// an undershoot and a correction, over the scrolling container that clips it. The programmatic scroll
+    /// (isolated scrollIntoViewIfNeeded, an instant scrollBy, Playwright's scroll) is only the FALLBACK -- a
+    /// container the wheel does not move, the 60-notch budget spent, <paramref name="wheel"/> false (a trial,
+    /// which must not move the pointer) -- and a fallback after a wheel attempt is reported (ReportFallback).
+    /// Measured on r42 / 0.51.0: every humanized action on an off-screen target scrolled programmatically.
+    /// </summary>
+    private static async Task<LocatorBoundingBoxResult?> BoxOfAsync(ILocator loc, float? timeout, bool force, bool wheel = true)
     {
         var page = loc.Page;
         if (!await loc.IsVisibleAsync().ConfigureAwait(false))
@@ -2577,20 +2928,93 @@ public static partial class Humanize
             if (force) throw new NativeRouteException("forced on a hidden target");
             await loc.WaitForAsync(new LocatorWaitForOptions { State = WaitForSelectorState.Visible, Timeout = timeout }).ConfigureAwait(false);
         }
-        if (await CssBoxAsync(loc).ConfigureAwait(false) is { } css) return css;
-        var box = await loc.BoundingBoxAsync().ConfigureAwait(false);
-        if (box is not null && !(await InViewAsync(page, box).ConfigureAwait(false) && await HitOkAsync(page, box, CssOf(loc)).ConfigureAwait(false)))
+        string? sel = CssOf(loc);
+        bool css = await CssPlainAsync(page, sel).ConfigureAwait(false);
+        var w = IsolatedWorld.For(page);
+        var box = css ? RectBox(await w.EvaluateAsync(IsolatedWorld.CssBox,
+                new Dictionary<string, object?> { ["sel"] = sel, ["scroll"] = false }).ConfigureAwait(false))
+            : await loc.BoundingBoxAsync().ConfigureAwait(false);
+        if (box is null) return null;
+        if (wheel && await NeedsScrollAsync(page, box, sel, css).ConfigureAwait(false))
         {
-            // Off-screen: scroll the window to it and prove it shows there (hit test), with no new handle.
-            // Clipped by a scrolling container, covered, or the window scroll did not bring it out:
-            // Playwright's scroll, which also scrolls containers, and a fresh box.
-            var moved = !await InViewAsync(page, box).ConfigureAwait(false) ? await ScrollWindowToAsync(page, box).ConfigureAwait(false) : null;
-            if (moved is not null && await InViewAsync(page, moved).ConfigureAwait(false) && await HitOkAsync(page, moved, CssOf(loc)).ConfigureAwait(false))
-                return moved;
-            await loc.ScrollIntoViewIfNeededAsync(new LocatorScrollIntoViewIfNeededOptions { Timeout = timeout }).ConfigureAwait(false);
-            box = await loc.BoundingBoxAsync().ConfigureAwait(false);
+            var (got, why, last) = await WheelIntoViewAsync(loc, sel, css, box).ConfigureAwait(false);
+            if (got is not null) return got;
+            if (why != "covered") ReportFallback(page, "scroll_into_view", "scroll into view: " + why!);
+            box = last ?? box;
         }
-        return box;
+        if (await InViewAsync(page, box).ConfigureAwait(false) && await HitOkAsync(page, box, sel).ConfigureAwait(false)) return box;
+        if (css)
+            return RectBox(await w.EvaluateAsync(IsolatedWorld.CssBox,
+                new Dictionary<string, object?> { ["sel"] = sel, ["scroll"] = true }).ConfigureAwait(false));
+        var moved = !await InViewAsync(page, box).ConfigureAwait(false) ? await ScrollWindowToAsync(page, box).ConfigureAwait(false) : null;
+        if (moved is not null && await InViewAsync(page, moved).ConfigureAwait(false) && await HitOkAsync(page, moved, sel).ConfigureAwait(false))
+            return moved;
+        await loc.ScrollIntoViewIfNeededAsync(new LocatorScrollIntoViewIfNeededOptions { Timeout = timeout }).ConfigureAwait(false);
+        return await loc.BoundingBoxAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Is <paramref name="sel"/> plain CSS the browser resolves to exactly the elements Playwright counts?</summary>
+    private static async Task<bool> CssPlainAsync(IPage page, string? sel)
+    {
+        if (string.IsNullOrEmpty(sel)) return false;
+        var r = await IsolatedWorld.For(page).EvaluateAsync(IsolatedWorld.CssBox,
+            new Dictionary<string, object?> { ["sel"] = sel, ["scroll"] = false }).ConfigureAwait(false);
+        if (r is not { ValueKind: JsonValueKind.Object } o || !o.TryGetProperty("n", out var n)
+            || n.ValueKind != JsonValueKind.Number || n.GetInt32() == 0) return false;
+        try { return await page.Locator(sel).CountAsync().ConfigureAwait(false) == n.GetInt32(); }
+        catch (PlaywrightException) { return false; }
+    }
+
+    private static async Task<Scroller?> ScrollerOfAsync(IPage page, string? sel)
+    {
+        var r = await IsolatedWorld.For(page).EvaluateAsync(Scroll.IsoScroller, new Dictionary<string, object?> { ["sel"] = sel })
+            .ConfigureAwait(false);
+        if (r is not { ValueKind: JsonValueKind.Object } o || !o.TryGetProperty("rect", out var rect)
+            || rect.ValueKind != JsonValueKind.Array || rect.GetArrayLength() != 4) return null;
+        bool B(string n) => o.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.True;
+        double[]? range = o.TryGetProperty("s", out var sv) && sv.ValueKind == JsonValueKind.Array && sv.GetArrayLength() == 4
+            ? sv.EnumerateArray().Select(v => v.GetDouble()).ToArray() : null;
+        return new Scroller(rect[0].GetDouble(), rect[1].GetDouble(), rect[2].GetDouble(), rect[3].GetDouble(), B("x"), B("y"), range);
+    }
+
+    private static async Task<bool> NeedsScrollAsync(IPage page, LocatorBoundingBoxResult box, string? sel, bool css)
+    {
+        if (!await InViewAsync(page, box).ConfigureAwait(false)) return true;
+        if (css && await ScrollerOfAsync(page, sel).ConfigureAwait(false) is { } sc)
+            return !Scroll.InView(new Box(box.X, box.Y, box.Width, box.Height), new Box(sc.X, sc.Y, sc.Width, sc.Height));
+        return false;
+    }
+
+    /// <summary>
+    /// Bring the target in with the WHEEL (<see cref="Scroll.BringIntoViewAsync"/>): the box where it shows and owns its
+    /// centre, else null and why ("not_scrollable", "notch_budget", "covered"). A plain-CSS target's nearest scrollable
+    /// ancestor is wheeled over; any other locator scrolls the window, its box read from the window's scroll offset
+    /// (no new Playwright handle per read).
+    /// </summary>
+    private static async Task<(LocatorBoundingBoxResult? Got, string? Why, LocatorBoundingBoxResult? Last)> WheelIntoViewAsync(
+        ILocator loc, string? sel, bool css, LocatorBoundingBoxResult box)
+    {
+        var page = loc.Page;
+        var w = IsolatedWorld.For(page);
+        var s0 = await w.ScrollAsync().ConfigureAwait(false);
+        async Task<Box?> BoxFn()
+        {
+            if (css)
+            {
+                var r = RectBox(await w.EvaluateAsync(IsolatedWorld.CssBox,
+                    new Dictionary<string, object?> { ["sel"] = sel, ["scroll"] = false }).ConfigureAwait(false));
+                return r is null ? null : new Box(r.X, r.Y, r.Width, r.Height);
+            }
+            var (sx, sy) = await w.ScrollAsync().ConfigureAwait(false);
+            return new Box(box.X - (sx - s0.X), box.Y - (sy - s0.Y), box.Width, box.Height);
+        }
+        var res = await Scroll.BringIntoViewAsync(new PageScrollIO(page), BoxFn, null, null,
+            css ? () => ScrollerOfAsync(page, sel) : null).ConfigureAwait(false);
+        var last = res.Box is Box lb ? Bb(lb.X, lb.Y, lb.Width, lb.Height) : null;
+        if (!res.Ok) return (null, res.Notches >= Scroll.NotchBudget ? "notch_budget" : "not_scrollable", last);
+        if (last is null || !(await InViewAsync(page, last).ConfigureAwait(false) && await HitOkAsync(page, last, sel).ConfigureAwait(false)))
+            return (null, "covered", last);
+        return (last, null, last);
     }
 
     private static LocatorBoundingBoxResult Bb(double x, double y, double w, double h)
@@ -2928,15 +3352,25 @@ public static partial class Humanize
             await GlideAsync(page, p, st, cx, cy, 16).ConfigureAwait(false);
             await PrePressAsync(p).ConfigureAwait(false);
             var (grabMs, releaseMs) = Motion.DragDwell(p);
-            await page.Mouse.DownAsync().ConfigureAwait(false);
+            double x0 = Forms.RangePoint(box, Forms.RangeFraction(c, lo, hi), rtl).Item1;
+            double span = Math.Abs(Forms.RangePoint(box, 1, false).Item1 - Forms.RangePoint(box, 0, false).Item1);
+            double stepPx = stepV is double sv && sv > 0 && hi > lo ? span * (sv / (hi - lo)) : 1;
+            async Task<(double X, double Y)?> Moved()
+            {
+                var v = await InputNumberAsync(loc).ConfigureAwait(false);
+                return v is double vv ? (Forms.RangePoint(box, Forms.RangeFraction(vv, lo, hi), rtl).Item1 - x0, 0) : null;
+            }
+            st.Held = true;
             try
             {
-                await Task.Delay((int)Math.Round(grabMs)).ConfigureAwait(false);
-                await GlideAsync(page, p, st, tx, ty, 24, settle: true).ConfigureAwait(false);
+                await page.Mouse.DownAsync().ConfigureAwait(false);
+                // closed loop (HumanDragByAsync): past the value by a few px, read the value, correct
+                await DragByLoopAsync(page, p, st, cx, cy, tx - x0, 0, Moved, Math.Max(1, stepPx / 2), grabMs).ConfigureAwait(false);
                 await Task.Delay((int)Math.Round(releaseMs)).ConfigureAwait(false);
             }
             finally
             {
+                st.Held = false;
                 // A button left down survives into every later action, so the release is unconditional.
                 try { await page.Mouse.UpAsync().ConfigureAwait(false); } catch (PlaywrightException) { }
             }

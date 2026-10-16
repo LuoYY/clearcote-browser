@@ -80,15 +80,13 @@ public class MotionVectorsSc232Tests
         Assert.Equal(0.5, model.GetProperty("x").GetProperty("mean").GetDouble());
         Assert.Equal(0.34, model.GetProperty("y").GetProperty("mean").GetDouble());
         Assert.Equal(140, model.GetProperty("target_w").GetInt32());
-        var m = typeof(Motion).GetMethod("WheelAnchorPoint", BindingFlags.Public | BindingFlags.Static);
-        if (m is null) { Console.WriteLine("SKIP (API missing): Motion.WheelAnchorPoint (lane E)"); return; }
         foreach (var c in Vec.GetProperty("wheel_anchor").GetProperty("cases").EnumerateArray())
         {
             var r = Motion.Mulberry32((uint)c.GetProperty("rng").GetInt32());
             var vp = c.GetProperty("viewport");
             foreach (var pt in c.GetProperty("points").EnumerateArray())
             {
-                var got = (Point)m.Invoke(null, new object?[] { vp[0].GetDouble(), vp[1].GetDouble(), r })!;
+                var got = Motion.WheelAnchorPoint(vp[0].GetDouble(), vp[1].GetDouble(), r);   // lane E: called directly
                 Assert.Equal(pt[0].GetDouble(), got.X, 6);
                 Assert.Equal(pt[1].GetDouble(), got.Y, 6);
             }

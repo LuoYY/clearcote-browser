@@ -41,14 +41,19 @@ from ._motion import (
     dblclick_gap, pause_ms, timing_traits,
     platform_from_navigator, rollover_rate, wheel_notches,
     dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
+    drag_hesitation, hesitate_then_drag,
+)
+from ._scroll import (
+    ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, SCROLL_RANGE as ISO_SCROLL_RANGE, anchor_needed, anchor_point, bring_into_view_async,
+    in_view as _box_in, input_device as _input_device, paced_wheel_async, plan_trackpad, wheel_drift,
 )
 from ._attention import (
     IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
 )
 from ._hold import press_and_hold_async
 from ._hzoptions import (
-    _CALLER, apply_to_persona, engine_mode as _hz_engine_mode, report_fallback as _report_fallback,
-    resolve as _hz_resolve, tempo_of as _hz_tempo, typo_rate_for as _hz_typo_rate,
+    _CALLER, apply_to_persona, engine_mode as _hz_engine_mode, options_of as _hz_options_of,
+    report_fallback as _report_fallback, resolve as _hz_resolve, tempo_of as _hz_tempo, typo_rate_for as _hz_typo_rate,
 )
 from . import _frames as _fr
 from ._keys import (
@@ -700,15 +705,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         """
         try:
             vw, vh = await _viewport()
-            x, y = st["pos"]
             # With a button down every move is a DRAG leg, so anchoring mid-drag would haul the
             # grabbed element across the page instead of scrolling under it.
-            if st["held"] or (st["placed"] and 8 <= x <= vw - 8 and 8 <= y <= vh - 8):
+            if not anchor_needed(st["pos"], vw, vh, st["placed"], st["held"]):
                 return
-            # Reading position: upper-middle, gaussian-spread. The exact centre is itself a tell.
-            ax = min(max(vw * 0.5 + random.gauss(0, vw * 0.10), vw * 0.12), vw * 0.88)
-            ay = min(max(vh * 0.34 + random.gauss(0, vh * 0.09), vh * 0.10), vh * 0.62)
-            await _glide(ax, ay, target_w=140)   # coarse placement, not a target acquisition
+            # Reading position: upper-middle, gaussian-spread (_scroll.anchor_point, shared by all 3 SDKs).
+            ax, ay = anchor_point(vw, vh)
+            await _glide(ax, ay, target_w=ANCHOR_TARGET_W)   # coarse placement, not a target acquisition
         except Exception:  # noqa: BLE001 - never let the anchor stop the scroll
             pass
 
@@ -723,10 +726,50 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             st["notch"] = WHEEL_NOTCH_PX[plat or _host_platform()]
         return st["notch"]
 
+    async def _device():
+        """"trackpad" or "mouse" for this page (see _humanize._device)."""
+        if "device" not in st:
+            hzo = _hz_options_of(page)   # lane A's HumanizeOptions.input_device first (then the stand-in seams)
+            opt = hzo.input_device if hzo is not None else None
+            for holder in (getattr(page, "_clearcote_options", None), getattr(page, "_clearcote_humanize_options", None)):
+                if opt or holder is None:
+                    continue
+                opt = holder.get("input_device") if isinstance(holder, dict) else getattr(holder, "input_device", None)
+                if opt:
+                    break
+            if not isinstance(opt, str):
+                opt = getattr(page, "_clearcote_input_device", None)
+            st["device"] = _input_device(await _platform(), opt if isinstance(opt, str) else None)
+        return st["device"]
+
+    def _scroll_io():
+        """The humanizer, as _scroll.bring_into_view_async sees it."""
+        class _IO:
+            rng = staticmethod(random.random)
+            viewport = staticmethod(_viewport)
+            pointer = staticmethod(lambda: st["pos"])
+            placed = staticmethod(lambda: st["placed"])
+            held = staticmethod(lambda: st["held"])
+            glide = staticmethod(lambda x, y, w: _glide(x, y, target_w=w))
+            wheel = staticmethod(lambda dx, dy: native_wheel(dx, dy))
+            sleep = staticmethod(asyncio.sleep)
+            notch_px = staticmethod(_notch_px)
+            device = staticmethod(_device)
+
+            @staticmethod
+            async def scroll_range():
+                r = await async_world_for(page).evaluate(ISO_SCROLL_RANGE)
+                return r if isinstance(r, list) and len(r) == 4 else None
+        return _IO
+
     async def hwheel(delta_x, delta_y):
         # Whole notches only: a CDP wheel event always reports wheelDelta +-120, so the eased
-        # sub-notch slices this replaced were events no mouse emits (see _humanize.hwheel).
+        # sub-notch slices this replaced were events no mouse emits (see _humanize.hwheel). A trackpad
+        # persona swipes the exact distance instead (_scroll.plan_trackpad).
         await _wheel_anchor()
+        if await _device() == "trackpad":
+            await paced_wheel_async(plan_trackpad(delta_x, delta_y), native_wheel, asyncio.sleep)
+            return
         notch = await _notch_px()
         plan = ([(0, notch if delta_y > 0 else -notch)] * wheel_notches(delta_y, notch)
                 + [(notch if delta_x > 0 else -notch, 0)] * wheel_notches(delta_x, notch))
@@ -749,7 +792,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             # where a move is a drag leg).
             if len(plan) >= 6 and not st["held"] and random.random() < 0.06:
                 try:
-                    dx, dy = random.gauss(0, 1.5), random.gauss(0, 1.2)
+                    dx, dy = wheel_drift()
                     await native_move(st["pos"][0] + dx, st["pos"][1] + dy)
                     st["pos"] = (st["pos"][0] + dx, st["pos"][1] + dy)
                 except Exception:  # noqa: BLE001
@@ -1284,36 +1327,84 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             return None
         return {"x": box["x"] - moved[0], "y": box["y"] - moved[1], "width": box["width"], "height": box["height"]}
 
-    async def _box_of(loc, timeout, force=False, selector=None):
-        """Wait the way Playwright would, with the CALLER's timeout (None = the page default), and
-        return the box, in view. With `force` Playwright skips actionability, so nothing is waited
-        for: a hidden target goes native at once.
 
-        Each Playwright call that resolves the element to a handle (wait_for,
-        scroll_into_view_if_needed, bounding_box) makes a MAIN-world handle whose preview reads the
-        element's textContent where the page can see it (verifier B: 4 such reads per humanized click,
-        7 per textarea fill). So each is made only when needed: the wait only for an element not
-        visible yet (is_visible runs in Playwright's utility world), the scroll only for a box not
-        already in view, and a plain-CSS ``selector`` needs no handle at all (_css_box). What remains,
-        for other selectors, is the one bounding_box. See _humanize._box_of."""
+    async def _css_plain(selector):
+        if not isinstance(selector, str) or not selector:
+            return False
+        r = await async_world_for(page).evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False})
+        if not r or not r.get("n"):
+            return False
+        try:
+            return await page.locator(selector).count() == r["n"]
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _wheel_into_view(loc, selector, css, box):
+        """See _humanize._wheel_into_view."""
+        w = async_world_for(page)
+
+        s0 = await w.scroll()
+
+        async def box_fn():
+            if css:
+                return _rect_box(await w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False}))
+            # no new Playwright handle per read (each one's preview reads textContent in the page's
+            # world): the box the caller already has, moved by how far the window has scrolled since
+            sx, sy = await w.scroll()
+            return {"x": box["x"] - (sx - s0[0]), "y": box["y"] - (sy - s0[1]),
+                    "width": box["width"], "height": box["height"]}
+
+        async def scroller_fn():
+            r = await w.evaluate(ISO_SCROLLER, {"sel": selector})
+            return r if isinstance(r, dict) and r.get("rect") else None
+
+        got, ok, notches = await bring_into_view_async(_scroll_io(), box_fn, scroller_fn=scroller_fn if css else None)
+        if not ok:
+            return None, ("notch_budget" if notches >= 60 else "not_scrollable"), got
+        if not (await _in_view(got) and await _hit_ok(got, selector)):
+            return None, "covered", got
+        return got, None, got
+
+    async def _needs_scroll(box, selector, css):
+        if not await _in_view(box):
+            return True
+        if css:
+            r = await async_world_for(page).evaluate(ISO_SCROLLER, {"sel": selector})
+            if isinstance(r, dict) and r.get("rect"):
+                x, y, cw, ch = r["rect"]
+                return not _box_in(box, (x, y, cw, ch))
+        return False
+
+    async def _box_of(loc, timeout, force=False, selector=None, wheel=True):
+        """Wait the way Playwright would, with the CALLER's timeout (None = the page default), and
+        return the box, in view, brought there with the WHEEL; the programmatic scroll is only the
+        reported fallback (see _humanize._box_of)."""
         if not await loc.is_visible():
             if force:
                 raise _Native("forced on a hidden target")
             await loc.wait_for(state="visible", timeout=timeout)
-        box = await _css_box(selector)
-        if box is not None:
+        css = await _css_plain(selector)
+        w = async_world_for(page)
+        box = _rect_box(await w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False})) if css \
+            else await loc.bounding_box()
+        if not box:
             return box
-        box = await loc.bounding_box()
-        if box and not (await _in_view(box) and await _hit_ok(box, selector)):
-            # Off-screen: scroll the window to it and prove it shows there (hit test), with no new
-            # handle. Clipped by a scrolling container, covered, or the window scroll did not bring
-            # it out: Playwright's scroll, which also scrolls containers, and a fresh box.
-            moved = await _scroll_window_to(box) if not await _in_view(box) else None
-            if moved and await _in_view(moved) and await _hit_ok(moved, selector):
-                return moved
-            await loc.scroll_into_view_if_needed(timeout=timeout)
-            box = await loc.bounding_box()
-        return box
+        if wheel and await _needs_scroll(box, selector, css):
+            got, why, last = await _wheel_into_view(loc, selector, css, box)
+            if got is not None:
+                return got
+            if why != "covered":
+                _fallback("scroll_into_view", "scroll into view: " + why)
+            box = last or box
+        if await _in_view(box) and await _hit_ok(box, selector):
+            return box
+        if css:
+            return _rect_box(await w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": True}))
+        moved = await _scroll_window_to(box) if not await _in_view(box) else None
+        if moved and await _in_view(moved) and await _hit_ok(moved, selector):
+            return moved
+        await loc.scroll_into_view_if_needed(timeout=timeout)
+        return await loc.bounding_box()
 
     async def _focused(loc):
         """Does ``loc`` hold the keyboard focus? Asked through Playwright's utility-world selector
@@ -1639,11 +1730,19 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             await _glide(cx, cy, target_w=16)
             await _pre_press()
             grab_ms, release_ms = drag_dwell(persona)
+            x0 = range_point(box, range_fraction(cur, lo, hi), rtl)[0]
+            span = abs(range_point(box, 1.0, False)[0] - range_point(box, 0.0, False)[0])
+            step_px = span * (step / (hi - lo)) if (step and hi > lo) else 1.0
+
+            async def moved():
+                v = await now()
+                return None if v is None else (range_point(box, range_fraction(v, lo, hi), rtl)[0] - x0, 0.0)
+
             st["held"] = True
             try:
                 await native_down()   # inside the try: a press in flight when cancelled was still sent
-                await asyncio.sleep(grab_ms / 1000.0)
-                await _glide(tx, ty, settle=True)
+                # closed loop (drag_by): past the value by a few px, read the value, correct
+                await _drag_by_core(cx, cy, tx - x0, 0.0, moved, max(1.0, step_px / 2.0), grab_ms)
                 await asyncio.sleep(release_ms / 1000.0)
             finally:
                 st["held"] = False
@@ -2234,7 +2333,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             return None
         while True:
             why = "element is not visible"
-            box = await _box_of(loc, left(), selector=selector)   # waits for visible; raises Playwright's timeout
+            # waits for visible; raises Playwright's timeout. No wheel: a trial must not move the pointer.
+            box = await _box_of(loc, left(), selector=selector, wheel=False)
             if box:
                 if not no_click and not await loc.is_enabled():
                     why = "element is not enabled"
@@ -2438,6 +2538,216 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: page._clearcote_hold(
         page.locator(selector).first, duration, **kw))
 
+    # ------------------------------------------------------------- drags (see _humanize: same steps)
+    def _loc_selector(loc):
+        try:
+            return loc._impl_obj._selector
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _peek_box(loc, selector):
+        if await _css_plain(selector):
+            return _rect_box(await async_world_for(page).evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False}))
+        return await loc.bounding_box()
+
+    async def _aim(box, position, force, selector):
+        if position:
+            x, y = await _position_point(box, {"position": position})
+        else:
+            x, y = click_point(box, st["pos"], persona)
+        x, y = float(round(x)), float(round(y))
+        if force:
+            return x, y
+        await asyncio.sleep(0.05)
+        hit = await _reaches_point(box, x, y, selector)
+        if hit is None or hit:
+            return x, y
+        if position:
+            return None
+        for fx, fy in probe_points[1:]:
+            px = float(round(box["x"] + box["width"] * fx))
+            py = float(round(box["y"] + box["height"] * fy))
+            if await _hit_in_box(box, px, py, selector) is True:
+                return px, py
+        return None
+
+    async def _creep(frm, toward, grab_ms):
+        steps = drag_hesitation(frm, toward, persona, dur_ms=grab_ms)
+        await _dispatch(steps)
+        if steps:
+            st["pos"] = (steps[-1][0], steps[-1][1])
+
+    async def _held_drag(frm, to, grab_ms, settle=True):
+        steps, _ = hesitate_then_drag(frm, to, persona, grab_ms, settle=settle)
+        await _dispatch(steps)
+        st["pos"] = (to[0], to[1])
+
+    async def _drag(src, dst, opts):
+        """See _humanize._drag."""
+        timeout = opts.get("timeout")
+        force = bool(opts.get("force"))
+        ssel, dsel = _loc_selector(src), _loc_selector(dst)
+        sbox = await _box_of(src, timeout, force, ssel)
+        if not sbox:
+            raise _Native("the source has no box")
+        sp = await _aim(sbox, opts.get("source_position"), force, ssel)
+        if sp is None:
+            raise _Native("the source point is covered (no probe point reaches it)")
+        if not await dst.is_visible():
+            if force:
+                raise _Native("the target is hidden and force is set")
+            await dst.wait_for(state="visible", timeout=timeout)
+        tbox = await _peek_box(dst, dsel)
+        if not tbox:
+            raise _Native("the target has no box")
+        tp = None
+        if await _in_view(tbox):
+            tp = await _aim(tbox, opts.get("target_position"), force, dsel)
+            if tp is None:
+                raise _Native("the target point is covered (no probe point reaches it)")
+        if native_down is None or native_up is None:
+            raise _Native("no mouse.down / mouse.up to drag with")
+        grab_ms, release_ms = drag_dwell(persona)
+        await _glide(sp[0], sp[1], target_w=max(6.0, min(sbox["width"], sbox["height"])))
+        await _pre_press()
+        st["held"] = True
+        try:
+            await native_down()
+            if tp is None:
+                await _creep(sp, (tbox["x"] + tbox["width"] / 2, tbox["y"] + tbox["height"] / 2), grab_ms)
+                got, ok, _ = await bring_into_view_async(_scroll_io(), lambda: _peek_box(dst, dsel))
+                if not ok or not got:
+                    _fallback("Locator.drag_to", "scroll into view: target_out_of_view")
+                    await dst.scroll_into_view_if_needed(timeout=timeout)
+                    got = await _peek_box(dst, dsel)
+                if not got:
+                    raise RuntimeError("drag target vanished")
+                pos = opts.get("target_position")
+                tp = await _position_point(got, {"position": pos}) if pos else click_point(got, st["pos"], persona)
+                tp = (float(round(tp[0])), float(round(tp[1])))
+                await _glide(tp[0], tp[1], settle=True, held=True)
+            else:
+                await _held_drag(sp, tp, grab_ms)
+            await asyncio.sleep(release_ms / 1000.0)
+        finally:
+            st["held"] = False
+            await _release(native_up())
+        return True
+
+    async def _settled_read(read):
+        a = await read()
+        for _ in range(12):
+            await asyncio.sleep(0.05)
+            b = await read()
+            if a is not None and b is not None and abs(a[0] - b[0]) < 0.01 and abs(a[1] - b[1]) < 0.01:
+                return b
+            a = b
+        return a if a is not None else (0.0, 0.0)
+
+    async def _drag_by_core(px, py, dx, dy, read, tol=2.0, grab_ms=None):
+        """See _humanize._drag_by_core."""
+        d = (dx * dx + dy * dy) ** 0.5
+        if grab_ms is None:
+            grab_ms = drag_dwell(persona)[0]
+        if d < 0.5:
+            st["drag_legs"] = 0
+            return await _settled_read(read)
+        ux, uy = dx / d, dy / d
+        past = _rand(3.0, 8.0)
+        await _held_drag((px, py), (px + dx + ux * past, py + dy + uy * past), grab_ms, settle=False)
+        legs = 1
+        while True:
+            await asyncio.sleep(_rand(60, 140) / 1000.0)
+            got = await _settled_read(read)
+            ex, ey = dx - got[0], dy - got[1]
+            if (ex * ex + ey * ey) ** 0.5 <= tol or legs >= 3:
+                break
+            await _glide(st["pos"][0] + ex, st["pos"][1] + ey, settle=True, held=True)
+            legs += 1
+        st["drag_legs"] = legs
+        return got
+
+    async def _drag_by(loc, dx, dy, opts):
+        """See _humanize._drag_by (``read`` may be a plain or an async callable)."""
+        timeout = opts.get("timeout")
+        force = bool(opts.get("force"))
+        sel = _loc_selector(loc)
+        box = await _box_of(loc, timeout, force, sel)
+        if not box:
+            raise RuntimeError("drag_by: the element has no box (not rendered)")
+        p0 = await _aim(box, opts.get("position"), force, sel)
+        if p0 is None:
+            raise RuntimeError("drag_by: another element would receive the press")
+        user_read = opts.get("read")
+        c0 = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+
+        async def read():
+            if user_read is not None:
+                v = user_read()
+                if asyncio.iscoroutine(v) or isinstance(v, asyncio.Future):
+                    v = await v
+                if v is None:
+                    return None
+                if isinstance(v, (int, float)):
+                    return (float(v), 0.0)
+                return (float(v[0]), float(v[1]))
+            b = await _peek_box(loc, sel)
+            if not b:
+                return None
+            return (b["x"] + b["width"] / 2 - c0[0], b["y"] + b["height"] / 2 - c0[1])
+
+        grab_ms, release_ms = drag_dwell(persona)
+        await _glide(p0[0], p0[1], target_w=max(6.0, min(box["width"], box["height"])))
+        await _pre_press()
+        st["held"] = True
+        try:
+            await native_down()
+            got = await _drag_by_core(p0[0], p0[1], float(dx), float(dy), read,
+                                      float(opts.get("tolerance") or 2.0), grab_ms)
+            page._clearcote_drag_legs = st.get("drag_legs")
+            await asyncio.sleep(release_ms / 1000.0)
+        finally:
+            st["held"] = False
+            await _release(native_up())
+        return got
+
+    page._clearcote_drag = _serial(_drag)
+    page._clearcote_drag_by = _serial(_drag_by)
+    native_page_dnd = getattr(page, "drag_and_drop", None)
+
+    async def hdrag_and_drop(source, target, **opts):
+        """page.drag_and_drop, humanized like Locator.drag_to (see _humanize.hdrag_and_drop)."""
+        if opts.get("trial"):
+            for sel, pos in ((source, opts.get("source_position")), (target, opts.get("target_position"))):
+                o = {k: opts[k] for k in ("force", "timeout") if opts.get(k) is not None}
+                if pos:
+                    o["position"] = pos
+                await _trial(sel, o, True)
+            return None
+        why = None
+        try:
+            src, dst = page.locator(source), page.locator(target)
+            if await src.count() <= 1 and await dst.count() <= 1:
+                await _drag(src.first, dst.first, opts)
+                return None
+        except _Native as e:
+            why = str(e) or "the humane drag cannot apply"
+        except Exception as e:  # noqa: BLE001
+            if _is_timeout(e) or _is_strict(e):
+                raise
+            why = "error: %s" % (e,)
+        if why:   # more than one match is not a fallback: Playwright raises its own strict-mode error
+            _report_fallback(page, "Page.drag_and_drop", why, source)
+        return await native_page_dnd(source, target, **opts)
+
+    if native_page_dnd is not None:
+        page.drag_and_drop = api_errors("Page.drag_and_drop", _serial(hdrag_and_drop))
+
+    async def hdrag_by(selector, dx, dy, **opts):
+        return await _drag_by(page.locator(selector).first, dx, dy, opts)
+
+    page.drag_by = api_errors("Page.drag_by", _serial(hdrag_by))
+
     # The after-action step first, then the per-call switch outermost: humanize=False goes straight
     # to the stock call and skips the after-action step too.
     _install_after_action()
@@ -2452,7 +2762,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
 # Every wrapped page / mouse / keyboard method takes humanize=False: the stock Playwright call, with the
 # keyword stripped. Wired outermost, after attach has wrapped everything (_wire_per_call_off).
 _PAGE_METHODS = ("click", "hover", "dblclick", "type", "fill", "press", "select_option", "check", "uncheck",
-                 "set_checked", "focus")
+                 "set_checked", "focus", "drag_and_drop")
 _MOUSE_METHODS = ("move", "click", "wheel", "dblclick", "down", "up")
 _KB_METHODS = ("type", "press", "down", "up")
 
@@ -2516,11 +2826,38 @@ def _wire_per_call_off(page, st, stock, stock_mouse, stock_kb):
             setattr(mouse, n, _per_call(s_up, cur))
         else:
             setattr(mouse, n, _per_call(s, cur, moved if n in ("move", "click", "dblclick") else None))
+    page._clearcote_stock_mouse = dict(stock_mouse)
+    if getattr(page, "drag_by", None) is not None:   # no Playwright drag_by: humanize=False is the plain stock drag
+        async def _stock_page_drag_by(selector, dx, dy, **kw):
+            return await _stock_drag_by(page.locator(selector).first, dx, dy, **kw)
+        page.drag_by = _per_call(_stock_page_drag_by, page.drag_by)
     kb = page.keyboard
     for n, s in stock_kb.items():
         cur = getattr(kb, n, None)
         if s is not None and cur is not None and cur is not s:
             setattr(kb, n, _per_call(s, cur))
+
+
+async def _stock_drag_by(self, dx, dy, **kw):
+    """Locator.drag_by(..., humanize=False): there is no Playwright drag_by, so the stock mouse does the plain
+    thing -- press at ``position`` (else the box centre), one move by (dx, dy), release -- and the asked delta
+    is returned (no read, no correction)."""
+    page = self.page
+    m = getattr(page, "_clearcote_stock_mouse", None) or {}
+    box = await self.bounding_box(timeout=kw.get("timeout"))
+    if not box:
+        raise RuntimeError("drag_by: the element has no box (not rendered)")
+    pos = kw.get("position")
+    x = box["x"] + (pos["x"] if pos else box["width"] / 2)
+    y = box["y"] + (pos["y"] if pos else box["height"] / 2)
+    move, down, up = (m.get("move") or page.mouse.move), (m.get("down") or page.mouse.down), (m.get("up") or page.mouse.up)
+    await move(x, y)
+    await down()
+    try:
+        await move(x + dx, y + dy)
+    finally:
+        await up()
+    return (float(dx), float(dy))
 
 
 def _locator_off(stock, fn):
@@ -2814,35 +3151,21 @@ def _patch_locator_class():
                 return None
         if not _on(self) and not kw.get("trial") and _frame_why(self):
             _report_fallback(self.page, "Locator.drag_to", _frame_why(self), _sel(self))
-        if _on(self) and not kw.get("trial"):
-            why = "the source or the target has no box"
-            try:
-                page = self.page
-                sb = await self.bounding_box()
-                tb = await target.bounding_box()
-                if sb and tb:
-                    sx, sy = sb["x"] + sb["width"] / 2, sb["y"] + sb["height"] / 2
-                    tx, ty = tb["x"] + tb["width"] / 2, tb["y"] + tb["height"] / 2
-                    # Human endpoint dynamics (the two worst slider tells): grab hesitation AFTER
-                    # pressing + a settle dwell BEFORE releasing, from the page's motor persona.
-                    persona = getattr(page, "_clearcote_persona", None)
-                    grab_ms, release_ms = drag_dwell(persona) if persona else (_rand(130, 360), _rand(90, 230))
-                    await page.mouse.move(sx, sy)
-                    try:
-                        await page.mouse.down()                 # pre-press pause, then held across the glide
-                        await asyncio.sleep(grab_ms / 1000.0)   # grab hesitation
-                        held_glide = getattr(page, "_clearcote_held_glide", None)
-                        if held_glide:
-                            await held_glide(tx, ty)            # humanized held-button drag + seating jiggle
-                        else:
-                            await page.mouse.move(tx, ty)
-                        await asyncio.sleep(release_ms / 1000.0)  # pre-release settle before letting go
-                    finally:
-                        await _release(page.mouse.up())         # let go, even when cancelled mid-drag
+        if not kw.get("trial") and _on(self) and _on(target) and await _strict(self) and await _strict(target):
+            drag = getattr(self.page, "_clearcote_drag", None)
+            if drag is not None:
+                why = "the humane drag cannot apply"
+                try:
+                    await drag(self, target, kw)
                     return None
-            except Exception as e:  # noqa: BLE001
-                why = "error: %s" % (e,)
-            _report_fallback(self.page, "Locator.drag_to", why, _sel(self))
+                except _Native as e:
+                    why = str(e) or why
+                except Exception as e:  # noqa: BLE001
+                    if _is_timeout(e) or _is_strict(e):
+                        raise
+                    why = "error: %s" % (e,)
+                # a covered end, no CDP, a vanished element: Playwright's own drag (lane A's report first)
+                _report_fallback(self.page, "Locator.drag_to", why, _sel(self))
         return await o_drag_to(self, target, **kw)
 
     # Each worded as Playwright words the Locator method (api_errors).
@@ -2858,6 +3181,16 @@ def _patch_locator_class():
     Locator.check = api_errors("Locator.check", _locator_off(o_check, check))
     Locator.uncheck = api_errors("Locator.uncheck", _locator_off(o_uncheck, uncheck))
     Locator.drag_to = api_errors("Locator.drag_to", _locator_off(o_drag_to, drag_to))
+
+    async def drag_by(self, dx, dy, **kw):
+        """New, not a Playwright method: drag this element by (dx, dy) px, closed loop; returns the
+        achieved (dx, dy). See the sync Locator.drag_by."""
+        fn = getattr(self.page, "_clearcote_drag_by", None)
+        if fn is None:
+            raise RuntimeError("drag_by needs humanize=True")
+        return await fn(self, dx, dy, kw)
+
+    Locator.drag_by = api_errors("Locator.drag_by", _locator_off(_stock_drag_by, drag_by))
     Locator.select_option = api_errors("Locator.select_option", _locator_off(o_select_option, select_option))
     # New, not a Playwright method: press and hold this element (_hold.py), under the page lock when the
     # page is humanized. Works on frame locators too: it presses at viewport coordinates.

@@ -65,9 +65,7 @@ def test_wheel_anchor_model_matches_plan():
 
 @pytest.mark.parametrize("case", VEC["wheel_anchor"]["cases"], ids=lambda c: str(c["rng"]))
 def test_wheel_anchor_point_vectors(case):
-    fn = getattr(_motion, "wheel_anchor_point", None)
-    if fn is None:
-        pytest.skip("API missing: _motion.wheel_anchor_point (lane E)")
+    fn = _motion.wheel_anchor_point   # lane E (SC 232): one pure model in all three SDKs
     r = mulberry32(case["rng"])
     for x, y in case["points"]:
         got = fn(case["viewport"][0], case["viewport"][1], r)

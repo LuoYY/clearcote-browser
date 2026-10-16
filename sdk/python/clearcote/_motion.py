@@ -462,6 +462,107 @@ def lognormal_ms(median: float, sigma: float, lo: float, hi: float, rng: Rng) ->
     """``median * exp(sigma * N(0,1))`` clamped to [lo, hi]: a right-skewed human timing around a
     per-identity median (the shape of measured hold and dwell distributions)."""
     return _clamp(median * math.exp(sigma * gauss_from(rng)), lo, hi)
+# Salt for the drag-start hesitation traits (per persona, like _SHAPE_SALT / _ROLLOVER_SALT): drawing
+# them from mulberry32(seed ^ salt) keeps make_persona's draw ORDER, so every seed's motor identity is
+# what it was, and plan_drag itself is untouched (its vectors still pin the three SDKs).
+_HESITATION_SALT = 0xC2B2AE35
+# A hand that has just closed on a handle does not set off at once: it holds 100-300 ms, creeping a
+# few px (never 8) in the direction it is about to go, before the leg proper. Measured on r38 / SDK
+# 0.51.0 (SC 232 review): every drag's first held move was already the full-speed leg start.
+HESITATION_MS = (100.0, 300.0)
+HESITATION_MAX_PX = 8.0
+
+
+def hesitation_traits(p: Persona):
+    """This persona's hesitation TRAITS, from its salted stream: (typical length ms 130-260, creep reach
+    px 2-6, sideways wobble px 0.4-1.2). Only traits come from the seed; every per-drag draw in
+    :func:`drag_hesitation` is unseeded (``random.random``) unless a test passes ``rng``, so two sessions of
+    one identity do not replay identical drags."""
+    r = mulberry32((p.seed ^ _HESITATION_SALT) & _MASK)
+    return _lerp(130.0, 260.0, r()), _lerp(2.0, 6.0, r()), _lerp(0.4, 1.2, r())
+
+
+def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Optional[float] = None):
+    """Plan the still-but-not-frozen moment between the grab and the drag leg frm->to: (x, y, sleep_ms)
+    samples spanning 100-300 ms (centred per persona), the pointer creeping < 8 px toward ``to`` with a
+    little sideways wobble. The last sample is where :func:`plan_drag` then starts. The samples are
+    drawn from ``rng`` AFTER nothing: a caller plans the leg from the returned end point, so the leg's
+    own draws keep their order. ``dur_ms``: the caller's own length for the creep (40-300 ms; see
+    :func:`hesitate_then_drag`), in place of this persona's draw (which is still drawn, so the order holds).
+    Same numbers in motion.ts dragHesitation and Motion.DragHesitation."""
+    if rng is None:
+        rng = random.random
+    centre, amp, wobble = hesitation_traits(p)
+    fx, fy = frm
+    tx, ty = to
+    d = math.hypot(tx - fx, ty - fy)
+    ux, uy = ((tx - fx) / d, (ty - fy) / d) if d >= 1e-6 else (1.0, 0.0)
+    dur = _clamp(centre * _lerp(0.8, 1.2, rng()), HESITATION_MS[0], HESITATION_MS[1])
+    if dur_ms is not None:
+        dur = _clamp(float(dur_ms), 40.0, HESITATION_MS[1])
+    reach = amp * _lerp(0.6, 1.0, rng())
+    step_ms = 1000.0 / p.device_hz
+    n = int(max(3, _js_round(dur / step_ms)))
+    dt = dur / n
+    phase = rng() * 2 * math.pi
+    out: list = []
+    side = 0.0
+    for i in range(1, n + 1):
+        tau = i / n
+        along = reach * min_jerk(tau)
+        side = 0.8 * side + gauss_from(rng) * wobble * 0.25
+        s = _clamp(side + wobble * 0.5 * math.sin(phase + 2 * math.pi * tau), -1.5, 1.5)
+        px, py = fx + ux * along - uy * s, fy + uy * along + ux * s
+        # the budget is a hard bound: the creep never leaves an 8 px circle around the grab
+        if math.hypot(px - fx, py - fy) >= HESITATION_MAX_PX - 0.5:
+            px, py = fx + ux * (HESITATION_MAX_PX - 1.0), fy + uy * (HESITATION_MAX_PX - 1.0)
+        out.append((px, py, dt * _lerp(0.9, 1.1, rng())))
+    return out
+
+
+def leg_exit_ms(frm, steps, radius=HESITATION_MAX_PX):
+    """When (ms from the start of ``steps``) the walk first leaves the ``radius`` circle around ``frm``;
+    the whole length when it never does."""
+    t = 0.0
+    for x, y, sl in steps:
+        if math.hypot(x - frm[0], y - frm[1]) >= radius:
+            return t
+        t += sl
+    return t
+
+
+def hesitate_then_drag(frm, to, p: Persona, window_ms: float, settle: bool = True, rng: Optional[Rng] = None):
+    """The held part of a drag: the hesitation creep, then the :func:`plan_drag` leg, planned together
+    so the pointer stays inside 8 px of the press for ``window_ms`` (clamped 100-300; the persona's grab
+    dwell) and then goes. The leg's own slow start counts toward the window: the creep is planned for
+    what the window leaves (at least 40 ms). Returns (steps, creep_count)."""
+    if rng is None:
+        rng = random.random
+    w = _clamp(float(window_ms), HESITATION_MS[0], HESITATION_MS[1])
+    creep = drag_hesitation(frm, to, p, rng, dur_ms=w)
+    leg = plan_drag(creep[-1][:2], to, p, settle=settle, rng=rng)
+    t8 = leg_exit_ms(frm, leg)
+    want = max(40.0, w - t8)
+    have = sum(s[2] for s in creep)
+    if abs(have - want) > 1.0:
+        # re-time the creep to what the window leaves (same shape, scaled in time and reach)
+        k = want / have
+        creep = [(frm[0] + (x - frm[0]) * min(1.0, k), frm[1] + (y - frm[1]) * min(1.0, k), sl * k)
+                 for x, y, sl in creep]
+        leg = plan_drag(creep[-1][:2], to, p, settle=settle, rng=rng)
+    return creep + leg, len(creep)
+
+
+def wheel_anchor_point(vw: float, vh: float, rng: Optional[Rng] = None):
+    """Where a reading hand parks the pointer before a wheel: x ~ 0.5w +- 0.10w clamped to [0.12w, 0.88w],
+    y ~ 0.34h +- 0.09h clamped to [0.10h, 0.62h] (two gaussians from ``rng``, x first). One model in all
+    three SDKs (motion.ts wheelAnchorPoint, Motion.WheelAnchorPoint / Scroll.WheelAnchorPoint); before 0.52
+    Node and .NET used other centres, spreads and clamps. _scroll.anchor_point is this function."""
+    if rng is None:
+        rng = random.random
+    x = _clamp(vw * 0.5 + gauss_from(rng) * vw * 0.10, vw * 0.12, vw * 0.88)
+    y = _clamp(vh * 0.34 + gauss_from(rng) * vh * 0.09, vh * 0.10, vh * 0.62)
+    return x, y
 
 
 def drag_dwell(p: Persona, rng: Optional[Rng] = None):
