@@ -477,3 +477,164 @@ def bring_into_view(io, box_fn, frac=None, rng: Optional[Callable[[], float]] = 
             # scrollable container (the caller falls back)
             return box, in_view(box, view), notches
     return box, False, notches
+
+
+# ---------------------------------------------------------------- async mirror (the same loop, awaited)
+async def _read_settled_async(box_fn, io):
+    """The box once two reads SETTLE_MS apart agree (a smooth scroll still animating does not), or the
+    last read after SETTLE_CAP_MS."""
+    a = await box_fn()
+    t0 = time.monotonic()
+    while True:
+        await io.sleep(SETTLE_MS / 1000.0)
+        b = await box_fn()
+        if a is None or b is None:
+            return b
+        if abs(a["x"] - b["x"]) < 0.01 and abs(a["y"] - b["y"]) < 0.01:
+            return b
+        if (time.monotonic() - t0) * 1000.0 > SETTLE_CAP_MS:
+            return b
+        a = b
+
+
+async def _send_notches_async(io, n, axis, sign, rng):
+    """``n`` whole notches on one axis, in finger-flick bursts with the hwheel cadence."""
+    notch = await io.notch_px()
+    burst = int(_lerp(FLICK_NOTCHES[0], FLICK_NOTCHES[1] + 1, rng()))
+    for k in range(n):
+        await io.wheel(sign * notch if axis == "x" else 0, sign * notch if axis == "y" else 0)
+        if k == n - 1:
+            break
+        burst -= 1
+        if burst == 0:
+            await io.sleep(_lerp(FLICK_GAP_MS[0], FLICK_GAP_MS[1], rng()) / 1000.0)
+            burst = int(_lerp(FLICK_NOTCHES[0], FLICK_NOTCHES[1] + 1, rng()))
+        else:
+            await io.sleep(_lerp(NOTCH_GAP_MS[0], NOTCH_GAP_MS[1], rng()) / 1000.0)
+        if rng() < READ_PAUSE_RATE:
+            await io.sleep(_lerp(READ_PAUSE_MS[0], READ_PAUSE_MS[1], rng()) / 1000.0)
+
+
+async def _send_trackpad_async(io, dx, dy, rng):
+    for ex, ey, sl in plan_trackpad(dx, dy, rng):
+        await io.wheel(ex, ey)
+        if sl:
+            await io.sleep(sl / 1000.0)
+
+
+async def _view_of_async(io, scroller):
+    vw, vh = await io.viewport()
+    if not scroller:
+        return (0.0, 0.0, float(vw), float(vh))
+    x, y, w, h = scroller["rect"]
+    # the part of the container that shows: its rect clipped to the viewport
+    x0, y0 = max(0.0, x), max(0.0, y)
+    x1, y1 = min(float(vw), x + w), min(float(vh), y + h)
+    return (x0, y0, max(0.0, x1 - x0), max(0.0, y1 - y0))
+
+
+async def _place_over_async(io, view, rng):
+    """Park the pointer where the wheel will act: the anchor distribution over ``view`` (the
+    viewport, or a nested scroller's visible part), unless it already sits there and no button is down."""
+    vx, vy, vw, vh = view
+    if vw <= 0 or vh <= 0:
+        return
+    px, py = io.pointer()
+    if not anchor_needed((px - vx, py - vy), vw, vh, io.placed(), io.held()):
+        return
+    ax, ay = anchor_point(vw, vh, rng)
+    await io.glide(vx + ax, vy + ay, ANCHOR_TARGET_W)
+    await io.sleep(_lerp(60.0, 180.0, rng()) / 1000.0)   # eyes land before the finger rolls the wheel
+
+
+async def bring_into_view_async(io, box_fn, frac=None, rng: Optional[Callable[[], float]] = None, scroller_fn=None):
+    """Wheel the target whose current box ``await box_fn()`` returns into view.
+
+    Computes the distance from the box, parks the pointer at the anchor (or over the nearest
+    scrollable ancestor when ``await scroller_fn()`` names one; a container itself off-screen is wheeled in
+    first), sends whole notches (a mouse persona) or a trackpad stream covering 60-90 % of the need,
+    waits for the scroll to settle (two equal reads 50 ms apart), re-reads the box and corrects, up to
+    ``NOTCH_BUDGET`` notches. Returns ``(box, ok, notches)``: ``ok`` False when the wheel did not move
+    the target (a non-scrollable container) or the budget ran out -- the caller's cue for the
+    programmatic fallback, which it reports."""
+    if rng is None:
+        rng = io.rng if getattr(io, "rng", None) else random.random
+    box = await box_fn()
+    if box is None:
+        return None, False, 0
+    scroller = await scroller_fn() if scroller_fn else None
+    if scroller:
+        srect = scroller["rect"]
+        vw, vh = await io.viewport()
+        sbox = {"x": srect[0], "y": srect[1], "width": srect[2], "height": srect[3]}
+        if not in_view(sbox, (0.0, 0.0, float(vw), float(vh))):
+            # the container must show before the wheel can act on it
+            async def _srect():
+                s = await scroller_fn()
+                return {"x": s["rect"][0], "y": s["rect"][1], "width": s["rect"][2], "height": s["rect"][3]} if s else None
+            _, ok0, _ = await bring_into_view_async(io, _srect, frac, rng, None)
+            if not ok0:
+                return await box_fn(), False, 0
+            scroller = await scroller_fn()
+            box = await box_fn()
+            if box is None:
+                return None, False, 0
+    view = await _view_of_async(io, scroller)
+    if in_view(box, view):
+        return box, True, 0
+    if frac is None:
+        frac = target_frac(rng)
+    notches = 0
+    first = True
+    device = await io.device()
+    notch = await io.notch_px()
+    placed = False
+    ax, ay = (v != 0 for v in scroll_need(box, view, frac))
+    if scroller:
+        ax, ay = ax and bool(scroller.get("x")), ay and bool(scroller.get("y"))
+    tol = notch * 0.5 if device != "trackpad" else 6.0
+    shown_rounds = 0
+    while notches < NOTCH_BUDGET:
+        dx, dy = aim_need(box, view, frac, ax, ay)
+        if in_view(box, view):
+            # in view: done once it is about where it was aimed (a whole notch cannot do better than
+            # half a notch), or after two corrections
+            if (abs(dx) < tol and abs(dy) < tol) or shown_rounds >= 2:
+                return box, True, notches
+            shown_rounds += 1
+        elif abs(dx) < 1 and abs(dy) < 1:
+            return box, False, notches
+        if not placed:
+            await _place_over_async(io, view, rng)
+            placed = True
+        ask_x = undershoot(dx, rng) if first else dx
+        ask_y = undershoot(dy, rng) if first else dy
+        first = False
+        if device == "trackpad":
+            await _send_trackpad_async(io, ask_x, ask_y, rng)
+            notches += max(1, _js_round(math.hypot(ask_x, ask_y) / notch))
+        else:
+            ny = wheel_notches(ask_y, notch) if abs(ask_y) >= tol else 0
+            nx = wheel_notches(ask_x, notch) if abs(ask_x) >= tol else 0
+            ny = min(ny, NOTCH_BUDGET - notches)
+            if ny:
+                await _send_notches_async(io, ny, "y", 1 if ask_y > 0 else -1, rng)
+                notches += ny
+            nx = min(nx, NOTCH_BUDGET - notches)
+            if nx:
+                await _send_notches_async(io, nx, "x", 1 if ask_x > 0 else -1, rng)
+                notches += nx
+            if not (nx or ny):
+                return box, in_view(box, view), notches
+        before = box
+        box = await _read_settled_async(box_fn, io)
+        if box is None:
+            return None, False, notches
+        if scroller:
+            scroller = await scroller_fn() if scroller_fn else scroller
+            view = await _view_of_async(io, scroller)
+        if abs(box["x"] - before["x"]) < MIN_MOVE_PX and abs(box["y"] - before["y"]) < MIN_MOVE_PX:
+            # the wheel did not move it: the end of the scroll (fine when it shows), or not a
+            # scrollable container (the caller falls back)
+            return box, in_view(box, view), notches
+    return box, False, notches
