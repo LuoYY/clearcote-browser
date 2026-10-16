@@ -1889,30 +1889,40 @@ def test_a_visible_checkbox_is_clicked_on_its_label_text_about_40_percent_of_the
     run(go())
 
 
-def test_the_label_draw_is_stable_per_persona(fast):
-    async def one(seed):
-        cb, lab = _cb_with_label(hidden=False)
-        p = Page(("#cb", cb), ("#lab", lab))
-        await H.attach_humanize(None, p, humanize=True, seed=seed)
-        out = []
-        for _ in range(8):
-            await p.set_checked("#cb", not cb.checked)
-            out.append(lab.inside(*kinds(p, "down")[-1][4]))
-        return out
-
+def test_same_seed_same_label_trait_but_unseeded_per_click_choices():
+    # The seed fixes the TRAIT (how often this identity clicks the label); each click's choice is an
+    # unseeded draw, or every session of an identity would choose the same way in the same order.
     from clearcote import _humanize
+    from clearcote._motion import make_persona
+    a, b = make_persona("same-identity"), make_persona("same-identity")
+    assert _humanize.label_share(a) == _humanize.label_share(b) == _humanize.LABEL_SHARE
+    da = [_humanize.label_draw(a) for _ in range(20)]
+    db = [_humanize.label_draw(b) for _ in range(20)]
+    assert da != db, "two sessions of one identity made the same 20 choices"
 
-    async def go():
-        _humanize._LABEL_STREAMS.clear()
-        a1 = await one("stable-a")
-        _humanize._LABEL_STREAMS.clear()       # a fresh process: the same identity draws the same way
-        assert a1 == await one("stable-a")
-        _humanize._LABEL_STREAMS.clear()
-        b1 = await one("stable-b")
-        b2 = await one("stable-b")             # the SAME process: the identity's stream continues
-        assert b1 + b2 != [b1[0]] * 16, "pages of one identity do not all draw the same way"
-    run(go())
 
+def test_the_label_draw_leaves_the_global_random_stream_alone():
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    p = make_persona("x")
+    random.seed(11)
+    want = [random.random() for _ in range(5)]
+    random.seed(11)
+    for _ in range(50):
+        _humanize.label_draw(p)
+    assert [random.random() for _ in range(5)] == want
+
+
+def test_a_tests_own_rng_and_the_personas_share_decide():
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    p = make_persona("x")
+    r1, r2 = random.Random(5), random.Random(5)
+    assert [_humanize.label_draw(p, r1) for _ in range(20)] == [_humanize.label_draw(p, r2) for _ in range(20)]
+    p.label_share = 1.0          # lane B may give personas their own share
+    assert all(_humanize.label_draw(p) for _ in range(20))
+    p.label_share = 0.0
+    assert not any(_humanize.label_draw(p) for _ in range(20))
 
 class _TouchCtx:
     def __init__(self, touch):

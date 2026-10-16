@@ -345,17 +345,24 @@ def native_select_args(value, options):
     return (vals if vals else None), o
 
 
-# The label-text draws of checkbox clicks (see _set_checked): one stream per persona seed, shared by every
-# page of that identity in this process.
-_LABEL_STREAMS = {}
+# Checkbox clicks on the <label> (see _set_checked). The persona fixes the TRAIT -- how often this identity
+# clicks a visible checkbox's label rather than its box (persona.label_share when the persona carries one,
+# else 0.4) --; each click's choice is an UNSEEDED draw, like plan_move's, or every session of an identity
+# would make the same choices in the same order (a cross-session fingerprint). The draw comes from a
+# process-level Random of its own (seeded from OS entropy), so the global random stream is not shifted.
+LABEL_SHARE = 0.4
+_LABEL_RNG = random.Random()
 
 
-def label_stream(persona):
-    key = "%s:label" % (getattr(persona, "seed", None),)
-    r = _LABEL_STREAMS.get(key)
-    if r is None:
-        r = _LABEL_STREAMS[key] = random.Random(key)
-    return r
+def label_share(persona):
+    """The persona's trait: the share of visible-checkbox clicks that land on the label text."""
+    v = getattr(persona, "label_share", None)
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0 else LABEL_SHARE
+
+
+def label_draw(persona, rng=None):
+    """This click: on the label? An unseeded draw against the persona's trait (``rng``: a test's own)."""
+    return (rng or _LABEL_RNG).random() < label_share(persona)
 
 
 # ------------------------------------------------------------------------- strict / fallback report
@@ -1845,12 +1852,6 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         value, options = native_select_args(value, options)   # option dicts: Playwright Python takes none
         return native_page_select_option(selector, value, **options)
 
-    # The label-text share of checkbox clicks is drawn from a stream of its own, salted with the
-    # persona: it must not shift the draws every other action makes from the global RNG (the
-    # pinned sequences), and it is stable per identity -- ONE stream per identity across its pages
-    # (label_stream), or every page's first checkbox would go the same way.
-    label_rng = label_stream(persona)
-
     def _label_aim(selector, loc, timeout):
         """Where a person clicks a checkbox / radio when not on its own box: its <label>. A HIDDEN
         input (a custom checkbox: zero-size, opacity 0, clipped) has no box to click at all, so its
@@ -1866,7 +1867,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             lab = w.call_on_node(info["node"], ISO_LABEL_OF)
             if not lab or not lab.get("label") or lab.get("hidden"):
                 return None
-            if label_rng.random() >= 0.4:
+            if not label_draw(persona):   # the persona's share; THIS click's choice is unseeded
                 return None
             r = lab["label"].get("text") or lab["label"]["rect"]
             lbox = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}

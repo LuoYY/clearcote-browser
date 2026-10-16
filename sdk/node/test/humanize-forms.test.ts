@@ -15,14 +15,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   apiErrors, asApiError, attachHumanize, createInputLock, isTimeout, pickOptions, sdkPlaywrightError, selectWants, typoRate,
-  wantIndex,
+  wantIndex, labelDraw, labelShare, LABEL_SHARE,
 } from "../src/humanize.js";
 import { errors as pwErrors } from "playwright-core";
 import {
-  ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL,
-  ISO_SCROLL_BY, ISO_VIEWPORT,
+  ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX, ISO_LABEL_BY_SEL, ISO_LABEL_OF,
+  ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL, ISO_SCROLL_BY, ISO_VIEWPORT,
 } from "../src/isolated.js";
 import { typeaheadSimulate } from "../src/forms.js";
+import { makePersona } from "../src/motion.js";
 
 const SLOW = 30_000; // glides and holds use real sleeps
 
@@ -53,6 +54,7 @@ interface Field {
   rowH?: number;                       // a list box: each row is rowH px, scrolled by scrollTop
   scrollTop?: number;
   appearAfterWait?: boolean;           // not visible until something waited for it
+  control?: string;                    // a <label>: the selector of the checkbox its click is passed on to
 }
 
 interface FakeOpts {
@@ -113,7 +115,16 @@ function makeFake(opts: FakeOpts = {}) {
   const inBox = (b: Box, x: number, y: number) => x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height;
   const overlayAt = (f: Field, x: number, y: number) =>
     opts.covered || (opts.coveredCentre && x > f.box.x + f.box.width * 0.25 && x < f.box.x + f.box.width * 0.75);
-  const fieldAt = (x: number, y: number) => allFields().find((f) => inBox(f.box, x, y)) ?? null;
+  const fieldAt = (x: number, y: number) => allFields().find((f) => f.visible !== false && inBox(f.box, x, y)) ?? null;
+  // what ISO_LABEL_OF reads from a checkbox: its label is the field whose `control` names it
+  const labelOf = (f: Field) => {
+    if (f.tag !== "input" || !["checkbox", "radio"].includes(f.type)) return null;
+    const sel = Object.keys(fields).find((k) => fields[k] === f);
+    const lab = allFields().find((g) => g.tag === "label" && g.control === sel);
+    return { tag: "input", type: f.type, rect: [f.box.x, f.box.y, f.box.width, f.box.height],
+      hidden: f.visible === false || f.box.width <= 1, checked: !!f.checked, disabled: false,
+      label: lab ? { rect: [lab.box.x, lab.box.y, lab.box.width, lab.box.height], text: null, contains: false } : null };
+  };
   const labels = (f: Field) => (f.options ?? []).map((o) => (o.disabled ? null : o.label));
   const isSelect = (f: Field) => f.tag === "select";
   const listbox = (f: Field) => isSelect(f) && (f.multiple || (f.size ?? 0) > 1);
@@ -183,6 +194,12 @@ function makeFake(opts: FakeOpts = {}) {
     const f = fieldAt(x, y);
     if (f && overlayAt(f, x, y)) { focus = opts.labelPassesFocus ? f : null; rec("overlay-click", { x, y }); return; }
     if (!f) return;
+    if (f.tag === "label" && f.control) {
+      const c = fieldFor(f.control);
+      rec("label-click", f.control);
+      if (c && !c.stubborn) { c.checked = !c.checked; rec("toggle", c.checked); }
+      return;
+    }
     focus = f;
     if (f.type === "checkbox") {
       if (f.stubborn) { rec("toggle-cancelled"); return; }
@@ -265,6 +282,13 @@ function makeFake(opts: FakeOpts = {}) {
           if (e.startsWith(`(${ISO_PLATFORM})`)) return { result: { value: "Win32" } };
           if (e.startsWith(`(${ISO_VIEWPORT})`)) return { result: { value: [1280, 800] } };
           if (e.startsWith(`(${ISO_SCROLL_BY})`)) return { result: { value: [0, 0] } };
+          if (e.startsWith(`(${ISO_LABEL_BY_SEL})`)) {
+            const a = argOf(e, ISO_LABEL_BY_SEL);
+            const f = fieldFor(a.sel);
+            if (!f) return { result: { value: { n: 0 } } };
+            const o = labelOf(f);
+            return { result: { value: o ? { ...o, n: 1 } : { n: 1 } } };
+          }
           if (e.startsWith(`(${ISO_CSS_BOX})`)) {
             const a = argOf(e, ISO_CSS_BOX);
             if (/internal:|>>/.test(a.sel)) return { result: { value: null } }; // not CSS the browser accepts
@@ -293,6 +317,7 @@ function makeFake(opts: FakeOpts = {}) {
               && Math.abs(b.width - arg.width) <= 1.5 && Math.abs(b.height - arg.height) <= 1.5 } };
           }
           if (params.functionDeclaration === ISO_LISTBOX_ROW) return { result: { value: f ? listboxState(f, arg.i) : null } };
+          if (params.functionDeclaration === ISO_LABEL_OF) return { result: { value: f ? labelOf(f) : null } };
           if (params.functionDeclaration !== ISO_DESCRIBE) return { exceptionDetails: { text: "unknown call" } };
           return { result: { value: f ? describeInfo(f, arg?.want ?? null) : null } };
         }
@@ -1013,7 +1038,11 @@ describe("type / press", () => {
     // fill the box, else the box rule answers), and asks whether a twin holds a control.
     expect(allExpressions.length).toBeGreaterThan(0);
     for (const e of allExpressions) {
-      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.includes(ISO_HIT_IN_BOX)) expect(e).not.toContain("querySelector");
+      // ISO_LABEL_BY_SEL (lane F): a HIDDEN checkbox has no box to hit-test, so its <label> is found from the
+      // plain-CSS selector the same way, again only when Playwright counts the same elements.
+      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.startsWith(`(${ISO_LABEL_BY_SEL})`) && !e.includes(ISO_HIT_IN_BOX)) {
+        expect(e).not.toContain("querySelector");
+      }
     }
     expect(allExpressions.some((e) => e.startsWith(`(${ISO_CSS_BOX})`))).toBe(true);
   });
@@ -1273,4 +1302,84 @@ describe("paths stay in the viewport; whole-pixel presses (SC 210 fix 2)", () =>
       expect(Number.isInteger(last.x) && Number.isInteger(last.y), JSON.stringify(last)).toBe(true);
     }
   }, 60_000);
+});
+
+// ------------------------------------------------------------------------- lane F (SC 232): coverage
+describe("label-aware checkbox aim", () => {
+  const hidden = () => ({
+    "#cb": { type: "checkbox", visible: false, box: { x: 0, y: 0, width: 0, height: 0 } },
+    "#lab": { tag: "label", type: "", control: "#cb", box: { x: 96, y: 96, width: 140, height: 24 } },
+  });
+
+  it("a hidden custom checkbox is checked by a trusted click on its label", async () => {
+    const f = await attached({ fields: hidden() as any });
+    await f.page.check("#cb");
+    expect(f.fields["#cb"].checked).toBe(true);
+    expect(f.of("label-click").length).toBe(1);
+    expect(f.natives).toEqual([]);
+    await f.page.uncheck("#cb");
+    expect(f.fields["#cb"].checked).toBe(false);
+    expect(f.of("label-click").length).toBe(2);
+  }, SLOW);
+
+  it("a visible checkbox is clicked on its label text about 40 % of the time", async () => {
+    let onLabel = 0;
+    for (let i = 0; i < 40; i++) {
+      const fk = makeFake({ fields: {
+        "#cb": { type: "checkbox", box: { x: 100, y: 100, width: 16, height: 16 } },
+        "#lab": { tag: "label", type: "", control: "#cb", box: { x: 122, y: 98, width: 120, height: 20 } },
+      } as any });
+      await attachHumanize({} as never, fk.page, { humanize: true, seed: `label-${Math.floor(i / 8)}` });
+      await fk.page.check("#cb");
+      expect(fk.fields["#cb"].checked).toBe(true);
+      onLabel += fk.of("label-click").length;
+    }
+    expect(onLabel).toBeGreaterThanOrEqual(6);
+    expect(onLabel).toBeLessThanOrEqual(26);
+  }, 120_000);
+});
+
+describe("label draws: the seed fixes the trait, each click is unseeded", () => {
+  it("two fresh personas of one seed share the trait and differ in their 20 choices", () => {
+    const a = makePersona("same-identity"), b = makePersona("same-identity");
+    expect(labelShare(a)).toBe(labelShare(b));
+    expect(labelShare(a)).toBe(LABEL_SHARE);
+    const da = Array.from({ length: 20 }, () => labelDraw(a));
+    const db = Array.from({ length: 20 }, () => labelDraw(b));
+    expect(da).not.toEqual(db);
+  });
+  it("a persona's own share and a test's rng decide", () => {
+    const p: any = makePersona("x");
+    expect(labelDraw(p, () => 0.39)).toBe(true);
+    expect(labelDraw(p, () => 0.41)).toBe(false);
+    p.labelShare = 1;
+    expect(Array.from({ length: 20 }, () => labelDraw(p)).every(Boolean)).toBe(true);
+  });
+});
+
+describe("tap on a touch context", () => {
+  it("raises in strict mode and sends nothing", async () => {
+    const f = await attached({ field: { tag: "button", type: "" } });
+    f.page._clearcoteStrict = true;
+    await expect(f.page.locator("#b").tap()).rejects.toThrow("tap is not humanized for touch contexts yet");
+    expect(f.of("down").length + f.of("move").length).toBe(0);
+  });
+
+  it("otherwise reports the fallback and clicks", async () => {
+    const f = await attached({ field: { tag: "button", type: "" } });
+    await f.page.locator("#b").tap();
+    expect(f.page._clearcoteLastFallback).toMatchObject({ api: "locator.tap", selector: "#b" });
+    expect(String(f.page._clearcoteLastFallback.reason)).toContain("not humanized for touch");
+    expect(f.of("down").length).toBe(1);
+  }, SLOW);
+});
+
+describe("frame locators take the frame route", () => {
+  it("a frame the hit test cannot prove goes to Playwright, reported", async () => {
+    const f = await attached({});
+    const loc: any = f.page.locator("#fr >> internal:control=enter-frame >> #x");
+    await loc.fill("new");
+    expect(protoCalls.map((c) => c.m)).toEqual(["fill"]);
+    expect(f.page._clearcoteLastFallback?.api).toBe("locator.fill");
+  });
 });
