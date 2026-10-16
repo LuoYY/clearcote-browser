@@ -643,7 +643,8 @@ def test_list_box_row_that_needs_a_mid_list_scroll(page, value):
     assert page.select_option("#lbmid", value) == [value]
     assert page.input_value("#lbmid") == value
     assert not [e for e in ev(page) if not e["tr"]], "every event trusted: no native fallback"
-    assert len(ev(page, "wheel")) <= 6
+    # wheels OVER THE LIST (0.52: the page itself may first be wheeled to bring the box into view)
+    assert len([e for e in ev(page, "wheel") if e["id"] in ("lbmid", "OPTION")]) <= 6
     assert ev(page, "mousedown", "OPTION"), "the row itself was clicked"
 
 

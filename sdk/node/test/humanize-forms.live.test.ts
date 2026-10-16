@@ -668,7 +668,8 @@ describe.runIf(LIVE)("live humanized form input", () => {
     expect(await page.selectOption("#lbmid", value)).toEqual([value]);
     expect(await page.inputValue("#lbmid")).toBe(value);
     expect((await ev()).filter((e) => !e.tr), "every event trusted: no native fallback").toEqual([]);
-    expect((await ev("wheel")).length).toBeLessThanOrEqual(6);
+    // wheels OVER THE LIST (0.52: the page itself may first be wheeled to bring the box into view)
+    expect((await ev("wheel")).filter((e: any) => e.id === "lbmid" || e.id === "OPTION").length).toBeLessThanOrEqual(6);
     expect((await ev("mousedown", "OPTION")).length, "the row itself was clicked").toBeGreaterThan(0);
   }, T);
 
