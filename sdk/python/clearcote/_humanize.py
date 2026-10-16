@@ -26,6 +26,7 @@ Design notes:
     fat-finger-then-correct chance.
 """
 
+import collections
 import functools
 import math
 import random
@@ -660,6 +661,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     st.update({"depth": 0, "last_end": None, "load_at": None, "mo": None, "mo_hits": 0, "mo_n": 0})
     # Hidden switch for the attention model until lane A's `ambient="idle"` / `attention` option lands.
     page._clearcote_attention = False
+    # Test seam: what the after-action model did, newest last (bounded).
+    trace = collections.deque(maxlen=256)
+    page._clearcote_after_trace = trace
 
     def _attention_on():
         return getattr(page, "_clearcote_attention", False) is True or ambient_mode(page) == "idle"
@@ -680,6 +684,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         if ms is None:
             ms = dwell_ms(persona, arng)
         steps = plan_dwell((x, y), box, persona, ms, arng)
+        trace.append(("dwell", ms, len(steps)))
         _dispatch(steps)
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])
@@ -707,10 +712,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             time.sleep(left)
         vw, vh = _view_bounds() or _viewport()
         tx, ty = plan_move_off(st["pos"], {"width": vw, "height": vh}, persona, arng)
+        trace.append(("move_off", st["pos"], (tx, ty)))
         _glide(tx, ty, target_w=140)   # one coarse glide: nothing to acquire
         return True
 
     def _idle_drift(ms):
+        trace.append(("drift", ms))
         vw, vh = _view_bounds() or _viewport()
         steps = _trim_ambient(plan_ambient(st["pos"], {"width": vw, "height": vh}, persona, ms, arng), ms)
         _dispatch(steps)
@@ -729,6 +736,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 n = 0
             pause = read_pause_ms(n, persona, arng) / 1000.0
             notches = explore_notches(arng)
+            trace.append(("read", pause * 1000.0, n, notches if not coords else 0))
             if pause - (now - la) > 0.35:   # the eyes read; the hand drifts once meanwhile
                 _idle_drift(min((pause - (now - la)) * 500.0, IDLE_DRIFT_MAX_MS))
             rest = la + pause - time.monotonic()
