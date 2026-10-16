@@ -339,13 +339,37 @@ def portable_args(portable_profile=False, encryption_key=None):
 _SWITCH_CACHE = {}
 
 
+def macos_framework_binary(exe):
+    """For a macOS bundle executable (``X.app/Contents/MacOS/X``), the framework binary that holds
+    the engine (``X.app/Contents/Frameworks/X Framework.framework/Versions/Current/X Framework``);
+    None for anything else. The executable itself is a small launcher with no switch strings."""
+    import os
+    macos_dir = os.path.dirname(str(exe or ""))
+    contents = os.path.dirname(macos_dir)
+    if os.path.basename(macos_dir) != "MacOS" or os.path.basename(contents) != "Contents":
+        return None
+    frameworks = os.path.join(contents, "Frameworks")
+    try:
+        names = sorted(n for n in os.listdir(frameworks) if n.endswith(" Framework.framework"))
+    except OSError:
+        return None
+    for fw in names:
+        stem = fw[: -len(".framework")]
+        for rel in (("Versions", "Current", stem), (stem,)):
+            path = os.path.join(frameworks, fw, *rel)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
 def engine_supports_switch(exe, name):
     """Whether the engine binary that will run implements the command-line switch ``name``.
 
     Chromium switch names are NUL-terminated C-string literals in the binary, so a NUL-delimited
     search for ``name`` is a capability probe that cannot collide with header names (HPACK's
     ``proxy-authenticate`` is not ``\\0proxy-auth\\0``). On Windows the switches live in
-    ``chrome.dll`` next to the launcher; elsewhere in the executable itself. Cached per
+    ``chrome.dll`` next to the launcher, on macOS in the bundle's framework (macos_framework_binary);
+    elsewhere in the executable itself. Cached per
     (path, size, mtime). Any failure answers False, which selects the legacy (Playwright) path —
     slower, never silently broken.
     """
@@ -359,6 +383,8 @@ def engine_supports_switch(exe, name):
             dll = os.path.join(os.path.dirname(exe), "chrome.dll")
             if os.path.exists(dll):
                 path = dll
+        else:
+            path = macos_framework_binary(exe) or exe
         st = os.stat(path)
         key = (path, name, st.st_size, int(st.st_mtime))
         if key in _SWITCH_CACHE:
@@ -535,6 +561,19 @@ def gpu_blocklist_args(headed, platform=None, user_args=()):
     if "--ignore-gpu-blocklist" in (user_args or ()):
         return []
     return ["--ignore-gpu-blocklist"]
+
+
+MOCK_KEYCHAIN_SWITCH = "--use-mock-keychain"
+
+
+def macos_keychain_args(platform=None, user_args=()):
+    """``--use-mock-keychain`` on macOS: the native build is unsigned, so Chromium asks for the
+    "Chromium Safe Storage" keychain item on every launch. Denying is harmless, but the prompt blocks an
+    unattended run. Nothing elsewhere, and nothing when the caller already passes it."""
+    platform = sys.platform if platform is None else platform
+    if platform != "darwin" or MOCK_KEYCHAIN_SWITCH in (user_args or ()):
+        return []
+    return [MOCK_KEYCHAIN_SWITCH]
 
 
 def x_display_available(environ=None):

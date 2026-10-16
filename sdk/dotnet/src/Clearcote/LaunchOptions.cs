@@ -169,11 +169,11 @@ public class LaunchOptions : FingerprintOptions
     public ColorScheme? ColorScheme { get; set; }
 
     // ── macOS: the Clearcote Docker image ────────────────────────────────────
-    // There is no native macOS build, so on macOS LaunchAsync runs the Clearcote Docker image and
-    // connects to it (see Clearcote.LaunchAsync).
+    // Without the native PRO build (a licence key on an Apple Silicon Mac), LaunchAsync on macOS runs the
+    // Clearcote Docker image and connects to it (see Clearcote.LaunchAsync).
 
-    /// Run Clearcote in its Docker image. Null: on macOS only (there is no native macOS build), unless
-    /// ExecutablePath / CLEARCOTE_BINARY names a binary; CLEARCOTE_DOCKER=0/1 decides when this is null.
+    /// Run Clearcote in its Docker image. Null: on macOS, unless ExecutablePath / CLEARCOTE_BINARY names
+    /// a binary or a licence key on an Apple Silicon Mac selects the native PRO build; CLEARCOTE_DOCKER=0/1 decides when this is null.
     /// False turns it off; true uses the image on any OS.
     public bool? Docker { get; set; }
     /// The image to run. Default CLEARCOTE_DOCKER_IMAGE, else teamflatearth/clearcote:sdk-&lt;SDK version&gt;.

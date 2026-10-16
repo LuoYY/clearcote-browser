@@ -55,6 +55,7 @@ from ._launchopts import (  # noqa: F401  (web_bluetooth_args re-exported for te
     gpu_backend_args,
     mesa_egl_available,
     gpu_blocklist_args,
+    macos_keychain_args,
     serve_infobar_args,
     serve_needs_no_sandbox,
     extension_args,
@@ -322,8 +323,19 @@ def download(cache_dir=None, quiet=False, auto_update=None, version=None, licens
 
 
 def _guard(exe):
-    from .release import platform_release
-    if platform_release() is None:
+    """Refuse a binary this OS has no build for -- but never one the caller named.
+
+    An existing ``executable_path`` / CLEARCOTE_BINARY is theirs to run on any OS (this used to
+    raise on macOS even when handed one, while telling the caller to pass executable_path). macOS
+    has a native PRO build (Apple Silicon), which the PRO download resolves itself."""
+    from .release import platform_release, pro_platform_key
+    if exe and os.path.exists(exe):
+        return
+    try:
+        pro = pro_platform_key()
+    except RuntimeError:
+        pro = None
+    if platform_release() is None and pro is None:
         raise RuntimeError(
             f"Clearcote {RELEASE['version']} ships Windows x64 and Linux x64 binaries — there is no "
             f"build for {sys.platform!r}.\nRun on Windows or Linux, or pass executable_path=... to a "
@@ -506,6 +518,9 @@ def _prepare(kwargs):
     # entropy, sitting in a conspicuous tail. Give it a real machine's list instead. No-ops when
     # a profile is already set (an explicit one, or "auto", owns the fonts), under light_stealth,
     # and when there is no seed at all -- see ensure_persona_fonts for why each is deliberate.
+    # Whether the font list is the caller's (or "auto"'s) rather than the one picked just below: the
+    # macOS build cannot apply a picked list (see coherence_warnings, platform-host-fonts).
+    caller_profile = fp.get("fingerprint_profile") is not None
     if not passthrough:
         ensure_persona_fonts(fp, quiet=quiet)
     # SOCKS5-with-credentials must go through --proxy-server (Playwright rejects creds in its SOCKS
@@ -550,6 +565,9 @@ def _prepare(kwargs):
     # SwiftShader for a Windows claim (Direct3D11-like limits), Mesa for a Linux claim (over the X
     # display, or over EGL when there is none). Pass-through has no persona to match. See gpu_backend_args.
     base += gpu_backend_args(None if passthrough else persona_platform(fp), headed, sys.platform, user)
+    # macOS: the build is unsigned, so every launch would prompt for the "Chromium Safe Storage"
+    # keychain item. See macos_keychain_args.
+    base += macos_keychain_args(sys.platform, user)
     # collapse all --enable-features/--disable-features (ours + the user's) into one of each, else
     # Chromium keeps only the last occurrence and the rest are silently dropped.
     args = merge_feature_flags(base + user)
@@ -576,6 +594,7 @@ def _prepare(kwargs):
         {**fp, "proxy": proxy_opt, "geoip": geoip, "headless": kwargs.get("headless"),
          "devtools": kwargs.get("devtools"), "user_agent": kwargs.get("user_agent"),
          "_user_args": user, "_font_reach": font_reachability(fp.get("fingerprint_profile")),
+         "_sdk_font_profile": not caller_profile and fp.get("fingerprint_profile") is not None,
          "_stock_runtime": (STOCK_RUNTIME_SWITCH in args
                             and engine_supports_switch(exe, STOCK_RUNTIME_SWITCH[2:]))},
         quiet=quiet, build_major=str(RELEASE["version"]).split(".")[0])
@@ -1071,13 +1090,18 @@ def launch(cloud=None, **kwargs):
     ``slow_mo`` go to the CDP connect; ``timeout`` defaults to 120 000 ms there, as the browser
     starts when you connect.
 
-    MACOS. There is no native macOS build, so on macOS launch() starts the Clearcote Docker image
-    (``teamflatearth/clearcote:sdk-<version>``; ``docker_image=`` or CLEARCOTE_DOCKER_IMAGE picks
-    another) and returns the same Playwright ``Browser``, connected to it over CDP; ``close()`` stops
-    the container. The persona options, ``headless``, ``proxy``, ``args``, ``version`` and the licence
-    key go to the container; an option it cannot take raises ValueError naming it. Docker must be
-    installed and running (DockerUnavailableError says so otherwise). ``docker=False`` (or
-    CLEARCOTE_DOCKER=0) turns this off; ``docker=True`` uses the container on any OS.
+    MACOS. With a licence key on an Apple Silicon Mac, launch() runs the native macOS PRO build
+    (a ``Chromium.app`` bundle, downloaded and verified like the other platforms). Its fonts and
+    canvas text metrics stay host-native, so only ``platform="macos"`` (the default there) is
+    coherent; another platform without a ``fingerprint_profile`` captured on that OS warns.
+    Without a licence key (the free build has no macOS binary), or on an Intel Mac, launch() starts
+    the Clearcote Docker image instead (``teamflatearth/clearcote:sdk-<version>``; ``docker_image=``
+    or CLEARCOTE_DOCKER_IMAGE picks another) and returns the same Playwright ``Browser``, connected
+    to it over CDP; ``close()`` stops the container. The persona options, ``headless``, ``proxy``,
+    ``args``, ``version`` and the licence key go to the container; an option it cannot take raises
+    ValueError naming it. Docker must be installed and running (DockerUnavailableError says so
+    otherwise). ``docker=True`` (or CLEARCOTE_DOCKER=1) uses the container on any OS, a licensed
+    Mac included; ``docker=False`` (or CLEARCOTE_DOCKER=0) never does.
 
     Fingerprint kwargs: fingerprint, platform, platform_version, brand, brand_version,
     gpu_vendor, gpu_renderer, hardware_concurrency, location, timezone, accept_language,
@@ -1104,7 +1128,7 @@ def launch(cloud=None, **kwargs):
         return launch_cloud(cloud, kwargs)
     _drop_cloud_credentials(kwargs)
     docker, docker_image = kwargs.pop("docker", None), kwargs.pop("docker_image", None)
-    if docker_requested(docker, kwargs):  # macOS (no native build): the Clearcote Docker image
+    if docker_requested(docker, kwargs):  # macOS without the native PRO build: the Docker image
         return launch_docker({**kwargs, "docker_image": docker_image})
     # ephemeral_profile=False restores the pre-0.23 incognito launch. Kept because the persistent
     # path costs a directory create+delete per launch, which a caller spawning hundreds of

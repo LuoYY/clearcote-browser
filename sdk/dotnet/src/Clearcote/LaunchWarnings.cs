@@ -43,6 +43,10 @@ public static class LaunchWarnings
     /// The code of the warning <see cref="ForPersonaHost"/> gives a Linux persona on a Windows host.
     public const string LinuxPersonaWindowsHost = "linux-persona-windows-host";
 
+    /// The code of the warning <see cref="ForPersonaHost"/> gives a non-macOS persona on a Mac (the same
+    /// code the Python and Node SDKs use for a persona whose OS differs from the host's).
+    public const string PlatformHostFonts = "platform-host-fonts";
+
     /// The codes of the once-per-process warnings <see cref="LaunchOptions.StockRuntime"/> gives: on an engine
     /// without the switch, and on a cloud launch (see <see cref="LaunchOpts.StockRuntimeArgs"/>).
     public const string StockRuntimeUnsupported = "stock-runtime-unsupported";
@@ -64,6 +68,17 @@ public static class LaunchWarnings
                 "a Linux persona on a Windows host reports Windows GPU limits (Direct3D caps WebGL), which no real " +
                 "Linux machine has. Use Platform = \"windows\" on Windows, or run Linux personas on Linux or in Docker " +
                 "(Docker = true)."));
+        // On the native macOS build fonts and canvas text metrics stay the Mac's own whatever the claim (its
+        // font persona patches target Linux-only sources), so only Platform = "macos" is coherent there --
+        // unless a FingerprintProfile captured on the claimed OS supplies them.
+        var claimed = o.Platform?.Trim().ToLowerInvariant();
+        if ((hostOs ?? Native.OsTag) == "macos" && !string.IsNullOrEmpty(claimed) && claimed != "macos"
+            && o.FingerprintProfile is null && !Fingerprint.IsFingerprintPassthrough(o.Fingerprint))
+            outList.Add(new(PlatformHostFonts,
+                $"Platform = \"{claimed}\" but this host is macos and no FingerprintProfile supplies that OS's fonts/metrics - " +
+                $"font, canvas and font-list hashes will be host-native and won't match a real {claimed} Chrome. Use a " +
+                $"FingerprintProfile captured on {claimed}, or set Platform = \"macos\". On the native macOS build only " +
+                "Platform = \"macos\" is coherent: its fonts and canvas text metrics always stay the Mac's own."));
         return outList;
     }
 

@@ -1,16 +1,18 @@
 // launch() on macOS: run the Clearcote Docker image and connect to it.
 //
-// There is no native Clearcote build for macOS. Rather than fail there, launch() starts the published
+// The free Clearcote build has no macOS binary (the native macOS build is PRO-only and Apple Silicon
+// only). Rather than fail there, launch() starts the published
 // Clearcote image (teamflatearth/clearcote:sdk-<this SDK's version>, a linux/amd64 image Docker Desktop
 // runs on Intel and Apple silicon alike), waits for its CDP endpoint, connects with Playwright and
 // resolves to the same Playwright Browser a local launch does. close() disconnects and stops the
 // container; nothing is left running.
 //
 // When it applies:
-//   - `docker: false` (or CLEARCOTE_DOCKER=0) turns it off: launch() behaves as before, which on macOS
-//     means "pass executablePath to a compatible binary".
+//   - `docker: false` (or CLEARCOTE_DOCKER=0) turns it off: launch() runs a local binary, which on macOS
+//     means the native PRO build (a licence key, Apple Silicon) or `executablePath`.
 //   - `docker: true` (or CLEARCOTE_DOCKER=1) turns it on on any OS that has Docker.
-//   - Unset: on for macOS, unless the caller named a binary (executablePath / CLEARCOTE_BINARY).
+//   - Unset: on for macOS, unless the caller named a binary (executablePath / CLEARCOTE_BINARY) or holds
+//     a licence key on an Apple Silicon Mac -- that runs the native macOS PRO build instead.
 //   - CLEARCOTE_TEST_ONLY_ASSUME_MACOS=1 makes this module treat the host as macOS, so the real Docker
 //     path can be exercised end to end on a Linux or Windows machine. It is not an option.
 //
@@ -52,6 +54,7 @@ import type { Browser } from "playwright-core";
 import { installHumanize, installHumanizeOnContext } from "./humanize.js";
 import { STOCK_RUNTIME_SWITCH, stockRuntimeWanted } from "./launchopts.js";
 import { resolveLicenseKey } from "./license.js";
+import { nativeMacosSupported } from "./release.js";
 
 export const DEFAULT_REPOSITORY = "teamflatearth/clearcote";
 export const TEST_ONLY_ASSUME_MACOS = "CLEARCOTE_TEST_ONLY_ASSUME_MACOS";
@@ -99,7 +102,7 @@ const SDK_VERSION: string = (() => {
   }
 })();
 
-/** launch() needs Docker on this host (macOS has no native Clearcote build) and it is missing or not running. */
+/** launch() needs Docker on this host (a Mac without the native PRO build) and it is missing or not running. */
 export class DockerUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -109,8 +112,8 @@ export class DockerUnavailableError extends Error {
 
 /** The Docker options of launch(). */
 export interface DockerOption {
-  /** Run Clearcote in its Docker image. Unset: on macOS only (there is no native macOS build), unless
-   * executablePath / CLEARCOTE_BINARY names a binary. false (or CLEARCOTE_DOCKER=0) turns it off;
+  /** Run Clearcote in its Docker image. Unset: on macOS, unless executablePath / CLEARCOTE_BINARY names a
+   * binary or a licence key on an Apple Silicon Mac selects the native PRO build. false (or CLEARCOTE_DOCKER=0) turns it off;
    * true uses the image on any OS. */
   docker?: boolean;
   /** The image to run. Default CLEARCOTE_DOCKER_IMAGE, else teamflatearth/clearcote:sdk-<SDK version>. */
@@ -154,7 +157,19 @@ export function dockerRequested(docker: unknown, options: Record<string, unknown
   if (FALSY.includes(env)) return false;
   if (TRUTHY.includes(env)) return true;
   if (process.env.CLEARCOTE_BINARY) return false;
-  return hostIsMacos();
+  if (!hostIsMacos()) return false;
+  // An Apple Silicon Mac with a licence key runs the native PRO build; the free build has no macOS
+  // binary, and the PRO one no Intel build, so every other Mac keeps the image.
+  return !nativeMacosLicensed(options);
+}
+
+/**
+ * Whether this host runs the native macOS PRO build: a real Apple Silicon Mac (not the test-only
+ * assume-macOS switch, which exists to exercise the Docker path) with a licence key.
+ */
+export function nativeMacosLicensed(options: Record<string, unknown> = {}): boolean {
+  if (!nativeMacosSupported(process.platform)) return false;
+  return !!resolveLicenseKey(options.licenseKey as string | undefined);
 }
 
 export function defaultImage(): string {
@@ -186,7 +201,7 @@ export function containerEnv(options: Record<string, unknown>): Record<string, s
     .sort();
   if (unknown.length) {
     const takes = DOCKER_ACCEPTED.filter((k) => !SDK_SIDE.includes(k)).sort().join(", ");
-    throw new TypeError(`${unknown[0]} is not available when launch() runs Clearcote in Docker (there is no native macOS build). The container takes: ${takes}. ${OFF_HINT}`);
+    throw new TypeError(`${unknown[0]} is not available when launch() runs Clearcote in Docker (there is no native macOS build here). The container takes: ${takes}. ${OFF_HINT}`);
   }
   const env: Record<string, string> = {};
   const has = (k: string) => options[k] !== undefined && options[k] !== null;
@@ -307,12 +322,12 @@ export async function dockerInfo(): Promise<{ exe: string; arch: string }> {
   const exe = dockerCli.which();
   if (!exe) {
     throw new DockerUnavailableError(
-      `Clearcote has no native macOS build, so on macOS launch() runs it in Docker, but the \`docker\` command was not found. Install Docker Desktop (${INSTALL_URL}), start it, and try again. ${OFF_HINT}`);
+      `Clearcote has no native macOS build here (that needs a licence key and an Apple Silicon Mac), so on macOS launch() runs it in Docker, but the \`docker\` command was not found. Install Docker Desktop (${INSTALL_URL}), start it, and try again. ${OFF_HINT}`);
   }
   const r = await dockerCli.run([exe, "info", "--format", "{{.ServerVersion}} {{.Architecture}}"], undefined, 30_000);
   if (r.code !== 0) {
     throw new DockerUnavailableError(
-      `Clearcote has no native macOS build, so on macOS launch() runs it in Docker, but Docker is not running (\`docker info\`: ${firstLine(r.stderr) || `exit ${r.code}`}). Start Docker Desktop and try again. ${OFF_HINT}`);
+      `Clearcote has no native macOS build here (that needs a licence key and an Apple Silicon Mac), so on macOS launch() runs it in Docker, but Docker is not running (\`docker info\`: ${firstLine(r.stderr) || `exit ${r.code}`}). Start Docker Desktop and try again. ${OFF_HINT}`);
   }
   return { exe, arch: r.stdout.trim().split(/\s+/)[1] ?? "" };
 }
@@ -819,7 +834,7 @@ export async function startContainer(options: Record<string, unknown>): Promise<
   for (const name of Object.keys(env).sort()) argv.push("-e", name); // the value comes from the CLI's environment
   if (expect.licensed) argv.push("-v", `${cacheVolume()}:/opt/xdg-cache`); // the licensed engine downloads once
   argv.push(image);
-  if (!options.quiet) process.stderr.write(`[clearcote] no native macOS build: starting the Clearcote Docker image ${image}\n`);
+  if (!options.quiet) process.stderr.write(`[clearcote] no native macOS build here (it needs a licence key and Apple Silicon): starting the Clearcote Docker image ${image}\n`);
   let id: string;
   try {
     id = await createStarted(exe, argv, env, secrets, image, seccomp);

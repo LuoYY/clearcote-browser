@@ -55,6 +55,43 @@ def platform_release(plat=None):
     return PLATFORMS.get(plat or sys.platform)
 
 
+# sys.platform -> the PRO catalog / /download/pro `platform` key. Wider than PLATFORMS: macOS has a
+# native PRO build (Apple Silicon, a Chromium.app bundle) but no free pinned release, so it is here and
+# not there. The PRO build is resolved by the site at run time, so there is nothing to pin for it.
+PRO_PLATFORMS = {"win32": "windows", "linux": "linux", "darwin": "macos"}
+
+# CPU architectures the native macOS PRO build runs on. It is arm64 only; an Intel Mac (or a Python
+# running under Rosetta, which reports x86_64) uses the Docker image instead.
+MACOS_ARCHES = ("arm64", "aarch64")
+
+
+def host_machine():
+    """This machine's CPU architecture, lower-cased (``platform.machine()``)."""
+    import platform
+
+    return (platform.machine() or "").strip().lower()
+
+
+def pro_platform_key(plat=None, machine=None):
+    """The PRO download platform key for an OS ("windows" / "linux" / "macos"), or None if there is
+    no PRO build for it. A macOS host that is not Apple Silicon raises: the build exists, just not for
+    this CPU, and "unsupported OS" would send the caller looking in the wrong place."""
+    plat = plat or sys.platform
+    key = next((v for k, v in PRO_PLATFORMS.items() if plat.startswith(k)), None)
+    if key == "macos" and (machine if machine is not None else host_machine()) not in MACOS_ARCHES:
+        raise RuntimeError(
+            "The native macOS Clearcote PRO build is for Apple Silicon (arm64) only; this Mac reports "
+            f"{(machine if machine is not None else host_machine()) or 'an unknown CPU'}. Use the Docker "
+            "image instead (launch(docker=True)), or run on an Apple Silicon Mac.")
+    return key
+
+
+def native_macos_supported(plat=None, machine=None):
+    """True on an Apple Silicon Mac, where the native PRO build runs."""
+    plat = plat or sys.platform
+    return plat == "darwin" and (machine if machine is not None else host_machine()) in MACOS_ARCHES
+
+
 # The pin for the CURRENT platform. Falls back to the Windows entry on an unsupported OS so the
 # existing error messaging still has a version to quote. Most code uses this; the download/guard
 # paths branch on platform_release() to reject unsupported OSes.
@@ -78,7 +115,8 @@ SIGNING_KEY_FPR = "CA96F185F96A693AEDB3AC1FCB00D851B7A86B0F"
 # routes the actual download through the authenticated /api/v1/download/pro route. When a PRO major is
 # later promoted to public, flip its `tier` to "free" and add the GitHub url — no SDK change needed.
 #
-# platform keys are "windows"/"linux" (matching the /download/pro `platform` param).
+# platform keys are "windows"/"linux"/"macos" (matching the /download/pro `platform` param; macOS is
+# PRO-only, Apple Silicon).
 CATALOG_URL = "https://www.clearcotelabs.com/api/v1/versions"
 
 # Offline fallback snapshot — keep in sync with published releases. Lets the SDK still VALIDATE a

@@ -32,7 +32,7 @@ import urllib.request
 import uuid
 import zipfile
 
-from .release import RELEASE, REPO, SIGNING_KEY_FPR, platform_release
+from .release import RELEASE, REPO, SIGNING_KEY_FPR, platform_release, pro_platform_key
 
 
 def _log(quiet, msg):
@@ -65,9 +65,37 @@ def default_cache_root():
     return _cache_root()
 
 
+def _app_binary(dirpath, name):
+    """``<X>.app/Contents/MacOS/<name>`` at the top of ``dirpath`` (or one folder down), else None.
+
+    The macOS build is a bundle: the executable is ``Chromium.app/Contents/MacOS/Chromium``, and the
+    same tree holds ``Chromium Framework`` and the ``Chromium Helper*`` apps. Looking for the bundle's
+    own executable first means a name search can never land on one of those."""
+    try:
+        tops = sorted(os.listdir(dirpath))
+    except OSError:
+        return None
+    for parent in [dirpath] + [os.path.join(dirpath, t) for t in tops if not t.endswith(".app")]:
+        try:
+            entries = tops if parent == dirpath else sorted(os.listdir(parent))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.endswith(".app"):
+                exe = os.path.join(parent, entry, "Contents", "MacOS", name)
+                if os.path.isfile(exe):
+                    return exe
+    return None
+
+
 def _find(dirpath, name):
+    app = _app_binary(dirpath, name)
+    if app:
+        return app
     name = name.lower()
-    for root, _dirs, files in os.walk(dirpath):
+    for root, dirs, files in os.walk(dirpath):
+        # never descend into a macOS framework: it holds the helper apps, never the browser itself
+        dirs[:] = [d for d in dirs if not d.endswith(".framework")]
         for f in files:
             if f.lower() == name:
                 return os.path.join(root, f)
@@ -84,6 +112,11 @@ MANIFEST = ".manifest.json"
 CRITICAL_FILES = {
     "win32": ["chrome.exe", "chrome.dll", "chrome_elf.dll", "icudtl.dat",
               "snapshot_blob.bin", "resources.pak"],
+    # The macOS PRO build is a Chromium.app bundle: the payload sits inside the framework, reached
+    # through its Versions/Current symlink (which the ditto extraction keeps).
+    "darwin": ["Chromium.app/Contents/MacOS/Chromium", "Chromium.app/Contents/Info.plist",
+               "Chromium.app/Contents/Frameworks/Chromium Framework.framework/Versions/Current/"
+               "Chromium Framework"],
     "other": ["icudtl.dat", "snapshot_blob.bin", "resources.pak"],
 }
 
@@ -91,7 +124,7 @@ _scanned = set()  # browser dirs whose full manifest already verified in this pr
 
 
 def _critical_names():
-    return CRITICAL_FILES["win32" if sys.platform == "win32" else "other"]
+    return CRITICAL_FILES[sys.platform if sys.platform in ("win32", "darwin") else "other"]
 
 
 def _write_manifest(base, browser_dir):
@@ -960,13 +993,7 @@ def _install_into(rel, base, tmp, quiet, lock, breaker_seen=None):
     # appears once fully written (no partial tree a concurrent launch could pick up), and — on
     # Windows — we can force an on-access AV scan of the finished tree before any launch (below).
     incoming = os.path.join(tmp, "browser")
-    if rel["asset"].endswith(".tar.xz") or rel.get("archive") == "tar.xz":
-        import tarfile
-        with tarfile.open(zip_path) as t:
-            t.extractall(incoming)
-    else:
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(incoming)
+    _extract(rel, zip_path, incoming)
     with contextlib.suppress(OSError):
         os.remove(zip_path)  # reclaim disk; keep only the extracted tree
 
@@ -1042,12 +1069,51 @@ def _install_into(rel, base, tmp, quiet, lock, breaker_seen=None):
 
 
 def _plat_key():
-    """Catalog platform key for this OS (matches the /download/pro `platform` param)."""
-    if sys.platform.startswith("win"):
-        return "windows"
-    if sys.platform.startswith("linux"):
-        return "linux"
-    return None
+    """Catalog platform key for this OS (matches the /download/pro `platform` param): "windows",
+    "linux", "macos" (Apple Silicon; raises on an Intel Mac), or None."""
+    return pro_platform_key()
+
+
+def _extract(rel, archive_path, dest):
+    """Unpack a downloaded archive into ``dest``.
+
+    On macOS the zip holds a ``Chromium.app`` bundle, which needs its symlinks
+    (``Versions/Current``, ``Resources``, ...) and exec bits; Python's zipfile keeps neither, so it
+    is unpacked with ``ditto`` (``unzip`` if that is missing) and the quarantine attribute cleared:
+    the build is unsigned, and Gatekeeper refuses a quarantined bundle."""
+    if rel["asset"].endswith(".tar.xz") or rel.get("archive") == "tar.xz":
+        import tarfile
+        with tarfile.open(archive_path) as t:
+            t.extractall(dest)
+        return
+    if sys.platform == "darwin":
+        os.makedirs(dest, exist_ok=True)
+        for argv in (["/usr/bin/ditto", "-x", "-k", archive_path, dest],
+                     ["/usr/bin/unzip", "-q", "-o", archive_path, "-d", dest]):
+            try:
+                done = subprocess.run(argv, capture_output=True, text=True)  # noqa: S603
+            except OSError:
+                continue  # that tool is not on this Mac: try the next one
+            if done.returncode != 0:
+                raise RuntimeError(f"Clearcote could not unpack {rel['asset']} with {argv[0]}: "
+                                   f"{(done.stderr or done.stdout or '').strip()[:300]}")
+            _clear_quarantine(dest)
+            return
+        raise RuntimeError("Clearcote needs /usr/bin/ditto or /usr/bin/unzip to unpack the macOS build.")
+    with zipfile.ZipFile(archive_path) as z:
+        z.extractall(dest)
+
+
+def _clear_quarantine(dest):
+    """Best-effort: drop com.apple.quarantine from every bundle under ``dest``."""
+    try:
+        apps = [os.path.join(dest, n) for n in os.listdir(dest) if n.endswith(".app")] or [dest]
+    except OSError:
+        return
+    for app in apps:
+        with contextlib.suppress(OSError):
+            subprocess.run(["/usr/bin/xattr", "-dr", "com.apple.quarantine", app],  # noqa: S603
+                           capture_output=True)
 
 
 def _ver_key(v):
@@ -1099,7 +1165,7 @@ def resolve_version(selector, has_license=False, quiet=False, catalog=None):
     """
     plat = _plat_key()
     if plat is None:
-        raise RuntimeError("Clearcote ships Windows x64 and Linux x64 only.")
+        raise RuntimeError("Clearcote ships Windows x64, Linux x64 and (PRO) macOS arm64 only.")
     catalog = catalog or _fetch_catalog(quiet)  # a given catalog (the bundled one): no network
     builds = [b for b in catalog.get("builds", []) if plat in (b.get("platforms") or {})]
     sel = str(selector or "").strip()
@@ -1181,6 +1247,16 @@ def ensure_binary(cache_dir=None, quiet=False, auto_update=None):
     """
     cache_root = cache_dir or _cache_root()
 
+    if platform_release() is None:
+        # Fail before downloading a build that cannot run here (this used to fetch the ~245 MB
+        # Windows zip on a Mac, then refuse it).
+        hint = ("On an Apple Silicon Mac, set a license key (CLEARCOTE_LICENSE_KEY) for the native PRO "
+                "build, or use the Docker image (docker=True). "
+                if sys.platform == "darwin" else "")
+        raise RuntimeError(
+            f"The free Clearcote build ships Windows x64 and Linux x64 binaries — there is none for "
+            f"{sys.platform!r}. {hint}Or pass executable_path=... to a compatible binary.")
+
     rel = None
     if _auto_update_requested(auto_update):
         latest = _resolve_latest(quiet)
@@ -1237,7 +1313,7 @@ def list_cached_builds(cache_dir=None):
     root = cache_dir or _cache_root()
     if not os.path.isdir(root):
         return []
-    binary = "chrome.exe" if sys.platform == "win32" else "chrome"
+    binary = {"win32": "chrome.exe", "darwin": "Chromium"}.get(sys.platform, "chrome")
     out = []
     for name in os.listdir(root):
         base = os.path.join(root, name)
@@ -1269,10 +1345,9 @@ def pro_ensure_binary(license_key, api_base=None, cache_dir=None, quiet=False, v
 
     base_url = (api_base or os.environ.get("CLEARCOTE_LICENSE_API")
                 or "https://www.clearcotelabs.com").rstrip("/")
-    plat = ("windows" if sys.platform.startswith("win")
-            else "linux" if sys.platform.startswith("linux") else None)
+    plat = pro_platform_key()  # raises on an Intel Mac: the macOS build is Apple Silicon only
     if plat is None:
-        raise RuntimeError("Clearcote PRO ships Windows x64 and Linux x64 only.")
+        raise RuntimeError("Clearcote PRO ships Windows x64, Linux x64 and macOS arm64 only.")
 
     channel = resolve_release_channel(release_channel)
     url = pro_download_url(base_url, plat, version, channel)
@@ -1304,7 +1379,7 @@ def pro_ensure_binary(license_key, api_base=None, cache_dir=None, quiet=False, v
         "exe_sha256": meta.get("exe_sha256"),
         "asset": meta["asset"],
         "archive": meta.get("archive"),
-        "binary": meta.get("binary", "chrome.exe"),
+        "binary": meta.get("binary") or {"windows": "chrome.exe", "macos": "Chromium"}.get(plat, "chrome"),
         "size": meta.get("size"),
         "unpinned": False,  # pinned -> sha256-only verify (no GPG), like the free pin
     }

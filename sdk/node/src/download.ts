@@ -24,7 +24,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { Worker } from "node:worker_threads";
 import extract from "extract-zip";
-import { RELEASE, REPO, SIGNING_KEY_FPR, platformRelease, CATALOG_URL, CATALOG_FALLBACK, type ReleaseInfo, type Catalog, type CatalogBuild } from "./release.js";
+import { RELEASE, REPO, SIGNING_KEY_FPR, platformRelease, proPlatformKey, CATALOG_URL, CATALOG_FALLBACK, type ReleaseInfo, type Catalog, type CatalogBuild } from "./release.js";
 
 /**
  * Read every file under `dir` so on-access antivirus finishes scanning the freshly-extracted,
@@ -126,7 +126,42 @@ export function defaultCacheRoot(): string {
   return path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "clearcote");
 }
 
+/**
+ * `<X>.app/Contents/MacOS/<name>` at the top of `dir` (or one folder down), else null. The macOS build
+ * is a bundle: the executable is `Chromium.app/Contents/MacOS/Chromium`, and the same tree holds
+ * `Chromium Framework` and the `Chromium Helper*` apps. Looking for the bundle's own executable first
+ * means a name search can never land on one of those.
+ */
+function appBinary(dir: string, name: string): string | null {
+  let tops: string[];
+  try {
+    tops = readdirSync(dir).sort();
+  } catch {
+    return null;
+  }
+  for (const parent of [dir, ...tops.filter((t) => !t.endsWith(".app")).map((t) => path.join(dir, t))]) {
+    let entries: string[];
+    try {
+      entries = parent === dir ? tops : readdirSync(parent).sort();
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.endsWith(".app")) continue;
+      const exe = path.join(parent, e, "Contents", "MacOS", name);
+      try {
+        if (statSync(exe).isFile()) return exe;
+      } catch {
+        /* not this bundle */
+      }
+    }
+  }
+  return null;
+}
+
 function findFile(dir: string, name: string): string | null {
+  const app = appBinary(dir, name);
+  if (app) return app;
   const stack = [dir];
   while (stack.length) {
     const cur = stack.pop() as string;
@@ -138,7 +173,8 @@ function findFile(dir: string, name: string): string | null {
     }
     for (const e of entries) {
       const full = path.join(cur, e.name);
-      if (e.isDirectory()) stack.push(full);
+      // never descend into a macOS framework: it holds the helper apps, never the browser itself
+      if (e.isDirectory()) { if (!e.name.endsWith(".framework")) stack.push(full); }
       else if (e.name.toLowerCase() === name.toLowerCase()) return full;
     }
   }
@@ -340,8 +376,15 @@ export const MANIFEST = ".manifest.json";
 // full manifest (below) is checked once per process.
 const CRITICAL_WIN = ["chrome.exe", "chrome.dll", "chrome_elf.dll", "icudtl.dat", "snapshot_blob.bin", "resources.pak"];
 const CRITICAL_OTHER = ["icudtl.dat", "snapshot_blob.bin", "resources.pak"];
+// The macOS PRO build is a Chromium.app bundle: the payload sits inside the framework, reached through
+// its Versions/Current symlink (which the ditto extraction keeps).
+const CRITICAL_MAC = [
+  "Chromium.app/Contents/MacOS/Chromium", "Chromium.app/Contents/Info.plist",
+  "Chromium.app/Contents/Frameworks/Chromium Framework.framework/Versions/Current/Chromium Framework",
+];
 
-const criticalNames = (): string[] => (process.platform === "win32" ? CRITICAL_WIN : CRITICAL_OTHER);
+const criticalNames = (): string[] =>
+  process.platform === "win32" ? CRITICAL_WIN : process.platform === "darwin" ? CRITICAL_MAC : CRITICAL_OTHER;
 
 const scanned = new Set<string>(); // browser dirs whose full manifest already verified this process
 
@@ -1087,6 +1130,8 @@ async function installInto(
     // Node has no stdlib xz; the system `tar` (always present on Linux) auto-detects .xz. Async, so the
     // lock's heartbeat keeps running during a long extraction.
     await promisify(execFile)("tar", ["-xf", zipPath, "-C", incoming]);
+  } else if (process.platform === "darwin") {
+    await extractMacBundle(rel.asset, zipPath, incoming);
   } else {
     await extract(zipPath, { dir: incoming });
   }
@@ -1158,12 +1203,49 @@ async function installInto(
   return exe;
 }
 
+/** Test seam: the child-process runner the macOS extraction uses. */
+export const macExtractHooks = {
+  run: (file: string, args: string[]): Promise<unknown> => promisify(execFile)(file, args),
+};
+
+/**
+ * Unpack the macOS zip, which holds a `Chromium.app` bundle. The bundle needs its symlinks
+ * (`Versions/Current`, `Resources`, ...) and exec bits; extract-zip keeps neither, so it is unpacked
+ * with `ditto` (`unzip` if that is missing) and the quarantine attribute cleared: the build is
+ * unsigned, and Gatekeeper refuses a quarantined bundle.
+ */
+export async function extractMacBundle(asset: string, zipPath: string, dest: string): Promise<void> {
+  mkdirSync(dest, { recursive: true });
+  const tools: Array<[string, string[]]> = [
+    ["/usr/bin/ditto", ["-x", "-k", zipPath, dest]],
+    ["/usr/bin/unzip", ["-q", "-o", zipPath, "-d", dest]],
+  ];
+  for (const [file, args] of tools) {
+    try {
+      await macExtractHooks.run(file, args);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; // that tool is not on this Mac
+      throw new Error(`Clearcote could not unpack ${asset} with ${file}: ${String((e as Error).message).slice(0, 300)}`);
+    }
+    let apps: string[] = [];
+    try {
+      apps = readdirSync(dest).filter((n) => n.endsWith(".app")).map((n) => path.join(dest, n));
+    } catch {
+      /* nothing to un-quarantine */
+    }
+    for (const app of apps.length ? apps : [dest]) {
+      await macExtractHooks.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app]).catch(() => undefined); // best-effort
+    }
+    return;
+  }
+  throw new Error("Clearcote needs /usr/bin/ditto or /usr/bin/unzip to unpack the macOS build.");
+}
+
 // ── Version catalog resolver ─────────────────────────────────────────────────
-// Catalog platform key for this OS (matches the /download/pro `platform` param).
-function platKey(): "windows" | "linux" | null {
-  if (process.platform === "win32") return "windows";
-  if (process.platform === "linux") return "linux";
-  return null;
+// Catalog platform key for this OS (matches the /download/pro `platform` param): "windows", "linux",
+// "macos" (Apple Silicon; throws on an Intel Mac), or null.
+function platKey(): "windows" | "linux" | "macos" | null {
+  return proPlatformKey();
 }
 
 /** Compare two version strings numerically: "150.0.7871.115" > "149.0.7827.114". */
@@ -1190,7 +1272,7 @@ async function fetchCatalog(quiet?: boolean): Promise<Catalog> {
   return CATALOG_FALLBACK;
 }
 
-function catalogAvailable(cat: Catalog, plat: "windows" | "linux"): string {
+function catalogAvailable(cat: Catalog, plat: "windows" | "linux" | "macos"): string {
   return cat.builds.filter((b) => b.platforms[plat]).map((b) => `${b.version} (${b.tier || "free"})`).join(", ") || "none";
 }
 
@@ -1215,7 +1297,7 @@ export function isProRevisionSelector(selector: string | undefined): boolean {
  */
 export async function resolveVersion(selector: string, hasLicense: boolean, quiet?: boolean, catalog?: Catalog): Promise<VersionPlan> {
   const plat = platKey();
-  if (!plat) throw new Error("Clearcote ships Windows x64 and Linux x64 only.");
+  if (!plat) throw new Error("Clearcote ships Windows x64, Linux x64 and (PRO) macOS arm64 only.");
   const cat = catalog ?? (await fetchCatalog(quiet)); // a given catalog (the bundled one): no network
   const builds = cat.builds.filter((b) => b.platforms[plat]);
   const sel = String(selector || "").trim();
@@ -1331,7 +1413,7 @@ export function resolveReleaseChannel(explicit?: string, env: Record<string, str
 }
 
 /** The PRO download URL for a platform, version selector and channel. */
-export function proDownloadUrl(baseUrl: string, plat: "windows" | "linux", version?: string, channel: ReleaseChannel = "stable"): string {
+export function proDownloadUrl(baseUrl: string, plat: "windows" | "linux" | "macos", version?: string, channel: ReleaseChannel = "stable"): string {
   let u = `${baseUrl.replace(/\/$/, "")}/api/v1/download/pro?platform=${plat}`;
   if (version) u += `&version=${encodeURIComponent(version)}`;
   // An exact pin overrides the channel on the server; sending it anyway lets the server report
@@ -1366,8 +1448,8 @@ export interface ProDownloadOptions {
  */
 export async function proEnsureBinary(licenseKey: string, opts: ProDownloadOptions = {}): Promise<string> {
   const baseUrl = (opts.apiBase || process.env.CLEARCOTE_LICENSE_API || "https://www.clearcotelabs.com").replace(/\/$/, "");
-  const plat = process.platform === "win32" ? "windows" : process.platform === "linux" ? "linux" : null;
-  if (!plat) throw new Error("Clearcote PRO ships Windows x64 and Linux x64 only.");
+  const plat = proPlatformKey(); // throws on an Intel Mac: the macOS build is Apple Silicon only
+  if (!plat) throw new Error("Clearcote PRO ships Windows x64, Linux x64 and macOS arm64 only.");
 
   const channel = resolveReleaseChannel(opts.releaseChannel);
   const proUrl = proDownloadUrl(baseUrl, plat, opts.version, channel);
@@ -1398,15 +1480,15 @@ export async function proEnsureBinary(licenseKey: string, opts: ProDownloadOptio
   const rel: ResolvedRelease = {
     tag: meta.tag || `pro-${meta.version || ""}`,
     version: meta.version || "",
-    asset: meta.asset || `clearcote-pro-${meta.version || ""}-${plat}-x64.${plat === "windows" ? "zip" : "tar.xz"}`,
+    asset: meta.asset || `clearcote-pro-${meta.version || ""}-${plat}-${plat === "macos" ? "arm64" : "x64"}.${plat === "linux" ? "tar.xz" : "zip"}`,
     url: meta.url,
     sha256: meta.sha256,
     exeSha256: meta.exe_sha256 || "",
     size: meta.size || 0,
     os: process.platform,
-    archive: (meta.archive as "zip" | "tar.xz") || (plat === "windows" ? "zip" : "tar.xz"),
-    binary: meta.binary || (plat === "windows" ? "chrome.exe" : "chrome"),
-    assetGlob: `${plat}-x64`,
+    archive: (meta.archive as "zip" | "tar.xz") || (plat === "linux" ? "tar.xz" : "zip"),
+    binary: meta.binary || (plat === "windows" ? "chrome.exe" : plat === "macos" ? "Chromium" : "chrome"),
+    assetGlob: `${plat}-${plat === "macos" ? "arm64" : "x64"}`,
     unpinned: false, // pinned -> sha256-only verify (no GPG), like the free pin
   };
 
@@ -1419,11 +1501,45 @@ export async function proEnsureBinary(licenseKey: string, opts: ProDownloadOptio
 }
 
 /**
+ * Refuse a binary this OS has no build for -- but never one the caller named. An existing
+ * `executablePath` / CLEARCOTE_BINARY is theirs to run on any OS (this used to throw on macOS even
+ * when handed one, while telling the caller to pass executablePath). macOS has a native PRO build
+ * (Apple Silicon), which the PRO download resolves itself.
+ */
+export function ensureRunnableHere(exe: string): void {
+  if (exe && existsSync(exe)) return;
+  let pro: string | null = null;
+  try {
+    pro = proPlatformKey();
+  } catch {
+    /* an Intel Mac: no build for this CPU */
+  }
+  if (platformRelease() === undefined && pro === null) {
+    throw new Error(
+      `Clearcote ${RELEASE.version} ships Windows x64 and Linux x64 binaries — there is no build for '${process.platform}'.\n` +
+        `Run on Windows or Linux, or pass executablePath to a compatible binary.\n` +
+        `(The binary downloaded and verified fine; it is cached at: ${exe})`
+    );
+  }
+}
+
+/**
  * Ensure the Clearcote binary is present and verified; return the path to chrome.exe.
  * Cached per release tag, so subsequent calls are instant.
  */
 export async function ensureBinary(opts: DownloadOptions = {}): Promise<string> {
   const cacheRoot = opts.cacheDir || defaultCacheRoot();
+  if (platformRelease() === undefined) {
+    // Fail before downloading a build that cannot run here (this used to fetch the ~245 MB Windows
+    // zip on a Mac, then refuse it).
+    const hint = process.platform === "darwin"
+      ? "On an Apple Silicon Mac, set a license key (CLEARCOTE_LICENSE_KEY) for the native PRO build, or use the Docker image (docker: true). "
+      : "";
+    throw new Error(
+      `The free Clearcote build ships Windows x64 and Linux x64 binaries — there is none for '${process.platform}'. ` +
+        `${hint}Or pass executablePath to a compatible binary.`,
+    );
+  }
 
   let rel: ResolvedRelease;
   if (autoUpdateRequested(opts.autoUpdate)) {
@@ -1457,7 +1573,7 @@ export function listCachedBuilds(cacheDir: string = defaultCacheRoot()): Array<{
     if (!e.isDirectory()) continue;
     const base = path.join(cacheDir, e.name);
     if (!existsSync(path.join(base, ".verified"))) continue;
-    const exe = findFile(path.join(base, "browser"), process.platform === "win32" ? "chrome.exe" : "chrome");
+    const exe = findFile(path.join(base, "browser"), process.platform === "win32" ? "chrome.exe" : process.platform === "darwin" ? "Chromium" : "chrome");
     if (!exe) continue;
     out.push({ tag: e.name, path: exe, mtime: statSync(base).mtimeMs });
   }

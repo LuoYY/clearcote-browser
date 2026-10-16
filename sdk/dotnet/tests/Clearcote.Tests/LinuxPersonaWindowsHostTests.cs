@@ -81,7 +81,8 @@ public class LinuxPersonaWindowsHostTests : IDisposable
         Assert.Empty(Codes(new FingerprintOptions { Platform = "windows", Fingerprint = "17" }));
         Assert.Empty(Codes(new FingerprintOptions { Fingerprint = "17" }));   // no platform: the host's own
         Assert.Empty(Codes(new FingerprintOptions { Platform = "linux", Fingerprint = "17" }, "linux"));
-        Assert.Empty(Codes(new FingerprintOptions { Platform = "linux", Fingerprint = "17" }, "macos"));
+        // a Mac gets the macOS font warning for any non-macOS claim (MacosNativeTests), never this one
+        Assert.DoesNotContain(LaunchWarnings.LinuxPersonaWindowsHost, Codes(new FingerprintOptions { Platform = "linux", Fingerprint = "17" }, "macos"));
     }
 
     [Fact]

@@ -68,6 +68,41 @@ export function platformRelease(plat: NodeJS.Platform | string = process.platfor
   return PLATFORMS[plat];
 }
 
+/**
+ * process.platform -> the PRO catalog / /download/pro `platform` key. Wider than PLATFORMS: macOS has
+ * a native PRO build (Apple Silicon, a Chromium.app bundle) but no free pinned release, so it is here
+ * and not there. The PRO build is resolved by the site at run time, so there is nothing to pin for it.
+ */
+export const PRO_PLATFORMS: Record<string, "windows" | "linux" | "macos"> = { win32: "windows", linux: "linux", darwin: "macos" };
+
+/** CPU architectures the native macOS PRO build runs on. arm64 only: an Intel Mac (or a Node running
+ * under Rosetta, which reports x64) uses the Docker image instead. */
+export const MACOS_ARCHES: readonly string[] = ["arm64"];
+
+/** Indirection so tests can fake the CPU (process.arch is read-only). */
+export const hostArch = { get: (): string => process.arch };
+
+/**
+ * The PRO download platform key for an OS ("windows" / "linux" / "macos"), or null if there is no
+ * PRO build for it. A macOS host that is not Apple Silicon throws: the build exists, just not for this
+ * CPU, and "unsupported OS" would send the caller looking in the wrong place.
+ */
+export function proPlatformKey(plat: string = process.platform, arch: string = hostArch.get()): "windows" | "linux" | "macos" | null {
+  const key = PRO_PLATFORMS[plat] ?? null;
+  if (key === "macos" && !MACOS_ARCHES.includes(arch)) {
+    throw new Error(
+      `The native macOS Clearcote PRO build is for Apple Silicon (arm64) only; this Mac reports ${arch || "an unknown CPU"}. ` +
+        "Use the Docker image instead (launch({ docker: true })), or run on an Apple Silicon Mac.",
+    );
+  }
+  return key;
+}
+
+/** True on an Apple Silicon Mac, where the native PRO build runs. */
+export function nativeMacosSupported(plat: string = process.platform, arch: string = hostArch.get()): boolean {
+  return plat === "darwin" && MACOS_ARCHES.includes(arch);
+}
+
 // The pin for the CURRENT platform. Falls back to the Windows entry on an unsupported OS so the
 // existing error messaging still has a version to quote. Most code uses this; the download/guard
 // paths branch on platformRelease() to reject unsupported OSes.
@@ -106,7 +141,7 @@ export interface CatalogBuild {
   version: string;
   tier: Tier;
   tag: string;
-  platforms: Partial<Record<"windows" | "linux", CatalogPlatform>>;
+  platforms: Partial<Record<"windows" | "linux" | "macos", CatalogPlatform>>;
 }
 export interface Catalog {
   schema: number;

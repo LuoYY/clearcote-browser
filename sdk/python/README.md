@@ -8,11 +8,15 @@ The verified Clearcote binary is **auto-downloaded and SHA-256 checked** on firs
 no zips or paths to manage. Or run the same code on a hosted Clearcote browser with
 `launch(cloud=True)`: see [Local or cloud](#local-or-cloud).
 
-> **Platform:** Clearcote ships **Windows x64** and **Linux x64** binaries; `launch()` runs on both
-> and the SDK auto-downloads the right one for your OS. On Linux the persona is Linux-native (Linux
-> GPU/voices/audio-device values) and DRM uses the Linux CDM. There is no native macOS build yet
-> ([roadmap](../../ROADMAP.md)): on macOS, `launch()` runs the [Docker image](../../docker/README.md) through
-> Docker Desktop instead (SDK 0.40.0+; `docker=True` or `CLEARCOTE_DOCKER=1` does the same on any OS). On a minimal Linux host, install the browser's runtime libs (e.g.
+> **Platform:** Clearcote ships **Windows x64** and **Linux x64** binaries, plus a **macOS arm64** (Apple
+> Silicon) PRO build; `launch()` runs on all of them and the SDK auto-downloads the right one for your OS. On Linux the persona is Linux-native (Linux
+> GPU/voices/audio-device values) and DRM uses the Linux CDM. On an Apple Silicon Mac
+> with a licence key, `launch()` runs the native macOS PRO build (a `Chromium.app`, unsigned: the SDK clears its
+> quarantine flag and passes `--use-mock-keychain`). Its fonts and canvas text metrics stay the Mac's own, so keep
+> `platform="macos"` (the default there); another platform warns unless a `fingerprint_profile` captured on that OS
+> supplies them. Without a licence key (the free build has no macOS binary) or on an Intel Mac, `launch()` runs the
+> [Docker image](../../docker/README.md) through Docker Desktop instead (SDK 0.40.0+; `docker=True` or
+> `CLEARCOTE_DOCKER=1` does the same on any OS, a licensed Mac included). On a minimal Linux host, install the browser's runtime libs (e.g.
 > `apt-get install -y libnss3 libnspr4 libgbm1 libasound2 libatk1.0-0 libatk-bridge2.0-0 libcups2
 > libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libxfixes3 libxext6 libpango-1.0-0
 > libcairo2 libx11-6 libxcb1 libexpat1 libdbus-1-3`) and pass `args=["--no-sandbox"]` (or

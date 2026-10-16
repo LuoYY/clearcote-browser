@@ -1,16 +1,18 @@
 """launch() on macOS: run the Clearcote Docker image and connect to it.
 
-There is no native Clearcote build for macOS. Rather than fail there, ``launch()`` starts the
+The free Clearcote build has no macOS binary (the native macOS build is PRO-only and Apple Silicon
+only). Rather than fail there, ``launch()`` starts the
 published Clearcote image (``teamflatearth/clearcote:sdk-<this SDK's version>``, a linux/amd64 image
 that Docker Desktop runs on Intel and Apple silicon alike), waits for its CDP endpoint, connects to it
 with Playwright and returns the same Playwright ``Browser`` a local launch returns. ``close()``
 disconnects and stops the container; nothing is left running.
 
 When it applies:
-  * ``docker=False`` (or ``CLEARCOTE_DOCKER=0``) turns it off: launch() behaves as before, which on
-    macOS means "pass executable_path= a compatible binary".
+  * ``docker=False`` (or ``CLEARCOTE_DOCKER=0``) turns it off: launch() runs a local binary, which on
+    macOS means the native PRO build (a licence key, Apple Silicon) or ``executable_path=``.
   * ``docker=True`` (or ``CLEARCOTE_DOCKER=1``) turns it on on any OS that has Docker.
-  * Unset: on for macOS, unless the caller named a binary (``executable_path`` / CLEARCOTE_BINARY).
+  * Unset: on for macOS, unless the caller named a binary (``executable_path`` / CLEARCOTE_BINARY) or
+    holds a licence key on an Apple Silicon Mac -- that runs the native macOS PRO build instead.
   * ``CLEARCOTE_TEST_ONLY_ASSUME_MACOS=1`` makes this module treat the host as macOS. It exists so the
     real Docker path can be exercised end to end on a Linux or Windows machine; it is not an option.
 
@@ -101,7 +103,7 @@ _OFF_HINT = ("To launch without Docker, pass docker=False (or set CLEARCOTE_DOCK
 
 
 class DockerUnavailableError(RuntimeError):
-    """launch() needs Docker on this host (macOS has no native Clearcote build) and it is missing or
+    """launch() needs Docker on this host (a Mac without the native PRO build) and it is missing or
     not running."""
 
 
@@ -151,7 +153,22 @@ def docker_requested(docker=None, kwargs=None) -> bool:
         return True
     if os.environ.get("CLEARCOTE_BINARY"):
         return False
-    return host_is_macos()
+    if not host_is_macos():
+        return False
+    # An Apple Silicon Mac with a licence key runs the native PRO build; the free build has no macOS
+    # binary, and the PRO one no Intel build, so every other Mac keeps the image.
+    return not native_macos_licensed(kwargs)
+
+
+def native_macos_licensed(kwargs=None) -> bool:
+    """Whether this host runs the native macOS PRO build: a real Apple Silicon Mac (not the test-only
+    assume-macOS switch, which exists to exercise the Docker path) with a licence key."""
+    from ._license import resolve_license_key
+    from .release import native_macos_supported
+
+    if not native_macos_supported(sys.platform):
+        return False
+    return bool(resolve_license_key((kwargs or {}).get("license_key")))
 
 
 def default_image() -> str:
@@ -185,7 +202,7 @@ def container_env(kwargs: dict) -> dict:
     if unknown:
         raise ValueError(
             f"{unknown[0]} is not available when launch() runs Clearcote in Docker (there is no native "
-            f"macOS build). The container takes: {', '.join(sorted(set(ACCEPTED) - set(SDK_SIDE)))}. "
+            f"macOS build here). The container takes: {', '.join(sorted(set(ACCEPTED) - set(SDK_SIDE)))}. "
             + _OFF_HINT)
     env = {}
     for k, name in _STR_ENV.items():
@@ -274,13 +291,13 @@ def docker_info() -> tuple:
     exe = _docker_cli()
     if not exe:
         raise DockerUnavailableError(
-            "Clearcote has no native macOS build, so on macOS launch() runs it in Docker, but the "
+            "Clearcote has no native macOS build here (that needs a licence key and an Apple Silicon Mac), so on macOS launch() runs it in Docker, but the "
             f"`docker` command was not found. Install Docker Desktop ({INSTALL_URL}), start it, and try "
             "again. " + _OFF_HINT)
     code, out, err = _run([exe, "info", "--format", "{{.ServerVersion}} {{.Architecture}}"], timeout=30)
     if code != 0:
         raise DockerUnavailableError(
-            "Clearcote has no native macOS build, so on macOS launch() runs it in Docker, but Docker is "
+            "Clearcote has no native macOS build here (that needs a licence key and an Apple Silicon Mac), so on macOS launch() runs it in Docker, but Docker is "
             f"not running (`docker info`: {_first_line(err) or f'exit {code}'}). Start Docker Desktop and "
             "try again. " + _OFF_HINT)
     parts = (out or "").split()
@@ -927,7 +944,7 @@ def start_container(kwargs: dict, quiet=False) -> dict:
         argv += ["-v", f"{cache_volume()}:/opt/xdg-cache"]
     argv.append(image)
     if not quiet:
-        sys.stderr.write(f"[clearcote] no native macOS build: starting the Clearcote Docker image {image}\n")
+        sys.stderr.write(f"[clearcote] no native macOS build here (it needs a licence key and Apple Silicon): starting the Clearcote Docker image {image}\n")
         sys.stderr.flush()
     try:
         cid = _create_started(exe, argv, env, secrets, image, seccomp)
