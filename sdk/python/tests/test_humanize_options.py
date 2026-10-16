@@ -140,7 +140,8 @@ def test_on_fallback_for_a_hidden_forced_fill_and_a_non_text_press(fast, mode):
     mode.run(page.fill, "#t", "x", force=True)
     mode.run(page.press, "#b", "Enter")
     assert [(e["api"], e["reason"]) for e in events] == [
-        ("Page.fill", "forced on a hidden target"), ("Page.press", "not a visible text field")]
+        # lane D: a button press focuses by Tab / a focus click; this simulator has neither a Tab order nor page.focus
+        ("Page.fill", "forced on a hidden target"), ("Page.press", "no humane focus route (out of Tab reach, no page.focus)")]
     assert [n[0] for n in sim.native] == ["fill", "press"]
 
 

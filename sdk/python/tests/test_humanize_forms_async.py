@@ -1459,12 +1459,26 @@ def test_frame_locators_take_the_frame_route_and_go_native_with_a_report_when_it
 
 
 # ------------------------------------------------------------------- press / type / range targets
-def test_press_on_a_button_goes_to_playwright_without_a_click(fast):
+def test_press_on_a_button_is_never_clicked_first(fast):
+    # Lane D (SC 232): a button out of Tab reach (this simulator has no Tab order) gets the pointer over
+    # it and Playwright's focus -- reported --, then a HELD key; never a click (it activated the button a
+    # second time) and never Playwright's 0 ms focus-and-press.
     async def go():
-        p = await attached(_btn())
+        p = Page(_btn())
+        seen = []
+
+        async def focus(sel, **kw):
+            p.native.append(("focus", sel, kw))
+            p.focused = p.by_sel[sel]
+        p.focus = focus
+        await H.attach_humanize(None, p, humanize={"on_fallback": seen.append}, seed="forms-unit")
         await p.press("#b", "Enter")
-        assert [n[:3] for n in p.native] == [("press", "#b", "Enter")]
-        assert not kinds(p, "click", "down", "press"), "a click first activated the button a second time"
+        assert [n[:2] for n in p.native] == [("focus", "#b")]
+        assert not kinds(p, "click", "down"), "a click first activated the button a second time"
+        presses = kinds(p, "press")
+        assert [e[1] for e in presses] == ["Enter"] and presses[0][2] >= 45
+        assert kinds(p, "move"), "the pointer goes to the button"
+        assert seen and seen[0]["api"] == "Page.press"
     run(go())
 
 

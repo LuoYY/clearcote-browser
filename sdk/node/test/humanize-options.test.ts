@@ -112,7 +112,8 @@ describe("fallback report and strict mode", () => {
     await f.page.fill("#t", "x", { force: true });
     await f.page.press("#b", "Enter");
     expect(events.map((e) => [e.api, e.reason])).toEqual([
-      ["page.fill", "forced on a hidden target"], ["page.press", "not a visible text field"]]);
+      // lane D: a button press focuses by Tab / a focus click; this fake cannot describe its focusables
+      ["page.fill", "forced on a hidden target"], ["page.press", "the target cannot be described (no box)"]]);
     expect(f.natives.map((n) => n.m)).toEqual(["fill", "press"]);
   }, SLOW);
 

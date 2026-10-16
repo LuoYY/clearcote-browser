@@ -67,6 +67,11 @@ from ._hzoptions import (
     tempo_of as _hz_tempo, typo_rate_for as _hz_typo_rate,
 )
 from . import _frames as _fr
+from ._keys import (
+    BLANK_POINT, FOCUSABLE, SEARCH_SLIP_RATE, SELECTION_STATE, TAB_DISTANCE, WORD_FIX_RATE, flight_ms,
+    modifier_lag_ms, modifier_lead_ms, plan_gap, plan_repeat, split_chord, submit_pause_ms, tab_pause_ms,
+    typing_traits,
+)
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk as _paced_walk
 
 # IIFE so it runs both as an add_init_script source AND when passed to page.evaluate().
@@ -453,6 +458,27 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     _stock_mouse = {n: getattr(page.mouse, n, None) for n in _MOUSE_METHODS}
     _stock_kb = {n: getattr(page.keyboard, n, None) for n in _KB_METHODS}
 
+    # The typing identity (WPM, bigram factors, Tab preference, typo rate, pauses), from a salted side
+    # stream of the persona seed (_keys.typing_traits): the persona's own draws are unchanged.
+    traits = typing_traits(persona.seed)
+    # Keys the CALLER holds through keyboard.down (key -> when it went down): a chord does not press a
+    # modifier that is already down, typing does not press Shift under a caller's Shift, and the key's
+    # keyup waits out a human hold (hkb_down / hkb_up).
+    held_keys = {}
+
+    def _kdwell():
+        """A keydown->keyup hold: lane B's key_dwell (log-normal around the persona's median, preset-scaled)."""
+        return key_dwell(persona)
+
+    def _tab_pref():
+        v = getattr(persona, "tab_pref", None)
+        return float(v) if isinstance(v, (int, float)) else traits.tab_pref
+
+    def _typo_rate():
+        """Per-character slip rate: lane A's typo_rate option, else lane B's typo_rate(persona)
+        (CLEARCOTE_HUMANIZE_TYPO_RATE when set, else the persona's 0.5-4 %)."""
+        return _hz_typo_rate(page, lambda: typo_rate(persona))
+
     # Tracked cursor position so each move continues from where the last one ended.
     # Seed at a plausible on-page spot (not 0,0) so the first glide doesn't start in the corner.
     # "placed" records whether the REAL pointer has been moved on this page yet: until it has, the
@@ -511,6 +537,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         Continuous (starts at the tracked position, lands exactly on target)."""
         _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle, held=held))
         st["pos"] = (x, y)
+        st["typed"] = None   # the hand left the keyboard: no submit / Tab pause owed (_after_typing)
 
     # --- Engine real-trajectory routing (PRO) --------------------------------
     # Route point-to-point moves/clicks through the browser engine's
@@ -1133,12 +1160,16 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         """Emit one character with a human keydown->keyup DWELL. keyboard.press's `delay` IS the hold
         (keyboard.type's delay is only inter-key flight). Fall back to type() for chars press can't map."""
         try:
-            native_kb_press(ch, delay=key_dwell(persona))
+            native_kb_press(ch, delay=_kdwell())
+            return
         except Exception:  # noqa: BLE001
-            try:
-                native_kb_type(ch)
-            except Exception:  # noqa: BLE001
-                pass
+            pass
+        # Outside the catch: in strict mode lane A's report raises, and that must reach the caller.
+        _fallback("Keyboard.press", "insertText: a character keyboard.press cannot map")
+        try:
+            native_kb_type(ch)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _active_value():
         """The focused field's current value, read in the isolated world (None if unknown)."""
@@ -1147,13 +1178,13 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         except Exception:  # noqa: BLE001
             return None
 
-    def _flight_s():
-        # gaussian inter-key cadence (a realistic distribution, not a uniform band)
-        return max(0.025, random.gauss(0.085, 0.045))
+    def _flight_s(prev=None, ch=None):
+        """One keyup->keydown flight of the persona's cadence (_keys.flight_ms), in seconds."""
+        return flight_ms(traits, prev, ch, random.random) / 1000.0
 
     def _backspaces(n):
         for k in range(n):
-            native_kb_press("Backspace", delay=key_dwell(persona))
+            native_kb_press("Backspace", delay=_kdwell())
             if k < n - 1:
                 time.sleep(_rand(70, 150) / 1000.0)
 
@@ -1163,14 +1194,43 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return None
         return len(now) - len(before)
 
-    def _do_typo(text, i, tp):
+    def _restore(target):
+        """Bring the focused field back to ``target`` (what it held before a slip) from wherever a word
+        delete left it: Backspace to the common prefix, then type the rest. Nothing when unreadable."""
+        got = _active_value()
+        if got is None or got == target:
+            return
+        k = 0
+        while k < min(len(got), len(target)) and got[k] == target[k]:
+            k += 1
+        if len(got) - k > 64 or len(target) - k > 64:
+            return
+        if len(got) > k:
+            _backspaces(len(got) - k)
+            time.sleep(_rand(80, 200) / 1000.0)
+        prev = None
+        for c in target[k:]:
+            if prev is not None:
+                time.sleep(_flight_s(prev, c))
+            _emit_key(c)
+            prev = c
+
+    def _word_delete():
+        """The word-delete chord the ENGINE's editing honours: Alt+Backspace on macOS, else Ctrl."""
+        _press_key(("Alt" if _host_platform() == "macos" else "Control") + "+Backspace")
+
+    def _do_typo(text, i, tp, leave=False):
         """Make the planned slip at text[i] and correct it. Returns True when it already typed
-        text[i] itself (the doubled-key case), so the caller must not type it again.
+        text[i] itself (the doubled-key case) -- or left a substitution uncorrected (``leave``: a search
+        field) --, so the caller must not type it again.
 
         Only what actually LANDED is deleted: an input mask or a maxlength can swallow the wrong key,
         and a Backspace pressed for a key that never arrived deletes a real character (the
         letter-typo-in-a-numeric-mask failure). Measured before and after the slip, in the isolated
-        world, one read each -- typos are ~2 % of keys, so this costs nearly nothing."""
+        world, one read each -- typos are 0.5-4 % of keys, so this costs nearly nothing.
+
+        A substitution noticed inside a word is fixed with the word-delete chord and the word typed
+        again in WORD_FIX_RATE of the cases (when the field can be read to put it back exactly)."""
         before = _active_value()
         kind = tp["kind"]
         if kind == "sub":
@@ -1178,12 +1238,25 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             got = _landed(before, _active_value())
             if got is not None and got <= 0:
                 return False                     # swallowed: nothing to correct
+            if leave:
+                return True                      # the slip stays: the wrong key took this place
             typed = 1
+            prev = tp["wrong"]
             for c in text[i + 1:i + 1 + tp.get("late", 0)]:   # late notice: a key or two more
-                time.sleep(_flight_s())
+                time.sleep(_flight_s(prev, c))
                 _emit_key(c)
+                prev = c
                 typed += 1
             time.sleep(_rand(140, 340) / 1000.0)  # noticing
+            ws = max(text.rfind(" ", 0, i), text.rfind("\n", 0, i)) + 1
+            # a WORD (letters only: no word delete in a code, a zip or a number), two keys of it on screen
+            if (before is not None and i - ws + typed >= 2 and native_kb_down is not None
+                    and all(c.isalpha() for c in text[ws:i + 1]) and random.random() < WORD_FIX_RATE):
+                _word_delete()
+                time.sleep(_rand(120, 260) / 1000.0)
+                _restore(before)
+                time.sleep(_rand(80, 200) / 1000.0)
+                return False
             got = _landed(before, _active_value())
             _backspaces(typed if got is None else max(0, min(typed, got)))
             time.sleep(_rand(80, 200) / 1000.0)
@@ -1201,7 +1274,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return True
         if kind == "swap":
             _emit_key(text[i + 1])
-            time.sleep(_flight_s())
+            time.sleep(_flight_s(text[i + 1], text[i]))
             _emit_key(text[i])
             got = _landed(before, _active_value())
             time.sleep(_rand(140, 340) / 1000.0)
@@ -1220,27 +1293,40 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         except Exception:  # noqa: BLE001
             return None
 
-    def _human_type_text(text, field=None, typos=True):
+    def _human_type_text(text, field=None, typos=True, floor_ms=0.0, exact=True):
         """Type text key-by-key with human timing. Each char goes through Playwright's native
         keyboard (trusted), so this stays isTrusted=True.
+
+        Cadence (_keys.plan_gap, the same planner in Node and .NET): the persona's WPM sets a base
+        flight, scaled by how the hand travels between the two keys (same finger 1.5-1.9x, same hand
+        1.1-1.3x, the other hand 0.85-1.0x, a two-row reach 1.15x) and log-normal noise, plus a pause
+        before a new word and after punctuation, the old whitespace pause and a 6 % thinking pause.
+        ``floor_ms`` (the caller's `delay`) is the shortest gap between two keys.
 
         Capitals and shifted symbols are typed the way a person types them: ShiftLeft goes down a
         moment before the key and comes up just after it, held across a run of them. Playwright's
         press("A") alone sent the key with shiftKey=false and no Shift key at all (measured on r28
-        with "Ab!") -- input no keyboard produces.
+        with "Ab!") -- input no keyboard produces. Under a Shift the caller holds (keyboard.down) no
+        second Shift is pressed.
 
-        Fat-finger typos are planned by _forms.plan_typo and never happen where a slip is a failure
-        rather than a slip (passwords, e-mail, numbers, phone numbers, URLs, one-time codes)."""
+        Fat-finger typos are planned by _forms.plan_typo at the persona's rate and never happen where a
+        slip is a failure rather than a slip (passwords, e-mail, numbers, phone numbers, URLs, one-time
+        codes). ``exact`` False (type / press_sequentially / keyboard.type, never fill) lets a
+        substitution in a search field stay uncorrected (SEARCH_SLIP_RATE)."""
         n = len(text)
         shift = False
+        ext_shift = "Shift" in held_keys
         roll_rate = rollover_rate(persona)
-        rate = _hz_typo_rate(page, lambda: typo_rate(persona)) if typos else 0.0
-        allow = rate > 0 and typos_allowed(_typing_field(field))
+        rate = _typo_rate() if typos else 0.0
+        fld = _typing_field(field) if rate > 0 else None
+        allow = rate > 0 and typos_allowed(fld)
+        search = bool(allow and not exact and fld and (fld.get("type") or "").lower() == "search")
+        floor = max(0.0, float(floor_ms or 0.0))
         i = 0
         try:
             while i < n:
                 ch = text[i]
-                need = _needs_shift(ch)
+                need = _needs_shift(ch) and not ext_shift
                 if need and not shift and native_kb_down and native_kb_up:
                     native_kb_down("Shift")
                     shift = True
@@ -1251,18 +1337,21 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                     tp = plan_typo(text, i, random, rate)
                     if tp is not None:
                         typo = True
+                        leave = search and tp["kind"] == "sub" and random.random() < SEARCH_SLIP_RATE
                         try:
-                            consumed = _do_typo(text, i, tp)
-                        except Exception:  # noqa: BLE001
-                            pass
+                            consumed = _do_typo(text, i, tp, leave)
+                        except Exception as e:  # noqa: BLE001
+                            if _is_strict(e):
+                                raise
                 # ROLLOVER: the next key goes down before this one comes up, the way people type fast
                 # pairs. One press() per character never overlaps (0 of 32 keydowns, measured on
-                # r32/r33), a keystroke-dynamics tell. Unshifted single-key pairs only.
+                # r32/r33), a keystroke-dynamics tell. Unshifted single-key pairs only; never under a
+                # caller's delay floor (the next key would come sooner than asked).
                 nxt = text[i + 1] if i + 1 < n else None
-                d1 = key_dwell(persona)
+                d1 = _kdwell()
                 if (nxt is not None and not typo and not shift and native_kb_down and native_kb_up
                         and ch in _ROLL_KEYS and nxt in _ROLL_KEYS and ch != nxt and d1 - 8 >= 12
-                        and random.random() < roll_rate):
+                        and floor <= 0 and random.random() < roll_rate):
                     overlap = _rand(12, min(55, d1 - 8))
                     try:
                         native_kb_down(ch)
@@ -1270,7 +1359,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                         native_kb_down(nxt)
                         time.sleep(overlap / 1000.0)
                         native_kb_up(ch)
-                        time.sleep(max(5.0, key_dwell(persona) - overlap) / 1000.0)
+                        time.sleep(max(5.0, _kdwell() - overlap) / 1000.0)
                         native_kb_up(nxt)
                     except Exception:  # noqa: BLE001
                         for k in (ch, nxt):
@@ -1284,20 +1373,17 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 elif not consumed:
                     try:
                         _emit_key(ch)
-                    except Exception:  # noqa: BLE001
+                    except Exception as e:  # noqa: BLE001
+                        if _is_strict(e):
+                            raise
                         break
                 if shift and (i == n - 1 or not _needs_shift(text[i + 1])):
                     time.sleep(_shift_lag_s())
                     native_kb_up("Shift")
                     shift = False
                 if i < n - 1:
-                    # gaussian inter-key cadence (a realistic distribution, not a uniform band)
-                    d = max(0.025, random.gauss(0.085, 0.045))   # ~85ms +- 45ms, floored at 25ms
-                    if ch in " \t\n":
-                        d += _rand(0.02, 0.10)                    # slight pause at word boundaries
-                    if random.random() < 0.06 * tempo:
-                        d += _rand(0.18, 0.45)                    # occasional thinking pause
-                    time.sleep(d * tempo)
+                    time.sleep(max(floor, plan_gap(traits, ch, text[i + 1], random.random,
+                                         getattr(persona, "tempo", 1.0), getattr(persona, "pause_scale", 1.0))) / 1000.0)
                 i += 1
         finally:
             if shift:  # never leave Shift held for the caller's next keystroke
@@ -1305,10 +1391,85 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                     native_kb_up("Shift")
                 except Exception:  # noqa: BLE001
                     pass
+            if n:
+                st["typed"] = time.monotonic()   # a following Enter / Tab waits (_after_typing)
+
+    def _after_typing(key):
+        """The pause a person makes between the last typed character and Enter (250-900 ms) or Tab
+        (120-400 ms), centred per persona, less whatever the caller already spent. Once per typed run;
+        a pointer action in between cancels it (_glide clears st["typed"])."""
+        t = st.get("typed")
+        st["typed"] = None
+        if t is None:
+            return
+        mods, k = split_chord(key)
+        if k == "Enter" and not mods:
+            ms = submit_pause_ms(traits, random.random)
+        elif k == "Tab" and set(mods) <= {"Shift"}:
+            ms = tab_pause_ms(traits, random.random)
+        else:
+            return
+        rest = ms / 1000.0 - (time.monotonic() - t)
+        if rest > 0:
+            time.sleep(rest)
+
+    def _hold_key(k, delay=None, repeat=1):
+        """One key: pressed with the persona's hold (or the caller's ``delay``); with ``repeat`` > 1 HELD
+        the way an OS auto-repeats it -- one keydown, the repeat delay (250-500 ms), then a keydown with
+        repeat=true every 25-40 ms (Playwright sends a key that is already down as an autoRepeat
+        keydown), ``repeat`` keydowns in all, then one keyup."""
+        repeat = max(1, int(repeat or 1))
+        if repeat == 1 or native_kb_down is None or native_kb_up is None:
+            for j in range(repeat):
+                native_kb_press(k, delay=delay if delay and delay > 0 else _kdwell())
+                if j < repeat - 1:
+                    time.sleep(_rand(60, 150) / 1000.0)
+            return
+        rp = plan_repeat(random.random)
+        native_kb_down(k)
+        try:
+            time.sleep(rp.first_ms / 1000.0)
+            for j in range(repeat - 1):
+                if j:
+                    time.sleep(rp.gap_ms / 1000.0)
+                native_kb_down(k)
+            time.sleep(rp.release_ms / 1000.0)
+        finally:
+            native_kb_up(k)   # never leave the key held
+
+    def _press_key(key, delay=None, repeat=1):
+        """keyboard.press, humanized: a chord ("Control+a", "ControlOrMeta+Shift+ArrowLeft") is split
+        into its modifiers and its key -- each modifier goes down in order, 40-110 ms before the next,
+        the key is held, 20-80 ms later the modifiers come up in reverse order. As one Playwright press
+        the modifier and the key went down within ~1 ms of each other. A modifier the caller already
+        holds (keyboard.down) is not pressed again. Playwright's key names are kept (ControlOrMeta is
+        resolved by Playwright, for the engine's platform)."""
+        mods, k = split_chord(key)
+        mods = [m for m in mods if m not in held_keys]
+        if not mods:
+            return _hold_key(k, delay, repeat)
+        if native_kb_down is None or native_kb_up is None:
+            return native_kb_press(key, delay=delay if delay and delay > 0 else _kdwell())
+        down = []
+        try:
+            for m in mods:
+                native_kb_down(m)
+                down.append(m)
+                time.sleep(modifier_lead_ms(random.random) / 1000.0)
+            _hold_key(k, delay, repeat)
+            time.sleep(modifier_lag_ms(random.random) / 1000.0)
+        finally:
+            for j, m in enumerate(reversed(down)):
+                if j:
+                    time.sleep(_rand(10, 40) / 1000.0)
+                try:
+                    native_kb_up(m)   # one failed keyup must not strand the others
+                except Exception:  # noqa: BLE001
+                    pass
 
     def hkb_type(text, **kw):
         _pointer_presence()
-        _human_type_text(text)
+        _human_type_text(text, floor_ms=kw.get("delay") or 0.0, exact=False)
 
     def hkb_press(key, **kw):
         """keyboard.press with the persona's hold, unless the caller specified their own.
@@ -1323,16 +1484,35 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
 
         The caller's own `delay` wins: press(key, delay=...) is the documented way to hold a key
         for a specific time (game input, long-press UI), and silently overriding it would break
-        that. Only the DEFAULT changes, from "no hold at all" to "a human hold".
-        """
+        that. Only the DEFAULT changes, from "no hold at all" to "a human hold". A chord is pressed
+        modifier first (_press_key); ``repeat=n`` holds the key through n auto-repeat keydowns; Enter
+        or Tab right after typing waits the persona's submit / Tab pause first (_after_typing)."""
         _pointer_presence()
-        if not kw.get("delay") or kw["delay"] <= 0:
-            # delay=0 is Playwright's default ("no hold"), so an explicit 0 is no different from none
-            kw["delay"] = key_dwell(persona)
-        return native_kb_press(key, **kw)
+        repeat = kw.pop("repeat", 1)
+        _after_typing(key)
+        d = kw.get("delay")
+        return _press_key(key, d if d and d > 0 else None, repeat)
+
+    def hkb_down(key):
+        """keyboard.down, tracked: the chord model and typing honour a modifier the caller holds, and
+        hkb_up gives the key at least a persona hold."""
+        _pointer_presence()
+        if key not in held_keys:
+            held_keys[key] = (time.monotonic(), _kdwell())
+        return native_kb_down(key)
+
+    def hkb_up(key):
+        t = held_keys.pop(key, None)
+        if t is not None:
+            rest = t[1] / 1000.0 - (time.monotonic() - t[0])
+            if rest > 0:
+                time.sleep(rest)   # a down() then an up() at once: no finger lifts a key in 0 ms
+        return native_kb_up(key)
 
     kb.type = hkb_type
     kb.press = hkb_press
+    if native_kb_down is not None and native_kb_up is not None:
+        kb.down, kb.up = hkb_down, hkb_up
 
     # ------------------------------------------------------- page-level targeted helpers
     # Points tried when resolving a control through the browser's hit test: a floating label or an
@@ -1551,7 +1731,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
 
     def _key(k, n=1, gap=(60, 150)):
         for j in range(n):
-            native_kb_press(k, delay=key_dwell(persona))
+            native_kb_press(k, delay=_kdwell())
             if j < n - 1:
                 time.sleep(pause_ms(persona, *gap) / 1000.0)
 
@@ -1566,7 +1746,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         native_kb_down("ControlOrMeta")
         try:
             time.sleep(_rand(40, 110) / 1000.0)
-            native_kb_press("a", delay=key_dwell(persona))
+            native_kb_press("a", delay=_kdwell())
             time.sleep(_rand(20, 80) / 1000.0)
         finally:
             native_kb_up("ControlOrMeta")
@@ -1598,24 +1778,107 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     native_page_press = page.press
     native_page_dblclick = page.dblclick
 
-    def _click_into(selector, timeout):
-        """Make ``selector`` the focus the way a person does (a click), unless it already is. Only
-        text-entry controls are clicked; for anything else, and when the click did not actually put
-        the caret there (an overlay took it), the caller goes native."""
+    def _tab_distance(info, selector=None):
+        """Where the control ``info`` (described, with its hit-test node) sits in the page's Tab order
+        relative to the focused element (_keys.TAB_DISTANCE, read in the isolated world): {dist, fromText,
+        focused, activatable, text, ...}, or None when either is outside the order or it cannot be read."""
+        if not info or info.get("node") is None or not info.get("rect"):
+            return None
+        x, y, w, h = info["rect"]
+        arg = {"x": x, "y": y, "width": w, "height": h}
+        if isinstance(selector, str) and selector:
+            arg["sel"] = selector
+        try:
+            return world_for(page).call_on_node(info["node"], TAB_DISTANCE, arg)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _tab_steps(d):
+        """Press Tab ``d`` times (Shift+Tab when ``d`` < 0), each with a hold, the first after the
+        persona's Tab pause when it follows typing, the rest 110-260 ms apart (the eye follows the
+        focus ring)."""
+        key = "Tab" if d > 0 else "Shift+Tab"
+        for j in range(abs(d)):
+            if j == 0:
+                _after_typing(key)
+            else:
+                time.sleep(_rand(110, 260) / 1000.0)
+            _press_key(key)
+
+    def _tab_into(loc, info, selector=None, need_empty=False, force=False):
+        """Tab into the control ``info`` instead of clicking it, the way a person moves between
+        adjacent fields: when focus sits in a TEXT field 1-3 Tab stops before it (or 1 after: Shift+Tab),
+        in the persona's share of cases (60-85 %, _keys.typing_traits.tab_pref). ``force``: any focused
+        element, up to 3 stops either way, no roll (a button a press goes to). ``need_empty``: only an
+        empty field -- Tab selects a field's text, and type() appends where a click leaves the caret.
+        True once focus is verified there; False (nothing pressed, or focus went elsewhere) = click."""
+        if native_kb_press is None or (need_empty and info and info.get("value")):
+            return False
+        td = _tab_distance(info, selector)
+        if not td or td.get("dist") is None or td.get("focused"):
+            return False
+        d = td["dist"]
+        if force:
+            if not (1 <= abs(d) <= 3):
+                return False
+        else:
+            if not td.get("fromText") or not (1 <= d <= 3 or d == -1) or random.random() >= _tab_pref():
+                return False
+        _tab_steps(d)
+        time.sleep(_rand(40, 120) / 1000.0)
+        return _focused(loc)
+
+    def _click_into(selector, timeout, tab=True):
+        """Make ``selector`` the focus the way a person does -- Tab from the field before it (_tab_into)
+        or a click --, unless it already is. Only text-entry controls are clicked; for anything else, and
+        when the click did not actually put the caret there (an overlay took it), the caller goes
+        native. Tab only into an EMPTY field: type() appends at the caret, and Tab selects the text."""
         loc = page.locator(selector).first
         if _focused(loc):
             return
         te = _text_entry(loc, timeout, selector)
         if te is None:
             raise _Native("not a visible text field")
+        if tab and _tab_into(loc, te[1], selector, need_empty=True):
+            return
         if not _focus_click(te[0], _proven_point(*te), loc, selector) or not _focused(loc):
             raise _Native("the click did not put the caret in the field")
         time.sleep(_rand(40, 120) / 1000.0)
 
+    def _focus_target(selector, timeout):
+        """Give ``selector`` -- any focusable element, a button or a link as well as a field -- the
+        keyboard focus the way a person does. Tab when it is 1-3 stops from the focused element (always
+        for something a click would ACTIVATE: a button, a link, a checkbox); otherwise a humanized click
+        (glide + press) for what a click only focuses (a field, a tabindex container). True when focus
+        is verified there. False for an activatable target out of Tab reach: the pointer has glided
+        onto it and the caller gives it the focus natively (a reported fallback), never the 0 ms
+        native press."""
+        loc = page.locator(selector).first
+        if _focused(loc):
+            return True
+        box = _box_of(loc, timeout, selector=selector)
+        info = _describe(box, FOCUSABLE) if box else None
+        if info is None:
+            raise _Native("the target cannot be described (no box)")
+        td = _tab_distance(info, selector)
+        act = td is None or bool(td.get("activatable"))   # unknown: never risk an activating click
+        if td and td.get("dist") is not None and 1 <= abs(td["dist"]) <= 3:
+            if act or random.random() < _tab_pref():
+                if _tab_into(loc, info, selector, force=True):
+                    return True
+        if not act and not info.get("disabled"):
+            if _focus_click(box, _proven_point(box, info), loc, selector) and _focused(loc):
+                time.sleep(_rand(40, 120) / 1000.0)
+                return True
+            raise _Native("the focus click did not focus it")
+        x, y = click_point(box, st["pos"], persona)
+        _glide(float(round(x)), float(round(y)))   # the hand goes to it; the focus has to be given
+        return False
+
     def htype(selector, text, **options):
         try:
             _click_into(selector, options.get("timeout"))
-            _human_type_text(text)
+            _human_type_text(text, floor_ms=options.get("delay") or 0.0, exact=False)
             return None
         except _Native as e:
             why = str(e)
@@ -1649,11 +1912,13 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         bulk = len(want) > 200   # what the field can hold: a 300-character value cut to 5 is typed
         if bulk and native_kb_insert is None:
             return False
-        if not _focus_click(box, _proven_point(box, info) if box else None, loc, selector):
-            return False
-        time.sleep(_rand(40, 120) / 1000.0)
-        if not _focused(loc):
-            return False
+        # From the field before it, a person Tabs (persona share, focus verified); else a click.
+        if not (info is not None and _tab_into(loc, info, selector)):
+            if not _focus_click(box, _proven_point(box, info) if box else None, loc, selector):
+                return False
+            time.sleep(_rand(40, 120) / 1000.0)
+            if not _focused(loc):
+                return False
 
         def read():
             try:
@@ -1855,15 +2120,52 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         o.setdefault("click_count", 2)
         return _targeted_click(native_page_dblclick, selector, o, no_click=False, native_opts=options)
 
+    native_page_focus = getattr(page, "focus", None)
+
+    def _fallback(api, reason, selector=None):
+        """A humanized route hands this call to Playwright: lane A's report (strict mode raises
+        ClearcoteStrictError and nothing is sent; otherwise on_fallback hears it). Never swallowed."""
+        return _report_fallback(page, api, reason, selector)
+
+    def _focus_for_press(selector, timeout):
+        """Give ``selector`` the focus before a key goes to it. A text field: Tab from the field before
+        it (only when empty: Tab selects the text) or a click into it. Anything else -- a button, a
+        link, a tabindex container -- through _focus_target (Tab within 3 stops, or a click that only
+        focuses); an activatable target out of Tab reach gets the pointer over it and the focus from
+        Playwright (reported), and the key is still pressed with a human hold."""
+        loc = page.locator(selector).first
+        if _focused(loc):
+            return
+        if not loc.is_visible():
+            raise _Native("not visible")   # Playwright waits for it
+        box = _box_of(loc, timeout, selector=selector)
+        info = _describe(box)
+        if info and classify_field(info["tag"], info["type"], info["ce"]) == "text":
+            if _tab_into(loc, info, selector, need_empty=True):
+                return
+            if not _focus_click(box, _proven_point(box, info), loc, selector) or not _focused(loc):
+                raise _Native("the click did not put the caret in the field")
+            time.sleep(_rand(40, 120) / 1000.0)
+            return
+        if _focus_target(selector, timeout):
+            return
+        if native_page_focus is None:
+            raise _Native("no humane focus route (out of Tab reach, no page.focus)")
+        _fallback("Page.press", "focus: an activatable target out of Tab reach")
+        native_page_focus(selector, **({"timeout": timeout} if timeout is not None else {}))
+        time.sleep(_rand(40, 120) / 1000.0)
+
     def hpress(selector, key, **options):
+        """page.press (and Locator.press): the target gets the focus the way a person gives it
+        (_focus_for_press: never Playwright's focus-and-press in 0 ms), then the key is pressed through
+        the keyboard model -- a chord modifier first, the persona's hold (or the caller's `delay`),
+        ``repeat=n`` as OS auto-repeat, and the submit / Tab pause after typing."""
+        repeat = options.pop("repeat", 1)
         try:
-            # Click into text fields only: a press on a button or a link that is not focused yet is
-            # Playwright's (it focuses without activating); clicking it first activated it twice.
-            _click_into(selector, options.get("timeout"))
-            # The persona's hold unless the caller set a real one, for the same reason hkb_press
-            # carries one: this is the path Locator.press delegates to.
+            _focus_for_press(selector, options.get("timeout"))
+            _after_typing(key)
             d = options.get("delay")
-            native_kb_press(key, delay=d if d else key_dwell(persona))
+            _press_key(key, d if d and d > 0 else None, repeat)
             return None
         except _Native as e:
             why = str(e)
@@ -1872,7 +2174,112 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 raise
             why = "error: %s" % (e,)
         _report_fallback(page, "Page.press", why, selector)
-        return native_page_press(selector, key, **options)
+        r = None
+        for _ in range(max(1, int(repeat or 1))):
+            r = native_page_press(selector, key, **options)
+        return r
+
+    def hfocus(selector, **options):
+        """page.focus / Locator.focus: Tab or a click (_focus_target), verified; Playwright's focus for
+        an activatable target out of Tab reach (reported) and for anything the humane route cannot do."""
+        try:
+            if _focus_target(selector, options.get("timeout")):
+                return None
+            _fallback("Page.focus", "an activatable target out of Tab reach")
+        except _Native:
+            _fallback("Page.focus", "native focus")
+        except Exception as e:  # noqa: BLE001
+            if _is_timeout(e):
+                raise
+        return native_page_focus(selector, **options)
+
+    def _blur(selector, options):
+        """Locator.blur, humanized: a focused element is left the way the persona leaves fields -- Tab
+        to the next stop, or a click on a blank point beside it (_keys.BLANK_POINT; Tab when there is
+        none). True when focus is verified gone; False = Playwright's blur (nothing to blur, or the
+        humane route did not take the focus away)."""
+        loc = page.locator(selector).first
+        if not _focused(loc):
+            return False
+        if traits.blur_style == "click" and native_down is not None and native_up is not None:
+            box = _box_of(loc, options.get("timeout"), selector=selector)
+            vw, vh = _viewport()
+            pt = world_for(page).evaluate(BLANK_POINT, {"box": box, "vw": vw, "vh": vh}) if box else None
+            if isinstance(pt, list) and len(pt) == 2:
+                x, y = float(round(pt[0] + random.gauss(0, 3))), float(round(pt[1] + random.gauss(0, 3)))
+                _glide(x, y, target_w=60)
+                _press_here(x, y)
+                time.sleep(_rand(40, 120) / 1000.0)
+                if not _focused(loc):
+                    return True
+        _after_typing("Tab")
+        _press_key("Tab")
+        time.sleep(_rand(40, 120) / 1000.0)
+        return not _focused(loc)
+
+    def _selected_all():
+        s = world_for(page).evaluate(SELECTION_STATE)
+        return isinstance(s, list) and len(s) == 3 and min(s[0], s[1]) == 0 and max(s[0], s[1]) == s[2]
+
+    def _select_text(selector, options):
+        """Locator.select_text, humanized: a text control's text selected the way the persona does it --
+        a triple click (an <input>), or the keys: End then Shift+Home (Ctrl+End, Ctrl+Shift+Home in a
+        textarea; Cmd+A on macOS, where Home/End do not move the caret). Verified in the isolated world
+        (SELECTION_STATE), one select-all retry; False = Playwright's select_text."""
+        loc = page.locator(selector).first
+        box = _box_of(loc, options.get("timeout"), options.get("force"), selector)
+        info = _describe(box) if box else None
+        if not info or info.get("disabled") or classify_field(info["tag"], info["type"], info["ce"]) != "text":
+            return False
+        tag = info["tag"]
+        if traits.select_style == "triple" and tag == "input" and native_down is not None and native_up is not None:
+            at = _proven_point(box, info)
+            x, y = at if at is not None else click_point(box, st["pos"], persona)
+            x, y = float(round(x)), float(round(y))
+            _glide(x, y)
+            _press_at(x, y, normalize_click_options({"click_count": 3}, _platform()))
+        else:
+            if not _focused(loc):
+                if not _focus_click(box, _proven_point(box, info), loc, selector) or not _focused(loc):
+                    return False
+                time.sleep(_rand(120, 300) / 1000.0)
+            if _host_platform() == "macos":
+                _press_key("ControlOrMeta+a")
+            elif tag == "input":
+                _press_key("End")
+                time.sleep(_rand(80, 200) / 1000.0)
+                _press_key("Shift+Home")
+            else:
+                _press_key("ControlOrMeta+End")
+                time.sleep(_rand(80, 200) / 1000.0)
+                _press_key("ControlOrMeta+Shift+Home")
+        time.sleep(_rand(60, 160) / 1000.0)
+        if _selected_all():
+            return True
+        _select_all()
+        time.sleep(_rand(60, 160) / 1000.0)
+        return _selected_all()
+
+    def _guarded(api, fn, native):
+        """Run the humane ``fn`` (True = done); Playwright's ``native`` when it declines or fails
+        (a timeout propagates)."""
+        def call(selector, **options):
+            try:
+                if fn(selector, options):
+                    return None
+            except _Native:
+                pass
+            except Exception as e:  # noqa: BLE001
+                if _is_timeout(e):
+                    raise
+            _fallback(api, "native")
+            return native(selector, **options)
+        return call
+
+    page._clearcote_blur = _guarded(
+        "Locator.blur", _blur, lambda s, **o: _LOCATOR_NATIVE["blur"](page.locator(s).first, **o))
+    page._clearcote_select_text = _guarded(
+        "Locator.select_text", _select_text, lambda s, **o: _LOCATOR_NATIVE["select_text"](page.locator(s).first, **o))
 
     # getattr for the same reason as mouse.down/up above: a page-like object that does not
     # implement select_option must still get every OTHER humanization, not lose all of it to
@@ -1895,7 +2302,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         time.sleep(pause_ms(persona, 220, 480) / 1000.0)        # the list opens; the eye finds the option
         tempo = timing_traits(persona).pause_scale
         for ch in plan["keys"]:
-            native_kb_press(ch, delay=key_dwell(persona))
+            native_kb_press(ch, delay=_kdwell())
             time.sleep(max(0.04, random.gauss(0.10, 0.035) * tempo))   # well inside type-ahead's 1 s window
         n = plan["arrows"]
         if n:
@@ -1907,23 +2314,14 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
 
     def _arrow_run(key, n):
         """``n`` presses of an arrow key in an OPEN drop-down. A long run is HELD, the way a person
-        crosses a long list: one press, the keyboard's repeat delay, then auto-repeat at its rate --
-        Playwright sends a key that is already down again as an autoRepeat keydown. Pressed one by
-        one at a human ~180 ms each, 370 rows took 68 s (verifier B). The open popup takes these keys,
-        so the page sees none of them, only how long the pick took."""
-        if n < 8 or native_kb_down is None or native_kb_up is None:
+        crosses a long list: one press, the keyboard's repeat delay, then auto-repeat at its rate
+        (_hold_key, _keys.plan_repeat). Pressed one by one at a human ~180 ms each, 370 rows took 68 s
+        (verifier B). The open popup takes these keys, so the page sees none of them, only how long the
+        pick took."""
+        if n < 8:
             _key(key, n)
             return
-        native_kb_down(key)
-        try:
-            time.sleep(_rand(380, 560) / 1000.0)    # the repeat delay
-            gap = _rand(28, 36) / 1000.0            # ~30 repeats a second
-            for _ in range(n - 1):
-                time.sleep(gap)
-                native_kb_down(key)
-        finally:
-            time.sleep(_rand(20, 60) / 1000.0)
-            native_kb_up(key)
+        _hold_key(key, None, n)
 
     def _listbox_row(info, i):
         return world_for(page).call_on_node(info["node"], ISO_LISTBOX_ROW, {"i": i})
@@ -2181,6 +2579,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     page.fill = api_errors("Page.fill", hfill)
     page.dblclick = api_errors("Page.dblclick", hdblclick)
     page.press = api_errors("Page.press", hpress)
+    if native_page_focus is not None:
+        page.focus = api_errors("Page.focus", hfocus)
     if native_page_select_option is not None:
         page.select_option = api_errors("Page.select_option", hselect_option)
     for name, want in (("check", True), ("uncheck", False)):
@@ -2444,13 +2844,18 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     _patch_locator_class()
 
 
+def _is_strict(err):
+    """Lane A's ClearcoteStrictError (strict mode): never swallowed by a best-effort path."""
+    return isinstance(err, ClearcoteStrictError)
+
+
 # ------------------------------------------------------------------ per-call humanize=False
 # Every wrapped page / mouse / keyboard method takes humanize=False: the stock Playwright call, with the
 # keyword stripped. Wired outermost, after attach has wrapped everything (_wire_per_call_off).
 _PAGE_METHODS = ("click", "hover", "dblclick", "type", "fill", "press", "select_option", "check", "uncheck",
-                 "set_checked")
+                 "set_checked", "focus")
 _MOUSE_METHODS = ("move", "click", "wheel", "dblclick", "down", "up")
-_KB_METHODS = ("type", "press")
+_KB_METHODS = ("type", "press", "down", "up")
 
 
 _SDK_ONLY_KW = ("dwell",)
@@ -2462,8 +2867,12 @@ def _per_call(stock, fn, after=None):
         if humanize is False:
             for k in _SDK_ONLY_KW:   # the SDK's own keywords (hover dwell=): Playwright's call takes none of them
                 kw.pop(k, None)
+            n = max(1, int(kw.pop("repeat", 1) or 1))   # press(repeat=n): n stock presses
             try:
-                return stock(*a, **kw)
+                r = None
+                for _ in range(n):
+                    r = stock(*a, **kw)
+                return r
             finally:
                 if after is not None:
                     after(a)
@@ -2574,6 +2983,8 @@ def _is_timeout(err):
 
 # --------------------------------------------------------------------------- locator patch
 _locator_patched = False
+# Playwright's own Locator methods the humanized ones fall back to (blur / select_text), by name.
+_LOCATOR_NATIVE = {}
 
 
 def _patch_locator_class():
@@ -2606,6 +3017,10 @@ def _patch_locator_class():
     o_drag_to = Locator.drag_to
     o_select_option = Locator.select_option
     o_set_checked = getattr(Locator, "set_checked", None)
+    o_focus = getattr(Locator, "focus", None)
+    o_blur = getattr(Locator, "blur", None)
+    o_select_text = getattr(Locator, "select_text", None)
+    _LOCATOR_NATIVE.update(blur=o_blur, select_text=o_select_text)
 
     def _on(self):
         # humanize active for this page?
@@ -2643,8 +3058,10 @@ def _patch_locator_class():
     _HOVER = ("force", "modifiers", "no_wait_after", "position", "timeout", "trial", "dwell")
     _DBL = ("button", "delay", "force", "modifiers", "no_wait_after", "position", "timeout", "trial")
     _FILL = ("force", "no_wait_after", "timeout")
-    _TYPE = ("timeout",)
-    _PRESS = ("delay", "no_wait_after", "timeout")
+    # `delay` travels: humanized typing keeps it as the shortest gap between two keys (it was dropped).
+    _TYPE = ("delay", "timeout")
+    # `repeat` is the SDK's (OS auto-repeat, hpress); Playwright's own press does not take it.
+    _PRESS = ("delay", "no_wait_after", "timeout", "repeat")
     _SELECT = ("index", "label", "element", "force", "no_wait_after", "timeout")
     _CHECK = ("force", "no_wait_after", "position", "timeout", "trial")
 
@@ -2714,8 +3131,35 @@ def _patch_locator_class():
         done, r = _route(self, kw, lambda: self.page.press(_sel(self), key, **_fwd(kw, _PRESS)))
         if done:
             return r
-        done, r = _froute(self, 'press', (key,), kw)
-        return r if done else o_press(self, key, **kw)
+        # repeat= is the SDK's (OS auto-repeat on the humanized route); the frame route presses once
+        n = max(1, int(kw.pop("repeat", 1) or 1))
+        if n == 1:
+            done, r = _froute(self, 'press', (key,), kw)
+            if done:
+                return r
+        for _ in range(n):   # not humanized: n separate Playwright presses
+            r = o_press(self, key, **kw)
+        return r
+
+    def focus(self, **kw):
+        done, r = _route(self, kw, lambda: self.page.focus(_sel(self), **_fwd(kw, ("timeout",))))
+        return r if done else o_focus(self, **kw)
+
+    def blur(self, **kw):
+        fn = getattr(self.page, "_clearcote_blur", None)
+        if fn is not None:
+            done, r = _route(self, kw, lambda: fn(_sel(self), **_fwd(kw, ("timeout",))))
+            if done:
+                return r
+        return o_blur(self, **kw)
+
+    def select_text(self, **kw):
+        fn = getattr(self.page, "_clearcote_select_text", None)
+        if fn is not None:
+            done, r = _route(self, kw, lambda: fn(_sel(self), **_fwd(kw, ("force", "timeout"))))
+            if done:
+                return r
+        return o_select_text(self, **kw)
 
     def press_sequentially(self, text, **kw):
         done, r = _route(self, kw, lambda: self.page.type(_sel(self), text, **_fwd(kw, _TYPE)))
@@ -2844,6 +3288,12 @@ def _patch_locator_class():
         "Locator.press_and_hold", lambda self, duration=None, **kw: press_and_hold(self, duration, **kw))
     if o_set_checked is not None:
         Locator.set_checked = api_errors("Locator.set_checked", _locator_off(o_set_checked, set_checked))
+    if o_focus is not None:
+        Locator.focus = api_errors("Locator.focus", _locator_off(o_focus, focus))
+    if o_blur is not None:
+        Locator.blur = api_errors("Locator.blur", _locator_off(o_blur, blur))
+    if o_select_text is not None:
+        Locator.select_text = api_errors("Locator.select_text", _locator_off(o_select_text, select_text))
 
 
 def install_humanize_on_context(context, humanize=False, show_cursor=False, browser=None, seed=None):
