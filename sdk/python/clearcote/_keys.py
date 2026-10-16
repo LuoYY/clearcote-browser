@@ -143,17 +143,18 @@ def flight_ms(traits, prev, ch, rng):
     return max(MIN_FLIGHT_MS, ms)
 
 
-def plan_gap(traits, prev, ch, rng):
+def plan_gap(traits, prev, ch, rng, tempo=1.0, pause_scale=1.0):
     """The whole sleep (ms) between the key ``prev`` coming up and the key ``ch`` going down: flight_ms
     plus the pauses the old cadence already had -- 20-100 ms more after whitespace, and a 6 % chance of a
     180-450 ms thinking pause. Draw order after flight_ms: whitespace (conditional), then the think
-    roll, then (conditional) the think length."""
+    roll, then (conditional) the think length. ``tempo`` scales the whole gap and ``pause_scale`` the
+    thinking-pause rate (lane A's presets: persona.tempo / persona.pause_scale; 1.0 = as planned)."""
     ms = flight_ms(traits, prev, ch, rng)
     if prev is not None and prev in " \t\n":
         ms += _lerp(20.0, 100.0, rng())
-    if rng() < 0.06:
+    if rng() < 0.06 * pause_scale:
         ms += _lerp(180.0, 450.0, rng())
-    return ms
+    return ms * tempo
 
 
 # ------------------------------------------------------------------------------------- slips

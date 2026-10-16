@@ -365,6 +365,44 @@ def test_same_seed_same_traits_but_fresh_per_key_draws(clock, no_roll):
     assert typing_traits(make_persona("ha-1").seed) == typing_traits(make_persona("ha-1").seed)
 
 
+def test_lane_a_tempo_scales_the_gaps(clock, no_roll):
+    # Lane A's presets set persona.tempo / persona.pause_scale; typing reads them at call time.
+    med = {}
+    for tempo in (1.0, 2.0):
+        random.seed(3)
+        p = spage("ha-2", clock)
+        p._clearcote_persona.tempo = tempo
+        p.keyboard.type(VEC["ks_text"][:200])
+        med[tempo] = statistics.median(char_gaps(p))
+    assert 1.7 <= med[2.0] / med[1.0] <= 2.3, med
+
+
+class ClearcoteStrictError(Exception):
+    pass
+
+
+def test_a_strict_error_from_the_insert_text_fallback_reaches_the_caller(clock, no_roll, monkeypatch):
+    # The typing loop's best-effort catch must not swallow lane A's strict-mode error.
+    seen = []
+
+    def report(page, api, reason, selector=None):
+        seen.append((api, reason))
+        raise ClearcoteStrictError(api + ": " + reason)
+    monkeypatch.setattr(hz, "_report_fallback", report, raising=False)
+    p = SPage(clock)
+    orig = p.keyboard.press
+
+    def press(key, delay=None, **kw):
+        if key == "ö":
+            raise RuntimeError('Unknown key: "ö"')   # Playwright's US layout cannot press it
+        return orig(key, delay=delay, **kw)
+    p.keyboard.press = press
+    hz.attach_humanize(None, p, humanize=True, seed="ha-1")
+    with pytest.raises(ClearcoteStrictError):
+        p.keyboard.type("aöb")
+    assert seen and seen[0][0] == "Keyboard.press"
+
+
 # ============================================================================ async: simulated page
 class KWorld(World):
     async def evaluate(self, src, arg=None, **kw):

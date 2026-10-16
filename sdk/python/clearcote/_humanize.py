@@ -819,11 +819,15 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         (keyboard.type's delay is only inter-key flight). Fall back to type() for chars press can't map."""
         try:
             native_kb_press(ch, delay=_dwell())
+            return
         except Exception:  # noqa: BLE001
-            try:
-                native_kb_type(ch)
-            except Exception:  # noqa: BLE001
-                pass
+            pass
+        # Outside the catch: in strict mode lane A's report raises, and that must reach the caller.
+        _fallback("Keyboard.press", "insertText: a character keyboard.press cannot map")
+        try:
+            native_kb_type(ch)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _active_value():
         """The focused field's current value, read in the isolated world (None if unknown)."""
@@ -993,8 +997,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                         leave = search and tp["kind"] == "sub" and random.random() < SEARCH_SLIP_RATE
                         try:
                             consumed = _do_typo(text, i, tp, leave)
-                        except Exception:  # noqa: BLE001
-                            pass
+                        except Exception as e:  # noqa: BLE001
+                            if _is_strict(e):
+                                raise
                 # ROLLOVER: the next key goes down before this one comes up, the way people type fast
                 # pairs. One press() per character never overlaps (0 of 32 keydowns, measured on
                 # r32/r33), a keystroke-dynamics tell. Unshifted single-key pairs only; never under a
@@ -1025,14 +1030,17 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 elif not consumed:
                     try:
                         _emit_key(ch)
-                    except Exception:  # noqa: BLE001
+                    except Exception as e:  # noqa: BLE001
+                        if _is_strict(e):
+                            raise
                         break
                 if shift and (i == n - 1 or not _needs_shift(text[i + 1])):
                     time.sleep(_shift_lag_s())
                     native_kb_up("Shift")
                     shift = False
                 if i < n - 1:
-                    time.sleep(max(floor, plan_gap(traits, ch, text[i + 1], random.random)) / 1000.0)
+                    time.sleep(max(floor, plan_gap(traits, ch, text[i + 1], random.random,
+                                         getattr(persona, "tempo", 1.0), getattr(persona, "pause_scale", 1.0))) / 1000.0)
                 i += 1
         finally:
             if shift:  # never leave Shift held for the caller's next keystroke
@@ -1746,6 +1754,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     def _fallback(api, reason):
         """A humanized route handed this call to Playwright: told to lane A's on_fallback hook when the
         page carries one (page._clearcote_on_fallback), else nothing (as before)."""
+        report = _lane_a_report()
+        if report is not None:
+            return report(page, api, reason)   # not caught: strict mode raises ClearcoteStrictError
         cb = getattr(page, "_clearcote_on_fallback", None)
         if callable(cb):
             try:
@@ -2356,6 +2367,24 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # Marker the Locator-class patch keys off: humanize is active for THIS page.
     page._clearcote_humanized = True
     _patch_locator_class()
+
+
+def _is_strict(err):
+    """Lane A's ClearcoteStrictError (strict mode): never swallowed by a best-effort path."""
+    return type(err).__name__ == "ClearcoteStrictError"
+
+
+def _lane_a_report():
+    """Lane A's fallback reporter (_report_fallback(page, api, reason, selector=None)) when this build has it."""
+    import importlib
+    for mod in ("clearcote._humanize", "clearcote._fallback", "clearcote._options"):
+        try:
+            fn = getattr(importlib.import_module(mod), "_report_fallback", None)
+        except Exception:  # noqa: BLE001
+            fn = None
+        if callable(fn):
+            return fn
+    return None
 
 
 class _Native(Exception):

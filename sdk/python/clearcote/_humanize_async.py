@@ -71,6 +71,24 @@ def api_errors(api, fn):
     return call
 
 
+def _is_strict(err):
+    """Lane A's ClearcoteStrictError (strict mode): never swallowed by a best-effort path."""
+    return type(err).__name__ == "ClearcoteStrictError"
+
+
+def _lane_a_report():
+    """Lane A's fallback reporter (_report_fallback(page, api, reason, selector=None)) when this build has it."""
+    import importlib
+    for mod in ("clearcote._humanize", "clearcote._fallback", "clearcote._options"):
+        try:
+            fn = getattr(importlib.import_module(mod), "_report_fallback", None)
+        except Exception:  # noqa: BLE001
+            fn = None
+        if callable(fn):
+            return fn
+    return None
+
+
 async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None):
     """Wrap one page's input methods + (optionally) inject the cursor overlay (async).
 
@@ -576,11 +594,15 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         """One character with a human keydown->keyup DWELL (keyboard.press's delay = the hold)."""
         try:
             await native_kb_press(ch, delay=_dwell())
+            return
         except Exception:  # noqa: BLE001
-            try:
-                await native_kb_type(ch)
-            except Exception:  # noqa: BLE001
-                pass
+            pass
+        # Outside the catch: in strict mode lane A's report raises, and that must reach the caller.
+        _fallback("Keyboard.press", "insertText: a character keyboard.press cannot map")
+        try:
+            await native_kb_type(ch)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _active_value():
         """The focused field's current value, read in the isolated world (None if unknown)."""
@@ -739,8 +761,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                         leave = search and tp["kind"] == "sub" and random.random() < SEARCH_SLIP_RATE
                         try:
                             consumed = await _do_typo(text, i, tp, leave)
-                        except Exception:  # noqa: BLE001
-                            pass
+                        except Exception as e:  # noqa: BLE001
+                            if _is_strict(e):
+                                raise
                 # ROLLOVER: the next key goes down before this one comes up (see
                 # _humanize._human_type_text). Unshifted single-key pairs only.
                 nxt = text[i + 1] if i + 1 < n else None
@@ -788,14 +811,17 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 elif not consumed:
                     try:
                         await _emit_key(ch)
-                    except Exception:  # noqa: BLE001
+                    except Exception as e:  # noqa: BLE001
+                        if _is_strict(e):
+                            raise
                         break
                 if shift and (i == n - 1 or not _needs_shift(text[i + 1])):
                     await asyncio.sleep(_shift_lag_s())
                     shift = False   # before the await: the keyup is sent even if cancelled mid-call
                     await native_kb_up("Shift")
                 if i < n - 1:
-                    await asyncio.sleep(max(floor, plan_gap(traits, ch, text[i + 1], random.random)) / 1000.0)
+                    await asyncio.sleep(max(floor, plan_gap(traits, ch, text[i + 1], random.random,
+                                         getattr(persona, "tempo", 1.0), getattr(persona, "pause_scale", 1.0))) / 1000.0)
                 i += 1
         finally:
             if shift:  # never leave Shift held for the caller's next keystroke (nor on cancellation)
@@ -1518,6 +1544,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     def _fallback(api, reason):
         """A humanized route handed this call to Playwright: told to lane A's on_fallback hook when the
         page carries one (page._clearcote_on_fallback), else nothing (as before)."""
+        report = _lane_a_report()
+        if report is not None:
+            return report(page, api, reason)   # not caught: strict mode raises ClearcoteStrictError
         cb = getattr(page, "_clearcote_on_fallback", None)
         if callable(cb):
             try:
