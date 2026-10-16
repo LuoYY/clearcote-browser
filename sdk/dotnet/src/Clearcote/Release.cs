@@ -76,6 +76,34 @@ public static class Release
     public static ReleaseInfo? PlatformRelease(string? os = null)
         => Platforms.TryGetValue(os ?? Native.OsTag, out var r) ? r : null;
 
+    /// OS tag -> the PRO catalog / /download/pro <c>platform</c> key. Wider than <see cref="Platforms"/>:
+    /// macOS has a native PRO build (Apple Silicon, a Chromium.app bundle) but no free pinned release, so it
+    /// is here and not there. The PRO build is resolved by the site at run time; there is nothing to pin.
+    public static readonly IReadOnlyDictionary<string, string> ProPlatforms =
+        new Dictionary<string, string> { ["windows"] = "windows", ["linux"] = "linux", ["macos"] = "macos" };
+
+    /// CPU architectures the native macOS PRO build runs on: Apple Silicon only. An Intel Mac uses the
+    /// Docker image instead.
+    public static readonly IReadOnlyList<string> MacosArches = new[] { "arm64" };
+
+    /// The PRO download platform key for an OS ("windows" / "linux" / "macos"; default: this machine), or
+    /// null if there is no PRO build for it. A Mac that is not Apple Silicon throws: the build exists, just
+    /// not for this CPU, and "unsupported OS" would send the caller looking in the wrong place.
+    public static string? ProPlatformKey(string? os = null, string? arch = null)
+    {
+        if (!ProPlatforms.TryGetValue(os ?? Native.OsTag, out var key)) return null;
+        var cpu = arch ?? Native.Arch;
+        if (key == "macos" && !MacosArches.Contains(cpu))
+            throw new PlatformNotSupportedException(
+                $"The native macOS Clearcote PRO build is for Apple Silicon (arm64) only; this Mac reports {(cpu.Length > 0 ? cpu : "an unknown CPU")}. " +
+                "Use the Docker image instead (Docker = true), or run on an Apple Silicon Mac.");
+        return key;
+    }
+
+    /// True on an Apple Silicon Mac, where the native PRO build runs.
+    public static bool NativeMacosSupported(string? os = null, string? arch = null)
+        => (os ?? Native.OsTag) == "macos" && MacosArches.Contains(arch ?? Native.Arch);
+
     /// The pin for the CURRENT platform. Falls back to the Windows entry on an unsupported OS so error
     /// messaging still has a version to quote; download/guard paths branch on PlatformRelease().
     public static readonly ReleaseInfo Current = PlatformRelease() ?? Windows;

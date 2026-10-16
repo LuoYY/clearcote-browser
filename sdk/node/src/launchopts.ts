@@ -6,7 +6,7 @@ import { hostPersonaPlatform } from "./fingerprint.js";
 import { warnOnce } from "./warnings.js";
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 /** A Playwright proxy descriptor. */
 export interface PwProxy {
@@ -317,10 +317,40 @@ const switchCache = new Map<string, boolean>();
  *
  * Chromium switch names are NUL-terminated C-string literals in the binary, so a NUL-delimited
  * search is a capability probe that cannot collide with header names (HPACK's `proxy-authenticate`
- * is not `\0proxy-auth\0`). On Windows the switches live in chrome.dll next to the launcher;
- * elsewhere in the executable. Cached per (path, size, mtime). Any failure answers false, which
+ * is not `\0proxy-auth\0`). On Windows the switches live in chrome.dll next to the launcher, on
+ * macOS in the bundle's framework (macosFrameworkBinary); elsewhere in the executable. Cached per (path, size, mtime). Any failure answers false, which
  * selects the legacy (Playwright) path — slower, never silently broken.
  */
+/**
+ * For a macOS bundle executable (`X.app/Contents/MacOS/X`), the framework binary that holds the engine
+ * (`X.app/Contents/Frameworks/X Framework.framework/Versions/Current/X Framework`); null for anything
+ * else. The executable itself is a small launcher with no switch strings.
+ */
+export function macosFrameworkBinary(exe: string): string | null {
+  const macosDir = dirname(exe);
+  const contents = dirname(macosDir);
+  if (basename(macosDir) !== "MacOS" || basename(contents) !== "Contents") return null;
+  const frameworks = join(contents, "Frameworks");
+  let names: string[];
+  try {
+    names = readdirSync(frameworks).filter((n) => n.endsWith(" Framework.framework")).sort();
+  } catch {
+    return null;
+  }
+  for (const fw of names) {
+    const stem = fw.slice(0, -".framework".length);
+    for (const rel of [join("Versions", "Current", stem), stem]) {
+      const file = join(frameworks, fw, rel);
+      try {
+        if (statSync(file).isFile()) return file;
+      } catch {
+        /* next candidate */
+      }
+    }
+  }
+  return null;
+}
+
 export function engineSupportsSwitch(exe: string | undefined, name: string): boolean {
   try {
     if (!exe) return false;
@@ -328,6 +358,8 @@ export function engineSupportsSwitch(exe: string | undefined, name: string): boo
     if (process.platform === "win32") {
       const dll = join(dirname(exe), "chrome.dll");
       if (existsSync(dll)) file = dll;
+    } else {
+      file = macosFrameworkBinary(exe) ?? exe;
     }
     const st = statSync(file);
     const key = `${file}|${name}|${st.size}|${Math.floor(st.mtimeMs)}`;
@@ -478,6 +510,18 @@ export const DEFAULT_IGNORED_ARGS: readonly string[] = ["--enable-automation", "
  * Headless Linux already renders WebGL through SwiftShader regardless (measured), so nothing is
  * added there. Not added when the caller already passes it.
  */
+export const MOCK_KEYCHAIN_SWITCH = "--use-mock-keychain";
+
+/**
+ * `--use-mock-keychain` on macOS: the native build is unsigned, so Chromium asks for the "Chromium Safe
+ * Storage" keychain item on every launch. Denying is harmless, but the prompt blocks an unattended run.
+ * Nothing elsewhere, and nothing when the caller already passes it.
+ */
+export function macosKeychainArgs(platform: string = process.platform, userArgs: readonly string[] = []): string[] {
+  if (platform !== "darwin" || userArgs.includes(MOCK_KEYCHAIN_SWITCH)) return [];
+  return [MOCK_KEYCHAIN_SWITCH];
+}
+
 export function gpuBlocklistArgs(headed: boolean, platform: NodeJS.Platform = process.platform, userArgs: readonly string[] = []): string[] {
   if (!headed && platform !== "win32") return [];
   if (userArgs.includes("--ignore-gpu-blocklist")) return [];

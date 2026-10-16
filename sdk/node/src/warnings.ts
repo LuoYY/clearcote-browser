@@ -77,7 +77,9 @@ export function coherenceWarnings(
     warn("platform-host-fonts",
       `platform='${platform}' but this host is ${fam} and no fingerprintProfile supplies that OS's ` +
       `fonts/metrics - font, canvas and font-list hashes will be host-native and won't match a real ` +
-      `${platform} Chrome. Use a fingerprintProfile captured on ${platform}, or set platform='${fam}'.`);
+      `${platform} Chrome. Use a fingerprintProfile captured on ${platform}, or set platform='${fam}'.` +
+      // the macOS build's font persona patches target Linux-only sources: its fonts never follow the claim
+      (fam === "macos" ? " On the native macOS build only platform='macos' is coherent: its fonts and canvas text metrics always stay the Mac's own." : ""));
   // On a Windows host the GPU runs through Direct3D 11, which clamps the WebGL and WebGPU limits (vertex
   // uniform vectors, a 16384 maximum texture size, ...). A persona can lower a limit, never lift one past the
   // driver's, so a Linux claim here reports limits no real Linux machine has. Pass-through claims nothing.

@@ -59,8 +59,34 @@ public static class Download
         return env is "1" or "true";
     }
 
+    /// <c>&lt;X&gt;.app/Contents/MacOS/&lt;name&gt;</c> at the top of <paramref name="dir"/> (or one folder down),
+    /// else null. The macOS build is a bundle: the executable is <c>Chromium.app/Contents/MacOS/Chromium</c>,
+    /// and the same tree holds <c>Chromium Framework</c> and the <c>Chromium Helper*</c> apps. Looking for the
+    /// bundle's own executable first means a name search can never land on one of those.
+    private static string? AppBinary(string dir, string name)
+    {
+        string[] tops;
+        try { tops = Directory.GetDirectories(dir).OrderBy(d => d, StringComparer.Ordinal).ToArray(); } catch { return null; }
+        var parents = new List<string> { dir };
+        parents.AddRange(tops.Where(t => !t.EndsWith(".app", StringComparison.Ordinal)));
+        foreach (var parent in parents)
+        {
+            string[] entries;
+            try { entries = parent == dir ? tops : Directory.GetDirectories(parent).OrderBy(d => d, StringComparer.Ordinal).ToArray(); }
+            catch { continue; }
+            foreach (var e in entries)
+            {
+                if (!e.EndsWith(".app", StringComparison.Ordinal)) continue;
+                var exe = Path.Combine(e, "Contents", "MacOS", name);
+                if (File.Exists(exe)) return exe;
+            }
+        }
+        return null;
+    }
+
     private static string? FindFile(string dir, string name)
     {
+        if (AppBinary(dir, name) is { } app) return app;
         var stack = new Stack<string>();
         stack.Push(dir);
         while (stack.Count > 0)
@@ -70,7 +96,8 @@ public static class Download
             try { entries = Directory.GetFileSystemEntries(cur); } catch { continue; }
             foreach (var e in entries)
             {
-                if (Directory.Exists(e)) stack.Push(e);
+                // never descend into a macOS framework: it holds the helper apps, never the browser itself
+                if (Directory.Exists(e)) { if (!e.EndsWith(".framework", StringComparison.Ordinal)) stack.Push(e); }
                 else if (string.Equals(Path.GetFileName(e), name, StringComparison.OrdinalIgnoreCase)) return e;
             }
         }
@@ -88,8 +115,16 @@ public static class Download
     private static readonly string[] CriticalWin =
         { "chrome.exe", "chrome.dll", "chrome_elf.dll", "icudtl.dat", "snapshot_blob.bin", "resources.pak" };
     private static readonly string[] CriticalOther = { "icudtl.dat", "snapshot_blob.bin", "resources.pak" };
+    // The macOS PRO build is a Chromium.app bundle: the payload sits inside the framework, reached through
+    // its Versions/Current symlink (which the ditto extraction keeps).
+    private static readonly string[] CriticalMac =
+    {
+        "Chromium.app/Contents/MacOS/Chromium", "Chromium.app/Contents/Info.plist",
+        "Chromium.app/Contents/Frameworks/Chromium Framework.framework/Versions/Current/Chromium Framework",
+    };
 
-    private static string[] CriticalNames() => OperatingSystem.IsWindows() ? CriticalWin : CriticalOther;
+    private static string[] CriticalNames() =>
+        OperatingSystem.IsWindows() ? CriticalWin : Native.OsTag == "macos" ? CriticalMac : CriticalOther;
 
     // Browser dirs whose full manifest already verified in this process.
     private static readonly HashSet<string> Scanned = new(StringComparer.OrdinalIgnoreCase);
@@ -986,6 +1021,8 @@ public static class Download
         Directory.CreateDirectory(incoming);
         if (rel.Asset.EndsWith(".tar.xz") || rel.Archive == "tar.xz")
             RunTar(zipPath, incoming);           // Node has no stdlib xz; the system tar auto-detects .xz
+        else if (Native.OsTag == "macos")
+            ExtractMacBundle(rel.Asset, zipPath, incoming);
         else
             ZipFile.ExtractToDirectory(zipPath, incoming);
         TryDelete(zipPath); // reclaim disk; keep only the extracted tree
@@ -1051,6 +1088,51 @@ public static class Download
         if (p.ExitCode != 0) throw new Exception($"Clearcote: `tar` extraction failed (exit {p.ExitCode}).");
     }
 
+    /// Test seam: runs a tool for the macOS extraction and returns its exit code; throws
+    /// <see cref="System.ComponentModel.Win32Exception"/> when the tool is not there (as Process.Start does).
+    internal static Func<string, IReadOnlyList<string>, int> MacToolRunner = RunTool;
+
+    private static int RunTool(string file, IReadOnlyList<string> args)
+    {
+        var psi = new ProcessStartInfo(file) { UseShellExecute = false, RedirectStandardError = true, RedirectStandardOutput = true };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        using var p = Process.Start(psi) ?? throw new System.ComponentModel.Win32Exception($"failed to start {file}");
+        p.StandardOutput.ReadToEnd();
+        p.StandardError.ReadToEnd();
+        p.WaitForExit();
+        return p.ExitCode;
+    }
+
+    /// Unpack the macOS zip, which holds a <c>Chromium.app</c> bundle. The bundle needs its symlinks
+    /// (<c>Versions/Current</c>, <c>Resources</c>, ...) and exec bits; ZipFile keeps no symlinks, so it is
+    /// unpacked with <c>ditto</c> (<c>unzip</c> if that is missing) and the quarantine attribute cleared: the
+    /// build is unsigned, and Gatekeeper refuses a quarantined bundle.
+    internal static void ExtractMacBundle(string asset, string zipPath, string destDir)
+    {
+        Directory.CreateDirectory(destDir);
+        var tools = new (string File, string[] Args)[]
+        {
+            ("/usr/bin/ditto", new[] { "-x", "-k", zipPath, destDir }),
+            ("/usr/bin/unzip", new[] { "-q", "-o", zipPath, "-d", destDir }),
+        };
+        foreach (var (file, args) in tools)
+        {
+            int code;
+            try { code = MacToolRunner(file, args); }
+            catch (System.ComponentModel.Win32Exception) { continue; } // that tool is not on this Mac
+            if (code != 0) throw new Exception($"Clearcote could not unpack {asset} with {file} (exit {code}).");
+            string[] apps;
+            try { apps = Directory.GetDirectories(destDir).Where(d => d.EndsWith(".app", StringComparison.Ordinal)).ToArray(); }
+            catch { apps = Array.Empty<string>(); }
+            foreach (var app in apps.Length > 0 ? apps : new[] { destDir })
+            {
+                try { MacToolRunner("/usr/bin/xattr", new[] { "-dr", "com.apple.quarantine", app }); } catch { } // best-effort
+            }
+            return;
+        }
+        throw new Exception("Clearcote needs /usr/bin/ditto or /usr/bin/unzip to unpack the macOS build.");
+    }
+
     private static void TryDelete(string path) { try { File.Delete(path); } catch { } }
 
     /// Resolve the release channel: explicit option &gt; CLEARCOTE_RELEASE_CHANNEL &gt; stable.
@@ -1090,8 +1172,8 @@ public static class Download
     {
         opts ??= new ProDownloadOptions();
         var baseUrl = (opts.ApiBase ?? Environment.GetEnvironmentVariable("CLEARCOTE_LICENSE_API") ?? "https://www.clearcotelabs.com").TrimEnd('/');
-        var plat = Native.IsWindows ? "windows" : Native.IsLinux ? "linux" : null;
-        if (plat is null) throw new Exception("Clearcote PRO ships Windows x64 and Linux x64 only.");
+        var plat = Release.ProPlatformKey();   // throws on an Intel Mac: the macOS build is Apple Silicon only
+        if (plat is null) throw new Exception("Clearcote PRO ships Windows x64, Linux x64 and macOS arm64 only.");
 
         var channel = ResolveReleaseChannel(opts.ReleaseChannel);
         using var client = SdkHttp.Create();
@@ -1122,15 +1204,15 @@ public static class Download
         {
             Tag = Get("tag") ?? $"pro-{version}",
             Version = version,
-            Asset = Get("asset") ?? $"clearcote-pro-{version}-{plat}-x64.{(plat == "windows" ? "zip" : "tar.xz")}",
+            Asset = Get("asset") ?? $"clearcote-pro-{version}-{plat}-{(plat == "macos" ? "arm64" : "x64")}.{(plat == "linux" ? "tar.xz" : "zip")}",
             Url = url!,
             Sha256 = sha!,
             ExeSha256 = Get("exe_sha256") ?? "",
             Size = meta.TryGetProperty("size", out var s) && s.TryGetInt64(out var sv) ? sv : 0,
             Os = plat,
-            Archive = Get("archive") ?? (plat == "windows" ? "zip" : "tar.xz"),
-            Binary = Get("binary") ?? (plat == "windows" ? "chrome.exe" : "chrome"),
-            AssetGlob = $"{plat}-x64",
+            Archive = Get("archive") ?? (plat == "linux" ? "tar.xz" : "zip"),
+            Binary = Get("binary") ?? (plat == "windows" ? "chrome.exe" : plat == "macos" ? "Chromium" : "chrome"),
+            AssetGlob = $"{plat}-{(plat == "macos" ? "arm64" : "x64")}",
             Unpinned = false, // pinned -> sha256-only verify (no GPG), like the free pin
         };
 
@@ -1145,7 +1227,9 @@ public static class Download
     // ── Version catalog resolver ─────────────────────────────────────────────
     private static readonly JsonSerializerOptions CatalogJsonOpts = new() { PropertyNameCaseInsensitive = true };
 
-    private static string? PlatKey() => Native.IsWindows ? "windows" : Native.IsLinux ? "linux" : null;
+    // Catalog platform key for this OS (matches the /download/pro platform param): "windows", "linux",
+    // "macos" (Apple Silicon; throws on an Intel Mac), or null.
+    private static string? PlatKey() => Release.ProPlatformKey();
 
     /// Compare version strings numerically: "150.0.7871.115" > "149.0.7827.114".
     private static int VerCmp(string a, string b)
@@ -1211,7 +1295,7 @@ public static class Download
     /// Pure validate-first resolution against an in-memory catalog (no I/O).
     public static VersionPlan ResolveFromCatalog(Catalog cat, string selector, bool hasLicense)
     {
-        var plat = PlatKey() ?? throw new Exception("Clearcote ships Windows x64 and Linux x64 only.");
+        var plat = PlatKey() ?? throw new Exception("Clearcote ships Windows x64, Linux x64 and (PRO) macOS arm64 only.");
         var builds = cat.Builds.Where(b => b.Platforms.ContainsKey(plat)).ToList();
         var sel = (selector ?? "").Trim();
 
@@ -1304,6 +1388,17 @@ public static class Download
     {
         opts ??= new DownloadOptions();
         var cacheRoot = opts.CacheDir ?? Native.CacheRoot();
+        if (Release.PlatformRelease() is null)
+        {
+            // Fail before downloading a build that cannot run here (this used to fetch the ~245 MB Windows
+            // zip on a Mac).
+            var hint = Native.OsTag == "macos"
+                ? "On an Apple Silicon Mac, set a license key (CLEARCOTE_LICENSE_KEY) for the native PRO build, or use the Docker image (Docker = true). "
+                : "";
+            throw new PlatformNotSupportedException(
+                $"The free Clearcote build ships Windows x64 and Linux x64 binaries — there is none for '{Native.OsTag}'. " +
+                $"{hint}Or set ExecutablePath to a compatible binary.");
+        }
 
         ReleaseInfo rel;
         if (AutoUpdateRequested(opts.AutoUpdate))

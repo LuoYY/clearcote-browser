@@ -9,7 +9,7 @@ using Microsoft.Playwright;
 namespace Clearcote;
 
 /// <summary>
-/// <see cref="Clearcote.LaunchAsync"/> needs Docker on this host (macOS has no native Clearcote build) and
+/// <see cref="Clearcote.LaunchAsync"/> needs Docker on this host (a Mac without the native PRO build) and
 /// it is missing or not running.
 /// </summary>
 public sealed class DockerUnavailableException : Exception
@@ -28,7 +28,8 @@ public sealed record DockerContainer(string Id, string Image, string Endpoint, i
 
 /// LaunchAsync on macOS: run the Clearcote Docker image and connect to it.
 ///
-/// There is no native Clearcote build for macOS. Rather than fail there, LaunchAsync starts the published
+/// The free Clearcote build has no macOS binary (the native macOS build is PRO-only and Apple Silicon only).
+/// Rather than fail there, LaunchAsync starts the published
 /// Clearcote image (teamflatearth/clearcote:sdk-&lt;this SDK's version&gt;, a linux/amd64 image Docker Desktop
 /// runs on Intel and Apple silicon alike), waits for its CDP endpoint, connects with Playwright and
 /// returns the same Playwright IBrowser a local launch does. CloseAsync disconnects and stops the
@@ -36,7 +37,8 @@ public sealed record DockerContainer(string Id, string Image, string Endpoint, i
 ///
 /// When it applies: <see cref="LaunchOptions.Docker"/> false (or CLEARCOTE_DOCKER=0) turns it off; true
 /// (or CLEARCOTE_DOCKER=1) turns it on on any OS with Docker; unset means macOS only, unless the caller
-/// named a binary (ExecutablePath / CLEARCOTE_BINARY). CLEARCOTE_TEST_ONLY_ASSUME_MACOS=1 treats the host
+/// named a binary (ExecutablePath / CLEARCOTE_BINARY) or holds a licence key on an Apple Silicon Mac --
+/// that runs the native macOS PRO build instead. CLEARCOTE_TEST_ONLY_ASSUME_MACOS=1 treats the host
 /// as macOS so the real Docker path can be exercised end to end elsewhere; it is not an option.
 ///
 /// The container is configured through the image's own CC_* variables (docker/serve.py), so only the
@@ -157,8 +159,16 @@ internal static class DockerLaunch
         if (Falsy.Contains(env)) return false;
         if (Truthy.Contains(env)) return true;
         if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CLEARCOTE_BINARY"))) return false;
-        return HostIsMacos();
+        if (!HostIsMacos()) return false;
+        // An Apple Silicon Mac with a licence key runs the native PRO build; the free build has no macOS
+        // binary, and the PRO one no Intel build, so every other Mac keeps the image.
+        return !NativeMacosLicensed(o);
     }
+
+    /// Whether this host runs the native macOS PRO build: an Apple Silicon Mac (not the test-only
+    /// assume-macOS switch, which exists to exercise the Docker path) with a licence key.
+    internal static bool NativeMacosLicensed(LaunchOptions? o)
+        => Release.NativeMacosSupported() && License.ResolveLicenseKey(o?.LicenseKey) is not null;
 
     internal static string DefaultImage() =>
         Environment.GetEnvironmentVariable("CLEARCOTE_DOCKER_IMAGE") is { Length: > 0 } img ? img : $"{DefaultRepository}:sdk-{Clearcote.Version}";
@@ -186,7 +196,7 @@ internal static class DockerLaunch
             if (p.Name == nameof(LaunchOptions.Widevine) && value is false) continue;
             if (value is not null && !Equals(value, p.GetValue(defaults)))
                 throw new ArgumentException(
-                    $"{p.Name} is not available when LaunchAsync runs Clearcote in Docker (there is no native macOS build). {OffHint}");
+                    $"{p.Name} is not available when LaunchAsync runs Clearcote in Docker (there is no native macOS build here). {OffHint}");
         }
         var env = new Dictionary<string, string>(StringComparer.Ordinal);
         var t = typeof(LaunchOptions);
@@ -283,11 +293,11 @@ internal static class DockerLaunch
     internal static async Task<(string Exe, string Arch)> DockerInfoAsync()
     {
         var exe = Which() ?? throw new DockerUnavailableException(
-            $"Clearcote has no native macOS build, so on macOS LaunchAsync runs it in Docker, but the `docker` command was not found. Install Docker Desktop ({InstallUrl}), start it, and try again. {OffHint}");
+            $"Clearcote has no native macOS build here (that needs a licence key and an Apple Silicon Mac), so on macOS LaunchAsync runs it in Docker, but the `docker` command was not found. Install Docker Desktop ({InstallUrl}), start it, and try again. {OffHint}");
         var r = await Run(new[] { exe, "info", "--format", "{{.ServerVersion}} {{.Architecture}}" }, null, 30_000, null).ConfigureAwait(false);
         if (r.Code != 0)
             throw new DockerUnavailableException(
-                $"Clearcote has no native macOS build, so on macOS LaunchAsync runs it in Docker, but Docker is not running (`docker info`: {(FirstLine(r.Stderr) is { Length: > 0 } l ? l : $"exit {r.Code}")}). Start Docker Desktop and try again. {OffHint}");
+                $"Clearcote has no native macOS build here (that needs a licence key and an Apple Silicon Mac), so on macOS LaunchAsync runs it in Docker, but Docker is not running (`docker info`: {(FirstLine(r.Stderr) is { Length: > 0 } l ? l : $"exit {r.Code}")}). Start Docker Desktop and try again. {OffHint}");
         var parts = r.Stdout.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         return (exe, parts.Length > 1 ? parts[1] : "");
     }
@@ -1003,7 +1013,7 @@ internal static class DockerLaunch
         foreach (var name in env.Keys.OrderBy(k => k, StringComparer.Ordinal)) argv.AddRange(new[] { "-e", name });   // value via the CLI's environment
         if (licensed) argv.AddRange(new[] { "-v", $"{CacheVolume()}:/opt/xdg-cache" });   // the licensed engine downloads once
         argv.Add(image);
-        if (!o.Quiet) Console.Error.WriteLine($"[clearcote] no native macOS build: starting the Clearcote Docker image {image}");
+        if (!o.Quiet) Console.Error.WriteLine($"[clearcote] no native macOS build here (it needs a licence key and Apple Silicon): starting the Clearcote Docker image {image}");
         string id;
         try
         {

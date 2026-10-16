@@ -355,6 +355,18 @@ public static class LaunchOpts
     /// blocklist also refuses WebGPU on the Microsoft Basic Render Driver of GPU-less VMs. Headless
     /// Linux already renders WebGL through SwiftShader, so nothing is added there. Never duplicated
     /// when the caller already passes it.</para>
+    /// The switch <see cref="MacosKeychainArgs"/> adds.
+    public const string MockKeychainSwitch = "--use-mock-keychain";
+
+    /// <c>--use-mock-keychain</c> on macOS: the native build is unsigned, so Chromium asks for the
+    /// "Chromium Safe Storage" keychain item on every launch. Denying is harmless, but the prompt blocks an
+    /// unattended run. Nothing elsewhere, and nothing when the caller already passes it.
+    public static List<string> MacosKeychainArgs(string? osTag = null, IEnumerable<string>? userArgs = null)
+    {
+        if ((osTag ?? Native.OsTag) != "macos" || (userArgs ?? Array.Empty<string>()).Contains(MockKeychainSwitch)) return new();
+        return new() { MockKeychainSwitch };
+    }
+
     public static List<string> GpuBlocklistArgs(bool headed, string? osTag = null, IEnumerable<string>? userArgs = null)
     {
         var isWindows = (osTag ?? Native.OsTag) == "windows";
@@ -459,7 +471,38 @@ public static class LaunchOpts
     /// Whether the engine binary implements a command-line switch, by searching it for the
     /// NUL-delimited literal <c>"\0name\0"</c> (a switch constant in the string table). The delimiters
     /// keep it from matching a longer literal. On Windows the switches live in chrome.dll next to the
-    /// launcher; elsewhere in the executable. Cached per (path, size, mtime). Any failure answers false.
+    /// launcher, on macOS in the bundle's framework (<see cref="MacosFrameworkBinary"/>); elsewhere in the
+    /// executable. Cached per (path, size, mtime). Any failure answers false.
+    /// For a macOS bundle executable (<c>X.app/Contents/MacOS/X</c>), the framework binary that holds the
+    /// engine (<c>X.app/Contents/Frameworks/X Framework.framework/Versions/Current/X Framework</c>); null for
+    /// anything else. The executable itself is a small launcher with no switch strings.
+    public static string? MacosFrameworkBinary(string exe)
+    {
+        var macosDir = Path.GetDirectoryName(exe);
+        var contents = macosDir is null ? null : Path.GetDirectoryName(macosDir);
+        if (macosDir is null || contents is null || Path.GetFileName(macosDir) != "MacOS" || Path.GetFileName(contents) != "Contents")
+            return null;
+        var frameworks = Path.Combine(contents, "Frameworks");
+        string[] names;
+        try
+        {
+            names = Directory.GetDirectories(frameworks).Select(Path.GetFileName).OfType<string>()
+                .Where(n => n.EndsWith(" Framework.framework", StringComparison.Ordinal))
+                .OrderBy(n => n, StringComparer.Ordinal).ToArray();
+        }
+        catch { return null; }
+        foreach (var fw in names)
+        {
+            var stem = fw[..^".framework".Length];
+            foreach (var rel in new[] { Path.Combine("Versions", "Current", stem), stem })
+            {
+                var file = Path.Combine(frameworks, fw, rel);
+                if (File.Exists(file)) return file;
+            }
+        }
+        return null;
+    }
+
     public static bool EngineSupportsSwitch(string? exe, string name)
     {
         try
@@ -471,6 +514,7 @@ public static class LaunchOpts
                 var dll = Path.Combine(Path.GetDirectoryName(exe) ?? "", "chrome.dll");
                 if (File.Exists(dll)) file = dll;
             }
+            file = MacosFrameworkBinary(file) ?? file;
             var fi = new FileInfo(file);
             if (!fi.Exists) return false;
             var key = $"{fi.FullName}|{name}|{fi.Length}|{fi.LastWriteTimeUtc.Ticks}";

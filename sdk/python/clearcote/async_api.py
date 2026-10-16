@@ -264,13 +264,14 @@ async def launch(cloud=None, **kwargs):
     geoip, profile, canvas_bridge, humanize, ... + any Playwright launch option).
 
     ``cloud=True`` (or ``CLEARCOTE_CLOUD=1`` with ``cloud`` unset) connects to a hosted session
-    instead, exactly like the sync ``launch(cloud=True)``. On macOS it runs the Clearcote Docker
-    image, as the sync ``launch()`` does (``docker=False`` turns that off)."""
+    instead, exactly like the sync ``launch(cloud=True)``. On macOS it runs the native PRO build
+    when licensed on Apple Silicon, else the Clearcote Docker image, as the sync ``launch()`` does
+    (``docker=True`` / ``docker=False`` force the choice)."""
     if cloud_requested(cloud):
         return await launch_cloud_async(cloud, kwargs)
     _drop_cloud_credentials(kwargs)
     docker, docker_image = kwargs.pop("docker", None), kwargs.pop("docker_image", None)
-    if docker_requested(docker, kwargs):  # macOS (no native build): the Clearcote Docker image
+    if docker_requested(docker, kwargs):  # macOS without the native PRO build: the Docker image
         return await launch_docker_async({**kwargs, "docker_image": docker_image})
     # seed reflects the merged/effective fingerprint (profile-aware) -> stable motor persona
     shader_dialect = kwargs.pop("shader_dialect", None)  # popped before _prepare: not a PW option

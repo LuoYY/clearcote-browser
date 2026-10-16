@@ -15,7 +15,7 @@ namespace Clearcote;
 public static class Clearcote
 {
     /// This SDK's version (kept in lockstep with the npm/PyPI SDKs).
-    public const string Version = "0.51.0";
+    public const string Version = "0.51.1";
 
     private static readonly SemaphoreSlim PwLock = new(1, 1);
     private static IPlaywright? _pw;
@@ -100,20 +100,25 @@ public static class Clearcote
     /// anything is created. See <see cref="Cloud"/> for the rest of the hosted API.
     /// </para>
     /// <para>
-    /// MACOS. There is no native macOS build, so on macOS this starts the Clearcote Docker image
+    /// MACOS. With a licence key on an Apple Silicon Mac, this runs the native macOS PRO build (a
+    /// <c>Chromium.app</c> bundle, downloaded and verified like the other platforms). Its fonts and canvas
+    /// text metrics stay host-native, so only Platform = "macos" (the default there) is coherent; another
+    /// platform without a FingerprintProfile captured on that OS warns. Without a licence key (the free build
+    /// has no macOS binary), or on an Intel Mac, this starts the Clearcote Docker image instead
     /// (teamflatearth/clearcote:sdk-&lt;version&gt;; <see cref="LaunchOptions.DockerImage"/> or
     /// CLEARCOTE_DOCKER_IMAGE picks another) and returns the same Playwright <see cref="IBrowser"/>, connected
     /// to it over CDP; CloseAsync stops the container. The persona options, Headless, Proxy, Args, Version and
     /// the licence key go to the container; an option it cannot take is refused by name.
     /// <see cref="DockerUnavailableException"/> says so when Docker is missing or not running.
-    /// <see cref="LaunchOptions.Docker"/> = false (or CLEARCOTE_DOCKER=0) turns this off; true uses the
-    /// container on any OS. <see cref="DockerContainerOf"/> names the container.
+    /// <see cref="LaunchOptions.Docker"/> = true (or CLEARCOTE_DOCKER=1) uses the container on any OS, a
+    /// licensed Mac included; false (or CLEARCOTE_DOCKER=0) never does. <see cref="DockerContainerOf"/> names
+    /// the container.
     /// </para>
     /// </remarks>
     public static async Task<IBrowser> LaunchAsync(LaunchOptions? options = null)
     {
         if (CloudLaunch.Requested(options)) return await CloudLaunch.LaunchBrowserAsync(options ?? new LaunchOptions()).ConfigureAwait(false);
-        // macOS (no native build): the Clearcote Docker image, connected over CDP.
+        // macOS without the native PRO build: the Clearcote Docker image, connected over CDP.
         if (DockerLaunch.Requested(options)) return await DockerLaunch.LaunchBrowserAsync(options ?? new LaunchOptions()).ConfigureAwait(false);
         options = await PrepareAsync(options ?? new LaunchOptions()).ConfigureAwait(false);
         var exe = await ExecutablePathAsync(options).ConfigureAwait(false);
@@ -529,6 +534,9 @@ public static class Clearcote
             baseList.AddRange(LaunchOpts.GpuBackendArgs(
                 fpArgs.Find(a => a.StartsWith(platFlag, System.StringComparison.Ordinal))?[platFlag.Length..],
                 extra.Headed, null, userArgs));
+            // macOS: the build is unsigned, so every launch would prompt for the "Chromium Safe Storage"
+            // keychain item. See MacosKeychainArgs.
+            baseList.AddRange(LaunchOpts.MacosKeychainArgs(null, userArgs));
         }
         var merged = LaunchOpts.MergeFeatureFlags(baseList.Concat(userArgs));
         // Last: drop 152 r22+ switches this engine does not implement (with a warning), wherever they came from.
@@ -540,7 +548,7 @@ public static class Clearcote
             ? new Proxy { Server = server, Username = p.Username, Password = p.Password, Bypass = p.Bypass }
             : null;
 
-    private static void EnsureRunnableHere(string exe)
+    internal static void EnsureRunnableHere(string exe)
     {
         if (!File.Exists(exe))
             throw new FileNotFoundException($"Clearcote binary not found at '{exe}'. Set ExecutablePath / CLEARCOTE_BINARY, or let the SDK auto-download it.", exe);

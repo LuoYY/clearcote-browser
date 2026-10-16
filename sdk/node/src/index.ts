@@ -29,7 +29,7 @@ import type {
   Page,
 } from "playwright-core";
 import { makeRecoveredCopy, recoveredExe, removeFailedLaunchDirs } from "./winlaunch.js";
-import { checkInstall, ensureBinary, ensureVersion, proEnsureBinary, resolvedEngineVersion, resolveReleaseChannel, warmFiles, type DownloadOptions } from "./download.js";
+import { checkInstall, ensureBinary, ensureRunnableHere, ensureVersion, proEnsureBinary, resolvedEngineVersion, resolveReleaseChannel, warmFiles, type DownloadOptions } from "./download.js";
 import { fingerprintArgs, isFingerprintPassthrough, splitFingerprintOptions, type FingerprintOptions } from "./fingerprint.js";
 import { resolveGeoDetailed, startEgressDriftCheck, GeoipError, type Geo } from "./geoip.js";
 import { defaultColorScheme, engineDecidesColorScheme, installColorSchemeDefault } from "./colorscheme.js";
@@ -60,13 +60,14 @@ import {
   DEFAULT_IGNORED_ARGS,
   gpuBlocklistArgs,
   gpuBackendArgs,
+  macosKeychainArgs,
   gateEngineSwitches,
   engineExtrasArgs,
   stockRuntimeArgs,
   stockRuntimeOn,
   type PwProxy,
 } from "./launchopts.js";
-import { RELEASE, platformRelease } from "./release.js";
+import { RELEASE } from "./release.js";
 import { fetchWidevine, seedWidevine, widevineArgs, widevineLaunchArgs, widevineMode } from "./widevine.js";
 import { emitCoherenceWarnings, emitWarnings, serveExposureWarnings } from "./warnings.js";
 import { checkFontDirs, fontLaunchEnv } from "./fonts.js";
@@ -399,15 +400,6 @@ export async function applyGeoip(fp: FingerprintOptions, proxy: unknown, quiet?:
   return geo;
 }
 
-function ensureRunnableHere(exe: string): void {
-  if (platformRelease() === undefined) {
-    throw new Error(
-      `Clearcote ${RELEASE.version} ships Windows x64 and Linux x64 binaries — there is no build for '${process.platform}'.\n` +
-        `Run on Windows or Linux, or pass executablePath to a compatible binary.\n` +
-        `(The binary downloaded and verified fine; it is cached at: ${exe})`
-    );
-  }
-}
 
 /**
  * Resolve the Clearcote chrome.exe path, downloading + verifying it if needed.
@@ -568,6 +560,9 @@ function assembleArgs(
     base.push(...gpuBackendArgs(
       fpArgs.find((a) => a.startsWith("--fingerprint-platform="))?.slice("--fingerprint-platform=".length),
       !!extra.headed, process.platform, userArgs));
+    // macOS: the build is unsigned, so every launch would prompt for the "Chromium Safe Storage"
+    // keychain item. See macosKeychainArgs.
+    base.push(...macosKeychainArgs(process.platform, userArgs));
   }
   const merged = mergeFeatureFlags([...base, ...userArgs]);
   // Last: drop 152 r22+ switches this engine does not implement (with a warning), wherever they came from.
@@ -1028,13 +1023,17 @@ export async function retryOnStaleRunToken<T>(lease: LeaseSession | null, start:
  * cannot take (executablePath, args, userDataDir, ...) throws naming it. `close()` disconnects and
  * ends the session.
  *
- * MACOS. There is no native macOS build, so on macOS launch() starts the Clearcote Docker image
+ * MACOS. With a licence key on an Apple Silicon Mac, launch() runs the native macOS PRO build (a
+ * `Chromium.app` bundle, downloaded and verified like the other platforms). Its fonts and canvas text
+ * metrics stay host-native, so only `platform: "macos"` (the default there) is coherent; another
+ * platform without a `fingerprintProfile` captured on that OS warns. Without a licence key (the free
+ * build has no macOS binary), or on an Intel Mac, launch() starts the Clearcote Docker image instead
  * (teamflatearth/clearcote:sdk-<version>; `dockerImage` or CLEARCOTE_DOCKER_IMAGE picks another) and
  * resolves to the same Playwright `Browser`, connected to it over CDP; `close()` stops the container.
  * The persona options, `headless`, `proxy`, `args`, `version` and the licence key go to the container;
  * an option it cannot take throws naming it. Docker must be installed and running
- * ({@link DockerUnavailableError} says so otherwise). `docker: false` (or CLEARCOTE_DOCKER=0) turns
- * this off; `docker: true` uses the container on any OS.
+ * ({@link DockerUnavailableError} says so otherwise). `docker: true` (or CLEARCOTE_DOCKER=1) uses the
+ * container on any OS, a licensed Mac included; `docker: false` (or CLEARCOTE_DOCKER=0) never does.
  */
 export async function launch(options: LaunchOptions | CloudLaunchOptions = {}): Promise<Browser> {
   if (cloudRequested((options as CloudSwitchOption).cloud)) {
@@ -1042,7 +1041,7 @@ export async function launch(options: LaunchOptions | CloudLaunchOptions = {}): 
   }
   const { docker, dockerImage, ...notDocker } = options as LaunchOptions;
   if (dockerRequested(docker, notDocker as Record<string, unknown>)) {
-    // macOS (no native build): the Clearcote Docker image, connected over CDP
+    // macOS without the native PRO build: the Clearcote Docker image, connected over CDP
     return launchDocker({ ...(withoutCloudOptions(notDocker) as Record<string, unknown>), dockerImage });
   }
   options = notDocker;

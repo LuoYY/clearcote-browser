@@ -16,6 +16,13 @@ internal static class Native
     public static string OsTag =>
         OsTagOverride ?? (IsWindows ? "windows" : IsLinux ? "linux" : IsMac ? "macos" : "unknown");
 
+    /// Test seam: when set, overrides the reported CPU architecture (see <see cref="Arch"/>).
+    internal static string? ArchOverride;
+
+    /// The machine's CPU architecture, lower-cased ("arm64", "x64", ...). The OS architecture, not this
+    /// process's: an x64 .NET under Rosetta on an Apple Silicon Mac still starts the arm64 browser natively.
+    public static string Arch => ArchOverride ?? RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant();
+
     /// Home dir. Reads HOME then USERPROFILE (so tests can redirect it, like the Node suite does).
     public static string HomeDir =>
         FirstNonEmpty(

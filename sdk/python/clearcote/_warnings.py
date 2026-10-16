@@ -86,12 +86,18 @@ def coherence_warnings(opts, host_platform=None, build_major=None):
 
     # --- persona / cross-signal coherence ---
     fam = _host_family(host)
-    if platform and fam and platform != fam and not profile:
+    # On macOS the font list the SDK picks for a seeded persona (_sdk_font_profile) changes nothing: the
+    # build's font persona patches target Linux-only sources, so fonts and canvas text metrics stay the
+    # Mac's own whatever the claim. Only a profile the caller supplied (captured on that OS) counts there.
+    sdk_fonts_only = fam == "macos" and opts.get("_sdk_font_profile")
+    if platform and fam and platform != fam and (not profile or sdk_fonts_only):
         warn("platform-host-fonts",
              "platform=%r but this host is %s and no fingerprint_profile supplies that OS's "
              "fonts/metrics - font, canvas and font-list hashes will be host-native and won't match a "
              "real %s Chrome. Use a fingerprint_profile captured on %s, or set platform=%r."
-             % (platform, fam, platform, platform, fam))
+             % (platform, fam, platform, platform, fam)
+             + (" On the native macOS build only platform='macos' is coherent: its fonts and canvas "
+                "text metrics always stay the Mac's own." if fam == "macos" else ""))
     # On a Windows host the GPU runs through Direct3D 11, which clamps the WebGL and WebGPU limits (vertex
     # uniform vectors, a 16384 maximum texture size, ...). A persona can lower a limit, never lift one past the
     # driver's, so a Linux claim here reports limits no real Linux machine has. Pass-through claims nothing.
