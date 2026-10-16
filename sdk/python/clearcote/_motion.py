@@ -557,7 +557,7 @@ class AfterTraits:
     """Per-identity after-action traits, stable per seed (see after_traits)."""
 
     dwell_ms: float          # centre of this hand's hover dwell, 250..700 (draws stay in 150..900)
-    move_off_rate: float     # share of clicks followed by a move-off, 0.60..0.85
+    move_off_rate: float     # share of clicks followed by a move-off, 0.64..0.82 (a 40-click run stays in 60-85 %)
     move_off_delay_ms: float  # centre of the release -> move-off gap, 300..600 (draws stay in 200..700)
     read_tempo: float        # scale on the attention model's read pause, 0.85..1.15
 
@@ -570,14 +570,17 @@ def after_traits(p: Persona) -> AfterTraits:
     a hand that keeps breathing on the mouse. Same values in motion.ts afterTraits and
     Motion.AfterTraitsOf."""
     r = mulberry32((p.seed ^ _AFTER_SALT) & _MASK)
-    return AfterTraits(dwell_ms=_lerp(250, 700, r()), move_off_rate=_lerp(0.60, 0.85, r()),
+    return AfterTraits(dwell_ms=_lerp(250, 700, r()), move_off_rate=_lerp(0.64, 0.82, r()),
                        move_off_delay_ms=_lerp(300, 600, r()), read_tempo=_lerp(0.85, 1.15, r()))
 
 
 def after_rng(p: Persona) -> Rng:
     """The persona's after-action stream positioned AFTER its four trait draws: the per-action draws
     (a dwell's length, a move-off's roll / angle / distance / delay, the attention model's pauses) come
-    from here, so a seed answers the same sequence in every SDK."""
+    from here in the shared vectors (sdk/testdata/humanize_after_vectors.json) so the three SDKs can be compared
+    draw for draw. The humanizers do NOT use it: the seed fixes traits only, and every per-action draw is
+    unseeded (random.random), as in plan_move -- a seeded per-action sequence would replay identically in
+    every session of an identity, a cross-session fingerprint."""
     r = mulberry32((p.seed ^ _AFTER_SALT) & _MASK)
     for _ in range(4):
         r()
@@ -585,10 +588,11 @@ def after_rng(p: Persona) -> Rng:
 
 
 def dwell_ms(p: Persona, rng: Optional[Rng] = None) -> float:
-    """How long a hover dwells on arrival: the persona's centre x 0.6..1.4, kept in 150..900 ms."""
+    """How long a hover dwells on arrival: the persona's centre x 0.6..1.4, kept in 150..850 ms (the band is
+    150-900 ms as the page measures it: the glide's slow tail inside 3 px adds a few tens of ms)."""
     if rng is None:
         rng = random.random
-    return _clamp(after_traits(p).dwell_ms * _lerp(0.6, 1.4, rng()), 150.0, 900.0)
+    return _clamp(after_traits(p).dwell_ms * _lerp(0.6, 1.4, rng()), 150.0, 850.0)
 
 
 def plan_dwell(at, box, p: Persona, ms: float, rng: Optional[Rng] = None):
@@ -601,7 +605,8 @@ def plan_dwell(at, box, p: Persona, ms: float, rng: Optional[Rng] = None):
     if rng is None:
         rng = random.random
     step_ms = 1000.0 / p.device_hz
-    n = int(max(3, _js_round(max(0.0, ms) / step_ms)))
+    # rest gaps run 0.9-1.4 frames (mean 1.15): the sample count makes the walked dwell last about ms
+    n = int(max(3, _js_round(max(0.0, ms) / (step_ms * 1.15))))
     out: list = []
     drift = [0.0, 0.0]
     tphase = rng() * 2 * math.pi

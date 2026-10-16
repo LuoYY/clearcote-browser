@@ -74,13 +74,11 @@ public static partial class Humanize
     // What the hand does once an action has landed: it rests on a hovered element (DwellAsync), drifts off a
     // clicked one (ScheduleMoveOff / RunMoveOffAsync), and between actions it reads and idles (Attention). All
     // LAZY: run at the start of the next humanized action inside the page gate (SerialAsync -> PreActionAsync),
-    // or by HumanSettleAsync, never from a timer. Per-action draws come from the persona's salted after-action
-    // stream (Motion.AfterRng): every existing draw keeps its order.
+    // or by HumanSettleAsync, never from a timer. The persona's traits come from a salted stream of its seed
+    // (Motion.AfterTraitsOf: every existing draw keeps its order); every per-action draw is unseeded.
 
     private sealed class AfterState
     {
-        public Rng? Rng;
-        public uint RngSeed;
         public long? LastEnd, LoadAt;
         public (long Due, double X, double Y)? MoveOff;
         public int MoHits, MoN;
@@ -113,15 +111,12 @@ public static partial class Humanize
     private static bool AttentionOn(IPage page)
         => (AttentionFlag.TryGetValue(page, out var f) && f.Value) || AmbientMode(page) == "idle";
 
+    // Per-action draws are UNSEEDED, as in PlanMove: the seed fixes the persona's traits only (Motion.AfterTraitsOf);
+    // a seeded per-action sequence would replay identically in every session of an identity.
     private static Rng AfterRngOf(IPage page, Persona p)
     {
-        var af = AfterOf(page);
-        if (af.Rng is null || af.RngSeed != p.Seed)
-        {
-            af.Rng = Motion.AfterRng(p);
-            af.RngSeed = p.Seed;
-        }
-        return af.Rng;
+        _ = page; _ = p;
+        return Random.Shared.NextDouble;
     }
 
     private static void Trace(AfterState af, params object[] e)
@@ -261,11 +256,11 @@ public static partial class Humanize
         await WalkStepsAsync(page, st, steps).ConfigureAwait(false);
     }
 
-    private static async Task AttendAsync(IPage page, Persona p, PointerState st, bool coords)
+    private static async Task AttendAsync(IPage page, Persona p, PointerState st, bool coords, long now)
     {
         var af = AfterOf(page);
         var rng = AfterRngOf(page, p);
-        long now = NowMs();
+        // `now`: when the action started -- a move-off glide just made does not count as idle time
         if (af.LoadAt is long la)
         {
             af.LoadAt = null;
@@ -300,8 +295,9 @@ public static partial class Humanize
         {
             var p = PersonaFor(page);
             var st = StateFor(page);
+            long now = NowMs();
             await RunMoveOffAsync(page, p, st, wait: false).ConfigureAwait(false);
-            if (AttentionOn(page)) await AttendAsync(page, p, st, coords).ConfigureAwait(false);
+            if (AttentionOn(page)) await AttendAsync(page, p, st, coords, now).ConfigureAwait(false);
         }
         catch (Exception e) when (e is PlaywrightException or InvalidOperationException or TimeoutException)
         {

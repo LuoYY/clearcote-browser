@@ -339,6 +339,21 @@ public class AfterActionTests
         Assert.All(mv, e => Assert.True(e.X >= 0 && e.X <= 1280 && e.Y >= 0 && e.Y <= 800));
     }
 
+    [Fact]
+    public async Task Seed_fixes_traits_only_per_action_draws_are_unseeded()
+    {
+        Assert.Equal(Motion.AfterTraitsOf(Motion.MakePersona("same-1")), Motion.AfterTraitsOf(Motion.MakePersona("same-1")));
+        var seqs = new List<List<double>>();
+        for (int k = 0; k < 2; k++)
+        {
+            var f = Make("same-1");
+            for (int i = 0; i < 4; i++) await f.Loc.HumanHoverAsync();
+            seqs.Add(Trace(f.Page).Where(e => (string)e[0] == "dwell").Select(e => (double)e[1]).ToList());
+        }
+        Assert.Equal(4, seqs[0].Count);
+        Assert.NotEqual(seqs[0], seqs[1]);
+    }
+
     // ---------------------------------------------------------------------------- shared vectors
     private static readonly JsonElement Vec =
         JsonDocument.Parse(File.ReadAllText(SharedTestData.PathOf("humanize_after_vectors.json"))).RootElement.Clone();

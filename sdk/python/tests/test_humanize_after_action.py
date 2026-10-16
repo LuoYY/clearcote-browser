@@ -301,7 +301,7 @@ def test_move_off_runs_at_the_next_action_when_due(clock):
         p.mouse.click(600, 200)
         ran += len([e for e in trace(p) if e[0] == "move_off"]) - before
         clock.sleep(0.75)
-    assert 5 <= ran <= 10
+    assert 3 <= ran <= 10   # click 1's draws share the page's running share with click 2's
 
 
 def test_selector_click_schedules_a_move_off(clock):
@@ -457,3 +457,20 @@ def test_shared_after_action_vectors():
     with open(OUT, encoding="utf-8") as f:
         want = json.load(f)
     _close(json.loads(json.dumps(build())), want)
+
+
+def test_same_seed_same_traits_but_unseeded_per_action_draws(clock):
+    """The seed fixes the persona's TRAITS only; every per-action draw is unseeded (coordinator rule, SC 232):
+    a seeded per-action sequence would replay identically in every session of one identity."""
+    from clearcote._motion import after_traits, make_persona
+    assert after_traits(make_persona("same-1")) == after_traits(make_persona("same-1"))
+    seqs = []
+    for _ in range(2):
+        p = attach(clock, "same-1")
+        for _ in range(5):
+            p.hover("#t")
+            p.click("#t")
+            settle(p)
+        seqs.append([round(e[1], 6) for e in trace(p) if e[0] == "dwell"]
+                    + [tuple(round(v, 6) for v in e[2]) for e in trace(p) if e[0] == "move_off"])
+    assert len(seqs[0]) >= 5 and seqs[0] != seqs[1], seqs

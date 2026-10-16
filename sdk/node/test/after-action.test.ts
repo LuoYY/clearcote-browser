@@ -194,7 +194,7 @@ describe("move-off after a click", () => {
       ran += trace(f).filter((e) => e[0] === "move_off").length - b;
       await vi.advanceTimersByTimeAsync(750);
     }
-    expect(ran).toBeGreaterThanOrEqual(5);
+    expect(ran).toBeGreaterThanOrEqual(3);
   }, 120_000);
 });
 
@@ -299,6 +299,21 @@ describe("ambient option", () => {
     h.fire("load");
     await vi.advanceTimersByTimeAsync(3000);
     expect(moves(h).length).toBeGreaterThan(20);
+  }, 60_000);
+});
+
+describe("randomness", () => {
+  it("the seed fixes traits only: two fresh personas of one seed draw different per-action samples", async () => {
+    const m: any = M;
+    expect(m.afterTraits(M.makePersona("same-1"))).toEqual(m.afterTraits(M.makePersona("same-1")));
+    const seqs: number[][] = [];
+    for (let k = 0; k < 2; k++) {
+      const f = await setup("same-1");
+      for (let i = 0; i < 5; i++) await drive(f.page.hover("#t"));
+      seqs.push(trace(f).filter((e) => e[0] === "dwell").map((e) => e[1] as number));
+    }
+    expect(seqs[0].length).toBe(5);
+    expect(seqs[0]).not.toEqual(seqs[1]);
   }, 60_000);
 });
 

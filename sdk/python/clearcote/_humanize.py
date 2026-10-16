@@ -52,7 +52,7 @@ from ._isolated import (
 from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     platform_from_navigator, rollover_rate, wheel_notches,
-    after_rng, dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
+    dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
 )
 from ._attention import (
     IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
@@ -655,9 +655,11 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     # What the hand does once an action has landed: it rests on a hovered element (hover dwell), drifts
     # off a clicked one (move-off), and between actions it reads and idles (_attention). All of it is
     # LAZY -- run at the start of the next public action, or by page.settle() --, never from a timer or a
-    # thread, so nothing races the action in flight. The per-action draws come from the persona's salted
-    # after-action stream (_motion.after_rng): every existing draw keeps its order.
-    arng = after_rng(persona)
+    # thread, so nothing races the action in flight. The persona's traits come from a salted stream of its seed
+    # (_motion.after_traits: every existing draw keeps its order); every per-action draw is unseeded.
+    # Per-action draws are UNSEEDED, as in plan_move: the seed fixes the persona's traits only (after_traits);
+    # a seeded per-action sequence would replay identically in every session of an identity.
+    arng = random.random
     st.update({"depth": 0, "last_end": None, "load_at": None, "mo": None, "mo_hits": 0, "mo_n": 0})
     # Hidden switch for the attention model until lane A's `ambient="idle"` / `attention` option lands.
     page._clearcote_attention = False
@@ -724,9 +726,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])
 
-    def _attend(coords):
+    def _attend(coords, now):
         """The attention model (_attention): a read pause after a load, else idle drifts after a gap."""
-        now = time.monotonic()
+        # `now`: when the action started -- a move-off glide just made does not count as idle time
         la = st["load_at"]
         if la is not None:
             st["load_at"] = None
@@ -756,9 +758,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             return
         st["depth"] += 1
         try:
+            now = time.monotonic()
             _run_move_off(False)
             if _attention_on():
-                _attend(coords)
+                _attend(coords, now)
         except Exception:  # noqa: BLE001 - the after-action model never stops the action
             pass
         finally:

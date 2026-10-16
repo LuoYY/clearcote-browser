@@ -37,7 +37,7 @@ from ._isolated import (
 from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     platform_from_navigator, rollover_rate, wheel_notches,
-    after_rng, dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
+    dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
 )
 from ._attention import (
     IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
@@ -451,8 +451,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # ------------------------------------------------------------ after-action (SC 232 lane C)
     # See the sync file: hover dwell, move-off after a click, and the attention model, all LAZY (run at the
     # start of the next action inside the page lock, or by page.settle()), never from a timer or a task.
-    # Per-action draws come from the persona's salted after-action stream (_motion.after_rng).
-    arng = after_rng(persona)
+    # Traits from the persona's salted stream (_motion.after_traits); per-action draws unseeded.
+    # Per-action draws are UNSEEDED, as in plan_move: the seed fixes the persona's traits only (after_traits);
+    # a seeded per-action sequence would replay identically in every session of an identity.
+    arng = random.random
     st.update({"depth": 0, "last_end": None, "load_at": None, "mo": None, "mo_hits": 0, "mo_n": 0})
     # Hidden switch for the attention model until lane A's `ambient="idle"` / `attention` option lands.
     page._clearcote_attention = False
@@ -517,8 +519,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])
 
-    async def _attend(coords):
-        now = time.monotonic()
+    async def _attend(coords, now):
+        # `now`: when the action started -- a move-off glide just made does not count as idle time
         la = st["load_at"]
         if la is not None:
             st["load_at"] = None
@@ -547,9 +549,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             return
         st["depth"] += 1
         try:
+            now = time.monotonic()
             await _run_move_off(False)
             if _attention_on():
-                await _attend(coords)
+                await _attend(coords, now)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - the after-action model never stops the action

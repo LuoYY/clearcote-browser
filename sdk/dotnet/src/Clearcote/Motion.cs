@@ -595,14 +595,15 @@ public static class Motion
     {
         var r = Mulberry32(p.Seed ^ AfterSalt);
         double dwell = Lerp(250, 700, r());
-        double rate = Lerp(0.60, 0.85, r());
+        double rate = Lerp(0.64, 0.82, r());
         double delay = Lerp(300, 600, r());
         double tempo = Lerp(0.85, 1.15, r());
         return new AfterTraits(dwell, rate, delay, tempo);
     }
 
-    /// <summary>The persona's after-action stream positioned after its four trait draws: the per-action draws come
-    /// from here, so a seed answers the same sequence in every SDK.</summary>
+    /// <summary>The persona's after-action stream positioned after its four trait draws. Used by the shared vectors
+    /// only, to compare the SDKs draw for draw: the humanizer's per-action draws are unseeded, as in PlanMove -- the
+    /// seed fixes traits only, or every session of an identity would replay one sequence.</summary>
     public static Rng AfterRng(Persona p)
     {
         var r = Mulberry32(p.Seed ^ AfterSalt);
@@ -610,11 +611,12 @@ public static class Motion
         return r;
     }
 
-    /// <summary>How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–900 ms.</summary>
+    /// <summary>How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–850 ms (150–900 as the
+    /// page measures it, with the glide's slow tail).</summary>
     public static double DwellMs(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return Clamp(AfterTraitsOf(p).DwellMs * Lerp(0.6, 1.4, rng()), 150, 900);
+        return Clamp(AfterTraitsOf(p).DwellMs * Lerp(0.6, 1.4, rng()), 150, 850);
     }
 
     /// <summary>
@@ -627,7 +629,7 @@ public static class Motion
     {
         rng ??= Random.Shared.NextDouble;
         double stepMs = 1000 / p.DeviceHz;
-        int n = (int)Math.Max(3, JsRound(Math.Max(0, ms) / stepMs));
+        int n = (int)Math.Max(3, JsRound(Math.Max(0, ms) / (stepMs * 1.15)));   // rest gaps average 1.15 frames
         var outSteps = new List<Step>(n);
         double d0 = 0, d1 = 0;
         double tphase = rng() * 2 * Math.PI;
@@ -697,6 +699,6 @@ public static class Motion
 }
 
 /// <summary>Per-identity after-action traits (see <see cref="Motion.AfterTraitsOf"/>): the centre of the hover dwell
-/// (250–700 ms), the share of clicks followed by a move-off (0.60–0.85), the centre of the release → move-off gap
+/// (250–700 ms), the share of clicks followed by a move-off (0.64–0.82), the centre of the release → move-off gap
 /// (300–600 ms) and the scale on the attention model's read pause (0.85–1.15).</summary>
 public readonly record struct AfterTraits(double DwellMs, double MoveOffRate, double MoveOffDelayMs, double ReadTempo);

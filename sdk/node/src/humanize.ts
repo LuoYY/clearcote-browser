@@ -34,7 +34,7 @@ import {
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
 import {
-  afterRng, dwellMs, moveOffDelayMs, moveOffRoll, planDwell, planMoveOff,
+  dwellMs, moveOffDelayMs, moveOffRoll, planDwell, planMoveOff,
 } from "./motion.js";
 import { ambientMode, exploreNotches, idleDrifts, readPauseMs, IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH } from "./attention.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
@@ -339,7 +339,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   const st = { x: rand(140, 380), y: rand(90, 240), held: false, placed: false };
   // After-action state (SC 232 lane C; see the block at the end of attachHumanize).
   const af = {
-    rng: afterRng(persona), depth: 0, lastEnd: null as number | null, loadAt: null as number | null,
+    // per-action draws are unseeded, as in planMove: the seed fixes the persona's traits only
+    rng: Math.random as () => number, depth: 0, lastEnd: null as number | null, loadAt: null as number | null,
     mo: null as { due: number; x: number; y: number } | null, moHits: 0, moN: 0, trace: [] as unknown[][],
   };
 
@@ -1887,8 +1888,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // What the hand does once an action has landed (a port of the Python humanizer's): it rests on a hovered
   // element (dwellOn), drifts off a clicked one (scheduleMoveOff / runMoveOff), and between actions it
   // reads and idles (attention.ts). All LAZY: run at the start of the next action inside the page lock
-  // (afterRun), or by page.settle(), never from a timer. The per-action draws come from the persona's
-  // salted after-action stream (motion.afterRng): every existing draw keeps its order.
+  // (afterRun), or by page.settle(), never from a timer. The seed fixes the persona's traits (motion.afterTraits,
+  // a salted stream: every existing draw keeps its order); every per-action draw is unseeded.
   // (Function declarations: hoisted, so locked()/targetedClick above can call them.)
   // Hidden switch for the attention model until lane A's `ambient: "idle"` / `attention` option lands.
   (page as any)._clearcoteAttention = false;
@@ -1992,8 +1993,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
   }
 
-  async function attend(coords: boolean): Promise<void> {
-    const now = Date.now();
+  async function attend(coords: boolean, now: number): Promise<void> {
+    // `now`: when the action started -- a move-off glide just made does not count as idle time
     const la = af.loadAt;
     if (la !== null) {
       af.loadAt = null;
@@ -2020,8 +2021,9 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     if (af.depth > 0 || st.held) return;
     af.depth++;
     try {
+      const now = Date.now();
       await runMoveOff(false);
-      if (attentionOn()) await attend(coords);
+      if (attentionOn()) await attend(coords, now);
     } catch { /* the after-action model never stops the action */ } finally { af.depth--; }
   }
 

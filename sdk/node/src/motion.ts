@@ -565,7 +565,7 @@ export const MOVE_OFF_MARGIN_PX = 8;
 export interface AfterTraits {
   /** Centre of this hand's hover dwell, 250–700 ms (draws stay in 150–900). */
   dwellMs: number;
-  /** Share of clicks followed by a move-off, 0.60–0.85. */
+  /** Share of clicks followed by a move-off, 0.64–0.82 (a 40-click run stays in 60–85 %). */
   moveOffRate: number;
   /** Centre of the release → move-off gap, 300–600 ms (draws stay in 200–700). */
   moveOffDelayMs: number;
@@ -581,23 +581,25 @@ export interface AfterTraits {
 export function afterTraits(p: Persona): AfterTraits {
   const r = mulberry32((p.seed ^ AFTER_SALT) >>> 0);
   const dwellMs = lerp(250, 700, r());
-  const moveOffRate = lerp(0.6, 0.85, r());
+  const moveOffRate = lerp(0.64, 0.82, r());
   const moveOffDelayMs = lerp(300, 600, r());
   const readTempo = lerp(0.85, 1.15, r());
   return { dwellMs, moveOffRate, moveOffDelayMs, readTempo };
 }
 
-/** The persona's after-action stream positioned AFTER its four trait draws: the per-action draws come
- * from here, so a seed answers the same sequence in every SDK. */
+/** The persona's after-action stream positioned AFTER its four trait draws. Used by the shared vectors only, to
+ * compare the SDKs draw for draw: the humanizer's per-action draws are unseeded (Math.random), as in planMove --
+ * the seed fixes traits only, or every session of an identity would replay one sequence. */
 export function afterRng(p: Persona): Rng {
   const r = mulberry32((p.seed ^ AFTER_SALT) >>> 0);
   for (let i = 0; i < 4; i++) r();
   return r;
 }
 
-/** How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–900 ms. */
+/** How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–850 ms (150–900 as the page
+ * measures it, with the glide's slow tail). */
 export function dwellMs(p: Persona, rng: Rng = Math.random): number {
-  return clamp(afterTraits(p).dwellMs * lerp(0.6, 1.4, rng()), 150, 900);
+  return clamp(afterTraits(p).dwellMs * lerp(0.6, 1.4, rng()), 150, 850);
 }
 
 /** Plan the pointer's rest on a hover target: OU drift + 8–12 Hz tremor around `at` for about `ms` (at
@@ -605,7 +607,7 @@ export function dwellMs(p: Persona, rng: Rng = Math.random): number {
  * The hand is not braced on a hover the way it is before a press: drift ×2, tremor ×1.5 of a glide's. */
 export function planDwell(at: Point, box: Box | null, p: Persona, ms: number, rng: Rng = Math.random): Step[] {
   const stepMs = 1000 / p.deviceHz;
-  const n = Math.max(3, jsRound(Math.max(0, ms) / stepMs));
+  const n = Math.max(3, jsRound(Math.max(0, ms) / (stepMs * 1.15))); // rest gaps average 1.15 frames
   const out: Step[] = [];
   let driftX = 0, driftY = 0;
   const tphase = rng() * 2 * Math.PI;
