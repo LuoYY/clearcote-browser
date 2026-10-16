@@ -1339,9 +1339,10 @@ public static partial class Humanize
                         {
                             consumed = await DoTypoAsync(page, p, chars, i, tp, leave).ConfigureAwait(false);
                         }
-                        catch (PlaywrightException)
+                        catch (PlaywrightException e) when (!e.GetType().Name.StartsWith("ClearcoteStrict", StringComparison.Ordinal))
                         {
-                            // a slip that could not be made is no slip: type the character as planned
+                            // a slip that could not be made is no slip: type the character as planned (lane A's
+                            // strict-mode error is not a failed slip: it propagates)
                         }
                     }
                 }
@@ -1364,7 +1365,8 @@ public static partial class Humanize
                     // lane D: the bigram flight model (Keys.PlanGap, the planner Python and Node use): the persona's
                     // WPM, scaled by how the hand travels between the two keys, log-normal noise, word-initial and
                     // punctuation pauses, the whitespace and thinking pauses; the caller's delay as a floor.
-                    await KeySleep(Math.Max(floor, Keys.PlanGap(tr, ch, chars[i + 1], Unseeded))).ConfigureAwait(false);
+                    await KeySleep(Math.Max(floor, Keys.PlanGap(tr, ch, chars[i + 1], Unseeded,
+                        PersonaScale(p, "Tempo"), PersonaScale(p, "PauseScale")))).ConfigureAwait(false);
                 }
             }
         }
@@ -1430,12 +1432,17 @@ public static partial class Humanize
         {
             await page.Keyboard.PressAsync(ch,
                 new KeyboardPressOptions { Delay = (float)Motion.KeyDwell(p) }).ConfigureAwait(false);
+            return;
         }
-        catch (PlaywrightException)
-        {
-            await page.Keyboard.TypeAsync(ch).ConfigureAwait(false);
-        }
+        catch (PlaywrightException) { /* below */ }
+        // Outside the catch: lane A's reporting (strict mode throws) must reach the caller.
+        Fallback("type: insertText for a character PressAsync cannot map");
+        await page.Keyboard.TypeAsync(ch).ConfigureAwait(false);
     }
+
+    /// <summary>Lane A's preset scales on the persona (Tempo, PauseScale) when this build has them, else 1.</summary>
+    private static double PersonaScale(Persona p, string name)
+        => typeof(Persona).GetProperty(name)?.GetValue(p) is double v && v > 0 ? v : 1.0;
 
     /// <summary>The focused field's current value, read in the isolated world (null if unknown).</summary>
     private static async Task<string?> ActiveValueAsync(IPage page)

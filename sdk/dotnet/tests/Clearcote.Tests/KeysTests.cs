@@ -379,4 +379,18 @@ public class KeysTests
         Assert.NotEqual(await Run(), await Run());
         Assert.Equal(TraitsOf("ha-1"), TraitsOf("ha-1"));
     }
+
+    [Fact]
+    public async Task Lane_a_tempo_scales_the_gaps()
+    {
+        // lane A's presets will put Tempo on the persona; until then the planner's tempo parameter is what scales
+        var t = TraitsOf("ha-2");
+        var s = Forms.Chars(Vec.GetProperty("ks_text").GetString()!);
+        var r1 = Motion.Mulberry32(3);
+        var r2 = Motion.Mulberry32(3);
+        var a = Enumerable.Range(0, 200).Select(i => Keys.PlanGap(t, s[i], s[i + 1], r1)).ToArray();
+        var b = Enumerable.Range(0, 200).Select(i => Keys.PlanGap(t, s[i], s[i + 1], r2, tempo: 2)).ToArray();
+        for (int i = 0; i < a.Length; i++) Assert.Equal(2 * a[i], b[i], 9);
+        await Task.CompletedTask;
+    }
 }

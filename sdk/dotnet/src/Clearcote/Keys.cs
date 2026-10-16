@@ -106,12 +106,14 @@ public static class Keys
     }
 
     /// <summary>The whole sleep between key <paramref name="prev"/> coming up and key <paramref name="ch"/> going down.</summary>
-    public static double PlanGap(TypingTraits t, string? prev, string? ch, Rng rng)
+    /// <remarks><paramref name="tempo"/> scales the whole gap and <paramref name="pauseScale"/> the thinking-pause
+    /// rate (lane A's presets; 1 = as planned).</remarks>
+    public static double PlanGap(TypingTraits t, string? prev, string? ch, Rng rng, double tempo = 1, double pauseScale = 1)
     {
         double ms = FlightMs(t, prev, ch, rng);
         if (prev is not null && IsWs(prev)) ms += Lerp(20, 100, rng());
-        if (rng() < 0.06) ms += Lerp(180, 450, rng());
-        return ms;
+        if (rng() < 0.06 * pauseScale) ms += Lerp(180, 450, rng());
+        return ms * tempo;
     }
 
     /// <summary>Playwright's key string split into (modifiers, key): "Shift++" -> (["Shift"], "+").</summary>
