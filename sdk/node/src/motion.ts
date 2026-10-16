@@ -479,6 +479,78 @@ export function planDrag(from: Point, to: Point, p: Persona, opts: { settle?: bo
   return out;
 }
 
+// Salt for the drag-start hesitation traits (Python _HESITATION_SALT, .NET HesitationSalt): a salted
+// stream keeps makePersona's draw ORDER, and planDrag itself is untouched.
+const HESITATION_SALT = 0xc2b2ae35;
+/** The drag-start hesitation window (ms): a hand that has just closed on a handle holds 100-300 ms. */
+export const HESITATION_MS: readonly [number, number] = [100, 300];
+/** ... creeping a few px, never this far, before the leg proper. */
+export const HESITATION_MAX_PX = 8;
+
+/** The still-but-not-frozen moment between the grab and the drag leg from->to: samples spanning
+ * 100-300 ms (centred per persona; `durMs`, 40-300, overrides the length but the persona's draw is still
+ * made), creeping < 8 px toward `to` with a little sideways wobble. Same numbers as Python
+ * `_motion.drag_hesitation` and .NET `Motion.DragHesitation` (sdk/testdata/humanize_scroll_vectors.json).
+ * Measured on r38 / SDK 0.51.0 (SC 232): every drag's first held move was already the full-speed leg. */
+export function dragHesitation(from: Point, to: Point, p: Persona, rng: Rng = Math.random, durMs?: number | null): Step[] {
+  const r = mulberry32((p.seed ^ HESITATION_SALT) >>> 0);
+  const centre = lerp(130, 260, r());
+  const amp = lerp(2, 6, r());
+  const wobble = lerp(0.4, 1.2, r());
+  const d = Math.hypot(to.x - from.x, to.y - from.y);
+  const [ux, uy] = d >= 1e-6 ? [(to.x - from.x) / d, (to.y - from.y) / d] : [1, 0];
+  let dur = clamp(centre * lerp(0.8, 1.2, rng()), HESITATION_MS[0], HESITATION_MS[1]);
+  if (durMs !== undefined && durMs !== null) dur = clamp(durMs, 40, HESITATION_MS[1]);
+  const reach = amp * lerp(0.6, 1.0, rng());
+  const stepMs = 1000 / p.deviceHz;
+  const n = Math.max(3, jsRound(dur / stepMs));
+  const dt = dur / n;
+  const phase = rng() * 2 * Math.PI;
+  const out: Step[] = [];
+  let side = 0;
+  for (let i = 1; i <= n; i++) {
+    const tau = i / n;
+    const along = reach * minJerk(tau);
+    side = 0.8 * side + gaussFrom(rng) * wobble * 0.25;
+    const s = clamp(side + wobble * 0.5 * Math.sin(phase + 2 * Math.PI * tau), -1.5, 1.5);
+    let px = from.x + ux * along - uy * s, py = from.y + uy * along + ux * s;
+    if (Math.hypot(px - from.x, py - from.y) >= HESITATION_MAX_PX - 0.5) {
+      px = from.x + ux * (HESITATION_MAX_PX - 1); py = from.y + uy * (HESITATION_MAX_PX - 1);
+    }
+    out.push({ x: px, y: py, sleepMs: dt * lerp(0.9, 1.1, rng()) });
+  }
+  return out;
+}
+
+/** When (ms from the start of `steps`) the walk first leaves the `radius` circle around `from`. */
+export function legExitMs(from: Point, steps: Step[], radius = HESITATION_MAX_PX): number {
+  let t = 0;
+  for (const s of steps) {
+    if (Math.hypot(s.x - from.x, s.y - from.y) >= radius) return t;
+    t += s.sleepMs;
+  }
+  return t;
+}
+
+/** The held part of a drag: the hesitation creep, then the planDrag leg, planned together so the pointer
+ * stays inside 8 px of the press for `windowMs` (clamped 100-300: the persona's grab dwell) and then goes.
+ * Same as Python `hesitate_then_drag`. */
+export function hesitateThenDrag(from: Point, to: Point, p: Persona, windowMs: number, settle = true,
+  rng: Rng = Math.random): { steps: Step[]; creep: number } {
+  const w = clamp(windowMs, HESITATION_MS[0], HESITATION_MS[1]);
+  let creep = dragHesitation(from, to, p, rng, w);
+  let leg = planDrag(creep[creep.length - 1], to, p, { settle, rng });
+  const t8 = legExitMs(from, leg);
+  const want = Math.max(40, w - t8);
+  const have = creep.reduce((a, s) => a + s.sleepMs, 0);
+  if (Math.abs(have - want) > 1) {
+    const k = want / have, m = Math.min(1, k);
+    creep = creep.map((s) => ({ x: from.x + (s.x - from.x) * m, y: from.y + (s.y - from.y) * m, sleepMs: s.sleepMs * k }));
+    leg = planDrag(creep[creep.length - 1], to, p, { settle, rng });
+  }
+  return { steps: creep.concat(leg), creep: creep.length };
+}
+
 /** Grab/release dwell times (ms) for a held-button drag, drawn from the persona window. */
 export function dragDwell(p: Persona, rng: Rng = Math.random): { grabMs: number; releaseMs: number } {
   return {

@@ -30,9 +30,14 @@
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { errors as pwErrors } from "playwright-core";
 import {
-  makePersona, planMove, dragDwell, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
-  wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
+  makePersona, planMove, dragDwell, dragHesitation, hesitateThenDrag, clickHold, keyDwell, clickPoint, planAmbient,
+  gaussFrom, rolloverRate, wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point,
+  type Step, type WheelPlatform,
 } from "./motion.js";
+import {
+  ANCHOR_TARGET_W, ISO_SCROLLER, anchorNeeded, anchorPoint, bringIntoView, inView as boxIn, inputDevice,
+  planTrackpad, wheelDrift, type ScrollBox, type ScrollIO, type Scroller,
+} from "./scroll.js";
 import { keepInView, trimTo, walk } from "./pacing.js";
 import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
 import {
@@ -597,12 +602,12 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   const scrollAnchor = async (): Promise<void> => {
     try {
       const vp = await viewport();
-      if (st.placed && st.x > 6 && st.y > 6 && st.x < vp.width - 6 && st.y < vp.height - 6) return;
-      // Upper-middle of the reading column, gaussian-jittered: an exact viewport centre is as
+      if (!anchorNeeded([st.x, st.y], vp.width, vp.height, st.placed, st.held)) return;
+      // Upper-middle of the reading column, gaussian-jittered (scroll.ts anchorPoint: the numbers Python
+      // and .NET use too -- before 0.52 the three SDKs each had their own): an exact viewport centre is as
       // machine-made as the origin is, so the anchor has to be a distribution, not a landmark.
-      const x = clamp(vp.width * 0.48 + gauss() * vp.width * 0.10, vp.width * 0.18, vp.width * 0.82);
-      const y = clamp(vp.height * 0.36 + gauss() * vp.height * 0.09, vp.height * 0.14, vp.height * 0.62);
-      await glide(x, y);
+      const [x, y] = anchorPoint(vp.width, vp.height);
+      await glide(x, y, { targetW: ANCHOR_TARGET_W });
       await sleep(rand(60, 180)); // eyes land before the finger rolls the wheel
     } catch { /* best-effort: scroll from wherever the cursor is */ }
   };
@@ -612,13 +617,55 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // cannot say (closed, mid-navigation, no CDP) gets the host's platform. Kept for the life of the
   // page either way: a mouse does not change its notch between two scrolls.
   let notchPx: number | null = null;
+  let wheelPlat: WheelPlatform | null = null;
   const wheelNotchPx = async (): Promise<number> => {
     if (notchPx === null) {
       let plat: WheelPlatform | null = null;
       try { plat = platformFromNavigator(await worldFor(page).evaluate<string>(ISO_PLATFORM)); } catch { /* host below */ }
-      notchPx = WHEEL_NOTCH_PX[plat ?? hostWheelPlatform()];
+      wheelPlat = plat ?? hostWheelPlatform();
+      notchPx = WHEEL_NOTCH_PX[wheelPlat];
     }
     return notchPx;
+  };
+  // "trackpad" or "mouse" for this page: the caller's `inputDevice` option when the options object carries
+  // one (read defensively: the options plumbing is lane A's), else a trackpad for a macOS persona.
+  let device: "trackpad" | "mouse" | null = null;
+  const inputDev = async (): Promise<"trackpad" | "mouse"> => {
+    if (device === null) {
+      await wheelNotchPx();
+      const o: any = opts as any;
+      const pg: any = page as any;
+      const cand = [o?.inputDevice, o?.input_device, pg._clearcoteOptions?.inputDevice, pg._clearcoteInputDevice]
+        .find((v) => typeof v === "string");
+      device = inputDevice(wheelPlat, cand);
+    }
+    return device;
+  };
+  const scrollIO: ScrollIO = {
+    viewport: () => viewport(),
+    pointer: () => [st.x, st.y],
+    placed: () => st.placed,
+    held: () => st.held,
+    glide: (x, y, w) => glide(x, y, { targetW: w }),
+    wheel: async (dx, dy) => { await nativeWheel(dx, dy); },
+    sleep: async (ms) => { await sleep(ms); },
+    notchPx: () => wheelNotchPx(),
+    device: () => inputDev(),
+  };
+  // A humanized step that had to fall back to a programmatic one: reported through the options' fallback
+  // hook when one is installed (`page._clearcoteReportFallback(event)`, lane A), and always left on the
+  // page as `_clearcoteLastFallback` (+ the list `_clearcoteFallbacks`).
+  const fallback = (api: string, reason: string): void => {
+    const event = { api, reason };
+    const pg: any = page as any;
+    try {
+      pg._clearcoteLastFallback = event;
+      pg._clearcoteFallbacks = (pg._clearcoteFallbacks || []).concat([event]);
+    } catch { /* a frozen page object */ }
+    try {
+      const rep = pg._clearcoteReportFallback ?? (opts as any)?.onFallback;
+      if (typeof rep === "function") Promise.resolve(rep(event)).catch(() => {});
+    } catch { /* a reporting hook never breaks the action */ }
   };
 
   /** Scroll in WHOLE NOTCHES, the only thing a wheel emits. Humanize scrolls whole notches: the
@@ -631,6 +678,16 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
    * macOS. One axis per event, like a real wheel or tilt, and the notches come in finger-flick bursts. */
   mouse.wheel = async (dx: number, dy: number) => {
     await scrollAnchor();
+    if ((await inputDev()) === "trackpad") {
+      // A trackpad persona swipes the exact distance: 2-40 px events at 60-120/s on a min-jerk bell, then
+      // an inertia tail (scroll.ts planTrackpad). Playwright sends pixel deltas either way (deltaMode 0);
+      // a notch persona's deltas are whole multiples of its notch.
+      for (const e of planTrackpad(dx, dy)) {
+        await nativeWheel(e.dx, e.dy);
+        if (e.sleepMs) await sleep(e.sleepMs);
+      }
+      return;
+    }
     const notch = await wheelNotchPx();
     const plan: [number, number][] = [];
     for (let k = wheelNotches(dy, notch); k > 0; k--) plan.push([0, Math.sign(dy) * notch]);
@@ -653,7 +710,13 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       // this a wheel burst is the one input where the pointer coordinate never changes at all. Never
       // while a button is down, where a move is a drag leg.
       if (plan.length >= 6 && !st.held && Math.random() < 0.06) {
-        try { await glide(st.x + gauss() * 3.5, st.y + gauss() * 2.5); } catch { /* drift is cosmetic */ }
+        // ONE native move of N(0,1.5) x N(0,1.2) px (scroll.ts wheelDrift; it used to be a planned glide of
+        // 3.5/2.5 px sd, unlike Python and .NET)
+        try {
+          const [ddx, ddy] = wheelDrift();
+          await nativeMove(st.x + ddx, st.y + ddy);
+          st.x += ddx; st.y += ddy;
+        } catch { /* drift is cosmetic */ }
       }
     }
   };
@@ -1058,25 +1121,83 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // Playwright's utility world), the scroll only for a box not already inside the viewport, and a
   // plain-CSS `selector` needs no handle at all (cssBox). What remains, for other selectors, is the
   // one boundingBox.
-  const boxOf = async (loc: Locator, timeout: number | undefined, force = false, selector: string | null = null):
-    Promise<Rect | null> => {
+  // Is `selector` plain CSS that the browser's querySelectorAll resolves to exactly the elements Playwright
+  // counts (see cssBox)? Then the box and its scroller are read in the isolated world, with no handle.
+  const cssPlain = async (selector: string | null): Promise<boolean> => {
+    if (typeof selector !== "string" || !selector) return false;
+    const r = await worldFor(page).evaluate<any>(ISO_CSS_BOX, { sel: selector, scroll: false });
+    if (!r || !r.n) return false;
+    try { return (await page.locator(selector).count()) === r.n; } catch { return false; }
+  };
+  const scrollerOf = async (selector: string | null): Promise<Scroller | null> => {
+    const r = await worldFor(page).evaluate<any>(ISO_SCROLLER, { sel: selector });
+    return r && Array.isArray(r.rect) ? r as Scroller : null;
+  };
+  // Bring the target in with the WHEEL (scroll.ts bringIntoView): the box where it shows and owns its centre,
+  // else null and why ("not_scrollable", "notch_budget", "covered"). A plain-CSS target's nearest scrollable
+  // ancestor is wheeled over; any other selector scrolls the window, its box read from the window's scroll
+  // offset (no new handle per read).
+  const wheelIntoView = async (loc: Locator, selector: string | null, css: boolean, box: Rect):
+    Promise<{ got: Rect | null; why: string | null; last: Rect | null }> => {
+    const w = worldFor(page);
+    const s0 = await w.scroll();
+    const boxFn = async (): Promise<ScrollBox | null> => {
+      if (css) return rectBox(await w.evaluate<any>(ISO_CSS_BOX, { sel: selector, scroll: false }));
+      const [sx, sy] = await w.scroll();
+      return { x: box.x - (sx - s0[0]), y: box.y - (sy - s0[1]), width: box.width, height: box.height };
+    };
+    const res = await bringIntoView(scrollIO, boxFn, null, undefined, css ? () => scrollerOf(selector) : null);
+    const last = res.box as Rect | null;
+    if (!res.ok) return { got: null, why: res.notches >= 60 ? "notch_budget" : "not_scrollable", last };
+    if (!last || !((await inView(last)) && (await hitOk(last, selector)))) return { got: null, why: "covered", last };
+    return { got: last, why: null, last };
+  };
+  const needsScroll = async (box: Rect, selector: string | null, css: boolean): Promise<boolean> => {
+    if (!(await inView(box))) return true;
+    if (css) {
+      const sc = await scrollerOf(selector);
+      if (sc) return !boxIn(box, sc.rect);
+    }
+    return false;
+  };
+
+  // Wait the way Playwright would, with the CALLER's timeout (undefined = the page default), and return the
+  // box, in view. With `force` nothing is waited for: a hidden target goes native at once.
+  //
+  // An out-of-view target is brought in with the WHEEL (wheelIntoView): whole notches (or a trackpad swipe)
+  // to 25-60 % of the viewport, an undershoot and a correction, over the scrolling container that clips it.
+  // The programmatic scroll (isolated scrollIntoViewIfNeeded, an instant window scrollBy, Playwright's
+  // scroll) is only the FALLBACK -- a container the wheel does not move, the 60-notch budget spent,
+  // `wheel: false` (a trial, which must not move the pointer) -- and a fallback after a wheel attempt is
+  // reported (fallback()). Measured on r42 / 0.51.0: every humanized action on an off-screen target scrolled
+  // programmatically, a `scroll` event with no wheel before it, the target at the exact centre.
+  //
+  // Each Playwright call that resolves the element to a handle makes a MAIN-world handle whose preview
+  // reads its textContent where the page can see it (verifier B), so each is made only when needed and a
+  // plain-CSS `selector` is read in the isolated world without one.
+  const boxOf = async (loc: Locator, timeout: number | undefined, force = false, selector: string | null = null,
+    wheel = true): Promise<Rect | null> => {
     if (!(await loc.isVisible())) {
       if (force) throw new NativeSignal();
       await loc.waitFor({ state: "visible", timeout });
     }
-    const css = await cssBox(selector);
-    if (css) return css;
-    let box = await loc.boundingBox();
-    if (box && !((await inView(box)) && (await hitOk(box, selector)))) {
-      // Off-screen: scroll the window to it and prove it shows there (hit test), with no new handle.
-      // Clipped by a scrolling container, covered, or the window scroll did not bring it out:
-      // Playwright's scroll, which also scrolls containers, and a fresh box.
-      const moved = !(await inView(box)) ? await scrollWindowTo(box) : null;
-      if (moved && (await inView(moved)) && (await hitOk(moved, selector))) return moved;
-      await loc.scrollIntoViewIfNeeded({ timeout });
-      box = await loc.boundingBox();
+    const css = await cssPlain(selector);
+    const w = worldFor(page);
+    let box: Rect | null = css ? rectBox(await w.evaluate<any>(ISO_CSS_BOX, { sel: selector, scroll: false }))
+      : await loc.boundingBox();
+    if (!box) return box;
+    if (wheel && (await needsScroll(box, selector, css))) {
+      const r = await wheelIntoView(loc, selector, css, box);
+      if (r.got) return r.got;
+      if (r.why !== "covered") fallback("scroll_into_view", r.why!);
+      box = r.last ?? box;
     }
-    return box;
+    if ((await inView(box)) && (await hitOk(box, selector))) return box;
+    if (css) return rectBox(await w.evaluate<any>(ISO_CSS_BOX, { sel: selector, scroll: true }));
+    const moved = !(await inView(box)) ? await scrollWindowTo(box) : null;
+    if (moved && (await inView(moved)) && (await hitOk(moved, selector))) return moved;
+    await loc.scrollIntoViewIfNeeded({ timeout });
+    return await loc.boundingBox();
   };
 
   // Does `loc` hold the keyboard focus? Asked through Playwright's utility-world selector engine
@@ -1296,11 +1417,18 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       await glide(cx, cy, { targetW: 16 });
       await prePress();
       const { grabMs, releaseMs } = dragDwell(persona);
+      const x0 = rangePoint(box, rangeFraction(cur, lo, hi), rtl)[0];
+      const span = Math.abs(rangePoint(box, 1, false)[0] - rangePoint(box, 0, false)[0]);
+      const stepPx = step && hi > lo ? span * (step / (hi - lo)) : 1;
+      const moved = async (): Promise<[number, number] | null> => {
+        const v = await now();
+        return v === null ? null : [rangePoint(box, rangeFraction(v, lo, hi), rtl)[0] - x0, 0];
+      };
       await nativeDown();
       st.held = true;
       try {
-        await sleep(grabMs);
-        await glide(tx, ty, { settle: true });
+        // closed loop (dragBy): past the value by a few px, read the value, correct
+        await dragByCore(cx, cy, tx - x0, 0, moved, Math.max(1, stepPx / 2), grabMs);
         await sleep(releaseMs);
       } finally {
         await nativeUp();
@@ -1719,7 +1847,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     if (o.force) { await loc.waitFor({ state: "attached", timeout: left() }); return; }
     for (;;) {
       let why = "element is not visible";
-      const box = await boxOf(loc, left(), false, selector); // waits for visible; throws Playwright's timeout
+      // waits for visible; throws Playwright's timeout. No wheel: a trial must not move the pointer.
+      const box = await boxOf(loc, left(), false, selector, false);
       if (box) {
         if (!noClick && !(await loc.isEnabled())) {
           why = "element is not enabled";
@@ -1848,9 +1977,216 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   (page as any).pressAndHold = apiErrors("page.pressAndHold", (selector: string, o?: PressAndHoldOptions) =>
     (page as any)._clearcoteHold(page.locator(selector).first(), o));
 
+  // ------------------------------------------------------------- drags (dragTo / dragAndDrop / dragBy)
+  const peekBox = async (loc: Locator, selector: string | null): Promise<Rect | null> =>
+    (await cssPlain(selector)) ? rectBox(await worldFor(page).evaluate<any>(ISO_CSS_BOX, { sel: selector, scroll: false }))
+      : await loc.boundingBox();
+  // The press point inside `box`: Playwright's `position` (padding-box relative, as click), else the
+  // persona's click point. Unless `force`, the hit test must prove it reaches the element (retried like a
+  // click); a covered point tries the probe points; null when nothing reaches it (the caller goes native).
+  const aim = async (box: Rect, position: { x: number; y: number } | undefined, force: boolean,
+    selector: string | null): Promise<[number, number] | null> => {
+    let x: number, y: number;
+    if (position) ({ x, y } = await positionPoint(box, position));
+    else ({ x, y } = clickPoint(box, st, persona));
+    x = roundHalfEven(x); y = roundHalfEven(y);
+    if (force) return [x, y];
+    await sleep(50);
+    const hit = await reachesPoint(box, x, y, selector);
+    if (hit === null || hit) return [x, y];
+    if (position) return null;
+    for (const [fx, fy] of probePoints.slice(1)) {
+      const px = Math.round(box.x + box.width * fx), py = Math.round(box.y + box.height * fy);
+      if ((await hitInBox(box, px, py, selector)) === true) return [px, py];
+    }
+    return null;
+  };
+  const creep = async (from: Point, toward: Point, grabMs: number): Promise<void> => {
+    const steps = dragHesitation(from, toward, persona, Math.random, grabMs);
+    await dispatch(steps);
+    if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
+  };
+  // Hesitation + the held leg in one walk (motion.ts hesitateThenDrag): inside 8 px of the press for the
+  // persona's grab window (100-300 ms), then the drag leg.
+  const heldDrag = async (from: Point, to: Point, grabMs: number, settle = true): Promise<void> => {
+    const { steps } = hesitateThenDrag(from, to, persona, grabMs, settle);
+    await dispatch(steps);
+    st.x = to.x; st.y = to.y;
+  };
+  const locSel = (loc: any): string | null => { try { return loc._selector ?? null; } catch { return null; } };
+
+  // The humanized drag of `src` onto `dst` (Locator.dragTo, page.dragAndDrop). Honours sourcePosition /
+  // targetPosition (padding-box relative, like click), force (no hit tests) and timeout; both ends are hit
+  // tested like a click (probe points on a covered end), else NativeSignal: the caller's native fallback.
+  // Before 0.52 the drag used the exact box centres, no hit test, and ignored every option.
+  const drag = async (src: Locator, dst: Locator, o: any = {}): Promise<void> => {
+    const timeout: number | undefined = o.timeout;
+    const force = Boolean(o.force);
+    const ssel = locSel(src), dsel = locSel(dst);
+    const sbox = await boxOf(src, timeout, force, ssel);
+    if (!sbox) throw new NativeSignal();
+    const sp = await aim(sbox, o.sourcePosition, force, ssel);
+    if (!sp) throw new NativeSignal();
+    if (!(await dst.isVisible())) {
+      if (force) throw new NativeSignal();
+      await dst.waitFor({ state: "visible", timeout });
+    }
+    const tbox = await peekBox(dst, dsel);
+    if (!tbox) throw new NativeSignal();
+    let tp: [number, number] | null = null;
+    if (await inView(tbox)) {
+      tp = await aim(tbox, o.targetPosition, force, dsel);
+      if (!tp) throw new NativeSignal();
+    }
+    const { grabMs, releaseMs } = dragDwell(persona);
+    await glide(sp[0], sp[1], { targetW: Math.max(6, Math.min(sbox.width, sbox.height)) });
+    await prePress();
+    st.held = true;
+    try {
+      await nativeDown();
+      if (!tp) {
+        await creep({ x: sp[0], y: sp[1] }, { x: tbox.x + tbox.width / 2, y: tbox.y + tbox.height / 2 }, grabMs);
+        // the drop zone is out of view: the free hand scrolls it in while the other holds
+        const r = await bringIntoView(scrollIO, () => peekBox(dst, dsel));
+        let got = r.box as Rect | null;
+        if (!r.ok || !got) {
+          fallback("drag_to", "target_out_of_view");
+          await dst.scrollIntoViewIfNeeded({ timeout });
+          got = await peekBox(dst, dsel);
+        }
+        if (!got) throw new Error("drag target vanished");
+        const q = o.targetPosition ? await positionPoint(got, o.targetPosition) : clickPoint(got, st, persona);
+        tp = [roundHalfEven(q.x), roundHalfEven(q.y)];
+        await glide(tp[0], tp[1], { settle: true, held: true });
+      } else {
+        await heldDrag({ x: sp[0], y: sp[1] }, { x: tp[0], y: tp[1] }, grabMs);
+      }
+      await sleep(releaseMs);
+    } finally {
+      try { await nativeUp(); } finally { st.held = false; }
+    }
+  };
+
+  const settledRead = async (read: () => Promise<[number, number] | null>): Promise<[number, number]> => {
+    let a = await read();
+    for (let i = 0; i < 12; i++) {
+      await sleep(50);
+      const b = await read();
+      if (a && b && Math.abs(a[0] - b[0]) < 0.01 && Math.abs(a[1] - b[1]) < 0.01) return b;
+      a = b;
+    }
+    return a ?? [0, 0];
+  };
+  let dragLegs = 0;
+  // Closed-loop held drag from (px, py), already pressed: hesitate, glide PAST the target by 3-8 px, read
+  // where the dragged thing is, correct up to twice with a settle in between; the achieved delta. Legs 1-3.
+  const dragByCore = async (px: number, py: number, dx: number, dy: number,
+    read: () => Promise<[number, number] | null>, tol = 2, grabMs?: number): Promise<[number, number]> => {
+    const d = Math.hypot(dx, dy);
+    const g = grabMs ?? dragDwell(persona).grabMs;
+    if (d < 0.5) { dragLegs = 0; return settledRead(read); }
+    const ux = dx / d, uy = dy / d;
+    const past = rand(3, 8);
+    await heldDrag({ x: px, y: py }, { x: px + dx + ux * past, y: py + dy + uy * past }, g, false);
+    let legs = 1;
+    let got: [number, number] = [0, 0];
+    for (;;) {
+      await sleep(rand(60, 140));
+      got = await settledRead(read);
+      const ex = dx - got[0], ey = dy - got[1];
+      if (Math.hypot(ex, ey) <= tol || legs >= 3) break;
+      await glide(st.x + ex, st.y + ey, { settle: true, held: true });
+      legs++;
+    }
+    dragLegs = legs;
+    return got;
+  };
+  // locator.dragBy / page.dragBy: press on the element (`position` or the persona's point), drag it by
+  // (dx, dy) closed-loop, release. `read`: returns the achieved [dx, dy] (or the x delta alone); default:
+  // how far the element's own box moved. Resolves to the final achieved { x, y }.
+  const dragBy = async (loc: Locator, dx: number, dy: number, o: DragByOptions = {}): Promise<{ x: number; y: number }> => {
+    const force = Boolean(o.force);
+    const sel = locSel(loc);
+    const box = await boxOf(loc, o.timeout, force, sel);
+    if (!box) throw new Error("dragBy: the element has no box (not rendered)");
+    const p0 = await aim(box, o.position, force, sel);
+    if (!p0) throw new Error("dragBy: another element would receive the press");
+    const c0 = [box.x + box.width / 2, box.y + box.height / 2];
+    const read = async (): Promise<[number, number] | null> => {
+      if (o.read) {
+        const v: any = await o.read();
+        if (v === null || v === undefined) return null;
+        if (typeof v === "number") return [v, 0];
+        return Array.isArray(v) ? [Number(v[0]), Number(v[1])] : [Number(v.x), Number(v.y)];
+      }
+      const b = await peekBox(loc, sel);
+      return b ? [b.x + b.width / 2 - c0[0], b.y + b.height / 2 - c0[1]] : null;
+    };
+    const { grabMs, releaseMs } = dragDwell(persona);
+    await glide(p0[0], p0[1], { targetW: Math.max(6, Math.min(box.width, box.height)) });
+    await prePress();
+    st.held = true;
+    let got: [number, number];
+    try {
+      await nativeDown();
+      got = await dragByCore(p0[0], p0[1], dx, dy, read, o.tolerance ?? 2, grabMs);
+      (page as any)._clearcoteDragLegs = dragLegs;
+      await sleep(releaseMs);
+    } finally {
+      try { await nativeUp(); } finally { st.held = false; }
+    }
+    return { x: got[0], y: got[1] };
+  };
+
+  (page as any)._clearcoteDrag = (src: Locator, dst: Locator, o: any) => locked(() => drag(src, dst, o));
+  (page as any)._clearcoteDragBy = (loc: Locator, dx: number, dy: number, o?: DragByOptions) =>
+    locked(() => dragBy(loc, dx, dy, o));
+  const nativeDnd = typeof (page as any).dragAndDrop === "function" ? (page as any).dragAndDrop.bind(page) : null;
+  if (nativeDnd) {
+    // page.dragAndDrop, humanized like Locator.dragTo (the first match of each selector; more than one match
+    // goes to the native call, which raises Playwright's strict-mode error).
+    (page as any).dragAndDrop = apiErrors("page.dragAndDrop", (source: string, target: string, o: any = {}) =>
+      locked(async () => {
+        if (o?.trial) {
+          for (const [s2, pos] of [[source, o.sourcePosition], [target, o.targetPosition]] as const) {
+            const t: any = pickOptions(o, ["force", "timeout"]);
+            if (pos) t.position = pos;
+            await trial(s2 as string, t, true);
+          }
+          return;
+        }
+        try {
+          const src = page.locator(source), dst = page.locator(target);
+          if ((await src.count()) <= 1 && (await dst.count()) <= 1) {
+            await drag(src.first(), dst.first(), o);
+            return;
+          }
+        } catch (e) {
+          if (isTimeout(e)) throw e;
+        }
+        return nativeDnd(source, target, o);   // the native fallback site
+      }));
+  }
+  (page as any).dragBy = apiErrors("page.dragBy", (selector: string, dx: number, dy: number, o?: DragByOptions) =>
+    locked(() => dragBy(page.locator(selector).first(), dx, dy, o)));
+
   // Marker the Locator-class patch keys off: humanize is active for THIS page.
   (page as any)._clearcoteHumanized = true;
   patchLocatorClass(page.locator("html"));
+}
+
+/** Options of `locator.dragBy(dx, dy, options)` / `page.dragBy(selector, dx, dy, options)`. */
+export interface DragByOptions {
+  /** Press here (relative to the element's padding box, like click's `position`) instead of the persona's point. */
+  position?: { x: number; y: number };
+  /** Skip the hit test at the press point. */
+  force?: boolean;
+  /** For the element to become visible (ms). */
+  timeout?: number;
+  /** Close enough (px), default 2. */
+  tolerance?: number;
+  /** How far the dragged thing has moved so far: [dx, dy], {x, y} or the x delta; default: the element's own box. */
+  read?: () => unknown;
 }
 
 // ------------------------------------------------------------------- selectOption wants
@@ -2053,29 +2389,27 @@ function patchLocatorClass(sample: Locator): void {
         return;
       }
     }
-    if (on(this) && !kw?.trial) {
-      try {
-        const pg: any = this.page();
-        const sb = await this.boundingBox();
-        const tb = await target.boundingBox();
-        if (sb && tb) {
-          const sx = sb.x + sb.width / 2, sy = sb.y + sb.height / 2;
-          const tx = tb.x + tb.width / 2, ty = tb.y + tb.height / 2;
-          // Human endpoint dynamics (the two worst slider tells): a grab hesitation AFTER pressing and
-          // a settle dwell BEFORE releasing, drawn from the page's motor persona.
-          const persona: Persona | undefined = pg._clearcotePersona;
-          const { grabMs, releaseMs } = persona ? dragDwell(persona) : { grabMs: rand(130, 360), releaseMs: rand(90, 230) };
-          await pg.mouse.move(sx, sy);
-          await pg.mouse.down(); await sleep(grabMs);   // pre-press pause inside down(); then the grab hesitation
-          const heldGlide = pg._clearcoteHeldGlide;     // humanized held-button drag + seating jiggle (settle)
-          if (heldGlide) await heldGlide(tx, ty); else await pg.mouse.move(tx, ty);
-          await sleep(releaseMs);                       // pre-release settle before letting go
-          await pg.mouse.up();
+    if (!kw?.trial && on(this) && on(target) && await strict(this) && await strict(target)) {
+      const d = this.page()._clearcoteDrag;
+      if (typeof d === "function") {
+        try {
+          await d(this, target, kw ?? {});
           return;
+        } catch (e) {
+          if (isTimeout(e)) throw e;
+          // a covered end, no CDP, a vanished element: Playwright's own drag (the fallback site)
         }
-      } catch { /* fall back */ }
+      }
     }
     return oDragTo.call(this, target, kw);
+  });
+
+  // New, not a Playwright method: drag this element by (dx, dy) px, closed loop (glide past, read where it
+  // went, correct up to twice); resolves to the achieved { x, y }. Needs a humanized page.
+  proto.dragBy = apiMethod("locator.dragBy", async function (this: any, dx: number, dy: number, kw?: DragByOptions) {
+    const fn = this.page()._clearcoteDragBy;
+    if (typeof fn !== "function") throw new Error("dragBy needs humanize: true");
+    return fn(this, dx, dy, kw);
   });
 }
 
