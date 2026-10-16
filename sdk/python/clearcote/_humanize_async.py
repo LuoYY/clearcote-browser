@@ -933,10 +933,16 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         """See _humanize._wheel_into_view."""
         w = async_world_for(page)
 
+        s0 = await w.scroll()
+
         async def box_fn():
             if css:
                 return _rect_box(await w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False}))
-            return await loc.bounding_box()
+            # no new Playwright handle per read (each one's preview reads textContent in the page's
+            # world): the box the caller already has, moved by how far the window has scrolled since
+            sx, sy = await w.scroll()
+            return {"x": box["x"] - (sx - s0[0]), "y": box["y"] - (sy - s0[1]),
+                    "width": box["width"], "height": box["height"]}
 
         async def scroller_fn():
             r = await w.evaluate(ISO_SCROLLER, {"sel": selector})

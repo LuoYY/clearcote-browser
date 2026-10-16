@@ -1169,10 +1169,16 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         window; other selectors scroll the window."""
         w = world_for(page)
 
+        s0 = w.scroll()
+
         def box_fn():
             if css:
                 return _rect_box(w.evaluate(ISO_CSS_BOX, {"sel": selector, "scroll": False}))
-            return loc.bounding_box()
+            # no new Playwright handle per read (each one's preview reads textContent in the page's
+            # world): the box the caller already has, moved by how far the window has scrolled since
+            sx, sy = w.scroll()
+            return {"x": box["x"] - (sx - s0[0]), "y": box["y"] - (sy - s0[1]),
+                    "width": box["width"], "height": box["height"]}
 
         def scroller_fn():
             r = w.evaluate(ISO_SCROLLER, {"sel": selector})
