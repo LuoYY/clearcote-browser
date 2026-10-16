@@ -538,3 +538,125 @@ def plan_ambient(frm, viewport, p: Persona, ms: float, rng: Optional[Rng] = None
             elapsed += step_ms
         cur = target
     return out
+
+
+# ------------------------------------------------------------------ after-action (SC 232 lane C)
+# Salt for the after-action stream (hover dwell, move-off after a click, the attention model). Like the
+# rollover and shape salts, a separate mulberry32(seed ^ salt) stream keeps make_persona's draw ORDER
+# (and so every existing seed's motor identity) unchanged. Same values in motion.ts / Motion.cs.
+_AFTER_SALT = 0xC2B2AE35
+
+# The pointer keeps within this many px of where a hover arrived while it dwells there.
+DWELL_RADIUS_PX = 3.0
+# A move-off after a click is kept this far inside the viewport.
+MOVE_OFF_MARGIN_PX = 8.0
+
+
+@dataclass(frozen=True)
+class AfterTraits:
+    """Per-identity after-action traits, stable per seed (see after_traits)."""
+
+    dwell_ms: float          # centre of this hand's hover dwell, 250..700 (draws stay in 150..900)
+    move_off_rate: float     # share of clicks followed by a move-off, 0.60..0.85
+    move_off_delay_ms: float  # centre of the release -> move-off gap, 300..600 (draws stay in 200..700)
+    read_tempo: float        # scale on the attention model's read pause, 0.85..1.15
+
+
+def after_traits(p: Persona) -> AfterTraits:
+    """The persona's after-action traits, the first four draws of its salted after-action stream.
+
+    Measured on r42 / SDK 0.51.0 (SC 232 review): a hover stopped dead on arrival (0 samples after the
+    last glide sample) and the pointer never left the pressed pixel after a click, both tells against
+    a hand that keeps breathing on the mouse. Same values in motion.ts afterTraits and
+    Motion.AfterTraitsOf."""
+    r = mulberry32((p.seed ^ _AFTER_SALT) & _MASK)
+    return AfterTraits(dwell_ms=_lerp(250, 700, r()), move_off_rate=_lerp(0.60, 0.85, r()),
+                       move_off_delay_ms=_lerp(300, 600, r()), read_tempo=_lerp(0.85, 1.15, r()))
+
+
+def after_rng(p: Persona) -> Rng:
+    """The persona's after-action stream positioned AFTER its four trait draws: the per-action draws
+    (a dwell's length, a move-off's roll / angle / distance / delay, the attention model's pauses) come
+    from here, so a seed answers the same sequence in every SDK."""
+    r = mulberry32((p.seed ^ _AFTER_SALT) & _MASK)
+    for _ in range(4):
+        r()
+    return r
+
+
+def dwell_ms(p: Persona, rng: Optional[Rng] = None) -> float:
+    """How long a hover dwells on arrival: the persona's centre x 0.6..1.4, kept in 150..900 ms."""
+    if rng is None:
+        rng = random.random
+    return _clamp(after_traits(p).dwell_ms * _lerp(0.6, 1.4, rng()), 150.0, 900.0)
+
+
+def plan_dwell(at, box, p: Persona, ms: float, rng: Optional[Rng] = None):
+    """Plan the pointer's rest on a hover target: OU drift + 8-12 Hz tremor samples around ``at`` for
+    about ``ms`` (at least 3 samples), every sample within DWELL_RADIUS_PX of ``at`` and inside ``box``
+    (a dict with x/y/width/height, 1 px in; None: no box). Returns (x, y, sleep_ms) tuples.
+
+    The hand is not braced on a hover the way it is before a press, so the drift runs at twice the
+    glide's amplitude and the tremor at 1.5x; the radius clamp keeps the pointer on the element."""
+    if rng is None:
+        rng = random.random
+    step_ms = 1000.0 / p.device_hz
+    n = int(max(3, _js_round(max(0.0, ms) / step_ms)))
+    out: list = []
+    drift = [0.0, 0.0]
+    tphase = rng() * 2 * math.pi
+    t = 0.0
+    ax, ay = at
+    for _ in range(n):
+        k = step_ms / p.drift_tau
+        drift[0] += -k * drift[0] + math.sqrt(2 * k) * p.drift_amp * 2.0 * gauss_from(rng)
+        drift[1] += -k * drift[1] + math.sqrt(2 * k) * p.drift_amp * 2.0 * gauss_from(rng)
+        ph = tphase + (2 * math.pi * p.tremor_hz * t) / 1000.0
+        dx = drift[0] + p.tremor_amp * 1.5 * math.sin(ph)
+        dy = drift[1] + p.tremor_amp * 1.5 * math.sin(ph + math.pi / 2)
+        r = math.hypot(dx, dy)
+        if r > DWELL_RADIUS_PX:
+            dx, dy = dx * DWELL_RADIUS_PX / r, dy * DWELL_RADIUS_PX / r
+        x, y = ax + dx, ay + dy
+        if box is not None:
+            bx, by, bw, bh = box["x"], box["y"], box["width"], box["height"]
+            x = _clamp(x, bx + 1, bx + bw - 1) if bw >= 2 else ax
+            y = _clamp(y, by + 1, by + bh - 1) if bh >= 2 else ay
+        sl = step_ms * _lerp(0.9, 1.4, rng())
+        out.append((x, y, sl))
+        t += sl
+    return out
+
+
+def move_off_roll(p: Persona, rng: Optional[Rng] = None) -> bool:
+    """Does this click get a move-off? True in ``after_traits(p).move_off_rate`` of draws."""
+    if rng is None:
+        rng = random.random
+    return rng() < after_traits(p).move_off_rate
+
+
+def move_off_delay_ms(p: Persona, rng: Optional[Rng] = None) -> float:
+    """The release -> move-off gap: the persona's centre x 0.7..1.3, kept in 200..700 ms."""
+    if rng is None:
+        rng = random.random
+    return _clamp(after_traits(p).move_off_delay_ms * _lerp(0.7, 1.3, rng()), 200.0, 700.0)
+
+
+def plan_move_off(frm, viewport, p: Persona, rng: Optional[Rng] = None):
+    """Where the hand drifts after a click: 40-200 px from ``frm`` at an angle in the downward
+    half-plane (20..160 deg, y down -- the gateway's moveOnTarget model), kept MOVE_OFF_MARGIN_PX inside
+    ``viewport`` (dict with width/height). Mirrored upward when the clamp would leave it on the spot
+    (a click near the bottom edge). Returns the (x, y) target; the glide there is plan_move's."""
+    if rng is None:
+        rng = random.random
+    vw, vh = viewport["width"], viewport["height"]
+    m = MOVE_OFF_MARGIN_PX
+    ang = math.radians(_lerp(20, 160, rng()))
+    dist = _lerp(40, 200, rng())
+    dx, dy = math.cos(ang) * dist, math.sin(ang) * dist
+    x = _clamp(frm[0] + dx, m, vw - m)
+    y = _clamp(frm[1] + dy, m, vh - m)
+    if math.hypot(x - frm[0], y - frm[1]) < 12.0:
+        x = _clamp(frm[0] + dx, m, vw - m)
+        y = _clamp(frm[1] - dy, m, vh - m)
+    return (x, y)
