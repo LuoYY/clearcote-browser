@@ -37,6 +37,10 @@ from ._motion import (
     platform_from_navigator, rollover_rate, wheel_notches,
 )
 from ._hold import press_and_hold_async
+from ._hzoptions import (
+    _CALLER, apply_to_persona, engine_mode as _hz_engine_mode, report_fallback as _report_fallback,
+    resolve as _hz_resolve, tempo_of as _hz_tempo, typo_rate_for as _hz_typo_rate,
+)
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk_async as _paced_walk
 
 
@@ -54,6 +58,7 @@ def api_errors(api, fn):
     see _humanize.as_api_error ("Page.click: Timeout ...", not "Locator.wait_for: Timeout ...")."""
     @functools.wraps(fn)
     async def call(*a, **kw):
+        token = _CALLER.set(api) if _CALLER.get() is None else None
         try:
             return await fn(*a, **kw)
         except Exception as e:  # noqa: BLE001
@@ -61,6 +66,9 @@ def api_errors(api, fn):
             if n is e:
                 raise
             raise n.with_traceback(e.__traceback__) from None
+        finally:
+            if token is not None:
+                _CALLER.reset(token)
     return call
 
 
@@ -83,8 +91,19 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
 
     # Per-identity motor persona (cadence, tremor, overshoot, handedness) seeded from the fingerprint
     # so behavior is stable within a session and unlinkable across seeds. Stored on the page.
-    persona = make_persona(seed)
+    # humanize= True | "strict" | HumanizeOptions | dict (_hzoptions). True is HumanizeOptions(): every
+    # default reproduces 0.51.0, and no option draws from the persona RNG (same seed, same persona).
+    hz = _hz_resolve(humanize)
+    if hz is None:
+        return
+    page._clearcote_hz = hz
+    persona = apply_to_persona(make_persona(seed), hz)
     page._clearcote_persona = persona
+    tempo = hz.tempo   # preset: every planned duration x1.4 / x1.0 / x0.7
+    # The stock methods, for per-call humanize=False (wired at the end of attach).
+    _stock = {n: getattr(page, n, None) for n in _PAGE_METHODS}
+    _stock_mouse = {n: getattr(page.mouse, n, None) for n in _MOUSE_METHODS}
+    _stock_kb = {n: getattr(page.keyboard, n, None) for n in _KB_METHODS}
 
     # Tracked cursor position so each move continues from where the last ended (seed off (0,0)).
     # "placed" is whether the REAL pointer has moved on this page yet: until it has, the browser's
@@ -137,6 +156,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             await native_move(sx, sy)
             st["placed"] = True
         vp = await _view_bounds()
+        if tempo != 1.0:
+            steps = [(sx, sy, sl * tempo) for sx, sy, sl in steps]
         await _paced_walk(_keep_in_view(steps, *vp) if vp else steps, mv)
 
     async def _view_bounds():
@@ -199,6 +220,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             dx, dy = x - st["pos"][0], y - st["pos"][1]
             dist = (dx * dx + dy * dy) ** 0.5
             dur = min(1.10, max(0.28, 0.30 + dist / 1700.0)) * (0.85 + 0.30 * random.random())
+            dur *= tempo
             params = {"targetId": _eng["tid"], "x": float(x), "y": float(y),
                       "duration": dur, "noClick": bool(no_click)}
             t_send = time.monotonic()
@@ -309,7 +331,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     async def _pre_press():
         """The pause between the pointer coming to rest and the button going down (_forms.pre_press_ms:
         40-250 ms, right-skewed, centred per identity)."""
-        await asyncio.sleep(pre_press_ms(persona.seed) / 1000.0)
+        await asyncio.sleep(pre_press_ms(persona.seed) * tempo / 1000.0)
 
     async def _press_here(x, y, hold=None):
         """Press and release the left button where the last glide left the pointer, after the
@@ -373,7 +395,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         # The engine path performs ONE plain left click. Anything else -- right/middle button, a
         # double click, a caller-chosen hold, modifiers -- glides SDK-side and presses as asked.
         o = normalize_click_options(kw, await _platform())
-        if engine_path_ok(o) and _engine_clicks_mode() != "off" and await _engine_glide(x, y, no_click=False):
+        if engine_path_ok(o) and _hz_engine_mode(page, _engine_clicks_mode) != "off" and await _engine_glide(x, y, no_click=False):
             return
         await _glide(x, y)
         try:
@@ -414,7 +436,8 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # OPT-IN: no ambient burst on load by default (it interleaves with caller-driven input,
     # e.g. a slider drag). Call page.ambient_motion(ms) explicitly, or set
     # page._clearcote_auto_ambient = True to restore the per-load burst.
-    page._clearcote_auto_ambient = False
+    page._clearcote_auto_ambient = hz.ambient == "load"
+    page._clearcote_ambient = hz.ambient or "off"   # read by the attention/idle code (lane C)
 
     async def _auto_ambient():
         if getattr(page, "_clearcote_auto_ambient", False):
@@ -635,7 +658,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         n = len(text)
         shift = False
         roll_rate = rollover_rate(persona)
-        rate = typo_rate() if typos else 0.0
+        rate = _hz_typo_rate(page, typo_rate) if typos else 0.0
         allow = rate > 0 and typos_allowed(await _typing_field(field))
         i = 0
         try:
@@ -714,9 +737,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                     d = max(0.025, random.gauss(0.085, 0.045))   # ~85ms +- 45ms, floored at 25ms
                     if ch in " \t\n":
                         d += _rand(0.02, 0.10)                    # slight pause at word boundaries
-                    if random.random() < 0.06:
+                    if random.random() < 0.06 * tempo:
                         d += _rand(0.18, 0.45)                    # occasional thinking pause
-                    await asyncio.sleep(d)
+                    await asyncio.sleep(d * tempo)
                 i += 1
         finally:
             if shift:  # never leave Shift held for the caller's next keystroke (nor on cancellation)
@@ -876,7 +899,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         for other selectors, is the one bounding_box. See _humanize._box_of."""
         if not await loc.is_visible():
             if force:
-                raise _Native()
+                raise _Native("forced on a hidden target")
             await loc.wait_for(state="visible", timeout=timeout)
         box = await _css_box(selector)
         if box is not None:
@@ -1009,9 +1032,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         if await _focused(loc):
             return
         te = await _text_entry(loc, timeout, selector)
-        if (te is None or not await _focus_click(te[0], _proven_point(*te), loc, selector)
-                or not await _focused(loc)):
-            raise _Native()
+        if te is None:
+            raise _Native("not a visible text field")
+        if not await _focus_click(te[0], _proven_point(*te), loc, selector) or not await _focused(loc):
+            raise _Native("the click did not put the caret in the field")
         await asyncio.sleep(_rand(40, 120) / 1000.0)
 
     async def htype(selector, text, **options):
@@ -1019,11 +1043,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             await _click_into(selector, options.get("timeout"))
             await _human_type_text(text)
             return None
-        except _Native:
-            pass
+        except _Native as e:
+            why = str(e)
         except Exception as e:  # noqa: BLE001
             if _is_timeout(e):
                 raise
+            why = "error: %s" % (e,)
+        _report_fallback(page, "Page.type", why, selector)
         # outside the try: a native call that raises must raise ONCE, not be retried by the handler
         return await native_page_type(selector, text, **options)
 
@@ -1216,6 +1242,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         return classify_field("div", None, ce is not None and ce.lower() != "false")
 
     async def hfill(selector, value, **options):
+        why = "the value is not a string"
         try:
             if isinstance(value, str):
                 timeout = options.get("timeout")   # None: the page's default, as Playwright would use
@@ -1224,6 +1251,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 info = await _describe(box)
                 kind = (classify_field(info["tag"], info["type"], info["ce"]) if info
                         else await _classify_fallback(loc))
+                why = ("the field is disabled or read-only" if info and (info.get("disabled") or info.get("readonly"))
+                       else "the %s route did not verify" % kind if kind in ("text", "range", "datetime")
+                       else "no humane route for a %s field" % kind)
                 if not (info and (info.get("disabled") or info.get("readonly"))):
                     if kind == "text" and await _fill_text(loc, box, value, info, selector):
                         return None
@@ -1234,8 +1264,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         except Exception as e:  # noqa: BLE001
             if _is_timeout(e):
                 raise
+            why = str(e) if isinstance(e, _Native) else "error: %s" % (e,)
         # Native: color (Playwright sets it -- the OS dialog is no route), unfillable types (Playwright
         # raises, as before humanize), and anything the humane route could not prove it did right.
+        _report_fallback(page, "Page.fill", why, selector)
         return await native_page_fill(selector, value, **options)
 
     async def hdblclick(selector, **options):
@@ -1253,11 +1285,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             d = options.get("delay")
             await native_kb_press(key, delay=d if d else key_dwell(persona))
             return None
-        except _Native:
-            pass
+        except _Native as e:
+            why = str(e)
         except Exception as e:  # noqa: BLE001
             if _is_timeout(e):
                 raise
+            why = "error: %s" % (e,)
+        _report_fallback(page, "Page.press", why, selector)
         return await native_page_press(selector, key, **options)
 
     async def _open_and_pick(selector, plan, at=None):
@@ -1462,9 +1496,12 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             res = await _select_humanized(selector, value, options)
             if res is not None:
                 return res
+            why = _select_why(value, options)
         except Exception as e:  # noqa: BLE001
             if _is_timeout(e):
                 raise
+            why = "error: %s" % (e,)
+        _report_fallback(page, "Page.select_option", why, selector)
         return await native_page_select_option(selector, value, **options)
 
     async def _set_checked(orig, selector, checked, options):
@@ -1580,10 +1617,10 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             # hidden goes native at once instead of timing out first.
             box = await _box_of(loc, timeout, o["force"], selector)
             if not box:
-                raise _Native()
+                raise _Native("the element has no box")
             aim.append((box["x"] + box["width"] / 2, box["y"] + box["height"] / 2))
             if not o["force"] and not await loc.is_enabled():
-                raise _Native()
+                raise _Native("the element is not enabled")
             if o["position"]:
                 x, y = await _position_point(box, o)
                 aim.append((x, y))
@@ -1598,11 +1635,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 # animation in flight does not) and own the click point -- no trusted press at a
                 # point some overlay owns. Either failing goes native: Playwright waits for it.
                 await asyncio.sleep(0.05)
-                if not await _reaches_point(box, x, y, selector):
-                    raise _Native()
+                reach = await _reaches_point(box, x, y, selector)
+                if not reach:
+                    raise _Native("the hit test cannot run here" if reach is None else
+                                  "the click point does not reach the element (covered, moving or clipped)")
             if o["modifiers"] and native_kb_down is None:
-                raise _Native()
-            if (not no_click and not o["force"] and orig is not None and _engine_clicks_mode() == "all"
+                raise _Native("modifiers need keyboard.down")
+            if (not no_click and not o["force"] and orig is not None and _hz_engine_mode(page, _engine_clicks_mode) == "all"
                     and engine_path_ok(o) and await _engine_glide(x, y, no_click=False)):
                 # Opt-in (CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and
                 # clicks the point the hit test above proved; plain left single clicks only, and only
@@ -1637,11 +1676,13 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 else:
                     await _press_at(x, y, o)
             return None
-        except _Native:
-            pass
+        except _Native as e:
+            why = str(e)
         except Exception as e:  # noqa: BLE001
             if _is_timeout(e):
                 raise
+            why = "error: %s" % (e,)
+        _report_fallback(page, "Page.hover" if no_click else "Page.click", why, selector)
         # outside the try, so a native call that raises is not run a second time by the handler
         return await _native()
 
@@ -1695,9 +1736,115 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: page._clearcote_hold(
         page.locator(selector).first, duration, **kw))
 
+    _wire_per_call_off(page, st, _stock, _stock_mouse, _stock_kb)
+
     # Marker the Locator-class patch keys off: humanize is active for THIS page.
     page._clearcote_humanized = True
     _patch_locator_class()
+
+
+# ------------------------------------------------------------------ per-call humanize=False
+# Every wrapped page / mouse / keyboard method takes humanize=False: the stock Playwright call, with the
+# keyword stripped. Wired outermost, after attach has wrapped everything (_wire_per_call_off).
+_PAGE_METHODS = ("click", "hover", "dblclick", "type", "fill", "press", "select_option", "check", "uncheck",
+                 "set_checked")
+_MOUSE_METHODS = ("move", "click", "wheel", "dblclick", "down", "up")
+_KB_METHODS = ("type", "press")
+
+
+def _per_call(stock, fn, after=None):
+    @functools.wraps(fn)
+    async def call(*a, humanize=None, **kw):
+        if humanize is False:
+            try:
+                return await stock(*a, **kw)
+            finally:
+                if after is not None:
+                    after(a)
+        return await fn(*a, **kw)
+    call._clearcote_stock = stock
+    return call
+
+
+def _wire_per_call_off(page, st, stock, stock_mouse, stock_kb):
+    def placed(a):
+        st["placed"] = True
+
+    def moved(a):
+        st["placed"] = True
+        if len(a) >= 2:
+            st["pos"] = (a[0], a[1])
+
+    for n, s in stock.items():
+        cur = getattr(page, n, None)
+        if s is not None and cur is not None and cur is not s:
+            setattr(page, n, _per_call(s, cur, placed if n in ("click", "hover", "dblclick") else None))
+    mouse = page.mouse
+    for n, s in stock_mouse.items():
+        cur = getattr(mouse, n, None)
+        if s is None or cur is None or cur is s:
+            continue
+        if n == "down":
+            async def s_down(*a, _s=s, **kw):   # stock press, but the held state stays tracked
+                st["held"] = True
+                try:
+                    return await _s(*a, **kw)
+                except Exception:
+                    st["held"] = False
+                    raise
+            setattr(mouse, n, _per_call(s_down, cur))
+        elif n == "up":
+            async def s_up(*a, _s=s, **kw):
+                try:
+                    return await _s(*a, **kw)
+                finally:
+                    st["held"] = False
+            setattr(mouse, n, _per_call(s_up, cur))
+        else:
+            setattr(mouse, n, _per_call(s, cur, moved if n in ("move", "click", "dblclick") else None))
+    kb = page.keyboard
+    for n, s in stock_kb.items():
+        cur = getattr(kb, n, None)
+        if s is not None and cur is not None and cur is not s:
+            setattr(kb, n, _per_call(s, cur))
+
+
+def _locator_off(stock, fn):
+    """A Locator method that takes humanize=False: the stock Playwright method, keyword stripped."""
+    @functools.wraps(fn)
+    async def call(self, *a, humanize=None, **kw):
+        if humanize is False:
+            return await stock(self, *a, **kw)
+        return await fn(self, *a, **kw)
+    return call
+
+
+def _select_why(value, options):
+    """Why select_option went to Playwright when the humane route returned nothing."""
+    if options.get("element") is not None:
+        return "element handles go to Playwright"
+    for v in (value, options.get("index"), options.get("label")):
+        for x in (v if isinstance(v, (list, tuple)) else [v]):
+            if isinstance(x, dict):
+                return "option dicts ({value, label, index}) go to Playwright"
+            if x is not None and not isinstance(x, (str, int)):
+                return "element handles go to Playwright"
+    return "no humane route, or the pick could not be shown to have worked"
+
+
+def _frame_why(loc):
+    """Why a locator on a humanized page is not routed: it enters or lives in a child frame. None when
+    the page is not humanized (not a fallback) or the locator is routable."""
+    try:
+        if not getattr(loc.page, "_clearcote_humanized", False):
+            return None
+        if "internal:control=enter-frame" in (loc._impl_obj._selector or ""):
+            return "frame locators go to Playwright"
+        if loc._impl_obj._frame.parent_frame is not None:
+            return "a locator in a child frame goes to Playwright"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 # --------------------------------------------------------------------------- locator patch
@@ -1784,6 +1931,9 @@ def _patch_locator_class():
         # checkbox whose click is cancelled was clicked three times.
         if _on(self) and await _strict(self):
             return True, await fn()
+        why = _frame_why(self)
+        if why:
+            _report_fallback(self.page, "Locator", why, _sel(self))
         return False, None
 
     async def fill(self, value, **kw):
@@ -1821,6 +1971,9 @@ def _patch_locator_class():
     async def tap(self, **kw):
         if _no_touch(self):   # Playwright's own "does not support tap" error (see _humanize)
             return await o_tap(self, **kw)
+        if _on(self):
+            _report_fallback(self.page, "Locator.tap",
+                             "tap is sent as a humanized mouse click: there is no humanized touch input", _sel(self))
         done, r = await _route(self, lambda: self.page.click(_sel(self), **_fwd(kw, _HOVER)))
         return r if done else await o_tap(self, **kw)
 
@@ -1854,7 +2007,10 @@ def _patch_locator_class():
                         opts["position"] = pos
                     await trial(_sel(loc), opts, True)
                 return None
+        if not _on(self) and not kw.get("trial") and _frame_why(self):
+            _report_fallback(self.page, "Locator.drag_to", _frame_why(self), _sel(self))
         if _on(self) and not kw.get("trial"):
+            why = "the source or the target has no box"
             try:
                 page = self.page
                 sb = await self.bounding_box()
@@ -1879,24 +2035,25 @@ def _patch_locator_class():
                     finally:
                         await _release(page.mouse.up())         # let go, even when cancelled mid-drag
                     return None
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                why = "error: %s" % (e,)
+            _report_fallback(self.page, "Locator.drag_to", why, _sel(self))
         return await o_drag_to(self, target, **kw)
 
     # Each worded as Playwright words the Locator method (api_errors).
-    Locator.fill = api_errors("Locator.fill", fill)
-    Locator.click = api_errors("Locator.click", click)
-    Locator.type = api_errors("Locator.type", type_)
-    Locator.dblclick = api_errors("Locator.dblclick", dblclick)
-    Locator.hover = api_errors("Locator.hover", hover)
-    Locator.press = api_errors("Locator.press", press)
-    Locator.press_sequentially = api_errors("Locator.press_sequentially", press_sequentially)
-    Locator.clear = api_errors("Locator.clear", clear)
-    Locator.tap = api_errors("Locator.tap", tap)
-    Locator.check = api_errors("Locator.check", check)
-    Locator.uncheck = api_errors("Locator.uncheck", uncheck)
-    Locator.drag_to = api_errors("Locator.drag_to", drag_to)
-    Locator.select_option = api_errors("Locator.select_option", select_option)
+    Locator.fill = api_errors("Locator.fill", _locator_off(o_fill, fill))
+    Locator.click = api_errors("Locator.click", _locator_off(o_click, click))
+    Locator.type = api_errors("Locator.type", _locator_off(o_type, type_))
+    Locator.dblclick = api_errors("Locator.dblclick", _locator_off(o_dblclick, dblclick))
+    Locator.hover = api_errors("Locator.hover", _locator_off(o_hover, hover))
+    Locator.press = api_errors("Locator.press", _locator_off(o_press, press))
+    Locator.press_sequentially = api_errors("Locator.press_sequentially", _locator_off(o_press_seq, press_sequentially))
+    Locator.clear = api_errors("Locator.clear", _locator_off(o_clear, clear))
+    Locator.tap = api_errors("Locator.tap", _locator_off(o_tap, tap))
+    Locator.check = api_errors("Locator.check", _locator_off(o_check, check))
+    Locator.uncheck = api_errors("Locator.uncheck", _locator_off(o_uncheck, uncheck))
+    Locator.drag_to = api_errors("Locator.drag_to", _locator_off(o_drag_to, drag_to))
+    Locator.select_option = api_errors("Locator.select_option", _locator_off(o_select_option, select_option))
     # New, not a Playwright method: press and hold this element (_hold.py), under the page lock when the
     # page is humanized. Works on frame locators too: it presses at viewport coordinates.
     async def press_and_hold(self, duration=None, **kw):
@@ -1904,10 +2061,11 @@ def _patch_locator_class():
         return await hold(self, duration, **kw)
     Locator.press_and_hold = api_errors("Locator.press_and_hold", press_and_hold)
     if o_set_checked is not None:
-        Locator.set_checked = api_errors("Locator.set_checked", set_checked)
+        Locator.set_checked = api_errors("Locator.set_checked", _locator_off(o_set_checked, set_checked))
 
 
 async def install_humanize_on_context(context, humanize=False, show_cursor=False, browser=None, seed=None):
+    humanize = _hz_resolve(humanize) or False   # True | "strict" | HumanizeOptions | dict; raises on a bad one
     if not humanize and not show_cursor:
         return
     b = browser or context.browser
@@ -1923,6 +2081,7 @@ async def install_humanize_on_context(context, humanize=False, show_cursor=False
 
 
 async def install_humanize(browser, humanize=False, show_cursor=False, seed=None):
+    humanize = _hz_resolve(humanize) or False   # see _humanize.install_humanize
     if not humanize and not show_cursor:
         return
     orig_new_page = browser.new_page
