@@ -574,9 +574,21 @@ export function aimTraits(p: Persona): AimTraits {
   return { spread, undershoot, sideBias: p.approachBias * 0.4 };
 }
 
-/** The persona's own RNG for landing points: mulberry32(seed ^ salt ^ 1), created on first use. */
+// One aim stream per seed for the whole process: every page of an identity gets its own Persona, and a stream
+// restarted per page put the first click of every page on the same pixel (seen live, SC 232).
+const AIM_STREAMS = new Map<number, Rng>();
+
+/** @internal Start every seed's aim stream over (tests and vector generation). */
+export function resetAimStreams(): void { AIM_STREAMS.clear(); }
+
+/** The identity's RNG for landing points: mulberry32(seed ^ salt ^ 1), one per seed per process, so the same
+ * seed lands on the same SEQUENCE of points while successive pages continue it instead of repeating its start. */
 function aimStream(p: Persona): Rng {
-  if (!p.aimRng) p.aimRng = mulberry32((p.seed ^ AIM_SALT ^ 1) >>> 0);
+  if (!p.aimRng) {
+    let r = AIM_STREAMS.get(p.seed);
+    if (!r) { r = mulberry32((p.seed ^ AIM_SALT ^ 1) >>> 0); AIM_STREAMS.set(p.seed, r); }
+    p.aimRng = r;
+  }
   return p.aimRng;
 }
 

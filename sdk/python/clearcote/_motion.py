@@ -582,11 +582,24 @@ def aim_traits(p: Persona) -> AimTraits:
     return AimTraits(spread=spread, undershoot=undershoot, side_bias=p.approach_bias * 0.4)
 
 
+# One aim stream per seed for the whole process: every page of an identity gets its own Persona, and a
+# stream restarted per page put the first click of every page on the same pixel (seen live, SC 232).
+_AIM_STREAMS: dict = {}
+
+
+def reset_aim_streams() -> None:
+    """Start every seed's aim stream over (tests and vector generation)."""
+    _AIM_STREAMS.clear()
+
+
 def _aim_stream(p: Persona) -> Rng:
-    """The persona's own RNG for landing points: mulberry32(seed ^ salt ^ 1), created on first use
-    and kept on the persona, so the same seed lands on the same sequence of points."""
+    """The identity's RNG for landing points: mulberry32(seed ^ salt ^ 1), one per seed per process,
+    so the same seed lands on the same SEQUENCE of points (reproducible) while successive pages of
+    one identity continue that sequence instead of repeating its start."""
     if p.aim_rng is None:
-        p.aim_rng = mulberry32((p.seed ^ _AIM_SALT ^ 1) & _MASK)
+        if p.seed not in _AIM_STREAMS:
+            _AIM_STREAMS[p.seed] = mulberry32((p.seed ^ _AIM_SALT ^ 1) & _MASK)
+        p.aim_rng = _AIM_STREAMS[p.seed]
     return p.aim_rng
 
 

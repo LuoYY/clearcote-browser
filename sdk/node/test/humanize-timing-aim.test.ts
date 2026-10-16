@@ -64,7 +64,17 @@ describe("per-persona timing", () => {
 });
 
 describe("clickPoint", () => {
-  const landings = (id: string, n = 200) => { const p = M.makePersona(id); return Array.from({ length: n }, () => M.clickPoint(BOX, { x: 0, y: 0 }, p)); };
+  const landings = (id: string, n = 200) => {
+    M.resetAimStreams(); // the identity's stream from its start
+    const p = M.makePersona(id);
+    return Array.from({ length: n }, () => M.clickPoint(BOX, { x: 0, y: 0 }, p));
+  };
+
+  it("a new page of the same identity continues its aim stream (not the same first pixel)", () => {
+    M.resetAimStreams();
+    const firsts = Array.from({ length: 5 }, () => JSON.stringify(M.clickPoint(BOX, { x: 0, y: 0 }, M.makePersona("ha-1"))));
+    expect(new Set(firsts).size).toBe(5);
+  });
 
   it("is reproducible per seed and differs across seeds", () => {
     expect(landings("ha-1")).toEqual(landings("ha-1"));
@@ -111,6 +121,7 @@ describe("shared timing vectors (Python, Node and .NET agree)", () => {
     for (const [k, v] of Object.entries(got)) expect(close(v, d[k]), `${k} ${v} vs ${d[k]}`).toBe(true);
     const cp = M.clickPoint(VEC.box, { x: VEC.from[0], y: VEC.from[1] }, p, r);
     expect(close(cp.x, d.click_point_rng[0]) && close(cp.y, d.click_point_rng[1])).toBe(true);
+    M.resetAimStreams();
     const fresh = M.makePersona(d.persona);
     for (const want of d.click_point_stream) {
       const pt = M.clickPoint(VEC.box, { x: VEC.from[0], y: VEC.from[1] }, fresh);

@@ -14,7 +14,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from clearcote._motion import (  # noqa: E402
     aim_traits, click_hold, click_point, dblclick_gap, drag_dwell, key_dwell, make_persona, mulberry32,
-    pause_ms, timing_traits,
+    pause_ms, reset_aim_streams, timing_traits,
 )
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "..", "testdata", "humanize_timing_vectors.json")
@@ -44,7 +44,8 @@ def main():
         d = {"persona": pid, "rng": 100 + k, "click_hold": click_hold(p, r), "key_dwell": key_dwell(p, r),
              "grab": g, "release": rel, "dblclick_gap": dblclick_gap(p, r), "pause_220_480": pause_ms(p, 220, 480, r),
              "click_point_rng": list(click_point(BOX, FROM, p, r))}
-        # the persona's own aim stream: a fresh persona's first three landing points
+        # the identity's own aim stream from its start: the first three landing points
+        reset_aim_streams()
         fresh = make_persona(pid)
         d["click_point_stream"] = [list(click_point(BOX, FROM, fresh)) for _ in range(3)]
         draws.append(d)

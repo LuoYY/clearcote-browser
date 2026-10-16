@@ -92,8 +92,19 @@ def test_double_click_gap_and_pauses_are_persona_draws():
 
 # --------------------------------------------------------------------------- click_point
 def _landings(pid, n=200):
-    p = make_persona(pid)                               # a fresh persona: its aim stream starts over
+    from clearcote._motion import reset_aim_streams
+    reset_aim_streams()                                 # the identity's stream from its start
+    p = make_persona(pid)
     return [click_point(BOX, (0.0, 0.0), p) for _ in range(n)]
+
+
+def test_a_new_page_of_the_same_identity_continues_its_aim_stream():
+    """Each page gets its own Persona; the first click of every page landed on one pixel when the stream
+    restarted per persona (seen live)."""
+    from clearcote._motion import reset_aim_streams
+    reset_aim_streams()
+    firsts = [click_point(BOX, (0.0, 0.0), make_persona("ha-1")) for _ in range(5)]
+    assert len(set(firsts)) == 5, firsts
 
 
 def test_click_point_is_reproducible_per_seed_and_differs_across_seeds():

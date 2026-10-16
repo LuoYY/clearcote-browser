@@ -294,6 +294,14 @@ public static class Motion
     // Salt for the aim stream (ClickPoint): the persona's landing-point sequence and its dispersion.
     private const uint AimSalt = 0x27D4EB2F;
 
+    // One aim stream per seed for the whole process: every page of an identity gets its own Persona, and a stream
+    // restarted per page put the first click of every page on the same pixel (seen live, SC 232). The same seed still
+    // lands on the same SEQUENCE of points.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<uint, Rng> AimStreams = new();
+
+    /// <summary>Start every seed's aim stream over (tests).</summary>
+    internal static void ResetAimStreams() => AimStreams.Clear();
+
     /// <summary>The persona's aiming traits from a salted stream of its seed: dispersion (sd 0.10–0.20 of the box),
     /// undershoot toward the approach side (0.06–0.16) and handedness (ApproachBias × 0.4). Same values as Python
     /// <c>aim_traits</c> and Node <c>aimTraits</c>.</summary>
@@ -319,7 +327,7 @@ public static class Motion
         {
             var at = AimTraitsOf(p);
             spread = at.Spread; under = at.Undershoot; side = at.SideBias;
-            rng ??= p.AimRng ??= Mulberry32(p.Seed ^ AimSalt ^ 1u);
+            rng ??= p.AimRng ??= AimStreams.GetOrAdd(p.Seed, s => Mulberry32(s ^ AimSalt ^ 1u));
         }
         rng ??= Random.Shared.NextDouble;
         double cx = box.X + box.Width / 2, cy = box.Y + box.Height / 2;

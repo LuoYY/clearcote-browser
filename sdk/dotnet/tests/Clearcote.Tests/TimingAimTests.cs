@@ -95,9 +95,18 @@ public class TimingAimTests
         }
     }
 
+    [Fact]
+    public void A_new_page_of_the_same_identity_continues_its_aim_stream()
+    {
+        Motion.ResetAimStreams();
+        var firsts = Enumerable.Range(0, 5).Select(_ => Motion.ClickPoint(B, new Point(0, 0), Motion.MakePersona("ha-1"))).ToList();
+        Assert.Equal(5, firsts.Distinct().Count());
+    }
+
     private static List<Point> Landings(string id, int n = 200)
     {
-        var p = Motion.MakePersona(id);   // a fresh persona: its aim stream starts over
+        Motion.ResetAimStreams();         // the identity's stream from its start
+        var p = Motion.MakePersona(id);
         return Enumerable.Range(0, n).Select(_ => Motion.ClickPoint(B, new Point(0, 0), p)).ToList();
     }
 
@@ -189,6 +198,7 @@ public class TimingAimTests
             var cp = Motion.ClickPoint(box, from, p, r);
             Assert.True(Close(cp.X, d.GetProperty("click_point_rng")[0].GetDouble())
                 && Close(cp.Y, d.GetProperty("click_point_rng")[1].GetDouble()), $"{id} click point");
+            Motion.ResetAimStreams();
             var fresh = Motion.MakePersona(id);
             foreach (var w in d.GetProperty("click_point_stream").EnumerateArray())
             {
