@@ -108,6 +108,9 @@ public static partial class Humanize
         o.Validate();
         Options.AddOrUpdate(page, o);
         Personas.AddOrUpdate(page, ApplyOptions(Motion.MakePersona(seed), o));
+        // As Attach(page, seed): the attention read pause counts from the last load, and Ambient = "load" runs
+        // its burst after it (SC 232 lane C).
+        HookLoad(page);
     }
 
     /// <summary>The page's humanize options (null when none were attached: the defaults apply).</summary>

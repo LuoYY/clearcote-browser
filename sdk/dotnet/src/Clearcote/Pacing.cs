@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Diagnostics;
 using System.Threading.Tasks;
 
@@ -150,4 +151,65 @@ internal static class Pacing
     /// <paramref name="maxJump"/>, and <see cref="IdleHopPx"/> after an idle gap. Never more for a longer gap: a
     /// walk that fell behind stretches in time instead of catching up with a jump. Port of _pacing._jump_cap.</summary>
     public static double JumpCap(double maxJump, double dtMs) => dtMs < IdleMs ? maxJump : Math.Min(maxJump, IdleHopPx);
+
+    /// <summary>px/ms arriving at sample <paramref name="k"/> (0 for the first). Port of _pacing._speed.</summary>
+    private static double SpeedAt(IReadOnlyList<Step> steps, int k)
+    {
+        if (k == 0) return 0;
+        var a = steps[k - 1];
+        var b = steps[k];
+        return Math.Sqrt((b.X - a.X) * (b.X - a.X) + (b.Y - a.Y) * (b.Y - a.Y)) / Math.Max(1e-3, a.SleepMs);
+    }
+
+    /// <summary>
+    /// Cut an ambient plan so it lasts about <paramref name="ms"/> (port of _pacing.trim_to / pacing.ts trimTo, SC 232
+    /// lane C: .NET had no ambient until now). <see cref="Motion.PlanAmbient"/> keeps adding whole excursions and rests
+    /// until its budget is spent, so it runs well past the ask. Of the samples whose end falls in
+    /// [<paramref name="lo"/>·ms, <paramref name="hi"/>·ms], keep up to the slowest one; only a tail is dropped. When
+    /// every candidate is mid-flight the cut moves forward to where that move has slowed down (&lt;= 10 % of the plan's
+    /// peak speed), within <paramref name="stretch"/>·ms.
+    /// </summary>
+    public static List<Step> TrimTo(IReadOnlyList<Step> steps, double ms, double lo = 0.85, double hi = 1.10, double stretch = 2.0)
+    {
+        if (steps.Count == 0 || ms <= 0) return new List<Step>(steps);
+        var (due, total) = Schedule(steps);
+        if (total <= hi * ms) return new List<Step>(steps);
+        int n = steps.Count;
+        var end = new double[n];
+        for (int k = 0; k < n; k++) end[k] = due[k] + Math.Max(0, steps[k].SleepMs);
+        int best = -1;
+        double bestV = 0;
+        for (int k = 0; k < n; k++)
+        {
+            if (end[k] < lo * ms) continue;
+            if (end[k] > hi * ms) break;
+            double v = SpeedAt(steps, k);
+            if (best < 0 || v < bestV) { best = k; bestV = v; }
+        }
+        if (best < 0)
+        {
+            best = 0;
+            for (int k = 0; k < n; k++) if (end[k] <= hi * ms) best = k;
+        }
+        double peak = 0;
+        for (int k = 0; k < n; k++) peak = Math.Max(peak, SpeedAt(steps, k));
+        if (peak > 0 && SpeedAt(steps, best) > 0.3 * peak)
+        {
+            int wide = -1;
+            double wideV = 0;
+            for (int k = 0; k < n; k++)
+            {
+                if (end[k] < 0.8 * ms || end[k] > 1.15 * ms) continue;
+                double v = SpeedAt(steps, k);
+                if (wide < 0 || v < wideV) { wide = k; wideV = v; }
+            }
+            if (wide >= 0 && wideV <= 0.3 * peak) return steps.Take(wide + 1).ToList();
+            for (int k = best + 1; k < n; k++)
+            {
+                if (end[k] > stretch * ms) break;
+                if (SpeedAt(steps, k) <= 0.1 * peak) { best = k; break; }
+            }
+        }
+        return steps.Take(best + 1).ToList();
+    }
 }

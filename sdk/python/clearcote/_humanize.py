@@ -26,7 +26,9 @@ Design notes:
     fat-finger-then-correct chance.
 """
 
+import collections
 import functools
+import math
 import random
 import re
 import sys
@@ -51,6 +53,10 @@ from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     dblclick_gap, pause_ms, timing_traits,
     platform_from_navigator, rollover_rate, wheel_notches,
+    dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
+)
+from ._attention import (
+    IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
 )
 from ._hold import press_and_hold
 from ._hzoptions import (
@@ -617,8 +623,11 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
             _pre_press()
             native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                          **_sel_kw(kw, "button", "click_count"))
-            return
-        _press_at(x, y, o)
+        else:
+            _press_at(x, y, o)
+        # Not after an engine click (returned above): a glide the engine does not see would take the
+        # next coordinate click off the engine path (_engine_in_sync).
+        _schedule_move_off()
 
     def hdblclick_xy(x, y, **kw):
         kw = dict(kw)
@@ -656,13 +665,190 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     page._clearcote_ambient = hz.ambient or "off"   # read by the attention/idle code (lane C)
 
     def _auto_ambient(_=None):
-        if getattr(page, "_clearcote_auto_ambient", False):
+        # ambient="load" (lane A's option, read defensively) is the same per-load burst as the flag.
+        if getattr(page, "_clearcote_auto_ambient", False) is True or ambient_mode(page) == "load":
             try:
                 hambient(_rand(450, 950))
             except Exception:  # noqa: BLE001
                 pass
 
     page.on("load", lambda _=None: _auto_ambient())
+    # The attention model's read pause counts from the last load (read lazily by the next action).
+    page.on("load", lambda _=None: st.__setitem__("load_at", time.monotonic()))
+
+    # ------------------------------------------------------------ after-action (SC 232 lane C)
+    # What the hand does once an action has landed: it rests on a hovered element (hover dwell), drifts
+    # off a clicked one (move-off), and between actions it reads and idles (_attention). All of it is
+    # LAZY -- run at the start of the next public action, or by page.settle() --, never from a timer or a
+    # thread, so nothing races the action in flight. The persona's traits come from a salted stream of its seed
+    # (_motion.after_traits: every existing draw keeps its order); every per-action draw is unseeded.
+    # Per-action draws are UNSEEDED, as in plan_move: the seed fixes the persona's traits only (after_traits);
+    # a seeded per-action sequence would replay identically in every session of an identity.
+    arng = random.random
+    st.update({"depth": 0, "last_end": None, "load_at": None, "mo": None, "mo_hits": 0, "mo_n": 0})
+    # Hidden switch for the attention model until lane A's `ambient="idle"` / `attention` option lands.
+    page._clearcote_attention = False
+    # Test seam: what the after-action model did, newest last (bounded).
+    trace = collections.deque(maxlen=256)
+    page._clearcote_after_trace = trace
+
+    def _attention_on():
+        return getattr(page, "_clearcote_attention", False) is True or ambient_mode(page) == "idle"
+
+    def _dwell(x, y, box, dwell):
+        """Rest on a hover target: OU drift + tremor within 3 px of the arrival point and inside ``box``,
+        for the persona's 150-900 ms (``dwell`` ms overrides it; 0 or less: no dwell)."""
+        ms = None
+        if dwell is not None:
+            try:
+                ms = float(dwell)
+            except (TypeError, ValueError):
+                ms = None
+            if ms is not None and not math.isfinite(ms):
+                ms = None
+            if ms is not None and ms <= 0:
+                return
+        if ms is None:
+            ms = dwell_ms(persona, arng)
+        steps = plan_dwell((x, y), box, persona, ms, arng)
+        trace.append(("dwell", ms, len(steps)))
+        _dispatch(steps)
+        if steps:
+            st["pos"] = (steps[-1][0], steps[-1][1])
+
+    def _schedule_move_off():
+        """After a press: in the persona's 60-85 % of clicks a move-off comes due 200-700 ms after the
+        release. It runs at the start of the next action (or in page.settle()) if it is due by then and
+        nothing has moved the pointer since; otherwise it is dropped -- the next glide is the move-off."""
+        hit = move_off_roll(persona, arng, st["mo_hits"], st["mo_n"])
+        st["mo_n"] += 1
+        st["mo"] = None
+        if hit:
+            st["mo_hits"] += 1
+            st["mo"] = {"due": time.monotonic() + move_off_delay_ms(persona, arng) / 1000.0, "pos": st["pos"]}
+
+    def _run_move_off(wait):
+        """Make the pending move-off (at most once). ``wait``: sleep until it is due (page.settle())."""
+        mo, st["mo"] = st["mo"], None
+        if not mo or st["held"] or st["pos"] != mo["pos"]:
+            return False
+        left = mo["due"] - time.monotonic()
+        if left > 0:
+            if not wait:
+                return False
+            time.sleep(left)
+        vw, vh = _view_bounds() or _viewport()
+        tx, ty = plan_move_off(st["pos"], {"width": vw, "height": vh}, persona, arng)
+        trace.append(("move_off", st["pos"], (tx, ty)))
+        _glide(tx, ty, target_w=140)   # one coarse glide: nothing to acquire
+        return True
+
+    def _idle_drift(ms):
+        trace.append(("drift", ms))
+        vw, vh = _view_bounds() or _viewport()
+        steps = _trim_ambient(plan_ambient(st["pos"], {"width": vw, "height": vh}, persona, ms, arng), ms)
+        _dispatch(steps)
+        if steps:
+            st["pos"] = (steps[-1][0], steps[-1][1])
+
+    def _attend(coords, now):
+        """The attention model (_attention): a read pause after a load, else idle drifts after a gap."""
+        # `now`: when the action started -- a move-off glide just made does not count as idle time
+        la = st["load_at"]
+        if la is not None:
+            st["load_at"] = None
+            try:
+                n = world_for(page).evaluate(ISO_TEXT_LENGTH)
+            except Exception:  # noqa: BLE001
+                n = 0
+            pause = read_pause_ms(n, persona, arng) / 1000.0
+            notches = explore_notches(arng)
+            trace.append(("read", pause * 1000.0, n, notches if not coords else 0))
+            if pause - (now - la) > 0.35:   # the eyes read; the hand drifts once meanwhile
+                _idle_drift(min((pause - (now - la)) * 500.0, IDLE_DRIFT_MAX_MS))
+            rest = la + pause - time.monotonic()
+            if rest > 0:
+                time.sleep(rest)
+            # A coordinate action names a point in the current layout: never scroll that away.
+            if notches and not coords:
+                hwheel(0, notches * _notch_px())
+            return
+        last = st["last_end"]
+        if last is not None:
+            for ms in idle_drifts(now - last, arng):
+                _idle_drift(ms)
+
+    def _pre_action(coords):
+        if st["depth"] > 0 or st["held"]:
+            return
+        st["depth"] += 1
+        try:
+            now = time.monotonic()
+            _run_move_off(False)
+            if _attention_on():
+                _attend(coords, now)
+        except Exception:  # noqa: BLE001 - the after-action model never stops the action
+            pass
+        finally:
+            st["depth"] -= 1
+
+    def _action(fn, coords=False):
+        """A public entry point: the lazy after-action step first (outermost call only), then the action.
+        The idle gap counts from its end."""
+        def run(*a, **kw):
+            if st["depth"] > 0 or kw.get("trial"):   # a trial performs no action: nothing after-action either
+                return fn(*a, **kw)
+            _pre_action(coords)
+            st["depth"] += 1
+            try:
+                return fn(*a, **kw)
+            finally:
+                st["depth"] -= 1
+                st["last_end"] = time.monotonic()
+        run.__name__ = getattr(fn, "__name__", "action")
+        run.__doc__ = getattr(fn, "__doc__", None)
+        return run
+
+    def _touch(fn):
+        """mouse.down / up: no after-action step (a press lands where the pointer is), but the idle gap
+        counts from them."""
+        def run(*a, **kw):
+            try:
+                return fn(*a, **kw)
+            finally:
+                st["last_end"] = time.monotonic()
+        return run
+
+    def hsettle():
+        """page.settle(): let the hand settle after the last action -- wait for a pending move-off to come
+        due and make it. False when none was pending (or the pointer has moved since)."""
+        if st["depth"] > 0:
+            return False
+        st["depth"] += 1
+        try:
+            done = _run_move_off(True)
+        except Exception:  # noqa: BLE001
+            done = False
+        finally:
+            st["depth"] -= 1
+        if done:
+            st["last_end"] = time.monotonic()
+        return done
+
+    def _install_after_action():
+        """Wrap the public entry points (called once, after they are all in place)."""
+        for name in ("move", "click", "wheel", "dblclick"):
+            if getattr(mouse, name, None) is not None:
+                setattr(mouse, name, _action(getattr(mouse, name), coords=True))
+        if native_down is not None and native_up is not None:
+            mouse.down, mouse.up = _touch(mouse.down), _touch(mouse.up)
+        for name in ("type", "press"):
+            setattr(kb, name, _action(getattr(kb, name)))
+        for name in ("click", "hover", "dblclick", "type", "fill", "press", "select_option", "check", "uncheck",
+                     "set_checked", "press_and_hold", "ambient_motion"):
+            if getattr(page, name, None) is not None:
+                setattr(page, name, _action(getattr(page, name)))
+        page.settle = hsettle
 
     def _viewport():
         """The REAL viewport, in CSS px.
@@ -1555,8 +1741,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         point the hit test proved when the centre is covered (``at``, a Playwright `position`), so a
         floating label over the select's centre cannot swallow it and leave the letters to change a
         closed select one per key."""
+        # move_off=False: the popup is open now and this sequence owns the pointer until the pick lands.
         _targeted_click(native_page_click, selector, {"position": at} if at else {}, no_click=False,
-                        native_opts=None)
+                        native_opts=None, move_off=False)
         # Every pause here is the persona's (timing_traits.pause_scale): the windows were one fixed
         # set for every identity.
         time.sleep(pause_ms(persona, 220, 480) / 1000.0)        # the list opens; the eye finds the option
@@ -1877,7 +2064,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 raise trial_timeout_error(selector, ms, why)
             time.sleep(0.1 if end is None else max(0.0, min(0.1, end - time.monotonic())))
 
-    def _targeted_click(orig, selector, options, no_click, native_opts):
+    def _targeted_click(orig, selector, options, no_click, native_opts, dwell=None, move_off=True):
         """The humanized form of page.click / dblclick / hover (and the click inside check/uncheck).
 
         Every Playwright option is honoured: `button`, `click_count`, `delay` (the hold) and
@@ -1964,6 +2151,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                         held.append(m)
                         time.sleep(_rand(40, 110) / 1000.0)
                     _glide(x, y, target_w=_aim_w(box))
+                    _dwell(x, y, box, dwell)
                 finally:
                     for m in reversed(held):
                         time.sleep(_rand(20, 80) / 1000.0)
@@ -1973,13 +2161,17 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                             pass
                 return None
             _glide(x, y, target_w=_aim_w(box))
-            if not no_click:
+            if no_click:
+                _dwell(x, y, box, dwell)   # the hand rests on what it hovered (SC 232 lane C)
+            else:
                 if native_down is None or native_up is None:
                     _pre_press()
                     native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                                  button=o["button"], click_count=o["click_count"])
                 else:
                     _press_at(x, y, o)
+                if move_off:
+                    _schedule_move_off()
             return None
         except _Native as e:
             why = str(e)
@@ -1997,7 +2189,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         return wrapped
 
     page.click = api_errors("Page.click", _make_targeted(page.click, False))
-    page.hover = api_errors("Page.hover", _make_targeted(page.hover, True))
+    native_page_hover = page.hover
+
+    def _hover(selector, dwell=None, **options):
+        # `dwell` (ms; 0: none) is the SDK's, not Playwright's: never forwarded to a native hover
+        return _targeted_click(native_page_hover, selector, options, True, None, dwell=dwell)
+    page.hover = api_errors("Page.hover", _hover)
     # Locator.drag_to(trial=True) answers its checks here too (see the Locator patch).
     page._clearcote_trial = _trial
 
@@ -2027,6 +2224,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
     page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: press_and_hold(
         page.locator(selector).first, duration, **kw))
 
+    # The after-action step first, then the per-call switch outermost: humanize=False goes straight
+    # to the stock call and skips the after-action step too.
+    _install_after_action()
     _wire_per_call_off(page, st, _stock, _stock_mouse, _stock_kb)
 
     # Marker the Locator-class patch keys off: humanize is active for THIS page.
@@ -2043,10 +2243,15 @@ _MOUSE_METHODS = ("move", "click", "wheel", "dblclick", "down", "up")
 _KB_METHODS = ("type", "press")
 
 
+_SDK_ONLY_KW = ("dwell",)
+
+
 def _per_call(stock, fn, after=None):
     @functools.wraps(fn)
     def call(*a, humanize=None, **kw):
         if humanize is False:
+            for k in _SDK_ONLY_KW:   # the SDK's own keywords (hover dwell=): Playwright's call takes none of them
+                kw.pop(k, None)
             try:
                 return stock(*a, **kw)
             finally:
@@ -2224,7 +2429,7 @@ def _patch_locator_class():
     # click(button="right") into a left click and click(trial=True) into a real one.
     _CLICK = ("button", "click_count", "delay", "force", "modifiers", "no_wait_after", "position",
               "timeout", "trial")
-    _HOVER = ("force", "modifiers", "no_wait_after", "position", "timeout", "trial")
+    _HOVER = ("force", "modifiers", "no_wait_after", "position", "timeout", "trial", "dwell")
     _DBL = ("button", "delay", "force", "modifiers", "no_wait_after", "position", "timeout", "trial")
     _FILL = ("force", "no_wait_after", "timeout")
     _TYPE = ("timeout",)
@@ -2264,7 +2469,8 @@ def _patch_locator_class():
 
     def hover(self, **kw):
         done, r = _route(self, kw, lambda: self.page.hover(_sel(self), **_fwd(kw, _HOVER)))
-        return r if done else o_hover(self, **kw)
+        # `dwell` is the SDK's: Playwright's own hover does not take it
+        return r if done else o_hover(self, **{k: v for k, v in kw.items() if k != "dwell"})
 
     def press(self, key, **kw):
         done, r = _route(self, kw, lambda: self.page.press(_sel(self), key, **_fwd(kw, _PRESS)))

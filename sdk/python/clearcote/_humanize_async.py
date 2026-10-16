@@ -11,7 +11,9 @@ the rationale and the measurements behind each step; comments here note what is 
 """
 
 import asyncio
+import collections
 import functools
+import math
 import random
 import time
 
@@ -36,6 +38,10 @@ from ._motion import (
     WHEEL_NOTCH_PX, make_persona, plan_move, drag_dwell, click_hold, key_dwell, click_point, plan_ambient,
     dblclick_gap, pause_ms, timing_traits,
     platform_from_navigator, rollover_rate, wheel_notches,
+    dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
+)
+from ._attention import (
+    IDLE_DRIFT_MAX_MS, TEXT_LENGTH as ISO_TEXT_LENGTH, ambient_mode, explore_notches, idle_drifts, read_pause_ms,
 )
 from ._hold import press_and_hold_async
 from ._hzoptions import (
@@ -121,10 +127,21 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     # asyncio.Lock releases on cancellation, so a cancelled action does not block the next one.
     lock = asyncio.Lock()
 
-    def _serial(fn):
+    def _serial(fn, coords=False, after=True):
+        # Inside the lock, the outermost action first runs the lazy after-action step (SC 232 lane C,
+        # _pre_action: a due move-off, the attention model); `coords`: the action names a viewport point,
+        # so no exploratory scroll may run before it. A trial performs no action: nothing after-action.
         async def serial(*a, **kw):
             async with lock:
-                return await fn(*a, **kw)
+                if not after or kw.get("trial") or st["depth"] > 0:
+                    return await fn(*a, **kw)
+                await _pre_action(coords)
+                st["depth"] += 1
+                try:
+                    return await fn(*a, **kw)
+                finally:
+                    st["depth"] -= 1
+                    st["last_end"] = time.monotonic()
         serial.__name__ = getattr(fn, "__name__", "serial")
         return serial
 
@@ -405,8 +422,11 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
             await _pre_press()
             await native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                                **_sel_kw(kw, "button", "click_count"))
-            return
-        await _press_at(x, y, o)
+        else:
+            await _press_at(x, y, o)
+        # Not after an engine click (returned above): a glide the engine does not see would take the
+        # next coordinate click off the engine path (_engine_in_sync).
+        _schedule_move_off()
 
     async def hdblclick_xy(x, y, **kw):
         kw = dict(kw)
@@ -440,13 +460,179 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     page._clearcote_ambient = hz.ambient or "off"   # read by the attention/idle code (lane C)
 
     async def _auto_ambient():
-        if getattr(page, "_clearcote_auto_ambient", False):
+        # ambient="load" (lane A's option, read defensively) is the same per-load burst as the flag.
+        if getattr(page, "_clearcote_auto_ambient", False) is True or ambient_mode(page) == "load":
             try:
                 await hambient(_rand(450, 950))
             except Exception:  # noqa: BLE001
                 pass
 
     page.on("load", lambda _=None: asyncio.ensure_future(_auto_ambient()))
+    # The attention model's read pause counts from the last load (read lazily by the next action).
+    page.on("load", lambda _=None: st.__setitem__("load_at", time.monotonic()))
+
+    # ------------------------------------------------------------ after-action (SC 232 lane C)
+    # See the sync file: hover dwell, move-off after a click, and the attention model, all LAZY (run at the
+    # start of the next action inside the page lock, or by page.settle()), never from a timer or a task.
+    # Traits from the persona's salted stream (_motion.after_traits); per-action draws unseeded.
+    # Per-action draws are UNSEEDED, as in plan_move: the seed fixes the persona's traits only (after_traits);
+    # a seeded per-action sequence would replay identically in every session of an identity.
+    arng = random.random
+    st.update({"depth": 0, "last_end": None, "load_at": None, "mo": None, "mo_hits": 0, "mo_n": 0})
+    # Hidden switch for the attention model until lane A's `ambient="idle"` / `attention` option lands.
+    page._clearcote_attention = False
+    # Test seam: what the after-action model did, newest last (bounded).
+    trace = collections.deque(maxlen=256)
+    page._clearcote_after_trace = trace
+
+    def _attention_on():
+        return getattr(page, "_clearcote_attention", False) is True or ambient_mode(page) == "idle"
+
+    async def _dwell(x, y, box, dwell):
+        """Rest on a hover target: OU drift + tremor within 3 px of the arrival point and inside ``box``,
+        for the persona's 150-900 ms (``dwell`` ms overrides it; 0 or less: no dwell)."""
+        ms = None
+        if dwell is not None:
+            try:
+                ms = float(dwell)
+            except (TypeError, ValueError):
+                ms = None
+            if ms is not None and not math.isfinite(ms):
+                ms = None
+            if ms is not None and ms <= 0:
+                return
+        if ms is None:
+            ms = dwell_ms(persona, arng)
+        steps = plan_dwell((x, y), box, persona, ms, arng)
+        trace.append(("dwell", ms, len(steps)))
+        await _dispatch(steps)
+        if steps:
+            st["pos"] = (steps[-1][0], steps[-1][1])
+
+    def _schedule_move_off():
+        """After a press: in the persona's 60-85 % of clicks a move-off comes due 200-700 ms after the
+        release (see the sync file)."""
+        hit = move_off_roll(persona, arng, st["mo_hits"], st["mo_n"])
+        st["mo_n"] += 1
+        st["mo"] = None
+        if hit:
+            st["mo_hits"] += 1
+            st["mo"] = {"due": time.monotonic() + move_off_delay_ms(persona, arng) / 1000.0, "pos": st["pos"]}
+
+    async def _run_move_off(wait):
+        mo, st["mo"] = st["mo"], None
+        if not mo or st["held"] or st["pos"] != mo["pos"]:
+            return False
+        left = mo["due"] - time.monotonic()
+        if left > 0:
+            if not wait:
+                return False
+            await asyncio.sleep(left)
+        vw, vh = (await _view_bounds()) or (await _viewport())
+        tx, ty = plan_move_off(st["pos"], {"width": vw, "height": vh}, persona, arng)
+        trace.append(("move_off", st["pos"], (tx, ty)))
+        await _glide(tx, ty, target_w=140)   # one coarse glide: nothing to acquire
+        return True
+
+    async def _idle_drift(ms):
+        trace.append(("drift", ms))
+        vw, vh = (await _view_bounds()) or (await _viewport())
+        steps = _trim_ambient(plan_ambient(st["pos"], {"width": vw, "height": vh}, persona, ms, arng), ms)
+        await _dispatch(steps)
+        if steps:
+            st["pos"] = (steps[-1][0], steps[-1][1])
+
+    async def _attend(coords, now):
+        # `now`: when the action started -- a move-off glide just made does not count as idle time
+        la = st["load_at"]
+        if la is not None:
+            st["load_at"] = None
+            try:
+                n = await async_world_for(page).evaluate(ISO_TEXT_LENGTH)
+            except Exception:  # noqa: BLE001
+                n = 0
+            pause = read_pause_ms(n, persona, arng) / 1000.0
+            notches = explore_notches(arng)
+            trace.append(("read", pause * 1000.0, n, notches if not coords else 0))
+            if pause - (now - la) > 0.35:   # the eyes read; the hand drifts once meanwhile
+                await _idle_drift(min((pause - (now - la)) * 500.0, IDLE_DRIFT_MAX_MS))
+            rest = la + pause - time.monotonic()
+            if rest > 0:
+                await asyncio.sleep(rest)
+            if notches and not coords:   # never scroll away the point a coordinate action names
+                await hwheel(0, notches * (await _notch_px()))
+            return
+        last = st["last_end"]
+        if last is not None:
+            for ms in idle_drifts(now - last, arng):
+                await _idle_drift(ms)
+
+    async def _pre_action(coords):
+        if st["depth"] > 0 or st["held"]:
+            return
+        st["depth"] += 1
+        try:
+            now = time.monotonic()
+            await _run_move_off(False)
+            if _attention_on():
+                await _attend(coords, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the after-action model never stops the action
+            pass
+        finally:
+            st["depth"] -= 1
+
+    def _action(fn, coords=False):
+        """An UNLOCKED public entry point (mouse.move / wheel): the after-action step first."""
+        async def run(*a, **kw):
+            if st["depth"] > 0 or kw.get("trial"):
+                return await fn(*a, **kw)
+            await _pre_action(coords)
+            st["depth"] += 1
+            try:
+                return await fn(*a, **kw)
+            finally:
+                st["depth"] -= 1
+                st["last_end"] = time.monotonic()
+        run.__name__ = getattr(fn, "__name__", "action")
+        return run
+
+    def _touch(fn):
+        async def run(*a, **kw):
+            try:
+                return await fn(*a, **kw)
+            finally:
+                st["last_end"] = time.monotonic()
+        return run
+
+    async def hsettle():
+        """await page.settle(): let the hand settle after the last action -- wait for a pending move-off to
+        come due and make it. False when none was pending (or the pointer has moved since)."""
+        async with lock:
+            if st["depth"] > 0:
+                return False
+            st["depth"] += 1
+            try:
+                done = await _run_move_off(True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                done = False
+            finally:
+                st["depth"] -= 1
+            if done:
+                st["last_end"] = time.monotonic()
+            return done
+
+    def _install_after_action():
+        """Wrap the unlocked public entry points (the locked ones run the step inside _serial)."""
+        mouse.move = _action(mouse.move, coords=True)
+        mouse.wheel = _action(mouse.wheel, coords=True)
+        if native_down is not None and native_up is not None:
+            mouse.down, mouse.up = _touch(mouse.down), _touch(mouse.up)
+        page.ambient_motion = _serial(page.ambient_motion)
+        page.settle = hsettle
 
     async def _viewport():
         """The REAL viewport, in CSS px.
@@ -533,9 +719,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 except Exception:  # noqa: BLE001
                     pass
 
-    mouse.move, mouse.click, mouse.wheel = hmove, _serial(hclick), hwheel
+    mouse.move, mouse.click, mouse.wheel = hmove, _serial(hclick, coords=True), hwheel
     if getattr(mouse, "dblclick", None) is not None:
-        mouse.dblclick = _serial(hdblclick_xy)   # stock dblclick teleported and pressed for ~0 ms
+        mouse.dblclick = _serial(hdblclick_xy, coords=True)   # stock dblclick teleported and pressed for ~0 ms
     # down/up wrapped only to TRACK held state for hmove; the presses stay native.
     mouse.down, mouse.up = hdown, hup
 
@@ -1322,7 +1508,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         covered (``at``, a Playwright `position`), so a floating label over the select's centre
         cannot swallow it and leave the letters to change a closed select one per key."""
         await _targeted_click(native_page_click, selector, {"position": at} if at else {}, no_click=False,
-                              native_opts=None)
+                              native_opts=None, move_off=False)
         # Every pause here is the persona's (timing_traits.pause_scale): the windows were one fixed
         # set for every identity.
         await asyncio.sleep(pause_ms(persona, 220, 480) / 1000.0)        # the list opens; the eye finds the option
@@ -1606,7 +1792,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 raise trial_timeout_error(selector, ms, why)
             await asyncio.sleep(0.1 if end is None else max(0.0, min(0.1, end - clock())))
 
-    async def _targeted_click(orig, selector, options, no_click, native_opts):
+    async def _targeted_click(orig, selector, options, no_click, native_opts, dwell=None, move_off=True):
         """The humanized form of page.click / dblclick / hover (and the click inside check/uncheck).
 
         Every Playwright option is honoured: `button`, `click_count`, `delay` (the hold) and
@@ -1689,6 +1875,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                         await native_kb_down(m)
                         await asyncio.sleep(_rand(40, 110) / 1000.0)
                     await _glide(x, y, target_w=_aim_w(box))
+                    await _dwell(x, y, box, dwell)
                 finally:
                     if held:
                         async def lift(keys=tuple(reversed(held))):
@@ -1701,13 +1888,17 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                         await _release(lift())
                 return None
             await _glide(x, y, target_w=_aim_w(box))
-            if not no_click:
+            if no_click:
+                await _dwell(x, y, box, dwell)   # the hand rests on what it hovered (SC 232 lane C)
+            else:
                 if native_down is None or native_up is None:
                     await _pre_press()
                     await native_click(x, y, delay=o["delay"] if o["delay"] is not None else click_hold(persona),
                                        button=o["button"], click_count=o["click_count"])
                 else:
                     await _press_at(x, y, o)
+                if move_off:
+                    _schedule_move_off()
             return None
         except _Native as e:
             why = str(e)
@@ -1751,9 +1942,12 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     if native_page_click is not None:
         page.click = api_errors("Page.click", _serial(_make_targeted(native_page_click, False)))
     if native_page_hover is not None:
-        page.hover = api_errors("Page.hover", _serial(_make_targeted(native_page_hover, True)))
+        async def _hover(selector, dwell=None, **options):
+            # `dwell` (ms; 0: none) is the SDK's, not Playwright's: never forwarded to a native hover
+            return await _targeted_click(native_page_hover, selector, options, True, None, dwell=dwell)
+        page.hover = api_errors("Page.hover", _serial(_hover))
     # Locator.drag_to(trial=True) answers its checks here too (see the Locator patch).
-    page._clearcote_trial = _serial(_trial)
+    page._clearcote_trial = _serial(_trial, after=False)
 
     # press_and_hold (_hold.py): see the sync file. It holds the page lock for the whole hold (one
     # action at a time); inside it uses page.mouse (not locked) and the hooks below.
@@ -1780,6 +1974,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: page._clearcote_hold(
         page.locator(selector).first, duration, **kw))
 
+    # The after-action step first, then the per-call switch outermost: humanize=False goes straight
+    # to the stock call and skips the after-action step too.
+    _install_after_action()
     _wire_per_call_off(page, st, _stock, _stock_mouse, _stock_kb)
 
     # Marker the Locator-class patch keys off: humanize is active for THIS page.
@@ -1796,10 +1993,15 @@ _MOUSE_METHODS = ("move", "click", "wheel", "dblclick", "down", "up")
 _KB_METHODS = ("type", "press")
 
 
+_SDK_ONLY_KW = ("dwell",)
+
+
 def _per_call(stock, fn, after=None):
     @functools.wraps(fn)
     async def call(*a, humanize=None, **kw):
         if humanize is False:
+            for k in _SDK_ONLY_KW:   # the SDK's own keywords (hover dwell=): Playwright's call takes none of them
+                kw.pop(k, None)
             try:
                 return await stock(*a, **kw)
             finally:
@@ -1958,7 +2160,7 @@ def _patch_locator_class():
     # everything the caller passed that a page method accepts travels with it.
     _CLICK = ("button", "click_count", "delay", "force", "modifiers", "no_wait_after", "position",
               "timeout", "trial")
-    _HOVER = ("force", "modifiers", "no_wait_after", "position", "timeout", "trial")
+    _HOVER = ("force", "modifiers", "no_wait_after", "position", "timeout", "trial", "dwell")
     _DBL = ("button", "delay", "force", "modifiers", "no_wait_after", "position", "timeout", "trial")
     _FILL = ("force", "no_wait_after", "timeout")
     _TYPE = ("timeout",)
@@ -1998,7 +2200,8 @@ def _patch_locator_class():
 
     async def hover(self, **kw):
         done, r = await _route(self, lambda: self.page.hover(_sel(self), **_fwd(kw, _HOVER)))
-        return r if done else await o_hover(self, **kw)
+        # `dwell` is the SDK's: Playwright's own hover does not take it
+        return r if done else await o_hover(self, **{k: v for k, v in kw.items() if k != "dwell"})
 
     async def press(self, key, **kw):
         done, r = await _route(self, lambda: self.page.press(_sel(self), key, **_fwd(kw, _PRESS)))
