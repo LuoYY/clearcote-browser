@@ -2708,11 +2708,152 @@ public static partial class Humanize
                 await TrialAsync(loc, timeout, o.Normalize(), noClick: false).ConfigureAwait(false);
                 return;
             }
-            await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()))
-                .ConfigureAwait(false);
+            // The click lands on the input's box, or on its <label> (LabelAimAsync): always for a hidden custom
+            // checkbox (the box click waited for it to show and timed out), LabelShare of the time otherwise.
+            bool clicked = false;
+            if (!force && position is null)
+            {
+                try
+                {
+                    var lbox = await LabelAimAsync(loc, timeout).ConfigureAwait(false);
+                    clicked = lbox is not null && await ClickLabelAsync(loc.Page, lbox).ConfigureAwait(false);
+                }
+                catch (Exception e) when (!Propagates(e))
+                {
+                    // not a stock fallback: the targeted click on the input itself follows (traced only)
+                    FallbackTrace?.Invoke("check: label aim: " + e.Message);
+                    clicked = false;
+                }
+            }
+            if (!clicked)
+                await TargetedClickAsync(loc, o, o.Normalize(), noClick: false, () => loc.ClickAsync(o.ToClick()))
+                    .ConfigureAwait(false);
             if (await loc.IsCheckedAsync().ConfigureAwait(false) == want) return;
             throw new PlaywrightException("Clicking the checkbox did not change its state");
         });
+
+    /// <summary>The share of visible-checkbox clicks that land on the label text: a PERSONA TRAIT (Python
+    /// label_share / Node labelShare). Each click's choice is an unseeded draw (<see cref="LabelDraw"/>), never
+    /// a seeded stream: every session of an identity would otherwise choose the same way in the same order.</summary>
+    public const double LabelShare = 0.4;
+
+    /// <summary>This click: on the label? An unseeded draw (Random.Shared, or a test's own) against the share.</summary>
+    internal static bool LabelDraw(Persona p, Random? rng = null) => (rng ?? Rnd).NextDouble() < LabelShare;
+
+    private static LocatorBoundingBoxResult? Quad(JsonElement e)
+        => e.ValueKind == JsonValueKind.Array && e.GetArrayLength() == 4
+            ? new LocatorBoundingBoxResult { X = (float)e[0].GetDouble(), Y = (float)e[1].GetDouble(),
+                Width = (float)e[2].GetDouble(), Height = (float)e[3].GetDouble() }
+            : null;
+
+    /// <summary>Where a person clicks a checkbox / radio when not on its own box: its &lt;label&gt;. A HIDDEN input
+    /// (a custom checkbox) has no box to click at all, so its label is the only target; a visible one gets its
+    /// label TEXT <see cref="LabelShare"/> of the time. Null = aim at the input itself, as before.</summary>
+    private static async Task<LocatorBoundingBoxResult?> LabelAimAsync(ILocator loc, float? timeout)
+    {
+        var page = loc.Page;
+        var w = IsolatedWorld.For(page);
+        if (await loc.IsVisibleAsync().ConfigureAwait(false))
+        {
+            var box = await BoxOfAsync(loc, timeout, force: false).ConfigureAwait(false);
+            var info = await DescribeAsync(page, box, null).ConfigureAwait(false);
+            if (info is null || info.Tag != "input" || (info.Type != "checkbox" && info.Type != "radio")) return null;
+            var lab = await w.CallOnNodeAsync(info.Node, IsolatedWorld.LabelOf).ConfigureAwait(false);
+            if (lab is not { ValueKind: JsonValueKind.Object } l || !l.TryGetProperty("label", out var lb)
+                || lb.ValueKind != JsonValueKind.Object || (l.TryGetProperty("hidden", out var h) && h.ValueKind == JsonValueKind.True))
+                return null;
+            if (!LabelDraw(PersonaFor(page))) return null;   // the persona's share; THIS click's choice is unseeded
+            var r = lb.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.Array ? Quad(tx) : Quad(lb.GetProperty("rect"));
+            return r is { Width: >= 2, Height: >= 2 } ? r : null;
+        }
+        var css = CssOf(loc);
+        if (css is null) return null;
+        var bySel = await w.EvaluateAsync(IsolatedWorld.LabelBySel, new Dictionary<string, object?> { ["sel"] = css }).ConfigureAwait(false);
+        if (bySel is not { ValueKind: JsonValueKind.Object } o || !o.TryGetProperty("n", out var n) || n.ValueKind != JsonValueKind.Number
+            || n.GetInt32() < 1 || !o.TryGetProperty("hidden", out var hid) || hid.ValueKind != JsonValueKind.True
+            || !o.TryGetProperty("label", out var lab2) || lab2.ValueKind != JsonValueKind.Object)
+            return null;
+        try
+        {
+            if (await page.Locator(css).CountAsync().ConfigureAwait(false) != n.GetInt32()) return null;
+        }
+        catch (PlaywrightException) { return null; }
+        var lbox = Quad(lab2.GetProperty("rect"));
+        if (lbox is null || lbox.Width < 2 || lbox.Height < 2) return null;
+        if (!await InViewAsync(page, lbox).ConfigureAwait(false)) lbox = await ScrollWindowToAsync(page, lbox).ConfigureAwait(false) ?? lbox;
+        return await InViewAsync(page, lbox).ConfigureAwait(false) ? lbox : null;
+    }
+
+    /// <summary>One humanized click inside a label's box, where the hit test proves the label owns the point.</summary>
+    private static async Task<bool> ClickLabelAsync(IPage page, LocatorBoundingBoxResult lbox)
+    {
+        var p = PersonaFor(page);
+        var st = StateFor(page);
+        var from = st.Known ? new Point(st.X, st.Y) : new Point(lbox.X - 120, lbox.Y - 90);
+        var pt = Motion.ClickPoint(new Box(lbox.X, lbox.Y, lbox.Width, lbox.Height), from, p);
+        double x = Math.Round(pt.X), y = Math.Round(pt.Y);
+        await Task.Delay(50).ConfigureAwait(false);
+        if (await HitInBoxAsync(page, lbox, x, y).ConfigureAwait(false) == false) return false;
+        await GlideAsync(page, p, st, x, y, Math.Max(6, Math.Min(lbox.Width, lbox.Height))).ConfigureAwait(false);
+        await PressAtAsync(page, p, new HumanClickOptions().Normalize()).ConfigureAwait(false);
+        return true;
+    }
+
+    // ------------------------------------------------------------------------- lane F: coordinate click, clear, press sequentially
+    /// <summary>
+    /// A humanized click at viewport point (<paramref name="x"/>, <paramref name="y"/>): the persona's glide from
+    /// wherever the pointer is, the pre-press pause, and the press shaped by <paramref name="options"/> (button,
+    /// click count, hold, modifiers; Position/Force/Trial/Timeout have no meaning for a point and are ignored).
+    /// The .NET form of Python/Node <c>page.mouse.click(x, y)</c> under humanize.
+    /// </summary>
+    public static async Task HumanClickAsync(this IPage page, double x, double y, HumanClickOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        var o = (options ?? new HumanClickOptions()).Normalize();
+        await SerialAsync(page, async () =>
+        {
+            var p = PersonaFor(page);
+            var st = StateFor(page);
+            await GlideAsync(page, p, st, x, y, 24).ConfigureAwait(false);
+            st.Known = true;
+            await PressAtAsync(page, p, o).ConfigureAwait(false);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Empty a text field the way a person does: click into it, held Ctrl/Cmd+A, Backspace, verified -- the
+    /// humanized <see cref="HumanFillAsync(ILocator,string,LocatorFillOptions)"/> with an empty value. Anything the
+    /// humane route cannot prove goes to Playwright's <c>ClearAsync</c>. Strict like Playwright's locator actions.
+    /// </summary>
+    public static async Task HumanClearAsync(this ILocator locator, LocatorClearOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(locator);
+        await SerialAsync(locator.Page, async () =>
+        {
+            if (await RoutableAsync(locator, strict: true).ConfigureAwait(false)
+                && await FillHumanizedAsync(locator, "", options?.Timeout, options?.Force == true).ConfigureAwait(false))
+                return;
+            await locator.ClearAsync(options).ConfigureAwait(false);   // outside any catch: raises once
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Type <paramref name="text"/> into the element key by key with the persona's dwell and cadence: the humanized
+    /// <see cref="HumanTypeAsync(ILocator,string)"/> under Playwright's current name. A caller's
+    /// <c>Delay</c> is honoured by Playwright's own <c>PressSequentiallyAsync</c> (an explicit fixed cadence).
+    /// </summary>
+    public static async Task HumanPressSequentiallyAsync(this ILocator locator, string text,
+        LocatorPressSequentiallyOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(locator);
+        ArgumentNullException.ThrowIfNull(text);
+        if (options?.Delay is > 0)
+        {
+            await locator.PressSequentiallyAsync(text, options).ConfigureAwait(false);
+            return;
+        }
+        await locator.HumanTypeAsync(text).ConfigureAwait(false);
+    }
 
     // --------------------------------------------------------------------------- the element itself
     /// <summary>

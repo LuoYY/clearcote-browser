@@ -171,6 +171,8 @@ export function optionsOf(page: unknown): ResolvedHumanize | null {
  * propagates and stops the stock call), or, in strict mode, throw ClearcoteStrictError instead. */
 export function reportFallback(page: unknown, api: string, reason: string, selector?: string): HumanizeFallbackEvent {
   const ev: HumanizeFallbackEvent = { api: caller.getStore() ?? api, reason, ...(selector !== undefined ? { selector } : {}) };
+  // the newest event is kept on the page either way (a test and hook-less caller seam)
+  try { (page as any)._clearcoteLastFallback = ev; } catch { /* a frozen or non-object page */ }
   const o = optionsOf(page);
   if (!o) return ev;
   if (o.strict) throw new ClearcoteStrictError(ev.api, reason, selector);

@@ -416,6 +416,41 @@ HIT_IN_BOX = """function (b) {
     }
   }
   return false; }"""
+# A checkbox / radio and its <label>, from the input node (`this`): is the input itself clickable
+# (`hidden`: display:none, visibility, opacity 0, a zero/one-pixel box, clip rect(0 0 0 0), parked
+# off-screen -- every "visually hidden" recipe a custom checkbox uses), and the label the browser
+# itself associates with it (input.labels: `for=` or an ancestor <label>), with the label's box and
+# the box of its TEXT (the first line box of its text nodes; null when it has none). The label passes
+# a click on to the control, so either box is a place a person checks the box from.
+LABEL_OF = """function () {
+  const e = this.nodeType === 1 ? this : this.parentElement;
+  if (!e || e.tagName !== 'INPUT' || (e.type !== 'checkbox' && e.type !== 'radio')) return null;
+  const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
+  const clip = /rect\\(\\s*0(px)?[ ,]+0(px)?[ ,]+0(px)?[ ,]+0(px)?\\s*\\)/.test(cs.clip || '');
+  const hidden = cs.display === 'none' || cs.visibility !== 'visible' || parseFloat(cs.opacity) < 0.05 ||
+    r.width <= 1 || r.height <= 1 || clip || r.right < 0 || r.bottom < 0 ||
+    r.left > innerWidth + 1 || r.top > innerHeight + 1;
+  const o = { tag: 'input', type: e.type, rect: [r.x, r.y, r.width, r.height], hidden,
+    checked: !!e.checked, disabled: !!e.disabled, label: null };
+  const lab = (e.labels && e.labels.length) ? e.labels[0] : e.closest('label');
+  if (!lab) return o;
+  const lr = lab.getBoundingClientRect(), ls = getComputedStyle(lab);
+  if (ls.display === 'none' || ls.visibility !== 'visible' || lr.width < 2 || lr.height < 2) return o;
+  let text = null;
+  try {
+    const rg = document.createRange(); rg.selectNodeContents(lab);
+    for (const q of rg.getClientRects()) if (q.width >= 2 && q.height >= 2) { text = [q.x, q.y, q.width, q.height]; break; }
+  } catch (x) { text = null; }
+  o.label = { rect: [lr.x, lr.y, lr.width, lr.height], text, contains: lab.contains(e) };
+  return o; }"""
+# LABEL_OF for the first match of a plain-CSS selector (a hidden input has no box to hit-test), plus how
+# many match (the caller checks Playwright counts the same). null when the selector is not CSS.
+LABEL_BY_SEL = """(a) => { let l;
+  try { l = document.querySelectorAll(a.sel); } catch (e) { return null; }
+  if (!l.length) return { n: 0 };
+  const o = (%s).call(l[0]);
+  if (!o) return { n: l.length };
+  o.n = l.length; return o; }""" % LABEL_OF
 # A list box's scroll state and one row's box, from any node inside the <select> (`this`): where its
 # visible rows are (top / bottom of the client area), how far it is scrolled (st, of max), the row's
 # rect, and which rows are selected.

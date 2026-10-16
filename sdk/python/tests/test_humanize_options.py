@@ -124,11 +124,12 @@ def test_strict_raises_on_a_covered_target_and_runs_nothing(fast, mode):
 
 
 @pytest.mark.parametrize("mode", MODES, ids=lambda m: m.name)
-def test_strict_raises_on_an_option_dict_select(fast, mode):
+def test_strict_raises_on_an_element_handle_select(fast, mode):
+    # Lane F humanizes option dicts ({value}/{label}/{index}); element handles still go to Playwright.
     sim, page = mode.page(_select(), humanize={"strict": True})
     with pytest.raises(mode.strict_error) as ei:
-        mode.run(page.select_option, "#s", {"label": "Cherry"})
-    assert "option dicts" in ei.value.reason and ei.value.api == "Page.select_option"
+        mode.run(page.select_option, "#s", element=object())
+    assert "element handles" in ei.value.reason and ei.value.api == "Page.select_option"
     assert sim.native == []
 
 
@@ -165,9 +166,17 @@ class _Frame:
 class _FakeLocator:
     """Just what the Locator patch reads: page, _impl_obj._selector, _impl_obj._frame."""
 
-    def __init__(self, page, selector, child=False):
+    def __init__(self, page, selector, child=False, aio=False):
         self.page = page
         self._impl_obj = _FakeImpl(selector, _Frame(object() if child else None))
+        self._aio = aio
+
+    def count(self):   # one match: the frame route (lane F) is tried, and cannot run on this stub
+        if self._aio:
+            async def one():
+                return 1
+            return one()
+        return 1
 
 
 @pytest.mark.parametrize("mode", MODES, ids=lambda m: m.name)
@@ -177,15 +186,17 @@ def test_strict_raises_on_a_frame_locator_with_the_locator_api(fast, mode):
         from playwright.sync_api._generated import Locator
     else:
         from playwright.async_api._generated import Locator
-    loc = _FakeLocator(page, "iframe >> internal:control=enter-frame >> #b")
+    # Lane F: a frame locator takes the frame route; where that route cannot run, strict raises with its reason.
+    aio = mode.name != "sync"
+    loc = _FakeLocator(page, "iframe >> internal:control=enter-frame >> #b", aio=aio)
     with pytest.raises(mode.strict_error) as ei:
         mode.run(Locator.click, loc)
-    assert ei.value.api == "Locator.click" and "frame locators" in ei.value.reason
+    assert ei.value.api == "Locator.click" and ei.value.reason.startswith("frame")
     assert str(ei.value).startswith("Locator.click: ")
-    child = _FakeLocator(page, "#b", child=True)
+    child = _FakeLocator(page, "#b", child=True, aio=aio)
     with pytest.raises(mode.strict_error) as ei:
         mode.run(Locator.fill, child, "x")
-    assert ei.value.api == "Locator.fill" and "child frame" in ei.value.reason
+    assert ei.value.api == "Locator.fill" and ei.value.reason.startswith("frame")
 
 
 @pytest.mark.parametrize("mode", MODES, ids=lambda m: m.name)

@@ -129,3 +129,72 @@ def test_click_fallback_reaches_playwright_once():
     page.click("#b", timeout=1234)
     page.hover("#h")
     assert page.native_clicks == [("#b", {"timeout": 1234}), ("hover:#h", {})]
+
+
+# ------------------------------------------------------------- lane F (SC 232): attach on every page
+class _SyncCtx:
+    """A sync context that emits "page" like Playwright's, with no Browser (a persistent context's)."""
+
+    def __init__(self, pages=()):
+        self.pages, self.handlers, self.browser = list(pages), [], None
+
+    def on(self, ev, fn):
+        if ev == "page":
+            self.handlers.append(fn)
+
+    def add_init_script(self, *_a, **_k):
+        return None
+
+    def emit(self, page):
+        self.pages.append(page)
+        for fn in self.handlers:
+            fn(page)
+
+
+def _humanized(page):
+    return page.__dict__.get("_clearcote_humanized") is True
+
+
+def test_sync_persistent_context_without_a_browser_attaches():
+    from clearcote._humanize import install_humanize_on_context
+    first = _SyncPage()
+    ctx = _SyncCtx([first])
+    install_humanize_on_context(ctx, humanize=True, seed="persist")
+    assert _humanized(first), "context.browser is None: humanize must still attach"
+    later = _SyncPage()
+    ctx.emit(later)
+    assert _humanized(later)
+    install_humanize_on_context(ctx, humanize=True, seed="persist")
+    assert len(ctx.handlers) == 1, "a second install adds no second listener"
+
+
+def test_sync_popup_of_the_implicit_context_of_browser_new_page_is_humanized():
+    from clearcote._humanize import install_humanize
+    ctx = _SyncCtx()
+
+    class _B:
+        def new_page(self, **kw):
+            pg = _SyncPage()
+            pg.__dict__["context"] = ctx
+            ctx.pages.append(pg)
+            return pg
+
+        def new_context(self, **kw):
+            return _SyncCtx()
+
+    b = _B()
+    install_humanize(b, humanize=True, seed="popup")
+    page = b.new_page()
+    assert _humanized(page)
+    move = page.mouse.move
+    popup = _SyncPage()
+    ctx.emit(popup)                      # window.open / target=_blank in that implicit context
+    assert _humanized(popup)
+    assert page.mouse.move is move, "the opener is not wrapped twice (idempotent attach)"
+
+
+def test_sync_native_select_args_translates_option_dicts():
+    from clearcote._humanize import native_select_args
+    assert native_select_args("a", {"timeout": 5}) == ("a", {"timeout": 5})
+    v, o = native_select_args([{"value": "v1"}, {"label": "L"}, {"index": 2}, "plain"], {"index": 0})
+    assert v == ["v1", "plain"] and o == {"index": [0, 2], "label": ["L"]}

@@ -177,11 +177,16 @@ def options_of(page) -> Optional[HumanizeOptions]:
 def report_fallback(page, api, reason, selector=None):
     """One humanized action is about to be handed to Playwright's own call. Default mode: tell
     ``on_fallback`` (its errors propagate: raising there is how a caller stops the stock call). Strict
-    mode: raise ClearcoteStrictError instead. Does nothing on a page without humanize options."""
+    mode: raise ClearcoteStrictError instead. Does nothing on a page without humanize options. Either way the
+    event is kept as ``page._clearcote_last_fallback`` (the newest one; a test and hook-less caller seam)."""
     o = options_of(page)
     outer = _CALLER.get()
     api = outer or api
     event = {"api": api, "reason": reason, "selector": selector}
+    try:
+        page._clearcote_last_fallback = event
+    except Exception:  # noqa: BLE001 - a page-like object that refuses attributes
+        pass
     if o is None:
         return event
     if o.strict:

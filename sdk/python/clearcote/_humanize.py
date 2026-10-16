@@ -46,7 +46,8 @@ from ._forms import (
 from ._isolated import (
     ACTIVE_FIELD as ISO_ACTIVE_FIELD, ACTIVE_VALUE as ISO_ACTIVE_VALUE, COVER_CHECK_MS, COVER_RETRY_MS,
     CSS_BOX as ISO_CSS_BOX, DESCRIBE as ISO_DESCRIBE, FORM_CONTROL, HIT_IN_BOX as ISO_HIT_IN_BOX,
-    FRAMES as ISO_FRAMES, LISTBOX_ROW as ISO_LISTBOX_ROW, SCROLL_BY as ISO_SCROLL_BY,
+    FRAMES as ISO_FRAMES, LABEL_BY_SEL as ISO_LABEL_BY_SEL, LABEL_OF as ISO_LABEL_OF,
+    LISTBOX_ROW as ISO_LISTBOX_ROW, SCROLL_BY as ISO_SCROLL_BY,
     PLATFORM as ISO_PLATFORM, VIEWPORT as ISO_VIEWPORT, world_for,
 )
 from ._motion import (
@@ -61,9 +62,11 @@ from ._attention import (
 from ._hold import press_and_hold
 from ._hzoptions import (
     _CALLER, ClearcoteStrictError, HumanizeOptions, apply_to_persona,
-    engine_mode as _hz_engine_mode, report_fallback as _report_fallback, resolve as _hz_resolve,
+    engine_mode as _hz_engine_mode, options_of as _hz_options_of, report_fallback as _report_fallback,
+    resolve as _hz_resolve,
     tempo_of as _hz_tempo, typo_rate_for as _hz_typo_rate,
 )
+from . import _frames as _fr
 from ._pacing import keep_in_view as _keep_in_view, trim_to as _trim_ambient, walk as _paced_walk
 
 # IIFE so it runs both as an add_init_script source AND when passed to page.evaluate().
@@ -274,11 +277,154 @@ def _sel_kw(options, *names):
     return {k: options[k] for k in names if k in options}
 
 
+# ------------------------------------------------------------------------- select_option wants
+def select_wants(value=None, index=None, label=None):
+    """Playwright's select_option arguments -> the wanted options as (kind, x) pairs, in the order
+    given, or None when the humane route does not apply (nothing asked, an ElementHandle, an option
+    dict naming more than one field). Mirrors Node's selectWants.
+
+    Kinds: "value" (a bare string: value OR label, Playwright's valueOrLabel), "valueOnly" (a
+    {"value": v} dict: the value alone, as Playwright's option object), "label" ({"label": l} or
+    ``label=``), "index" ({"index": i} or ``index=``). Playwright Python takes no option dicts itself
+    (Node does); the humanized call accepts them, and the native fallback gets them translated
+    (native_select_args)."""
+    out = []
+
+    def add(kind, v):
+        for x in (v if isinstance(v, (list, tuple)) else [v]):
+            if isinstance(x, dict):
+                keys = [k for k in ("value", "label", "index") if x.get(k) is not None]
+                if len(keys) != 1:
+                    return False
+                k = keys[0]
+                if k == "index":
+                    if isinstance(x["index"], bool) or not isinstance(x["index"], int):
+                        return False
+                    out.append(("index", x["index"]))
+                elif k == "label":
+                    out.append(("label", str(x["label"])))
+                else:
+                    out.append(("valueOnly", str(x["value"])))
+            elif kind == "index":
+                if isinstance(x, bool) or not isinstance(x, int):
+                    return False
+                out.append(("index", x))
+            elif isinstance(x, str):
+                out.append((kind, x))
+            else:
+                return False   # an ElementHandle, or anything else: native
+        return True
+
+    for kind, v in (("value", value), ("index", index), ("label", label)):
+        if v is not None and not add(kind, v):
+            return None
+    return out or None
+
+
+def want_index(opts, kind, w):
+    """The option index one want resolves to, Playwright's way, or -1."""
+    if kind == "valueOnly":
+        for i, o in enumerate(opts):
+            if o.get("value") == w:
+                return i
+        return -1
+    return match_option(opts, **{kind: w})
+
+
+def native_select_args(value, options):
+    """(value, options) for Playwright's own select_option when ``value`` holds option dicts, which
+    Playwright Python does not take: {"value": v} -> value= (valueOrLabel, the closest it has),
+    {"label": l} -> label=, {"index": i} -> index=, merged with what the caller passed. Anything
+    without a dict is returned as it is."""
+    items = value if isinstance(value, (list, tuple)) else [value]
+    if not any(isinstance(x, dict) for x in items):
+        return value, options
+    o = dict(options)
+    vals, idx, labs = [], [], []
+    for x in items:
+        if isinstance(x, dict):
+            if x.get("value") is not None:
+                vals.append(str(x["value"]))
+            elif x.get("label") is not None:
+                labs.append(str(x["label"]))
+            elif x.get("index") is not None:
+                idx.append(x["index"])
+        elif x is not None:
+            vals.append(x)
+
+    def merge(name, more):
+        if not more:
+            return
+        have = o.get(name)
+        have = [] if have is None else (list(have) if isinstance(have, (list, tuple)) else [have])
+        o[name] = have + more
+    merge("index", idx)
+    merge("label", labs)
+    return (vals if vals else None), o
+
+
+# Checkbox clicks on the <label> (see _set_checked). The persona fixes the TRAIT -- how often this identity
+# clicks a visible checkbox's label rather than its box (persona.label_share when the persona carries one,
+# else 0.4) --; each click's choice is an UNSEEDED draw, like plan_move's, or every session of an identity
+# would make the same choices in the same order (a cross-session fingerprint). The draw comes from a
+# process-level Random of its own (seeded from OS entropy), so the global random stream is not shifted.
+LABEL_SHARE = 0.4
+_LABEL_RNG = random.Random()
+
+
+def label_share(persona):
+    """The persona's trait: the share of visible-checkbox clicks that land on the label text."""
+    v = getattr(persona, "label_share", None)
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0 else LABEL_SHARE
+
+
+def label_draw(persona, rng=None):
+    """This click: on the label? An unseeded draw against the persona's trait (``rng``: a test's own)."""
+    return (rng or _LABEL_RNG).random() < label_share(persona)
+
+
+# ------------------------------------------------------------------------- strict / fallback report
+# The coverage paths (tap, frame routes) report through lane A's report_fallback (_hzoptions): strict mode
+# raises ClearcoteStrictError, otherwise on_fallback hears the event. The last event is also kept on
+# page._clearcote_last_fallback (read by tests and by callers without a hook).
+TAP_NOT_HUMANIZED = "tap is not humanized for touch contexts yet"
+
+
+def strict_mode(page):
+    """Is strict humanize mode on for ``page`` (a fallback to native input must raise, not happen)? The page's
+    HumanizeOptions decide; a stand-in page without options may set ``_clearcote_strict``."""
+    o = _hz_options_of(page)
+    if o is not None:
+        return o.strict is True
+    return getattr(page, "_clearcote_strict", False) is True
+
+
+def report_fallback(page, api, reason, selector=None):
+    """A humanized API is about to fall back to native input: lane A's report (strict raises, else on_fallback;
+    the event is kept as ``page._clearcote_last_fallback``)."""
+    if _hz_options_of(page) is None and strict_mode(page):
+        raise ClearcoteStrictError(
+            "humanize strict: %s would fall back to a stock Playwright call (%s)"
+            % ("%r" % (selector,) if selector else "the action", reason),
+            api=api, reason=reason, selector=selector)
+    return _report_fallback(page, api, reason, selector)
+
+
 def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None):
     """Wrap one page's input methods + (optionally) inject the cursor overlay.
 
-    ``seed`` (the fingerprint seed) selects a stable per-identity motor persona; unset ⇒ random."""
-    if show_cursor:
+    ``seed`` (the fingerprint seed) selects a stable per-identity motor persona; unset ⇒ random.
+
+    IDEMPOTENT: a page reaches here twice (install_humanize wraps browser.new_page AND hooks the
+    context's "page" event; a context's existing pages are attached again by a second install), and a
+    second attach would wrap the already-wrapped mouse -- every sample of the outer glide walking a
+    whole inner one (measured in Node: 18x). The ``_clearcote_humanized`` marker is the guard."""
+    if show_cursor and getattr(page, "_clearcote_cursor", False) is not True:
+        try:
+            page._clearcote_cursor = True
+        except Exception:  # noqa: BLE001
+            pass
+
         def inject():
             try:
                 page.evaluate(CURSOR_OVERLAY)
@@ -287,7 +433,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         inject()
         page.on("load", lambda _=None: inject())
         page.on("framenavigated", lambda f: inject() if f == page.main_frame else None)
-    if humanize is None or humanize is False:
+    if humanize is None or humanize is False or getattr(page, "_clearcote_humanized", False) is True:
         return
 
     # Per-identity motor persona (cadence, tremor, overshoot, handedness) seeded from the fingerprint
@@ -1882,14 +2028,10 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         shown to have worked -- the caller then runs stock select_option."""
         if options.get("element") is not None:
             return None
-        wants = []
-        for k, v in (("value", value), ("index", options.get("index")), ("label", options.get("label"))):
-            if v is None:
-                continue
-            for x in (v if isinstance(v, (list, tuple)) else [v]):
-                if isinstance(x, dict):
-                    return None   # {value, label, index} option dicts: native
-                wants.append((k, x))
+        # {value} / {label} / {index} option dicts (and lists of them) are wanted options like the
+        # bare strings, as in Node (selectWants); they used to go native, and Playwright Python does
+        # not even take them.
+        wants = select_wants(value, options.get("index"), options.get("label"))
         if not wants:
             return None
         loc = page.locator(selector).first
@@ -1900,7 +2042,7 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         opts = info["options"]
         idx = []
         for kind, w in wants:
-            i = match_option(opts, **{kind: w})
+            i = want_index(opts, kind, w)
             if i < 0 or opts[i].get("disabled"):
                 return None   # not there (yet) or disabled: Playwright waits / reports it
             if i not in idx:
@@ -1944,14 +2086,70 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 raise
             why = "error: %s" % (e,)
         _report_fallback(page, "Page.select_option", why, selector)
+        value, options = native_select_args(value, options)   # option dicts: Playwright Python takes none
         return native_page_select_option(selector, value, **options)
+
+    def _label_aim(selector, loc, timeout):
+        """Where a person clicks a checkbox / radio when not on its own box: its <label>. A HIDDEN
+        input (a custom checkbox: zero-size, opacity 0, clipped) has no box to click at all, so its
+        label is the only target (its ::before box is just part of the label's box); a visible one
+        gets its label TEXT 40 % of the time (label_rng). None = aim at the input itself, as before:
+        no label, no CDP, a non-CSS selector for a hidden input, the 60 %."""
+        w = world_for(page)
+        if loc.is_visible():
+            box = _box_of(loc, timeout, selector=selector)
+            info = _describe(box) if box else None
+            if not info or info.get("tag") != "input" or info.get("type") not in ("checkbox", "radio"):
+                return None
+            lab = w.call_on_node(info["node"], ISO_LABEL_OF)
+            if not lab or not lab.get("label") or lab.get("hidden"):
+                return None
+            if not label_draw(persona):   # the persona's share; THIS click's choice is unseeded
+                return None
+            r = lab["label"].get("text") or lab["label"]["rect"]
+            lbox = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
+            return lbox if lbox["width"] >= 2 and lbox["height"] >= 2 else None
+        # Not visible: Playwright would wait for it and time out. A plain-CSS selector can still be
+        # resolved in the isolated world (Playwright must count the same elements, as _css_box).
+        if not isinstance(selector, str) or not selector:
+            return None
+        lab = w.evaluate(ISO_LABEL_BY_SEL, {"sel": selector})
+        if not lab or not lab.get("n") or not lab.get("hidden") or not lab.get("label"):
+            return None
+        try:
+            if page.locator(selector).count() != lab["n"]:
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        r = lab["label"]["rect"]
+        lbox = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
+        if lbox["width"] < 2 or lbox["height"] < 2:
+            return None
+        if not _in_view(lbox):
+            lbox = _scroll_window_to(lbox) or lbox
+        return lbox if _in_view(lbox) else None
+
+    def _click_label(lbox):
+        """One humanized click inside ``lbox`` (a label's box), where the hit test proves the label owns
+        the point. False when it does not (something covers it): the caller aims at the input."""
+        x, y = click_point(lbox, st["pos"], persona)
+        x, y = float(round(x)), float(round(y))
+        time.sleep(0.05)
+        if _hit_in_box(lbox, x, y) is False:
+            return False
+        _glide(x, y)
+        _press_at(x, y, normalize_click_options({}, _platform()))
+        return True
 
     def _set_checked(orig, selector, checked, options):
         """check / uncheck / set_checked: a humanized click when the state must change, then the
         state verified -- Playwright raises when a click does not change it, so do we (by falling
         through to the native call, which raises with its own message). `trial` performs no action:
         the state is read (a non-checkbox raises, as in Playwright) and, when a click would be needed,
-        its checks run here (_trial) -- not Playwright's trial, which moves the pointer and presses."""
+        its checks run here (_trial) -- not Playwright's trial, which moves the pointer and presses.
+
+        The click lands on the input's box, or on its <label> (_label_aim): always for a hidden custom
+        checkbox (the box click waited for it to show and timed out), 40 % of the time otherwise."""
         loc = page.locator(selector).first
         if options.get("trial"):
             if loc.is_checked(timeout=options.get("timeout")) == checked:
@@ -1961,7 +2159,17 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         # native fallback, so nothing here may click a second time.
         if loc.is_checked(timeout=options.get("timeout")) == checked:
             return None
-        _targeted_click(native_page_click, selector, dict(options), no_click=False, native_opts=None)
+        clicked = False
+        if not options.get("force") and not options.get("position"):
+            try:
+                lbox = _label_aim(selector, loc, options.get("timeout"))
+                clicked = bool(lbox) and _click_label(lbox)
+            except Exception as e:  # noqa: BLE001
+                if _is_timeout(e):
+                    raise
+                clicked = False
+        if not clicked:
+            _targeted_click(native_page_click, selector, dict(options), no_click=False, native_opts=None)
         if loc.is_checked() == checked:
             return None
         # One click did not change it (a page that cancels the click): Playwright's check raises here
@@ -2221,6 +2429,8 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         st["pos"] = (x, y)
         st["placed"] = True
     page._clearcote_nudge = _nudge
+    # the frame route (_frames) clears a field with the same held chord as the page routes
+    page._clearcote_select_all = _select_all
     page.press_and_hold = api_errors("Page.press_and_hold", lambda selector, duration=None, **kw: press_and_hold(
         page.locator(selector).first, duration, **kw))
 
@@ -2376,6 +2586,7 @@ def _patch_locator_class():
     if _locator_patched:
         return
     _locator_patched = True
+    _fr.patch_frame_class(is_async=False)   # child-frame selector actions -> the frame route
     try:
         from playwright.sync_api._generated import Locator
     except Exception:  # noqa: BLE001
@@ -2440,48 +2651,84 @@ def _patch_locator_class():
     def _fwd(kw, names=("timeout",)):
         return {k: kw[k] for k in names if k in kw and kw[k] is not None}
 
-    def _route(self, kw, fn):
+    def _froute(self, action, args, kw):
+        """A locator inside a child frame (FrameLocator, Frame.locator) on a humanized page: through the
+        frame route (_frames.route: the frame's own isolated world for the hit test, the page's humanized
+        mouse and keyboard for the input). (False, None) when it does not apply -- the native method
+        runs, and the route has reported why."""
+        if not (_fr.humanized(self.page) and _fr.frame_locator_of(self)) or not _strict(self):
+            return False, None
+        r = _fr.route(self, action, args, kw)
+        return (False, None) if r is _fr.NATIVE else (True, r)
+
+    def _route(self, kw, fn, frame_routed=True):
         # Once routed, every error propagates: the page-level wrappers own the native fallback, so
         # retrying the original locator method here ran the action a second (or third) time -- a
         # checkbox whose click is cancelled was clicked three times.
         if _on(self) and _strict(self):
             return True, fn()
-        why = _frame_why(self)
+        # A frame locator: the frame route (_froute, lane F) runs next and reports its own fallbacks; only an
+        # action without a frame route (tap) reports here.
+        why = None if frame_routed else _frame_why(self)
         if why:
             _report_fallback(self.page, "Locator", why, _sel(self))
         return False, None
 
     def fill(self, value, **kw):
         done, r = _route(self, kw, lambda: self.page.fill(_sel(self), value, **_fwd(kw, _FILL)))
+        if done:
+            return r
+        done, r = _froute(self, 'fill', (value,), kw)
         return r if done else o_fill(self, value, **kw)
 
     def click(self, **kw):
         done, r = _route(self, kw, lambda: self.page.click(_sel(self), **_fwd(kw, _CLICK)))
+        if done:
+            return r
+        done, r = _froute(self, 'click', (), kw)
         return r if done else o_click(self, **kw)
 
     def type_(self, text, **kw):
         done, r = _route(self, kw, lambda: self.page.type(_sel(self), text, **_fwd(kw, _TYPE)))
+        if done:
+            return r
+        done, r = _froute(self, 'type', (text,), kw)
         return r if done else o_type(self, text, **kw)
 
     def dblclick(self, **kw):
         done, r = _route(self, kw, lambda: self.page.dblclick(_sel(self), **_fwd(kw, _DBL)))
+        if done:
+            return r
+        done, r = _froute(self, 'dblclick', (), kw)
         return r if done else o_dblclick(self, **kw)
 
     def hover(self, **kw):
         done, r = _route(self, kw, lambda: self.page.hover(_sel(self), **_fwd(kw, _HOVER)))
+        if done:
+            return r
+        done, r = _froute(self, 'hover', (), kw)
         # `dwell` is the SDK's: Playwright's own hover does not take it
         return r if done else o_hover(self, **{k: v for k, v in kw.items() if k != "dwell"})
 
     def press(self, key, **kw):
         done, r = _route(self, kw, lambda: self.page.press(_sel(self), key, **_fwd(kw, _PRESS)))
+        if done:
+            return r
+        done, r = _froute(self, 'press', (key,), kw)
         return r if done else o_press(self, key, **kw)
 
     def press_sequentially(self, text, **kw):
         done, r = _route(self, kw, lambda: self.page.type(_sel(self), text, **_fwd(kw, _TYPE)))
+        if done:
+            return r
+        done, r = _froute(self, 'press_sequentially', (text,), kw)
         return r if done else o_press_seq(self, text, **kw)
 
     def clear(self, **kw):
         done, r = _route(self, kw, lambda: self.page.fill(_sel(self), "", **_fwd(kw, _FILL)))
+        if done:
+            return r
+        done, r = _froute(self, 'clear', (), kw)
         return r if done else o_clear(self, **kw)
 
     def tap(self, **kw):
@@ -2491,21 +2738,33 @@ def _patch_locator_class():
             # missing element and raised a TimeoutError (SC 210 error parity).
             return o_tap(self, **kw)
         if _on(self):
-            _report_fallback(self.page, "Locator.tap",
-                             "tap is sent as a humanized mouse click: there is no humanized touch input", _sel(self))
-        done, r = _route(self, kw, lambda: self.page.click(_sel(self), **_fwd(kw, _HOVER)))
+            # A touch context: there is no humanized touch sequence yet, so the tap goes out as the humanized
+            # MOUSE click. Lane A's report: strict mode raises ClearcoteStrictError (a Playwright error) and
+            # nothing is sent; otherwise on_fallback hears it and the click runs as before.
+            report_fallback(self.page, "Locator.tap", TAP_NOT_HUMANIZED + ": sent as a humanized mouse click",
+                            _sel(self))
+        done, r = _route(self, kw, lambda: self.page.click(_sel(self), **_fwd(kw, _HOVER)), frame_routed=False)
         return r if done else o_tap(self, **kw)
 
     def check(self, **kw):
         done, r = _route(self, kw, lambda: self.page.check(_sel(self), **_fwd(kw, _CHECK)))
+        if done:
+            return r
+        done, r = _froute(self, 'check', (), kw)
         return r if done else o_check(self, **kw)
 
     def uncheck(self, **kw):
         done, r = _route(self, kw, lambda: self.page.uncheck(_sel(self), **_fwd(kw, _CHECK)))
+        if done:
+            return r
+        done, r = _froute(self, 'uncheck', (), kw)
         return r if done else o_uncheck(self, **kw)
 
     def set_checked(self, checked, **kw):
         done, r = _route(self, kw, lambda: self.page.set_checked(_sel(self), checked, **_fwd(kw, _CHECK)))
+        if done:
+            return r
+        done, r = _froute(self, 'set_checked', (checked,), kw)
         return r if done else o_set_checked(self, checked, **kw)
 
     def select_option(self, value=None, **kw):
@@ -2513,7 +2772,13 @@ def _patch_locator_class():
         implementation behind the page method is what stops the two entry points drifting apart
         (which is how page.select_option once stayed untrusted while the locator call was not)."""
         done, r = _route(self, kw, lambda: self.page.select_option(_sel(self), value, **_fwd(kw, _SELECT)))
-        return r if done else o_select_option(self, value, **kw)
+        if done:
+            return r
+        done, r = _froute(self, "select_option", (value,), kw)
+        if done:
+            return r
+        value, kw = native_select_args(value, kw)   # option dicts: Playwright Python takes none
+        return o_select_option(self, value, **kw)
 
     def drag_to(self, target, **kw):
         if kw.get("trial") and _on(self) and _on(target) and _strict(self) and _strict(target):
@@ -2582,20 +2847,32 @@ def _patch_locator_class():
 
 
 def install_humanize_on_context(context, humanize=False, show_cursor=False, browser=None, seed=None):
-    """Install humanize/show_cursor on a single context (used for launch_persistent_context)."""
+    """Install humanize/show_cursor on a single context: every page it has now and every page it
+    opens later (a popup, window.open, a link with target=_blank) -- through its "page" event.
+
+    Attaches whether or not the context has a Browser (mirrors Node's installHumanizeOnContext): a
+    persistent context has none (context.browser is None; launch_persistent_context), and this used to
+    attach only when a Browser was found, so humanize was silently off there. attach_humanize needs
+    only the page; the engine route takes the browser from the page's context when there is one and
+    the page's own CDP session when there is not. Hooking a context twice is a no-op (the marker), and
+    attach_humanize is idempotent per page."""
     humanize = _hz_resolve(humanize) or False   # True | "strict" | HumanizeOptions | dict; raises on a bad one
     if not humanize and not show_cursor:
         return
-    b = browser or context.browser
+    b = browser or getattr(context, "browser", None)
     if show_cursor:
         try:
             context.add_init_script(CURSOR_OVERLAY)
         except Exception:  # noqa: BLE001
             pass
-    if b is not None:
+    if getattr(context, "_clearcote_hooked", False) is not True:
+        try:
+            context._clearcote_hooked = True
+        except Exception:  # noqa: BLE001
+            pass
         context.on("page", lambda p: attach_humanize(b, p, humanize, show_cursor, seed))
-        for p in context.pages:
-            attach_humanize(b, p, humanize, show_cursor, seed)
+    for p in getattr(context, "pages", None) or ():
+        attach_humanize(b, p, humanize, show_cursor, seed)
 
 
 def install_humanize(browser, humanize=False, show_cursor=False, seed=None):
@@ -2612,6 +2889,15 @@ def install_humanize(browser, humanize=False, show_cursor=False, seed=None):
     def new_page(**kw):
         page = orig_new_page(**kw)
         attach_humanize(browser, page, humanize, show_cursor, seed)
+        # browser.new_page makes its context INSIDE Playwright (not through the wrapped new_context
+        # below), so hook that implicit context too: a popup it opens is a page the "page" event
+        # delivers, and nothing else sees it.
+        ctx = getattr(page, "context", None)
+        if ctx is not None:
+            try:
+                install_humanize_on_context(ctx, humanize, show_cursor, browser, seed)
+            except Exception:  # noqa: BLE001
+                pass
         return page
 
     def new_context(**kw):

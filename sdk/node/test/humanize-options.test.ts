@@ -99,7 +99,8 @@ describe("fallback report and strict mode", () => {
     const err = await f.page.locator("#fr >> internal:control=enter-frame >> #fi").fill("new").catch((e: any) => e);
     expect(err).toBeInstanceOf(ClearcoteStrictError);
     expect(err.api).toBe("locator.fill");
-    expect(err.reason).toMatch(/frame locators/);
+    // lane F: a frame locator takes the frame route; strict throws when that route cannot run (the fake proves no point)
+    expect(err.reason).toMatch(/^frame: /);
     expect(String(err.message)).toMatch(/^locator\.fill: /);
     expect(protoCalls).toEqual([]);
   }, SLOW);

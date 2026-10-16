@@ -20,6 +20,11 @@ from clearcote import _humanize_async as H
 from clearcote._isolated import (
     ACTIVE_FIELD, ACTIVE_VALUE, CSS_BOX, DESCRIBE, HIT_IN_BOX, LISTBOX_ROW, PLATFORM, SCROLL, SCROLL_BY, VIEWPORT,
 )
+from clearcote import _isolated as _iso
+
+# the label reads (lane F); optional so this file still collects against an SDK without them
+LABEL_OF = getattr(_iso, "LABEL_OF", "<no LABEL_OF>")
+LABEL_BY_SEL = getattr(_iso, "LABEL_BY_SEL", "<no LABEL_BY_SEL>")
 
 PWTimeout = type("TimeoutError", (Exception,), {})   # what _is_timeout recognises (Playwright's name)
 ROW_H = 18.0
@@ -34,8 +39,12 @@ class Field:
                  maxlength=-1, autocomplete=None, inputmode=None, bl=2.0, bt=2.0, options=None,
                  selected_index=0, multiple=False, size=0, no_select_all=False, never_commit=False,
                  stubborn=False, visible=True, covered=False, fmt=None, rmin=None, rmax=None, rstep=None,
-                 cover_center=False, in_frame=False, appear_on_wait=False):
+                 cover_center=False, in_frame=False, appear_on_wait=False, control=None):
         self.tag, self.type, self.value, self.rect = tag, type, value, rect
+        self.control = control                    # a <label>: the checkbox its click is passed on to
+        self.label = None                         # a checkbox: its <label> Field (set by the label)
+        if control is not None:
+            control.label = self
         self.in_frame = in_frame                  # its points lie in a child frame: the hit test sees nothing
         self.appear_on_wait = appear_on_wait      # hidden until Playwright's wait_for (it shows up)
         self.st = 0.0                             # a list box's scrollTop
@@ -104,8 +113,22 @@ class Field:
         return o
 
     # what the browser does with one trusted click / key
+    def label_of(self):
+        """What LABEL_OF reads from a checkbox: hidden when not visible or (nearly) zero-size."""
+        x, y, w, h = self.rect
+        o = {"tag": "input", "type": self.type, "rect": [x, y, w, h],
+             "hidden": (not self.visible) or w <= 1 or h <= 1, "checked": self.checked, "disabled": False,
+             "label": None}
+        if self.label is not None:
+            o["label"] = {"rect": list(self.label.rect), "text": None, "contains": False}
+        return o
+
     def click(self, x, y, mods):
         self.clicks = getattr(self, "clicks", 0) + 1
+        if self.tag == "label":
+            if self.control is not None:
+                self.control.click(x, y, mods)   # the label passes the click on to its control
+            return
         if self.type == "checkbox":
             if not self.stubborn:
                 self.checked = not self.checked
@@ -195,6 +218,15 @@ class World:
                 self.p.scrolls.append(("css", sel))
                 self.p.bring_into_view(f)
             return {"n": 1, "rect": list(f.rect)}
+        if src == LABEL_BY_SEL:
+            f = self.p.by_sel.get(arg["sel"])
+            if f is None:
+                return {"n": 0}
+            o = f.label_of() if f.tag == "input" and f.type in ("checkbox", "radio") else None
+            if o is None:
+                return {"n": 1}
+            o["n"] = 1
+            return o
         if src == SCROLL_BY:
             dx, dy = arg
             self.p.scrolls.append(("window", dx, dy))
@@ -225,6 +257,8 @@ class World:
             return all(abs(a - b) <= 1.5 for a, b in zip(f.rect, (arg["x"], arg["y"], arg["width"], arg["height"])))
         if src == LISTBOX_ROW:
             return f.row_state(arg["i"])
+        if src == LABEL_OF:
+            return f.label_of() if f.tag == "input" and f.type in ("checkbox", "radio") else None
         assert src == DESCRIBE, src
         if (arg or {}).get("want") == "select" and f.tag != "select":
             return None
@@ -1223,9 +1257,8 @@ def test_select_the_current_option_fires_nothing(fast):
     run(go())
 
 
-@pytest.mark.parametrize("args,kw", [(("bra5",), {}), (("nowhere",), {}), (({"value": "gre4"},), {}),
-                                     ((None,), {"element": object()})])
-def test_disabled_missing_and_object_options_go_native(fast, args, kw):
+@pytest.mark.parametrize("args,kw", [(("bra5",), {}), (("nowhere",), {}), ((None,), {"element": object()})])
+def test_disabled_missing_and_element_options_go_native(fast, args, kw):
     async def go():
         sel = _select()
         p = await attached(sel)
@@ -1367,7 +1400,10 @@ def test_locator_actions_forward_their_options(Locator):
         await Locator.tap(s, position={"x": 3, "y": 4})
         return s
     s = run(go())
-    assert s.page.calls == [
+    # a tap on a touch context is reported as a fallback (lane A's report keeps it as
+    # page._clearcote_last_fallback), then routed as the humanized click
+    assert s.page._clearcote_last_fallback["api"] == "Locator.tap"
+    assert [c for c in s.page.calls if c[0] != "_report_fallback"] == [
         ("click", "#b", {"button": "right", "click_count": 2, "modifiers": ["Shift"], "position": {"x": 1, "y": 2},
                          "timeout": 1500}),
         ("dblclick", "#b", {"delay": 90}),
@@ -1407,14 +1443,19 @@ def test_a_routed_locator_action_lets_every_error_through_and_never_reruns_nativ
 
 @pytest.mark.parametrize("kw", [dict(parent=object()),
                                 dict(selector="#fr >> internal:control=enter-frame >> #fi")])
-def test_frame_locators_stay_native(Locator, kw):
-    # A FrameLocator's child keeps the MAIN frame as its _frame; only its selector shows the iframe.
+def test_frame_locators_take_the_frame_route_and_go_native_with_a_report_when_it_cannot_run(Locator, kw):
+    # A FrameLocator's child keeps the MAIN frame as its _frame; only its selector shows the iframe. It
+    # no longer goes through the page-level methods (they act on the main frame); it takes the frame
+    # route (_frames), which cannot run on this stub (no element waits, no CDP) -> Playwright's own
+    # method, with the fallback reported (lane F, SC 232; was: native, silently).
     async def go():
         s = _Self(**kw)
         await Locator.fill(s, "new")
         return s
     s = run(go())
-    assert s.page.calls == [] and [c[0] for c in s._impl_obj.calls] == ["fill"]
+    assert [c[0] for c in s._impl_obj.calls] == ["fill"], "Playwright's own fill, once"
+    assert [c[0] for c in s.page.calls] == [], "no page.* method"
+    assert s.page._clearcote_last_fallback["api"] == "Locator.fill", "the fallback reported"
 
 
 # ------------------------------------------------------------------- press / type / range targets
@@ -1762,4 +1803,238 @@ def test_a_humanized_click_presses_the_whole_pixel_the_hit_test_proved(fast):
             moves = kinds(p, "move")
             x, y = moves[-1][1], moves[-1][2]
             assert x == int(x) and y == int(y), (x, y)
+    run(go())
+
+
+# ------------------------------------------------------------------------- lane F (SC 232): coverage
+# option dicts, label-aware checkbox aim, tap on touch contexts, attach on every context's page event.
+@pytest.mark.parametrize("args,kw,want", [
+    (({"value": "gre4"},), {}, "gre4"),
+    (({"label": "Uruguay"},), {}, "uru6"),
+    (({"index": 3},), {}, "gha3"),
+    (([{"label": "Ghana"}, {"value": "alb1"}],), {}, "alb1"),   # the first in document order wins
+])
+def test_option_dicts_are_humanized_not_native(fast, args, kw, want):
+    async def go():
+        sel = _select()
+        p = await attached(sel)
+        assert await p.select_option("#s", *args, **kw) == [want]
+        s = sel[1]
+        assert s.options[s.selected_index]["value"] == want
+        assert s.changes == 1 and s.opens == 1, "one trusted change through the opened drop-down"
+        assert p.native == [], "no native select_option"
+    run(go())
+
+
+def test_a_value_dict_matches_the_value_only_and_unmatched_dicts_reach_playwright_translated(fast):
+    async def go():
+        sel = _select()
+        p = await attached(sel)
+        # {"value": "Germany"}: Playwright matches an option object's value alone -- no option has it
+        assert await p.select_option("#s", {"value": "Germany"}) == ["native"]
+        assert p.native[-1][2] == ["Germany"], "the dict is translated for Playwright Python"
+        # two fields in one dict: not an option Playwright can name either -> native, untouched
+        assert await p.select_option("#s", {"value": "gre4", "label": "Greece"}) == ["native"]
+        assert sel[1].opens == 0
+    run(go())
+
+
+def test_select_wants_pins_the_node_shapes():
+    from clearcote._humanize import select_wants
+    assert select_wants("a") == [("value", "a")]
+    assert select_wants({"value": "a"}) == [("valueOnly", "a")]
+    assert select_wants([{"label": "L"}, {"index": 2}]) == [("label", "L"), ("index", 2)]
+    assert select_wants(None, index=[1, 2], label="x") == [("index", 1), ("index", 2), ("label", "x")]
+    assert select_wants({"index": "2"}) is None and select_wants({"index": True}) is None
+    assert select_wants({"value": "a", "label": "b"}) is None and select_wants({}) is None
+    assert select_wants(object()) is None and select_wants(None) is None
+
+
+def _cb_with_label(hidden):
+    cb = Field(type="checkbox", rect=(0.0, 0.0, 0.0, 0.0) if hidden else (100.0, 100.0, 16.0, 16.0),
+               visible=not hidden)
+    lab = Field(tag="label", type="", rect=(96.0, 96.0, 140.0, 24.0) if hidden else (122.0, 98.0, 120.0, 20.0),
+                control=cb)
+    return cb, lab
+
+
+def test_a_hidden_custom_checkbox_is_checked_by_a_trusted_click_on_its_label(fast):
+    async def go():
+        cb, lab = _cb_with_label(hidden=True)
+        p = await attached(("#cb", cb), ("#lab", lab))
+        await p.check("#cb")
+        assert cb.checked, "the label passed the click on"
+        downs = kinds(p, "down")
+        assert len(downs) == 1 and lab.inside(*downs[0][4]), "pressed inside the label's box"
+        assert not non_trial(p), "no native check"
+        await p.uncheck("#cb")
+        assert not cb.checked and len(kinds(p, "down")) == 2
+    run(go())
+
+
+def test_a_visible_checkbox_is_clicked_on_its_label_text_about_40_percent_of_the_time(fast):
+    async def go():
+        on_label = []
+        for i in range(60):
+            cb, lab = _cb_with_label(hidden=False)
+            p = Page(("#cb", cb), ("#lab", lab))
+            await H.attach_humanize(None, p, humanize=True, seed="label-share-%d" % (i // 6))
+            await p.check("#cb")
+            assert cb.checked and not non_trial(p)
+            on_label.append(lab.inside(*kinds(p, "down")[0][4]))
+        share = sum(on_label) / len(on_label)
+        assert 0.2 <= share <= 0.6, share
+        assert any(on_label) and not all(on_label)
+    run(go())
+
+
+def test_same_seed_same_label_trait_but_unseeded_per_click_choices():
+    # The seed fixes the TRAIT (how often this identity clicks the label); each click's choice is an
+    # unseeded draw, or every session of an identity would choose the same way in the same order.
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    a, b = make_persona("same-identity"), make_persona("same-identity")
+    assert _humanize.label_share(a) == _humanize.label_share(b) == _humanize.LABEL_SHARE
+    da = [_humanize.label_draw(a) for _ in range(20)]
+    db = [_humanize.label_draw(b) for _ in range(20)]
+    assert da != db, "two sessions of one identity made the same 20 choices"
+
+
+def test_the_label_draw_leaves_the_global_random_stream_alone():
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    p = make_persona("x")
+    random.seed(11)
+    want = [random.random() for _ in range(5)]
+    random.seed(11)
+    for _ in range(50):
+        _humanize.label_draw(p)
+    assert [random.random() for _ in range(5)] == want
+
+
+def test_a_tests_own_rng_and_the_personas_share_decide():
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    p = make_persona("x")
+    r1, r2 = random.Random(5), random.Random(5)
+    assert [_humanize.label_draw(p, r1) for _ in range(20)] == [_humanize.label_draw(p, r2) for _ in range(20)]
+    p.label_share = 1.0          # lane B may give personas their own share
+    assert all(_humanize.label_draw(p) for _ in range(20))
+    p.label_share = 0.0
+    assert not any(_humanize.label_draw(p) for _ in range(20))
+
+class _TouchCtx:
+    def __init__(self, touch):
+        self._impl_obj = type("I", (), {"_options": {"hasTouch": touch}})()
+
+
+class _TapPage:
+    _clearcote_humanized = True
+
+    def __init__(self, strict=False, touch=True):
+        self.calls = []
+        self.context = _TouchCtx(touch)
+        if strict:
+            self._clearcote_strict = True
+
+    async def click(self, sel, **kw):
+        self.calls.append(("click", sel, kw))
+
+
+class _TapSelf:
+    def __init__(self, page):
+        self._impl_obj, self.page = _Impl(None, "#b"), page
+
+    async def count(self):
+        return 1
+
+
+def test_tap_on_a_touch_context_raises_in_strict_mode(Locator):
+    from playwright.async_api import Error
+
+    async def go():
+        s = _TapSelf(_TapPage(strict=True))
+        with pytest.raises(Error, match="tap is not humanized for touch contexts yet"):
+            await Locator.tap(s)
+        assert s.page.calls == [] and s._impl_obj.calls == [], "nothing was sent"
+    run(go())
+
+
+def test_tap_on_a_touch_context_reports_the_fallback_and_clicks(Locator):
+    async def go():
+        page = _TapPage()
+        s = _TapSelf(page)
+        await Locator.tap(s, position={"x": 1, "y": 2})
+        assert page.calls == [("click", "#b", {"position": {"x": 1, "y": 2}})]
+        ev = page._clearcote_last_fallback
+        assert ev["api"] == "Locator.tap" and "not humanized for touch" in ev["reason"] and ev["selector"] == "#b"
+        seen = []
+        page2 = _TapPage()
+        from clearcote._hzoptions import HumanizeOptions
+        page2._clearcote_hz = HumanizeOptions(on_fallback=seen.append)   # lane A's on_fallback hears it
+        await Locator.tap(_TapSelf(page2))
+        assert len(seen) == 1 and seen[0]["api"] == "Locator.tap"
+    run(go())
+
+
+class _EvCtx:
+    """A context that emits "page" like Playwright's: no Browser (a persistent context's)."""
+
+    def __init__(self, pages=()):
+        self.pages, self.handlers, self.browser = list(pages), [], None
+
+    def on(self, ev, fn):
+        if ev == "page":
+            self.handlers.append(fn)
+
+    async def add_init_script(self, *_a, **_k):
+        return None
+
+    async def emit(self, page):
+        self.pages.append(page)
+        for fn in self.handlers:
+            r = fn(page)
+            if r is not None and hasattr(r, "__await__"):
+                await r
+
+
+def test_a_persistent_context_without_a_browser_attaches(fast):
+    async def go():
+        first = Page(_btn())
+        ctx = _EvCtx([first])
+        await H.install_humanize_on_context(ctx, humanize=True, seed="persist")
+        assert getattr(first, "_clearcote_humanized", False) is True, "context.browser is None: still attached"
+        later = Page(_btn())
+        await ctx.emit(later)
+        await _real_sleep(0)
+        assert getattr(later, "_clearcote_humanized", False) is True, "a page it opens later too"
+        await H.install_humanize_on_context(ctx, humanize=True, seed="persist")
+        assert len(ctx.handlers) == 1, "hooking a context twice adds no second listener"
+    run(go())
+
+
+def test_a_popup_of_the_implicit_context_of_browser_new_page_is_humanized(fast):
+    async def go():
+        ctx = _EvCtx()
+
+        class _B:
+            async def new_page(self, **kw):
+                pg = Page(_btn())
+                pg.context = ctx
+                ctx.pages.append(pg)
+                return pg
+
+            async def new_context(self, **kw):
+                return _EvCtx()
+
+        b = _B()
+        await H.install_humanize(b, humanize=True, seed="popup")
+        page = await b.new_page()
+        assert page._clearcote_humanized is True
+        mouse = page.mouse.move
+        popup = Page(_btn())
+        await ctx.emit(popup)             # window.open / target=_blank in that context
+        await _real_sleep(0)
+        assert getattr(popup, "_clearcote_humanized", False) is True
+        assert page.mouse.move is mouse, "the opener was not wrapped a second time"
     run(go())

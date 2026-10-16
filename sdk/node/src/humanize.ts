@@ -42,9 +42,30 @@ import { keepInView, trimTo, walk } from "./pacing.js";
 import { pressAndHold, type PressAndHoldOptions } from "./hold.js";
 import {
   COVER_CHECK_MS, COVER_RETRY_MS, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_FORM_CONTROL,
-  ISO_FRAMES, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
+  ISO_FRAMES, ISO_HIT_IN_BOX, ISO_LABEL_BY_SEL, ISO_LABEL_OF, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL_BY, ISO_VIEWPORT,
   roundHalfEven, worldFor, type DescribedElement,
 } from "./isolated.js";
+import { NATIVE, frameLocatorOf, frameRoute, humanized as frameHumanized, strictMode } from "./frames.js";
+
+export { reportFallback, strictMode } from "./frames.js";
+
+/** The error a strict-mode tap raises on a touch context (lane F, SC 232). */
+export const TAP_NOT_HUMANIZED = "tap is not humanized for touch contexts yet";
+
+// Checkbox clicks on the <label> (setChecked). The persona fixes the TRAIT -- how often this identity clicks a
+// visible checkbox's label rather than its box (persona.labelShare when the persona carries one, else 0.4) --;
+// each click's choice is an UNSEEDED Math.random draw, like planMove's: a seeded per-identity stream would make
+// every session of an identity choose the same way in the same order (a cross-session fingerprint).
+export const LABEL_SHARE = 0.4;
+/** The persona's trait: the share of visible-checkbox clicks that land on the label text. */
+export function labelShare(persona: Persona): number {
+  const v = (persona as any).labelShare;
+  return typeof v === "number" && v >= 0 && v <= 1 ? v : LABEL_SHARE;
+}
+/** This click: on the label? An unseeded draw against the persona's trait (`rng`: a test's own). */
+export function labelDraw(persona: Persona, rng: () => number = Math.random): boolean {
+  return rng() < labelShare(persona);
+}
 import {
   DEFAULT_TYPO_RATE, NEARBY_LETTERS, classifyField, datetimeEqual, enginePathOk, fitMaxlength, formattedEqual, maskKept,
   matchOption, normalizeClickOptions, numericEqual, planDatetime, planSelect, planTypo, prePressMs, pyFloat,
@@ -1754,9 +1775,55 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       return trial(selector, opts, false);
     }
     if ((await loc.isChecked({ timeout: opts.timeout })) === checked) return;
-    await targetedClick(nativePageClick, selector, { ...opts }, false, null);
+    // The click lands on the input's box, or on its <label> (labelAim): always for a hidden custom checkbox
+    // (the box click waited for it to show and timed out), 40 % of the time otherwise.
+    let clicked = false;
+    if (!opts.force && !opts.position) {
+      try {
+        const lbox = await labelAim(selector, loc, opts.timeout);
+        clicked = !!lbox && await clickLabel(lbox);
+      } catch (e) {
+        if (isTimeout(e)) throw e;
+        clicked = false;
+      }
+    }
+    if (!clicked) await targetedClick(nativePageClick, selector, { ...opts }, false, null);
     if ((await loc.isChecked()) === checked) return;
     throw sdkPlaywrightError("Clicking the checkbox did not change its state");
+  };
+  type LabelRead = { n?: number; hidden?: boolean; label?: { rect: number[]; text: number[] | null } | null } | null;
+  // Where a person clicks a checkbox / radio when not on its own box: its <label> (see Python _label_aim).
+  const labelAim = async (selector: string, loc: Locator, timeout: number | undefined): Promise<Rect | null> => {
+    const w = worldFor(page);
+    if (await loc.isVisible()) {
+      const box = await boxOf(loc, timeout, false, selector);
+      const info = box ? await describe(box) : null;
+      if (!info || info.node === undefined || info.tag !== "input" || !["checkbox", "radio"].includes(info.type)) return null;
+      const lab = await w.callOnNode<LabelRead>(info.node, ISO_LABEL_OF);
+      if (!lab || !lab.label || lab.hidden) return null;
+      if (!labelDraw(persona)) return null; // the persona's share; THIS click's choice is unseeded
+      const r = lab.label.text ?? lab.label.rect;
+      return r[2] >= 2 && r[3] >= 2 ? { x: r[0], y: r[1], width: r[2], height: r[3] } : null;
+    }
+    if (!selector) return null;
+    const lab = await w.evaluate<LabelRead>(ISO_LABEL_BY_SEL, { sel: selector });
+    if (!lab || !lab.n || !lab.hidden || !lab.label) return null;
+    try { if ((await page.locator(selector).count()) !== lab.n) return null; } catch { return null; }
+    const r = lab.label.rect;
+    let lbox: Rect | null = { x: r[0], y: r[1], width: r[2], height: r[3] };
+    if (lbox.width < 2 || lbox.height < 2) return null;
+    if (!(await inView(lbox))) lbox = (await scrollWindowTo(lbox)) ?? lbox;
+    return (await inView(lbox)) ? lbox : null;
+  };
+  // One humanized click inside a label's box where the hit test proves the label owns the point.
+  const clickLabel = async (lbox: Rect): Promise<boolean> => {
+    const p = clickPoint(lbox, st, persona);
+    const x = roundHalfEven(p.x), y = roundHalfEven(p.y);
+    await sleep(50);
+    if ((await hitInBox(lbox, x, y)) === false) return false;
+    await glide(x, y);
+    await pressAt(normalizeClickOptions({}));
+    return true;
   };
   for (const [name, want] of [["check", true], ["uncheck", false]] as const) {
     if (typeof (page as any)[name] === "function") {
@@ -1968,6 +2035,8 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     const info = await describe(box, null);
     return info ? [info.bl || 0, info.bt || 0] : [0, 0];
   };
+  // the frame route (frames.ts) clears a field with the same held chord as the page routes
+  (page as any)._clearcoteSelectAll = () => selectAll();
   (page as any)._clearcoteNudge = async (x: number, y: number): Promise<void> => {
     await nativeMove(x, y);
     st.x = x; st.y = y; st.placed = true;
@@ -2326,11 +2395,21 @@ function patchLocatorClass(sample: Locator): void {
   // Once routed, every error propagates: the page-level wrappers own the native fallback, so retrying
   // the original locator method here ran the action a second (or third) time -- a checkbox whose click
   // is cancelled was clicked three times.
-  const route = async (self: any, fn: () => Promise<any>): Promise<[boolean, any]> => {
+  const route = async (self: any, fn: () => Promise<any>, frameRouted = true): Promise<[boolean, any]> => {
     if (on(self) && await strict(self)) return [true, await fn()];
-    const why = frameWhy(self);
+    // A frame locator: the frame route (froute, lane F) runs next and reports its own fallbacks; only an action
+    // without a frame route (tap) reports here.
+    const why = frameRouted ? null : frameWhy(self);
     if (why) reportFallback(self.page(), "locator", why, sel(self));
     return [false, undefined];
+  };
+  // A locator inside a child frame (FrameLocator, frame.locator) on a humanized page: the frame route (frames.ts:
+  // the frame's own isolated world for the hit test, the page's humanized mouse and keyboard for the input).
+  // [false] when it does not apply -- the native method runs, and the route has reported why.
+  const froute = async (self: any, action: string, args: any[], kw: any): Promise<[boolean, any]> => {
+    if (!(frameHumanized(self.page()) && frameLocatorOf(self)) || !(await strict(self))) return [false, undefined];
+    const r = await frameRoute(self, action, args, kw);
+    return r === NATIVE ? [false, undefined] : [true, r];
   };
   // Every routed method words its errors as Playwright words the Locator method (asApiError): through
   // page.*, an error read "page.click: ..." or "locator.waitFor: ...".
@@ -2349,56 +2428,80 @@ function patchLocatorClass(sample: Locator): void {
 
   proto.fill = apiMethod("locator.fill", async function (this: any, value: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().fill(sel(this), value, pickOptions(kw, FILL_OPTS)));
-    return done ? r : oFill.call(this, value, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'fill', [value], kw);
+    return fdone ? fr : oFill.call(this, value, kw);
   });
   proto.click = apiMethod("locator.click", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().click(sel(this), pickOptions(kw, CLICK_OPTS)));
-    return done ? r : oClick.call(this, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'click', [], kw);
+    return fdone ? fr : oClick.call(this, kw);
   });
   proto.type = apiMethod("locator.type", async function (this: any, text: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().type(sel(this), text, pickOptions(kw, TYPE_OPTS)));
-    return done ? r : oType.call(this, text, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'type', [text], kw);
+    return fdone ? fr : oType.call(this, text, kw);
   });
   proto.dblclick = apiMethod("locator.dblclick", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().dblclick(sel(this), pickOptions(kw, DBL_OPTS)));
-    return done ? r : oDbl.call(this, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'dblclick', [], kw);
+    return fdone ? fr : oDbl.call(this, kw);
   });
   proto.hover = apiMethod("locator.hover", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().hover(sel(this), pickOptions(kw, HOVER_OPTS)));
     if (done) return r;
+    const [fdone, fr] = await froute(this, 'hover', [], kw);
+    if (fdone) return fr;
     const { dwell: _dwell, ...pw } = kw ?? {}; // `dwell` is the SDK's: Playwright's own hover does not take it
     return oHover.call(this, pw);
   });
   proto.press = apiMethod("locator.press", async function (this: any, key: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().press(sel(this), key, pickOptions(kw, PRESS_OPTS)));
-    return done ? r : oPress.call(this, key, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'press', [key], kw);
+    return fdone ? fr : oPress.call(this, key, kw);
   });
   proto.pressSequentially = apiMethod("locator.pressSequentially", async function (this: any, text: string, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().type(sel(this), text, pickOptions(kw, TYPE_OPTS)));
-    return done ? r : oPressSeq.call(this, text, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'pressSequentially', [text], kw);
+    return fdone ? fr : oPressSeq.call(this, text, kw);
   });
   proto.clear = apiMethod("locator.clear", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().fill(sel(this), "", pickOptions(kw, FILL_OPTS)));
-    return done ? r : oClear.call(this, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'clear', [], kw);
+    return fdone ? fr : oClear.call(this, kw);
   });
   proto.tap = apiMethod("locator.tap", async function (this: any, kw: any = {}) {
     if (noTouch(this)) return oTap.call(this, kw);
-    if (on(this)) reportFallback(this.page(), "locator.tap", "tap is sent as a humanized mouse click: there is no humanized touch input", sel(this));
-    const [done, r] = await route(this, () => this.page().click(sel(this), pickOptions(kw, HOVER_OPTS)));
+    // A touch context: no humanized touch sequence yet, so the tap goes out as the humanized MOUSE click. Lane A's
+    // report: strict mode throws ClearcoteStrictError and nothing is sent; otherwise onFallback hears it.
+    if (on(this)) reportFallback(this.page(), "locator.tap", TAP_NOT_HUMANIZED + ": sent as a humanized mouse click", sel(this));
+    const [done, r] = await route(this, () => this.page().click(sel(this), pickOptions(kw, HOVER_OPTS)), false);
     return done ? r : oTap.call(this, kw);
   });
   proto.check = apiMethod("locator.check", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().check(sel(this), pickOptions(kw, CHECK_OPTS)));
-    return done ? r : oCheck.call(this, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'check', [], kw);
+    return fdone ? fr : oCheck.call(this, kw);
   });
   proto.uncheck = apiMethod("locator.uncheck", async function (this: any, kw: any = {}) {
     const [done, r] = await route(this, () => this.page().uncheck(sel(this), pickOptions(kw, CHECK_OPTS)));
-    return done ? r : oUncheck.call(this, kw);
+    if (done) return r;
+    const [fdone, fr] = await froute(this, 'uncheck', [], kw);
+    return fdone ? fr : oUncheck.call(this, kw);
   });
   if (typeof oSetChecked === "function") {
     proto.setChecked = apiMethod("locator.setChecked", async function (this: any, checked: boolean, kw: any = {}) {
       const [done, r] = await route(this, () => this.page().setChecked(sel(this), checked, pickOptions(kw, CHECK_OPTS)));
-      return done ? r : oSetChecked.call(this, checked, kw);
+      if (done) return r;
+      const [fdone, fr] = await froute(this, 'setChecked', [checked], kw);
+      return fdone ? fr : oSetChecked.call(this, checked, kw);
     });
   }
   // Delegate to the humanized page.selectOption, like every other method here: one implementation
@@ -2406,7 +2509,9 @@ function patchLocatorClass(sample: Locator): void {
   if (typeof oSelectOption === "function") {
     proto.selectOption = apiMethod("locator.selectOption", async function (this: any, values: any, kw: any = {}) {
       const [done, r] = await route(this, () => this.page().selectOption(sel(this), values, pickOptions(kw, SELECT_OPTS)));
-      return done ? r : oSelectOption.call(this, values, kw);
+      if (done) return r;
+      const [fdone, fr] = await froute(this, 'selectOption', [values], kw);
+      return fdone ? fr : oSelectOption.call(this, values, kw);
     });
   }
 
@@ -2480,6 +2585,9 @@ export function installHumanize(browser: Browser, opts0: HumanizeLaunchOptions):
   (browser as any).newPage = async (options?: any) => {
     const page = await origNewPage(options);
     await attachHumanize(browser, page, opts);
+    // browser.newPage makes its context inside Playwright (not through the wrapped newContext below): hook
+    // that implicit context too, so a popup it opens (window.open, target=_blank) is humanized.
+    try { installHumanizeOnContext(page.context(), opts, browser); } catch { /* a page-like object */ }
     return page;
   };
   const origNewContext = browser.newContext.bind(browser);
@@ -2505,6 +2613,10 @@ export function installHumanizeOnContext(
   if (!opts.humanize && !opts.showCursor) return;
   const b = browser ?? context.browser();
   if (opts.showCursor) { context.addInitScript(CURSOR_OVERLAY).catch(() => {}); }
-  context.on("page", (p) => { attachHumanize(b, p, opts).catch(() => {}); });
+  // One listener per context: a second install (browser.newPage's implicit context, hooked again) adds none.
+  if ((context as any)._clearcoteHooked !== true) {
+    (context as any)._clearcoteHooked = true;
+    context.on("page", (p) => { attachHumanize(b, p, opts).catch(() => {}); });
+  }
   for (const p of context.pages()) attachHumanize(b, p, opts).catch(() => {});
 }
