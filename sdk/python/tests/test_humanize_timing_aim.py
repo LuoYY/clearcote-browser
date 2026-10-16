@@ -91,33 +91,44 @@ def test_double_click_gap_and_pauses_are_persona_draws():
 
 
 # --------------------------------------------------------------------------- click_point
-def _landings(pid, n=200):
-    from clearcote._motion import reset_aim_streams
-    reset_aim_streams()                                 # the identity's stream from its start
+def _landings(pid, n=200, rng_seed=7):
     p = make_persona(pid)
-    return [click_point(BOX, (0.0, 0.0), p) for _ in range(n)]
+    rng = mulberry32(rng_seed)                          # an explicit sample stream: reproducible
+    return [click_point(BOX, (0.0, 0.0), p, rng) for _ in range(n)]
 
 
-def test_a_new_page_of_the_same_identity_continues_its_aim_stream():
-    """Each page gets its own Persona; the first click of every page landed on one pixel when the stream
-    restarted per persona (seen live)."""
-    from clearcote._motion import reset_aim_streams
-    reset_aim_streams()
-    firsts = [click_point(BOX, (0.0, 0.0), make_persona("ha-1")) for _ in range(5)]
-    assert len(set(firsts)) == 5, firsts
-
-
-def test_click_point_is_reproducible_per_seed_and_differs_across_seeds():
+def test_click_point_is_reproducible_with_a_given_rng_and_differs_across_seeds():
     a, b = _landings("ha-1"), _landings("ha-1")
-    assert a == b, "same seed, same landing sequence"
+    assert a == b, "same persona and rng, same landing sequence"
     others = [_landings(pid) for pid in IDS[1:]]
-    assert all(o != a for o in others)
+    assert all(o != a for o in others), "same rng, other identity: other landings (its own aim traits)"
+
+
+def test_two_sessions_of_one_identity_do_not_replay_the_same_first_click():
+    """The seed fixes the aim TRAITS; each click is an unseeded draw. A seeded landing stream put page 1,
+    click 1 of every visit on the same pixel: a cross-session fingerprint."""
+    from clearcote._motion import aim_traits
+    differ = 0
+    for _ in range(20):
+        a, b = make_persona("ha-1"), make_persona("ha-1")
+        assert aim_traits(a) == aim_traits(b)
+        if click_point(BOX, (0.0, 0.0), a) != click_point(BOX, (0.0, 0.0), b):
+            differ += 1
+    assert differ >= 19, differ
+
+
+def test_timing_samples_are_unseeded_per_sample_while_the_medians_are_seeded():
+    from clearcote._motion import dblclick_gap, pause_ms, timing_traits
+    a, b = make_persona("ha-2"), make_persona("ha-2")
+    assert timing_traits(a) == timing_traits(b)
+    for fn in (click_hold, key_dwell, lambda p: drag_dwell(p)[0], dblclick_gap, lambda p: pause_ms(p, 220, 480)):
+        assert sum(fn(a) != fn(b) for _ in range(20)) >= 19
 
 
 def test_click_point_dispersion_is_a_persona_trait_of_0_1_to_0_2_of_the_box():
     sds = []
     for pid in IDS:
-        xs = [x for x, _ in _landings(pid, 600)]
+        xs = [x for x, _ in _landings(pid, 600, rng_seed=11)]
         sds.append(statistics.pstdev(xs) / BOX["width"])
     assert all(0.08 <= s <= 0.21 for s in sds), sds    # clamping trims the tails a little
     assert max(sds) - min(sds) > 0.02, sds              # not one dispersion for everyone

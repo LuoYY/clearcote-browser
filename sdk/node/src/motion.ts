@@ -101,9 +101,6 @@ export interface Persona {
   /** Per-key dwell band — keydown→keyup (ms), 45–120; scripted typing ~2–3 ms. */
   keyDwellMinMs: number;
   keyDwellMaxMs: number;
-  /** @internal The persona's own aim stream ({@link clickPoint}), created on first use so the landing
-   * sequence is reproducible per seed. Not part of the identity. */
-  aimRng?: Rng;
 }
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
@@ -552,7 +549,7 @@ export function dragDwell(p: Persona, rng: Rng = Math.random): { grabMs: number;
 
 export interface Box { x: number; y: number; width: number; height: number; }
 
-// Salt for the aim stream (clickPoint): the persona's landing-point sequence and its dispersion.
+// Salt for the aim traits (clickPoint): the persona's landing dispersion, undershoot and handedness.
 const AIM_SALT = 0x27d4eb2f;
 
 /** Per-identity aiming traits, stable per seed (see aimTraits). */
@@ -574,37 +571,17 @@ export function aimTraits(p: Persona): AimTraits {
   return { spread, undershoot, sideBias: p.approachBias * 0.4 };
 }
 
-// One aim stream per seed for the whole process: every page of an identity gets its own Persona, and a stream
-// restarted per page put the first click of every page on the same pixel (seen live, SC 232).
-const AIM_STREAMS = new Map<number, Rng>();
-
-/** @internal Start every seed's aim stream over (tests and vector generation). */
-export function resetAimStreams(): void { AIM_STREAMS.clear(); }
-
-/** The identity's RNG for landing points: mulberry32(seed ^ salt ^ 1), one per seed per process, so the same
- * seed lands on the same SEQUENCE of points while successive pages continue it instead of repeating its start. */
-function aimStream(p: Persona): Rng {
-  if (!p.aimRng) {
-    let r = AIM_STREAMS.get(p.seed);
-    if (!r) { r = mulberry32((p.seed ^ AIM_SALT ^ 1) >>> 0); AIM_STREAMS.set(p.seed, r); }
-    p.aimRng = r;
-  }
-  return p.aimRng;
-}
-
 /** A human click point inside `box`: a 2D gaussian toward the centre with the persona's dispersion
  * (sd 0.10–0.20 of the box), nudged toward the approach side (undershoot 6–16 %) and sideways by its
- * handedness (approachBias), clamped a couple px inside the edges. Drawn from the persona's own aim stream
- * unless `rng` is given, so the landing sequence is reproducible per seed (it was Math.random: unseeded,
- * one dispersion for everyone). Without a persona: sd 0.15, 12 % undershoot, no handedness, Math.random. */
-export function clickPoint(box: Box, from: Point, p?: Persona | null, rng?: Rng): Point {
+ * handedness (approachBias), clamped a couple px inside the edges. The SEED fixes the persona's spread,
+ * undershoot and handedness (it was one dispersion for everyone); each click's draw is unseeded (Math.random
+ * unless `rng` is given), like every per-action draw, so no two visits of one identity replay the same
+ * landing sequence. Without a persona: sd 0.15, 12 % undershoot, no handedness. */
+export function clickPoint(box: Box, from: Point, p?: Persona | null, rng: Rng = Math.random): Point {
   let spread = 0.15, under = 0.12, side = 0;
   if (p) {
     const at = aimTraits(p);
     spread = at.spread; under = at.undershoot; side = at.sideBias;
-    rng = rng ?? aimStream(p);
-  } else {
-    rng = rng ?? Math.random;
   }
   const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
   const dx = cx - from.x, dy = cy - from.y;

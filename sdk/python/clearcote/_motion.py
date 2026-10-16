@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 Rng = Callable[[], float]
@@ -113,9 +113,6 @@ class Persona:
     click_hold_max_ms: float = 230.0
     key_dwell_min_ms: float = 45.0
     key_dwell_max_ms: float = 120.0
-    # The persona's own aim stream (click_point): created on first use, so the SEQUENCE of landing
-    # points is reproducible per seed. Not part of the identity (compare=False).
-    aim_rng: Optional[Rng] = field(default=None, repr=False, compare=False)
 
 
 def make_persona(seed: Optional[Union[str, int, float]] = None) -> Persona:
@@ -560,7 +557,7 @@ def platform_from_navigator(value: Optional[str]) -> Optional[str]:
     return None
 
 
-# Salt for the aim stream (click_point): the persona's landing-point sequence and its dispersion.
+# Salt for the aim traits (click_point): the persona's landing dispersion, undershoot and handedness.
 _AIM_SALT = 0x27D4EB2F
 
 
@@ -582,43 +579,21 @@ def aim_traits(p: Persona) -> AimTraits:
     return AimTraits(spread=spread, undershoot=undershoot, side_bias=p.approach_bias * 0.4)
 
 
-# One aim stream per seed for the whole process: every page of an identity gets its own Persona, and a
-# stream restarted per page put the first click of every page on the same pixel (seen live, SC 232).
-_AIM_STREAMS: dict = {}
-
-
-def reset_aim_streams() -> None:
-    """Start every seed's aim stream over (tests and vector generation)."""
-    _AIM_STREAMS.clear()
-
-
-def _aim_stream(p: Persona) -> Rng:
-    """The identity's RNG for landing points: mulberry32(seed ^ salt ^ 1), one per seed per process,
-    so the same seed lands on the same SEQUENCE of points (reproducible) while successive pages of
-    one identity continue that sequence instead of repeating its start."""
-    if p.aim_rng is None:
-        if p.seed not in _AIM_STREAMS:
-            _AIM_STREAMS[p.seed] = mulberry32((p.seed ^ _AIM_SALT ^ 1) & _MASK)
-        p.aim_rng = _AIM_STREAMS[p.seed]
-    return p.aim_rng
-
-
 def click_point(box, frm, p: Optional[Persona], rng: Optional[Rng] = None):
     """A human click point inside ``box`` (dict with x/y/width/height): a 2D gaussian toward the
     centre with the persona's dispersion (sd 0.10-0.20 of the box), nudged toward the approach side
     (undershoot, 6-16 %) and sideways by its handedness (approach_bias), clamped a couple px inside
-    the edges. Drawn from the persona's own aim stream unless ``rng`` is given, so the landing
-    sequence is reproducible per seed (it was random.random: unseeded, one dispersion for everyone).
-    Without a persona: sd 0.15, 12 % undershoot, no handedness, random.random."""
+    the edges. The SEED fixes the persona's spread, undershoot and handedness (it was one dispersion
+    for everyone); each click's draw is unseeded (random.random unless ``rng`` is given), like every
+    per-action draw, so no two visits of one identity replay the same landing sequence.
+    Without a persona: sd 0.15, 12 % undershoot, no handedness."""
+    if rng is None:
+        rng = random.random
     if p is None:
         spread, under, side = 0.15, 0.12, 0.0
-        if rng is None:
-            rng = random.random
     else:
         at = aim_traits(p)
         spread, under, side = at.spread, at.undershoot, at.side_bias
-        if rng is None:
-            rng = _aim_stream(p)
     cx = box["x"] + box["width"] / 2
     cy = box["y"] + box["height"] / 2
     dx, dy = cx - frm[0], cy - frm[1]

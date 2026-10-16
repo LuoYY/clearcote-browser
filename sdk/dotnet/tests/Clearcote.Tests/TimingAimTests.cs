@@ -95,26 +95,42 @@ public class TimingAimTests
         }
     }
 
-    [Fact]
-    public void A_new_page_of_the_same_identity_continues_its_aim_stream()
+    private static List<Point> Landings(string id, int n = 200, uint seed = 7)
     {
-        Motion.ResetAimStreams();
-        var firsts = Enumerable.Range(0, 5).Select(_ => Motion.ClickPoint(B, new Point(0, 0), Motion.MakePersona("ha-1"))).ToList();
-        Assert.Equal(5, firsts.Distinct().Count());
-    }
-
-    private static List<Point> Landings(string id, int n = 200)
-    {
-        Motion.ResetAimStreams();         // the identity's stream from its start
         var p = Motion.MakePersona(id);
-        return Enumerable.Range(0, n).Select(_ => Motion.ClickPoint(B, new Point(0, 0), p)).ToList();
+        var rng = Motion.Mulberry32(seed);   // an explicit sample stream: reproducible
+        return Enumerable.Range(0, n).Select(_ => Motion.ClickPoint(B, new Point(0, 0), p, rng)).ToList();
     }
 
     [Fact]
-    public void ClickPoint_is_reproducible_per_seed_and_differs_across_seeds()
+    public void ClickPoint_is_reproducible_with_a_given_rng_and_differs_across_seeds()
     {
         Assert.Equal(Landings("ha-1"), Landings("ha-1"));
         foreach (var id in Ids.Skip(1)) Assert.NotEqual(Landings("ha-1"), Landings(id));
+    }
+
+    [Fact]
+    public void Two_sessions_of_one_identity_do_not_replay_the_same_first_click()
+    {
+        int differ = 0;
+        for (int i = 0; i < 20; i++)
+        {
+            Persona a = Motion.MakePersona("ha-1"), b = Motion.MakePersona("ha-1");
+            Assert.Equal(Motion.AimTraitsOf(a), Motion.AimTraitsOf(b));
+            if (Motion.ClickPoint(B, new Point(0, 0), a) != Motion.ClickPoint(B, new Point(0, 0), b)) differ++;
+        }
+        Assert.True(differ >= 19, $"{differ}");
+    }
+
+    [Fact]
+    public void Timing_samples_are_unseeded_per_sample_while_the_medians_are_seeded()
+    {
+        Persona a = Motion.MakePersona("ha-2"), b = Motion.MakePersona("ha-2");
+        Assert.Equal(Motion.TimingTraitsOf(a), Motion.TimingTraitsOf(b));
+        var fns = new Func<Persona, double>[] { p => Motion.ClickHold(p), p => Motion.KeyDwell(p),
+            p => Motion.DragDwell(p).GrabMs, p => Motion.DblclickGap(p), p => Motion.PauseMs(p, 220, 480) };
+        foreach (var fn in fns)
+            Assert.True(Enumerable.Range(0, 20).Count(_ => fn(a) != fn(b)) >= 19);
     }
 
     [Fact]
@@ -122,7 +138,7 @@ public class TimingAimTests
     {
         var sds = Ids.Select(id =>
         {
-            var xs = Landings(id, 600).Select(pt => pt.X).ToList();
+            var xs = Landings(id, 600, 11).Select(pt => pt.X).ToList();
             double mu = xs.Average();
             return Math.Sqrt(xs.Sum(x => (x - mu) * (x - mu)) / xs.Count) / B.Width;
         }).ToList();
@@ -198,13 +214,6 @@ public class TimingAimTests
             var cp = Motion.ClickPoint(box, from, p, r);
             Assert.True(Close(cp.X, d.GetProperty("click_point_rng")[0].GetDouble())
                 && Close(cp.Y, d.GetProperty("click_point_rng")[1].GetDouble()), $"{id} click point");
-            Motion.ResetAimStreams();
-            var fresh = Motion.MakePersona(id);
-            foreach (var w in d.GetProperty("click_point_stream").EnumerateArray())
-            {
-                var pt = Motion.ClickPoint(box, from, fresh);
-                Assert.True(Close(pt.X, w[0].GetDouble()) && Close(pt.Y, w[1].GetDouble()), $"{id} stream {pt}");
-            }
         }
     }
 }

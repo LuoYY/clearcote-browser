@@ -56,9 +56,6 @@ public sealed class Persona
     /// <summary>Per-key dwell band (keydown→keyup), 45–120 ms; scripted typing ~2–3ms.</summary>
     public double KeyDwellMinMs { get; init; } = 45;
     public double KeyDwellMaxMs { get; init; } = 120;
-    /// <summary>The persona's own aim stream (<see cref="Motion.ClickPoint"/>), created on first use so the landing
-    /// sequence is reproducible per seed. Not part of the identity.</summary>
-    internal Rng? AimRng { get; set; }
 }
 
 public readonly record struct Point(double X, double Y);
@@ -291,17 +288,8 @@ public static class Motion
         return null;
     }
 
-    // Salt for the aim stream (ClickPoint): the persona's landing-point sequence and its dispersion.
+    // Salt for the aim traits (ClickPoint): the persona's landing dispersion, undershoot and handedness.
     private const uint AimSalt = 0x27D4EB2F;
-
-    // One aim stream per seed for the whole process: every page of an identity gets its own Persona, and a stream
-    // restarted per page put the first click of every page on the same pixel (seen live, SC 232). The same seed still
-    // lands on the same SEQUENCE of points.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<uint, Rng> AimStreams = new();
-
-    /// <summary>Start every seed's aim stream over (tests).</summary>
-    internal static void ResetAimStreams() => AimStreams.Clear();
-
     /// <summary>The persona's aiming traits from a salted stream of its seed: dispersion (sd 0.10–0.20 of the box),
     /// undershoot toward the approach side (0.06–0.16) and handedness (ApproachBias × 0.4). Same values as Python
     /// <c>aim_traits</c> and Node <c>aimTraits</c>.</summary>
@@ -316,9 +304,10 @@ public static class Motion
     /// <summary>
     /// A human click point inside <paramref name="box"/>: a 2D gaussian toward the centre with the persona's
     /// dispersion, nudged toward the approach side (undershoot) and sideways by its handedness, clamped inside the
-    /// edges. Drawn from the persona's own aim stream unless <paramref name="rng"/> is given, so the landing sequence
-    /// is reproducible per seed (it was Random.Shared: unseeded, one dispersion for everyone). Without a persona:
-    /// sd 0.15, 12 % undershoot, no handedness.
+    /// edges. The SEED fixes the persona's spread, undershoot and handedness (it was one dispersion for everyone); each
+    /// click's draw is unseeded (Random.Shared unless <paramref name="rng"/> is given), like every per-action draw, so
+    /// no two visits of one identity replay the same landing sequence. Without a persona: sd 0.15, 12 % undershoot,
+    /// no handedness.
     /// </summary>
     public static Point ClickPoint(Box box, Point from, Persona? p, Rng? rng = null)
     {
@@ -327,7 +316,6 @@ public static class Motion
         {
             var at = AimTraitsOf(p);
             spread = at.Spread; under = at.Undershoot; side = at.SideBias;
-            rng ??= p.AimRng ??= AimStreams.GetOrAdd(p.Seed, s => Mulberry32(s ^ AimSalt ^ 1u));
         }
         rng ??= Random.Shared.NextDouble;
         double cx = box.X + box.Width / 2, cy = box.Y + box.Height / 2;

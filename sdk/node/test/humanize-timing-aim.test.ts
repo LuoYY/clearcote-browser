@@ -64,26 +64,42 @@ describe("per-persona timing", () => {
 });
 
 describe("clickPoint", () => {
-  const landings = (id: string, n = 200) => {
-    M.resetAimStreams(); // the identity's stream from its start
+  const landings = (id: string, n = 200, seed = 7) => {
     const p = M.makePersona(id);
-    return Array.from({ length: n }, () => M.clickPoint(BOX, { x: 0, y: 0 }, p));
+    const rng = M.mulberry32(seed); // an explicit sample stream: reproducible
+    return Array.from({ length: n }, () => M.clickPoint(BOX, { x: 0, y: 0 }, p, rng));
   };
 
-  it("a new page of the same identity continues its aim stream (not the same first pixel)", () => {
-    M.resetAimStreams();
-    const firsts = Array.from({ length: 5 }, () => JSON.stringify(M.clickPoint(BOX, { x: 0, y: 0 }, M.makePersona("ha-1"))));
-    expect(new Set(firsts).size).toBe(5);
-  });
-
-  it("is reproducible per seed and differs across seeds", () => {
+  it("is reproducible with a given rng and differs across seeds", () => {
     expect(landings("ha-1")).toEqual(landings("ha-1"));
     for (const id of IDS.slice(1)) expect(landings(id)).not.toEqual(landings("ha-1"));
   });
 
+  it("two sessions of one identity do not replay the same first click (seed fixes traits, not draws)", () => {
+    let differ = 0;
+    for (let i = 0; i < 20; i++) {
+      const a = M.makePersona("ha-1"), b = M.makePersona("ha-1");
+      expect(M.aimTraits(a)).toEqual(M.aimTraits(b));
+      if (JSON.stringify(M.clickPoint(BOX, { x: 0, y: 0 }, a)) !== JSON.stringify(M.clickPoint(BOX, { x: 0, y: 0 }, b))) differ++;
+    }
+    expect(differ).toBeGreaterThanOrEqual(19);
+  });
+
+  it("timing samples are unseeded per sample while the medians are seeded", () => {
+    const a = M.makePersona("ha-2"), b = M.makePersona("ha-2");
+    expect(M.timingTraits(a)).toEqual(M.timingTraits(b));
+    const fns: ((p: M.Persona) => number)[] = [M.clickHold, M.keyDwell, (p) => M.dragDwell(p).grabMs, M.dblclickGap,
+      (p) => M.pauseMs(p, 220, 480)];
+    for (const fn of fns) {
+      let d = 0;
+      for (let i = 0; i < 20; i++) if (fn(a) !== fn(b)) d++;
+      expect(d).toBeGreaterThanOrEqual(19);
+    }
+  });
+
   it("disperses 0.1-0.2 of the box, per persona", () => {
     const sds = IDS.map((id) => {
-      const xs = landings(id, 600).map((p) => p.x);
+      const xs = landings(id, 600, 11).map((p) => p.x);
       const mu = xs.reduce((a, b) => a + b, 0) / xs.length;
       return Math.sqrt(xs.reduce((a, b) => a + (b - mu) ** 2, 0) / xs.length) / BOX.width;
     });
@@ -121,11 +137,5 @@ describe("shared timing vectors (Python, Node and .NET agree)", () => {
     for (const [k, v] of Object.entries(got)) expect(close(v, d[k]), `${k} ${v} vs ${d[k]}`).toBe(true);
     const cp = M.clickPoint(VEC.box, { x: VEC.from[0], y: VEC.from[1] }, p, r);
     expect(close(cp.x, d.click_point_rng[0]) && close(cp.y, d.click_point_rng[1])).toBe(true);
-    M.resetAimStreams();
-    const fresh = M.makePersona(d.persona);
-    for (const want of d.click_point_stream) {
-      const pt = M.clickPoint(VEC.box, { x: VEC.from[0], y: VEC.from[1] }, fresh);
-      expect(close(pt.x, want[0]) && close(pt.y, want[1]), JSON.stringify([pt, want])).toBe(true);
-    }
   });
 });
