@@ -16,6 +16,10 @@ public class LaunchOptions : FingerprintOptions
     /// instead of directly from this machine. Off by default. Null = CLEARCOTE_LICENSE_THROUGH_PROXY.
     /// No effect without a proxy.
     public bool? LicenseThroughProxy { get; set; }
+    /// Offline mode: path to an Offline Key file (Platform Licence). Null = CLEARCOTE_OFFLINE_KEY. No licence
+    /// calls and no download are made; set <see cref="ExecutablePath"/> (or CLEARCOTE_BINARY) to the offline
+    /// bundle's PRO binary. See <see cref="Offline"/>.
+    public string? OfflineKey { get; set; }
     /// PRO release channel. <c>Preview</c> selects the newest build for
     /// this platform (a newer preview when one exists, otherwise stable). An exact <see cref="Version"/>
     /// pin overrides it. Null = CLEARCOTE_RELEASE_CHANNEL ("stable" | "preview"; anything else throws),

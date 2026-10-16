@@ -35,6 +35,8 @@ public class LicenseOptions
     /// own proxy instead of directly from this machine. Off by default: direct calls never spend proxy
     /// bandwidth. Null = CLEARCOTE_LICENSE_THROUGH_PROXY (1/true/yes/on). No effect without a proxy.
     public bool? LicenseThroughProxy { get; set; }
+    /// Offline mode: path to an Offline Key file. Null = CLEARCOTE_OFFLINE_KEY. See <see cref="Offline"/>.
+    public string? OfflineKey { get; set; }
 }
 
 /// State of a <see cref="License.GetSessionSeatsAsync"/> answer.
@@ -821,6 +823,9 @@ public static class License
         LicenseOptions opts, string? sdkVersion = null, bool quiet = false,
         Func<Task<string?>>? engineVersion = null, ProxyOptions? proxy = null)
     {
+        // Offline mode: the key file's token is the run token; nothing is checked out (Offline.cs).
+        var off = Offline.Lease(opts.OfflineKey, quiet);
+        if (off is not null) return off;
         var licenseKey = ResolveLicenseKey(opts.LicenseKey);
         if (licenseKey is null) return null; // free mode — inert
 
@@ -955,7 +960,7 @@ public static class License
                 if (e.Value is string sv) outEnv[(string)e.Key] = sv;
         }
         outEnv[RunTokenEnv] = token;
-        if (tokenFile is not null) outEnv[RunTokenFileEnv] = tokenFile;
+        if (!string.IsNullOrEmpty(tokenFile)) outEnv[RunTokenFileEnv] = tokenFile;  // offline leases have no file
         return outEnv;
     }
 }

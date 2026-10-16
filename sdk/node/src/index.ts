@@ -75,6 +75,8 @@ import {
   applyHeadlessGeometry, fitServedWindow, fitWindowToWorkArea, headedLinuxFit, installWindowFixup, servedGeometry,
 } from "./geometry.js";
 import { acquireLease, resolveLicenseKey, withRunToken, STALE_TOKEN_REFUSAL, type LicenseOptions, type LeaseSession } from "./license.js";
+import { offlineKeyPath, requireOfflineBinary } from "./offline.js";
+export { OfflineKeyError, offlineLease, loadOfflineKey, OFFLINE_KEY_ENV } from "./offline.js";
 import { Cloud, cloudRequested, launchCloud, verifyWebhook, type CloudLaunchOptions, type CloudProfile } from "./cloud.js";
 import { dockerRequested, launchDocker, type DockerOption } from "./docker.js";
 export { DockerUnavailableError, type DockerContainer, type DockerOption } from "./docker.js";
@@ -1054,7 +1056,7 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   // profile= a saved persona: its options are the base, explicit options override. ("auto" is
   // resolved later, once the executable is known.)
   const merged = mergeSavedProfile(options);
-  const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
+  const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, offlineKey, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
   const { fingerprint, rest: afterFp } = splitFingerprintOptions(rest);
   const { agent, rest: pwOptions } = splitAgentOptions(afterFp);
   const fontDirList = checkFontDirs(fontDirs);  // Linux fontconfig dirs: a typo throws before the lease
@@ -1065,8 +1067,11 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   // The binary is resolved before the proxy route is chosen: http(s) credentials go to the
   // engine's --proxy-auth only when THIS engine implements it (r19+); older engines keep
   // Playwright's handling, which authenticates (routing blindly would leave every request at 407).
-  const pro = proSelector(licenseKey, licenseApiBase);
-  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
+  requireOfflineBinary(offlineKey, exeOption);  // offline mode never downloads (./offline.ts)
+  const offline = !!offlineKeyPath(offlineKey);
+  // Offline: no PRO selection (it would ask the server which build to fetch), and nothing that downloads.
+  const pro = offline ? undefined : proSelector(licenseKey, licenseApiBase);
+  const exe = await executablePath(offline ? { executablePath: exeOption, quiet } : { executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
   ensureRunnableHere(exe);
   // Before the warnings below, so they judge the persona that will actually run (as in Python).
   await applyProfileAuto(profile, fingerprint, exe, { quiet, licenseKey, licenseApiBase, profileSelect });
@@ -1091,7 +1096,7 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   // License (opt-in): check out a concurrency slot and inject CLEARCOTE_RUN_TOKEN so the PRO
   // engine gate lets the browser launch. Inert (null) in free mode / when no key is set.
   const lease = await acquireLease({
-    licenseKey, licenseApiBase, quiet, sdkVersion: SDK_VERSION, licenseThroughProxy, proxy: proxyOpt as PwProxy | undefined,
+    licenseKey, licenseApiBase, offlineKey, quiet, sdkVersion: SDK_VERSION, licenseThroughProxy, proxy: proxyOpt as PwProxy | undefined,
     // resolved lazily on cold checkout only (never per launch); telemetry, never gates the lease
     engineVersion: () => resolvedEngineVersion(version, !!resolveLicenseKey(licenseKey)),
   });
@@ -1179,7 +1184,7 @@ async function launchLocalPersistentContext(
   options: PersistentContextOptions = {}
 ): Promise<BrowserContext> {
   const merged = mergeSavedProfile(options);
-  const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
+  const { profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption, args, geoip, humanize, showCursor, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, offlineKey, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest } = merged;
   const { fingerprint, rest: afterFp } = splitFingerprintOptions(rest);
   const { agent, rest: pwOptions } = splitAgentOptions(afterFp);
   const fontDirList = checkFontDirs(fontDirs);  // Linux fontconfig dirs: a typo throws before the lease
@@ -1187,8 +1192,11 @@ async function launchLocalPersistentContext(
   const geo = geoip ? await applyGeoip(fingerprint, (pwOptions as PlaywrightLaunchOptions).proxy, quiet) : undefined;
   // A rotating proxy changes the exit per connection; checked alongside the launch, awaited at the end.
   const egressDrift = startEgressDriftCheck((pwOptions as PlaywrightLaunchOptions).proxy as PwProxy | undefined, geo?.ip ?? undefined, quiet);
-  const pro = proSelector(licenseKey, licenseApiBase);
-  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
+  requireOfflineBinary(offlineKey, exeOption);  // offline mode never downloads (./offline.ts)
+  const offline = !!offlineKeyPath(offlineKey);
+  // Offline: no PRO selection (it would ask the server which build to fetch), and nothing that downloads.
+  const pro = offline ? undefined : proSelector(licenseKey, licenseApiBase);
+  const exe = await executablePath(offline ? { executablePath: exeOption, quiet } : { executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
   ensureRunnableHere(exe);
   await applyProfileAuto(profile, fingerprint, exe, { quiet, licenseKey, licenseApiBase, profileSelect });
   const { args: proxyArgs, proxy } = resolveProxy((pwOptions as PlaywrightLaunchOptions).proxy as PwProxy | undefined, engineSupportsSwitch(exe, "proxy-auth"));
@@ -1237,7 +1245,7 @@ async function launchLocalPersistentContext(
   // A license key selects the PRO (gated) binary; no key -> the free binary (unchanged path).
   // License (opt-in): check out a concurrency slot + inject CLEARCOTE_RUN_TOKEN. Inert in free mode.
   const lease = await acquireLease({
-    licenseKey, licenseApiBase, quiet, sdkVersion: SDK_VERSION, licenseThroughProxy, proxy: proxyOpt as PwProxy | undefined,
+    licenseKey, licenseApiBase, offlineKey, quiet, sdkVersion: SDK_VERSION, licenseThroughProxy, proxy: proxyOpt as PwProxy | undefined,
     // resolved lazily on cold checkout only (never per launch); telemetry, never gates the lease
     engineVersion: () => resolvedEngineVersion(version, !!resolveLicenseKey(licenseKey)),
   });
@@ -1484,7 +1492,7 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
   const merged = mergeSavedProfile(launchOpts);
   const {
     profile, profileSelect, extensions, portableProfile, shaderDialect, personaEnv, fontDirs, socks5Udp, encryptionKey, disablePrivacySandbox, executablePath: exeOption,
-    args: userArgs, geoip, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest
+    args: userArgs, geoip, autoUpdate, cacheDir, quiet, widevine, version, licenseKey, licenseApiBase, licenseThroughProxy, offlineKey, releaseChannel, allowThirdPartyCookies, transparentProxy, stockRuntime, ...rest
   } = merged;
   const { fingerprint, rest: afterFp } = splitFingerprintOptions(rest);
   const { agent, rest: pwOptions } = splitAgentOptions(afterFp);
@@ -1493,8 +1501,11 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
   const geo = geoip ? await applyGeoip(fingerprint, proxyOpt, quiet) : undefined;
   // A rotating proxy changes the exit per connection; checked alongside the launch, awaited at the end.
   const egressDrift = startEgressDriftCheck(proxyOpt, geo?.ip ?? undefined, quiet);
-  const pro = proSelector(licenseKey, licenseApiBase);
-  const exe = await executablePath({ executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
+  requireOfflineBinary(offlineKey, exeOption);  // offline mode never downloads (./offline.ts)
+  const offline = !!offlineKeyPath(offlineKey);
+  // Offline: no PRO selection (it would ask the server which build to fetch), and nothing that downloads.
+  const pro = offline ? undefined : proSelector(licenseKey, licenseApiBase);
+  const exe = await executablePath(offline ? { executablePath: exeOption, quiet } : { executablePath: exeOption, version, autoUpdate, cacheDir, quiet, releaseChannel, pro });  // capability-gated proxy route
   ensureRunnableHere(exe);
   await applyProfileAuto(profile, fingerprint, exe, { quiet, licenseKey, licenseApiBase, profileSelect });
   // Widevine: as launch() (on by default for a licensed launch on an r32+ engine, opt-in otherwise).
@@ -1546,7 +1557,7 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
 
   // License (opt-in): check out a concurrency slot + inject CLEARCOTE_RUN_TOKEN. Inert in free mode.
   const lease = await acquireLease({
-    licenseKey, licenseApiBase, quiet, sdkVersion: SDK_VERSION, licenseThroughProxy, proxy: proxyOpt,
+    licenseKey, licenseApiBase, offlineKey, quiet, sdkVersion: SDK_VERSION, licenseThroughProxy, proxy: proxyOpt,
     // resolved lazily on cold checkout only (never per launch); telemetry, never gates the lease
     engineVersion: () => resolvedEngineVersion(version, !!resolveLicenseKey(licenseKey)),
   });

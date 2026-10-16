@@ -86,6 +86,8 @@ from ._warnings import emit_coherence_warnings
 from ._widevine import (  # noqa: F401  (widevine_cdm_args re-exported for tests)
     apply_widevine_launch, fetch_widevine, seed_widevine, widevine_cdm_args, widevine_launch_args, widevine_mode,
 )
+from . import _offline
+from ._offline import OfflineKeyError
 from ._license import (
     STALE_TOKEN_REFUSAL,
     ConcurrencyLimitError,
@@ -181,6 +183,7 @@ __all__ = [
     "LicenseError",
     "ConcurrencyLimitError",
     "LicenseRevokedError",
+    "OfflineKeyError",
     "OPENROUTER_BASE_URL",
     "RELEASE",
     "__version__",
@@ -936,6 +939,16 @@ def _acquire_lease_from_kwargs(kwargs):
     Uses kwargs.get for quiet (leave it for _prepare to pop). Injects nothing here —
     the caller injects CLEARCOTE_RUN_TOKEN into pw_kwargs after apply_font_env.
     """
+    # Offline mode (offline_key= / CLEARCOTE_OFFLINE_KEY): no licence calls and no download; the key's token
+    # is the run token and the binary comes from the offline bundle (_offline.py).
+    off = _offline.offline_lease(kwargs.pop("offline_key", None), quiet=kwargs.get("quiet", False))
+    if off is not None:
+        for k in ("license_key", "license_api_base", "license_through_proxy"):
+            kwargs.pop(k, None)
+        _offline.require_offline_binary(kwargs)
+        kwargs["_cc_pro"] = None
+        kwargs["_cc_lease"] = off
+        return off
     license_key = kwargs.pop("license_key", None)
     license_api_base = kwargs.pop("license_api_base", None)
     # Stash the effective license (explicit > env > file) so _prepare selects the
@@ -965,6 +978,7 @@ def _acquire_lease_from_kwargs(kwargs):
 def _adopt_license_kwargs(kwargs, lease):
     """Consume the licence kwargs exactly as :func:`_acquire_lease_from_kwargs` would, but reuse
     ``lease`` instead of checking out a second concurrency slot. Used by the nested host probe."""
+    kwargs.pop("offline_key", None)
     license_key = kwargs.pop("license_key", None)
     license_api_base = kwargs.pop("license_api_base", None)
     kwargs.pop("license_through_proxy", None)

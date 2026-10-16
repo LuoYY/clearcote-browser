@@ -39,6 +39,7 @@ public static class Clearcote
     public static async Task<string> ExecutablePathAsync(LaunchOptions? options = null)
     {
         options ??= new LaunchOptions();
+        Offline.RequireOfflineBinary(options.OfflineKey, options.ExecutablePath);  // offline mode never downloads
         if (!string.IsNullOrEmpty(options.ExecutablePath))
         {
             // Caller-supplied tree (often a browser bundled into a packaged app): we did not install
@@ -133,7 +134,7 @@ public static class Clearcote
         // opt-in for a free one. Bounded + fail-soft by default; before the lease, so a slow fetch holds no slot.
         args.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
         var lease = await License.AcquireLeaseAsync(
-            new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy },
+            new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy, OfflineKey = options.OfflineKey },
             Version, options.Quiet,   // sdk_version = the SDK PACKAGE version
             () => Download.ResolvedEngineVersionAsync(licVersion, licKey is not null), options.Proxy).ConfigureAwait(false);
         // Bind a per-launch run-token file so a supporting engine (r23+) can stop a running free
@@ -267,7 +268,7 @@ public static class Clearcote
         // best-effort as always. Before the lease, so a slow fetch holds no slot.
         args.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
         var lease = await License.AcquireLeaseAsync(
-            new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy },
+            new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy, OfflineKey = options.OfflineKey },
             Version, options.Quiet,   // sdk_version = the SDK PACKAGE version
             () => Download.ResolvedEngineVersionAsync(licVersion, licKey is not null), options.Proxy).ConfigureAwait(false);
         // Bind a per-launch run-token file (r23+ engine online-enforcement opt-in); passed ALONGSIDE
@@ -395,7 +396,7 @@ public static class Clearcote
         // Widevine: as LaunchAsync (on by default for a licensed launch on an r32+ engine, opt-in otherwise).
         cdpArgs.AddRange(await Widevine.LaunchArgsAsync(exe, options.Widevine, licKey is not null, options.Args, options.Quiet).ConfigureAwait(false));
         var lease = await License.AcquireLeaseAsync(
-            new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy },
+            new LicenseOptions { LicenseKey = options.LicenseKey, LicenseApiBase = options.LicenseApiBase, LicenseThroughProxy = options.LicenseThroughProxy, OfflineKey = options.OfflineKey },
             Version, options.Quiet,   // sdk_version = the SDK PACKAGE version
             () => Download.ResolvedEngineVersionAsync(licVersion, licKey is not null), options.Proxy).ConfigureAwait(false);
         // Bind a per-launch run-token file (r23+ engine online-enforcement opt-in); passed ALONGSIDE

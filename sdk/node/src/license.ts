@@ -9,6 +9,7 @@
 // With NO license key this is entirely inert — the free build never calls the
 // backend and never gates. See clearcoat/PRIVATE-SDK-LICENSING-PLAN.md.
 
+import { offlineLease } from "./offline.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync, chmodSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,6 +46,12 @@ export interface LicenseOptions {
    * no direct egress. Also enabled by CLEARCOTE_LICENSE_THROUGH_PROXY=1. No effect without a proxy.
    */
   licenseThroughProxy?: boolean;
+  /**
+   * Offline mode: path to an Offline Key file (Platform Licence). Also CLEARCOTE_OFFLINE_KEY. No licence
+   * calls and no download are made; pass `executablePath` (or CLEARCOTE_BINARY) to the offline bundle's
+   * PRO binary. See ./offline.ts.
+   */
+  offlineKey?: string;
 }
 
 /** Whether licence calls should use the launch proxy: explicit option, else the env switch. */
@@ -755,6 +762,9 @@ export async function acquireLease(
     proxy?: string | { server?: string; username?: string; password?: string } | null;
   } = {},
 ): Promise<LeaseSession | null> {
+  // Offline mode: the key file's token is the run token; nothing is checked out (./offline.ts).
+  const off = offlineLease(opts.offlineKey, !!opts.quiet);
+  if (off) return off;
   const licenseKey = resolveLicenseKey(opts.licenseKey);
   if (!licenseKey) return null; // free mode — inert
 
