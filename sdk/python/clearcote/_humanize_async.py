@@ -534,31 +534,38 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                             pass
                 await _release(lift())
 
+    async def _engine_ext_click(x, y, o):
+        """See _humanize._engine_ext_click: a right/middle, double/triple or modified click walked AND pressed by an
+        r43 engine, the modifier keys pressed here around it; shared by mouse.click and the targeted click (R5)."""
+        ext = engine_click_params(o)
+        if not ext or _hz_engine_mode(page, _engine_clicks_mode) == "off" or not await _engine_ext_ok():
+            return False
+        if o["modifiers"] and not (native_kb_down and native_kb_up):
+            return False
+        held = []
+        try:
+            for m in o["modifiers"]:
+                held.append(m)   # before the await (see _press_at)
+                await native_kb_down(m)
+                await asyncio.sleep(_rand(40, 110) / 1000.0)
+            return bool(await _engine_glide(x, y, no_click=False, ext=ext))
+        finally:
+            for m in reversed(held):
+                await asyncio.sleep(_rand(20, 80) / 1000.0)
+                try:
+                    await native_kb_up(m)
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def hclick(x, y, **kw):
         # The engine path performs ONE plain left click. Anything else -- right/middle button, a
         # double click, a caller-chosen hold, modifiers -- glides SDK-side and presses as asked.
         o = normalize_click_options(kw, await _platform())
         if engine_path_ok(o) and _hz_engine_mode(page, _engine_clicks_mode) != "off" and await _engine_glide(x, y, no_click=False):
             return
-        # r43 engine (SC 232 lane H): right/middle, double/triple and modified clicks too (modifier keys pressed here).
-        ext = engine_click_params(o)
-        if (ext and _hz_engine_mode(page, _engine_clicks_mode) != "off" and await _engine_ext_ok()
-                and (not o["modifiers"] or (native_kb_down and native_kb_up))):
-            held = []
-            try:
-                for m in o["modifiers"]:
-                    await native_kb_down(m)
-                    held.append(m)
-                    await asyncio.sleep(_rand(40, 110) / 1000.0)
-                if await _engine_glide(x, y, no_click=False, ext=ext):
-                    return
-            finally:
-                for m in reversed(held):
-                    await asyncio.sleep(_rand(20, 80) / 1000.0)
-                    try:
-                        await native_kb_up(m)
-                    except Exception:  # noqa: BLE001
-                        pass
+        # r43 engine (SC 232 lane H): right/middle, double/triple and modified clicks too (_engine_ext_click).
+        if await _engine_ext_click(x, y, o):
+            return
         await _glide(x, y)
         # A press that raises RAISES (it was swallowed here: a click whose press failed reported
         # success). Only the pin before a press (hdown) stays best-effort.
@@ -1101,9 +1108,27 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         try:
             await _engine_session()
             await _eng["session"].send(ENGINE_KEY_SEQUENCE, {"targetId": _eng["tid"], "keys": keys})
-            return True
         except Exception:  # noqa: BLE001
             return False
+        _trace_engine_typed(keys, floor)
+        return True
+
+    def _trace_engine_typed(keys, floor):
+        """See _humanize._trace_engine_typed: one ``typed`` line of the planned down/up times (R3c)."""
+        if not _trace.enabled():
+            return
+        outer = st.get("keyrec")
+        t = time.perf_counter() * 1000.0 if outer is not None else 0.0
+        rec = []
+        for k in keys:
+            down = t
+            up = down + float(k.get("dwellMs") or 0.0)
+            rec.append({"key": k["key"], "down": down, "up": up})
+            t = up + float(k.get("gapMs") or 0.0)
+        if outer is not None:
+            outer.extend(rec)
+        else:
+            _trace.record("typed", rec, {"n": len(keys), "typos": False, "floor_ms": floor, "engine": True})
 
     async def _human_type_text(text, field=None, typos=True, floor_ms=0.0, exact=True):
         """Type text key-by-key with human timing through Playwright's native (trusted) keyboard.
@@ -1117,14 +1142,20 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         n = len(text)
         shift = False
         ext_shift = "Shift" in held_keys
-        roll_rate = rollover_rate(persona)
         rate = _typo_rate() if typos else 0.0
         fld = await _typing_field(field) if rate > 0 else None
         allow = rate > 0 and typos_allowed(fld)
         search = bool(allow and not exact and fld and (fld.get("type") or "").lower() == "search")
         floor = max(0.0, float(floor_ms or 0.0))
-        # r43 engine (SC 232 lane H): a run with no slip to plan goes out as ONE dispatchKeySequence (see the sync file).
-        if not allow and n > 1 and not ext_shift and await _engine_ext_ok() and await _engine_type(text, floor):
+        # The rolled-over pairs, drawn up front at lane B's rollover_rate (see _humanize._human_type_text).
+        roll_rate = rollover_rate(persona)
+        rolls = frozenset(i for i in range(n - 1)
+                          if floor <= 0 and native_kb_down and native_kb_up and text[i] in _ROLL_KEYS
+                          and text[i + 1] in _ROLL_KEYS and text[i] != text[i + 1] and random.random() < roll_rate)
+        # r43 engine (SC 232 lane H): a run with no slip to plan, no caller-held Shift and NO ROLLOVER goes out as
+        # ONE dispatchKeySequence (see the sync file: the command cannot overlap keys, R3b); never with engine "off" (R3a).
+        if (not allow and n > 1 and not ext_shift and not rolls and _hz_engine_mode(page, _engine_clicks_mode) != "off"
+                and await _engine_ext_ok() and await _engine_type(text, floor)):
             st["typed"] = time.monotonic()   # a following Enter / Tab still waits (_after_typing)
             return
         # the score hook records this run's keys (the native_kb_* wrappers) and scores it as "typed" at the end
@@ -1154,12 +1185,11 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                             if _is_strict(e):
                                 raise
                 # ROLLOVER: the next key goes down before this one comes up (see
-                # _humanize._human_type_text). Unshifted single-key pairs only.
+                # _humanize._human_type_text). The pairs were drawn up front (``rolls``).
                 nxt = text[i + 1] if i + 1 < n else None
                 d1 = _kdwell()
                 if (nxt is not None and not typo and not shift and native_kb_down and native_kb_up
-                        and ch in _ROLL_KEYS and nxt in _ROLL_KEYS and ch != nxt and d1 - 8 >= 12
-                        and floor <= 0 and random.random() < roll_rate):
+                        and i in rolls and d1 - 8 >= 12):
                     overlap = _rand(12, min(55, d1 - 8))
                     # A key counts as down from the moment its keydown is SENT: a cancellation that
                     # lands while that call is awaited does not unsend it (measured on r37: a key left
@@ -2577,12 +2607,14 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                                   "the click point does not reach the element (covered, moving or clipped)")
             if o["modifiers"] and native_kb_down is None:
                 raise _Native("modifiers need keyboard.down")
-            if (not no_click and not o["force"] and orig is not None and _hz_engine_mode(page, _engine_clicks_mode) == "all"
-                    and engine_path_ok(o) and await _engine_glide(x, y, no_click=False)):
-                # Opt-in (CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and
-                # clicks the point the hit test above proved; plain left single clicks only, and only
-                # while the engine knows where the pointer is (_engine_in_sync). Otherwise: planner.
-                return None
+            if not no_click and not o["force"] and orig is not None and _hz_engine_mode(page, _engine_clicks_mode) == "all":
+                # Opt-in (engine "all"): the engine walks the approach and clicks the proven point -- a plain
+                # left click on the r42 route (in sync, or re-synced by an r43 engine), a right / double /
+                # modified click through the r43 extensions as mouse.click does (R5). Otherwise: the planner.
+                if engine_path_ok(o) and await _engine_glide(x, y, no_click=False):
+                    return None
+                if await _engine_ext_click(x, y, o):
+                    return None
             if no_click and o["modifiers"]:
                 # hover with modifiers: Playwright holds them across the move
                 held = []

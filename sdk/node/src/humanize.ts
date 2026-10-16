@@ -199,9 +199,19 @@ export function engineExtMode(): boolean {
   const v = (process.env.CLEARCOTE_HUMANIZE_ENGINE_EXT || "").trim().toLowerCase();
   return !["0", "off", "false", "no", "none"].includes(v);
 }
-// CDP's "invalid params" (-32602): what an r43 engine answers to an EMPTY dispatchKeySequence.
-const isInvalidParams = (e: any): boolean =>
-  !isMethodNotFound(e) && (e?.code === -32602 || /-32602|invalid/i.test(String(e?.message ?? e)));
+// CDP's "invalid params" (-32602) and nothing else: what an r43 engine answers to an EMPTY dispatchKeySequence --
+// the code when the error carries one, else the exact -32602 wording ("Invalid parameters", crdtp's, after
+// Playwright's "Protocol error (method): " prefix; Playwright strips the code). Any other failure of the probe (a
+// proxy's "Invalid target", "Invalid session id") is NOT an r43 engine: a browser memoised as r43 by mistake would
+// get fromX/fromY on an out-of-sync plain click, which a pre-r43 engine ignores while walking from its own stale
+// point -- the teleport the re-sync exists to remove (verifier A's R4, SC 232: any "invalid" counted).
+const CDP_INVALID_PARAMS = /(?:^|: )Invalid parameters(?![A-Za-z])/;
+const isInvalidParams = (e: any): boolean => {
+  if (isMethodNotFound(e)) return false;
+  if (typeof e?.code === "number") return e.code === -32602;
+  const m = String(e?.message ?? e);
+  return m.includes("-32602") || CDP_INVALID_PARAMS.test(m);
+};
 // Which browsers' engines take the r43 extensions (asked once per browser, like the command name), and which
 // browsers lane A's onFallback has already heard about.
 const engineExt = new WeakMap<object, boolean>();
@@ -714,25 +724,31 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     }
   };
   mouse.up = async (...a: any[]) => { try { return await nativeUp(...a); } finally { st.held = false; } };
+  // r43 engine (SC 232 lane H): a right/middle, double/triple or modified click walked AND pressed engine-side
+  // (dispatchPointerPath button / clickCount / modifiers); the modifier KEYS are pressed here around it (lead
+  // before, lag after), as pressAt does. False when the engine cannot take it (a caller-chosen hold, no r43
+  // extensions, modifiers without keyboard.down): the planner presses then. Shared by mouse.click and the targeted
+  // click (verifier A's R5: selector clicks never took it).
+  const engineExtClick = async (x: number, y: number, o: ReturnType<typeof normalizeClickOptions>): Promise<boolean> => {
+    const ext = engineClickParams(o);
+    if (!ext || engineModeFor(page, engineClicksMode) === "off" || !(await engineExtOk())) return false;
+    if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) return false;
+    const held: string[] = [];
+    try {
+      for (const m of o.modifiers) { await nativeKbDown!(m); held.push(m); await sleep(rand(40, 110)); }
+      return await engineGlide(x, y, false, ext);
+    } finally {
+      for (const m of held.reverse()) { await sleep(rand(20, 80)); try { await nativeKbUp!(m); } catch { /* best effort */ } }
+    }
+  };
   // The engine path performs ONE plain left click. Anything else -- right/middle button, a double
   // click, a caller-chosen hold -- glides SDK-side and presses as asked (pressAt); the old wrapper
   // dropped those options and always left-clicked once.
   const hclick = async (x: number, y: number, options: any = {}): Promise<void> => {
     const o = normalizeClickOptions(options);
     if (enginePathOk(o) && engineModeFor(page, engineClicksMode) !== "off" && await engineGlide(x, y, false)) return;
-    // r43 engine (SC 232 lane H): right/middle, double/triple and modified clicks too; the modifier KEYS are
-    // pressed here around it (lead before, lag after), as pressAt does.
-    const ext = engineClickParams(o);
-    if (ext && engineModeFor(page, engineClicksMode) !== "off" && await engineExtOk()
-        && (!o.modifiers.length || (nativeKbDown && nativeKbUp))) {
-      const held: string[] = [];
-      try {
-        for (const m of o.modifiers) { await nativeKbDown!(m); held.push(m); await sleep(rand(40, 110)); }
-        if (await engineGlide(x, y, false, ext)) return;
-      } finally {
-        for (const m of held.reverse()) { await sleep(rand(20, 80)); try { await nativeKbUp!(m); } catch { /* best effort */ } }
-      }
-    }
+    // r43 engine (SC 232 lane H): right/middle, double/triple and modified clicks too (engineExtClick).
+    if (await engineExtClick(x, y, o)) return;
     await glide(x, y);
     // A press that rejects REJECTS (it was swallowed here: a click whose press failed reported success).
     // Only the pin before a press (mouse.down) stays best-effort.
@@ -1152,8 +1168,26 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     try {
       await engineSession();
       await eng.session.send(ENGINE_KEY_SEQUENCE, { targetId: eng.tid, keys });
-      return true;
     } catch { return false; }
+    traceEngineTyped(keys, floor);
+    return true;
+  };
+  // The score hook (lane G) hears an engine typed run as one "typed" line of the PLANNED down/up times (the engine
+  // paces them in the browser; the per-key path records its dispatched ones). Inside an outer traced run the keys
+  // join that run's record instead (verifier A's R3c: the engine run wrote nothing).
+  const traceEngineTyped = (keys: Array<Record<string, unknown>>, floor: number): void => {
+    if (!traceEnabled()) return;
+    const outer = keyRec;
+    let t = outer !== null ? kbNow() : 0;
+    const rec: { key: string; down: number; up: number }[] = [];
+    for (const k of keys) {
+      const down = t;
+      const up = down + (Number(k.dwellMs) || 0);
+      rec.push({ key: String(k.key), down, up });
+      t = up + (Number(k.gapMs) || 0);
+    }
+    if (outer !== null) outer.push(...rec);
+    else traceRecord("typed", rec, { n: keys.length, typos: false, floor_ms: floor, engine: true });
   };
   const humanTypeText = async (text: string, field?: TypoField | null, typos = true, floorMs = 0, exact = true): Promise<void> => {
     const chars = Array.from(text);
@@ -1165,10 +1199,25 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     const allow = rate > 0 && typosAllowed(fld);
     const search = allow && !exact && !!fld && String((fld as any).type || "").toLowerCase() === "search";
     const floor = Math.max(0, Number(floorMs) || 0);
-    // r43 engine (SC 232 lane H): a run with no slip to plan (typos off, or a field where a slip is a failure) and
-    // no caller-held Shift goes out as ONE dispatchKeySequence -- the same dwell and flight draws, paced in the
-    // browser, so the rhythm carries no CDP round trips. Rollover is not modelled there.
-    if (!allow && n > 1 && !extShift && await engineExtOk() && await engineType(text, floor)) {
+    // ROLLOVER, decided up front: the pairs this run overlaps (index of the first key), one unseeded draw per
+    // eligible pair at lane B's rollover rate (12-38 % per identity). Eligible: unshifted single-key pairs
+    // (ROLL_KEYS), never a key with itself, never under a caller's delay floor. Drawn before the route is chosen so
+    // the engine run below is taken exactly for the runs that would have had no rollover, and the per-key path
+    // realises the persona's share on the others -- the distribution of overlaps per run is the per-key path's.
+    const rolls = new Set<number>();
+    if (floor <= 0 && nativeKbDown && nativeKbUp) {
+      for (let i = 0; i < n - 1; i++) {
+        if (ROLL_KEYS.has(chars[i]) && ROLL_KEYS.has(chars[i + 1]) && chars[i] !== chars[i + 1] && Math.random() < rollRate) rolls.add(i);
+      }
+    }
+    // r43 engine (SC 232 lane H): a run with no slip to plan (typos off, or a field where a slip is a failure), no
+    // caller-held Shift and NO ROLLOVER goes out as ONE dispatchKeySequence -- the same dwell and flight draws, paced
+    // in the browser, so the rhythm carries no CDP round trips. A run the persona rolls over stays per key: the
+    // command cannot overlap keys (the engine clamps gapMs at 0), and an identity whose credential fields typed with
+    // zero overlap next to text fields with its 12-38 % would contradict itself (verifier A's R3b). Not with engine
+    // "off" (R3a): that is the documented way to keep everything SDK-side.
+    if (!allow && n > 1 && !extShift && rolls.size === 0 && engineModeFor(page, engineClicksMode) !== "off"
+        && await engineExtOk() && await engineType(text, floor)) {
       st.typed = Date.now(); // a following Enter / Tab still waits (afterTyping)
       return;
     }
@@ -1195,13 +1244,12 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
             try { consumed = await doTypo(chars, i, tp, leave); } catch (e) { if (isStrict(e)) throw e; /* typo path best-effort */ }
           }
         }
-        // Rollover of ch and the next char: unshifted single-key pairs only, never a key with itself,
-        // never after a typo, never under a caller's delay floor. keyboard.down inserts the character
-        // exactly as press does, so the typed value is unchanged.
+        // Rollover of ch and the next char (the pairs were drawn up front: `rolls`); a typo or a Shift in
+        // flight still cancels one. keyboard.down inserts the character exactly as press does, so the typed
+        // value is unchanged.
         const nx = chars[i + 1];
         let rolled = false;
-        if (nativeKbDown && nativeKbUp && !shift && i + 1 < n && !typo && floor <= 0 && ROLL_KEYS.has(ch)
-            && ROLL_KEYS.has(nx) && ch !== nx && Math.random() < rollRate) {
+        if (nativeKbDown && nativeKbUp && !shift && i + 1 < n && !typo && rolls.has(i)) {
           const d1 = kdwell(), d2 = kdwell();
           if (d1 - 8 >= 12) {
             const overlap = rand(12, Math.min(55, d1 - 8));
@@ -2585,11 +2633,14 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
           : "the click point does not reach the element (covered, moving or clipped)");
       }
       if (o.modifiers.length && !(nativeKbDown && nativeKbUp)) throw new NativeSignal("modifiers need keyboard.down");
-      if (!noClick && !o.force && orig && engineModeFor(page, engineClicksMode) === "all" && enginePathOk(o) && await engineGlide(x, y, false)) {
-        // Opt-in (CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and clicks the
-        // point the hit test above proved; plain left single clicks only, and only while the engine
-        // knows where the pointer is (engineInSync). Otherwise: the planner.
-        return;
+      if (!noClick && !o.force && orig && engineModeFor(page, engineClicksMode) === "all") {
+        // Opt-in (engine "all" / CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and
+        // clicks the point the hit test above proved. A plain left click takes the r42 route (while the engine
+        // knows where the pointer is, engineInSync; an r43 engine re-syncs from the SDK's position, fromX/fromY);
+        // a right / double / modified click takes the r43 extensions, as mouse.click does (engineExtClick,
+        // verifier A's R5). Otherwise: the planner.
+        if (enginePathOk(o) && await engineGlide(x, y, false)) return;
+        if (await engineExtClick(x, y, o)) return;
       }
       if (noClick && o.modifiers.length) {
         // hover with modifiers: Playwright holds them across the move

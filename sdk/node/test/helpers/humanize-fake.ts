@@ -51,6 +51,7 @@ export interface FakeOpts {
   fields?: Record<string, Partial<Field>>;     // several fields, by selector
   box?: Box;
   engine?: boolean;          // the engine pointer path answers
+  engineExt?: boolean;       // ... and takes the r43 extensions (an EMPTY dispatchKeySequence is -32602)
   count?: number;            // how many elements a locator matches
   waitForError?: Error;      // locator.waitFor / isChecked reject with this
   enabled?: boolean;
@@ -92,6 +93,7 @@ export function makeFake(opts: FakeOpts = {}) {
   let handles = 0;           // main-world element handles Playwright would make (each = a textContent preview)
   let waited = false;
   const engineCalls: any[] = [];
+  const keySequences: any[] = [];
   const waits: any[] = [];
   const t0 = performance.now();
   const rec = (t: string, a?: any) => events.push({ t, a, ts: performance.now() - t0 });
@@ -348,6 +350,11 @@ export function makeFake(opts: FakeOpts = {}) {
           engineCalls.push(params);
           if (opts.engine) return {};
           throw new Error("engine path unavailable here");
+        case "Browser.dispatchKeySequence":
+          if (!opts.engineExt) throw new Error("Protocol error (Browser.dispatchKeySequence): 'Browser.dispatchKeySequence' wasn't found");
+          if (!params?.keys?.length) throw Object.assign(new Error("Protocol error (Browser.dispatchKeySequence): Invalid parameters"), { code: -32602 });
+          keySequences.push(params);
+          return {};
         default: throw new Error(`unexpected CDP ${method}`);
       }
     },
@@ -415,7 +422,7 @@ export function makeFake(opts: FakeOpts = {}) {
     },
   };
   return {
-    page, events, natives, engineCalls, waits, box: defBox, handles: () => handles,
+    page, events, natives, engineCalls, keySequences, waits, box: defBox, handles: () => handles,
     field: single as Field, fields,
     setFocused: (v: boolean | string) => { focus = v === false ? null : typeof v === "string" ? fields[v] : single; },
     of: (t: string) => events.filter((e) => e.t === t),

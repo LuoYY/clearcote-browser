@@ -201,10 +201,22 @@ def _cdp_method_missing(err):
     return "wasn't found" in m or "-32601" in m or "method not found" in m.lower()
 
 
+# CDP's -32602 message is exactly "Invalid parameters" (crdtp DispatchResponse::InvalidParams), after Playwright's
+# "Protocol error (method): " prefix and before any data it appends. Playwright strips the code itself.
+_CDP_INVALID_PARAMS = re.compile(r"(?:^|: )Invalid parameters(?![A-Za-z])")
+
+
 def _cdp_invalid_params(err):
-    """True for CDP's "invalid params" (-32602): what an r43 engine answers to an EMPTY dispatchKeySequence."""
+    """True for CDP's "invalid params" (-32602) and nothing else: what an r43 engine answers to an EMPTY
+    dispatchKeySequence. The code when the text carries it, else the exact -32602 wording. Any other failure of
+    the probe -- a proxy's "Invalid target", "Invalid session id" -- is NOT an r43 engine: a browser memoised as
+    r43 by mistake would get fromX/fromY on an out-of-sync plain click, which a pre-r43 engine ignores while
+    walking from its own stale point (the teleport the re-sync exists to remove), where 0.51.0 declined the
+    engine route (verifier A's R4, SC 232: any "invalid" counted)."""
     m = str(err)
-    return not _cdp_method_missing(err) and ("-32602" in m or "invalid" in m.lower())
+    if _cdp_method_missing(err):
+        return False
+    return "-32602" in m or _CDP_INVALID_PARAMS.search(m) is not None
 
 
 def _engine_ext_mode():
@@ -872,6 +884,32 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _engine_ext_click(x, y, o):
+        """r43 engine (SC 232 lane H): a right/middle, double/triple or modified click walked AND pressed
+        engine-side (dispatchPointerPath button / clickCount / modifiers). The modifier KEYS are pressed here
+        around it (lead before, lag after), as _press_at does. False when the engine cannot take it (a
+        caller-chosen hold, no r43 extensions, modifiers without keyboard.down): the planner presses then.
+        Shared by mouse.click and the targeted click (verifier A's R5: selector clicks never took it)."""
+        ext = engine_click_params(o)
+        if not ext or _hz_engine_mode(page, _engine_clicks_mode) == "off" or not _engine_ext_ok():
+            return False
+        if o["modifiers"] and not (native_kb_down and native_kb_up):
+            return False
+        held = []
+        try:
+            for m in o["modifiers"]:
+                native_kb_down(m)
+                held.append(m)
+                time.sleep(_rand(40, 110) / 1000.0)
+            return bool(_engine_glide(x, y, no_click=False, ext=ext))
+        finally:
+            for m in reversed(held):
+                time.sleep(_rand(20, 80) / 1000.0)
+                try:
+                    native_kb_up(m)
+                except Exception:  # noqa: BLE001
+                    pass
+
     def hclick(x, y, **kw):
         # The engine path performs ONE plain left click. Anything else -- right/middle button, a
         # double click, a caller-chosen hold -- glides SDK-side and presses as asked; the old
@@ -880,25 +918,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         if engine_path_ok(o) and _hz_engine_mode(page, _engine_clicks_mode) != "off" and _engine_glide(x, y, no_click=False):
             return
         # r43 engine (SC 232 lane H): right/middle buttons, double/triple clicks and modified clicks take the
-        # engine route too. The modifier KEYS are pressed here around it (lead before, lag after), as _press_at.
-        ext = engine_click_params(o)
-        if (ext and _hz_engine_mode(page, _engine_clicks_mode) != "off" and _engine_ext_ok()
-                and (not o["modifiers"] or (native_kb_down and native_kb_up))):
-            held = []
-            try:
-                for m in o["modifiers"]:
-                    native_kb_down(m)
-                    held.append(m)
-                    time.sleep(_rand(40, 110) / 1000.0)
-                if _engine_glide(x, y, no_click=False, ext=ext):
-                    return
-            finally:
-                for m in reversed(held):
-                    time.sleep(_rand(20, 80) / 1000.0)
-                    try:
-                        native_kb_up(m)
-                    except Exception:  # noqa: BLE001
-                        pass
+        # engine route too (_engine_ext_click).
+        if _engine_ext_click(x, y, o):
+            return
         _glide(x, y)
         # A press that raises RAISES (it was swallowed here: a click whose press failed reported
         # success). Only the pin before a press (hdown) stays best-effort.
@@ -1519,9 +1541,29 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         try:
             _engine_session()
             _eng["session"].send(ENGINE_KEY_SEQUENCE, {"targetId": _eng["tid"], "keys": keys})
-            return True
         except Exception:  # noqa: BLE001
             return False
+        _trace_engine_typed(keys, floor)
+        return True
+
+    def _trace_engine_typed(keys, floor):
+        """The score hook (lane G) hears an engine typed run as one ``typed`` line of the PLANNED down/up times
+        (the engine paces them in the browser; the per-key path records its dispatched ones). Inside an outer
+        traced run the keys join that run's record instead (verifier A's R3c: the engine run wrote nothing)."""
+        if not _trace.enabled():
+            return
+        outer = st.get("keyrec")
+        t = time.perf_counter() * 1000.0 if outer is not None else 0.0
+        rec = []
+        for k in keys:
+            down = t
+            up = down + float(k.get("dwellMs") or 0.0)
+            rec.append({"key": k["key"], "down": down, "up": up})
+            t = up + float(k.get("gapMs") or 0.0)
+        if outer is not None:
+            outer.extend(rec)
+        else:
+            _trace.record("typed", rec, {"n": len(keys), "typos": False, "floor_ms": floor, "engine": True})
 
     def _human_type_text(text, field=None, typos=True, floor_ms=0.0, exact=True):
         """Type text key-by-key with human timing. Each char goes through Playwright's native
@@ -1546,16 +1588,29 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         n = len(text)
         shift = False
         ext_shift = "Shift" in held_keys
-        roll_rate = rollover_rate(persona)
         rate = _typo_rate() if typos else 0.0
         fld = _typing_field(field) if rate > 0 else None
         allow = rate > 0 and typos_allowed(fld)
         search = bool(allow and not exact and fld and (fld.get("type") or "").lower() == "search")
         floor = max(0.0, float(floor_ms or 0.0))
-        # r43 engine (SC 232 lane H): a run with no slip to plan (typos off, or a field where a slip is a failure)
-        # and no caller-held Shift goes out as ONE dispatchKeySequence -- the same dwell and flight draws, paced in
-        # the browser, so the rhythm carries no CDP round trips. Rollover is not modelled there.
-        if not allow and n > 1 and not ext_shift and _engine_ext_ok() and _engine_type(text, floor):
+        # ROLLOVER, decided up front: the pairs this run overlaps (index of the first key), one unseeded draw per
+        # eligible pair at lane B's rollover_rate (12-38 % per identity). Eligible: unshifted single-key pairs
+        # (_ROLL_KEYS), never a key with itself, never under a caller's delay floor. Drawn before the route is
+        # chosen so the engine run below is taken exactly for the runs that would have had no rollover, and the
+        # per-key path realises the persona's share on the others -- the distribution of overlaps per run is the
+        # per-key path's, whichever route types it.
+        roll_rate = rollover_rate(persona)
+        rolls = frozenset(i for i in range(n - 1)
+                          if floor <= 0 and native_kb_down and native_kb_up and text[i] in _ROLL_KEYS
+                          and text[i + 1] in _ROLL_KEYS and text[i] != text[i + 1] and random.random() < roll_rate)
+        # r43 engine (SC 232 lane H): a run with no slip to plan (typos off, or a field where a slip is a failure),
+        # no caller-held Shift and NO ROLLOVER goes out as ONE dispatchKeySequence -- the same dwell and flight
+        # draws, paced in the browser, so the rhythm carries no CDP round trips. A run the persona rolls over
+        # stays per key: the command cannot overlap keys (the engine clamps gapMs at 0), and an identity whose
+        # credential fields typed with zero overlap next to text fields with its 12-38 % would contradict itself
+        # (verifier A's R3b). Not with engine "off" (R3a): that is the documented way to keep everything SDK-side.
+        if (not allow and n > 1 and not ext_shift and not rolls and _hz_engine_mode(page, _engine_clicks_mode) != "off"
+                and _engine_ext_ok() and _engine_type(text, floor)):
             st["typed"] = time.monotonic()   # a following Enter / Tab still waits (_after_typing)
             return
         # the score hook records this run's keys (the native_kb_* wrappers) and scores it as "typed" at the end
@@ -1586,13 +1641,12 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                                 raise
                 # ROLLOVER: the next key goes down before this one comes up, the way people type fast
                 # pairs. One press() per character never overlaps (0 of 32 keydowns, measured on
-                # r32/r33), a keystroke-dynamics tell. Unshifted single-key pairs only; never under a
-                # caller's delay floor (the next key would come sooner than asked).
+                # r32/r33), a keystroke-dynamics tell. The pairs were drawn up front (``rolls``, above);
+                # a typo or a Shift in flight still cancels one.
                 nxt = text[i + 1] if i + 1 < n else None
                 d1 = _kdwell()
                 if (nxt is not None and not typo and not shift and native_kb_down and native_kb_up
-                        and ch in _ROLL_KEYS and nxt in _ROLL_KEYS and ch != nxt and d1 - 8 >= 12
-                        and floor <= 0 and random.random() < roll_rate):
+                        and i in rolls and d1 - 8 >= 12):
                     overlap = _rand(12, min(55, d1 - 8))
                     try:
                         native_kb_down(ch)
@@ -3071,12 +3125,16 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                                   "the click point does not reach the element (covered, moving or clipped)")
             if o["modifiers"] and native_kb_down is None:
                 raise _Native("modifiers need keyboard.down")
-            if (not no_click and not o["force"] and orig is not None and _hz_engine_mode(page, _engine_clicks_mode) == "all"
-                    and engine_path_ok(o) and _engine_glide(x, y, no_click=False)):
-                # Opt-in (CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach and
-                # clicks the point the hit test above proved; plain left single clicks only, and only
-                # while the engine knows where the pointer is (_engine_in_sync). Otherwise: planner.
-                return None
+            if not no_click and not o["force"] and orig is not None and _hz_engine_mode(page, _engine_clicks_mode) == "all":
+                # Opt-in (engine "all" / CLEARCOTE_HUMANIZE_ENGINE_CLICKS=all): the engine walks the approach
+                # and clicks the point the hit test above proved. A plain left click takes the r42 route (while
+                # the engine knows where the pointer is, _engine_in_sync; an r43 engine re-syncs from the SDK's
+                # position, fromX/fromY); a right / double / modified click takes the r43 extensions, as
+                # mouse.click does (_engine_ext_click; verifier A's R5). Otherwise: the planner.
+                if engine_path_ok(o) and _engine_glide(x, y, no_click=False):
+                    return None
+                if _engine_ext_click(x, y, o):
+                    return None
             if no_click and o["modifiers"]:
                 # hover with modifiers: Playwright holds them across the move
                 held = []

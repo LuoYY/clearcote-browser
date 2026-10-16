@@ -11,6 +11,7 @@ than on the implementation's call sequence. Its isolated world is injected as pa
 the cache async_world_for() reads.
 """
 import asyncio
+import json
 import random
 
 import pytest
@@ -789,11 +790,14 @@ def _with_session(p, s):
     p.context = type("Ctx", (), {"new_cdp_session": staticmethod(new_cdp_session), "browser": None})()
 
 
-def test_r43_engine_walks_right_double_modified_clicks_held_legs_and_typed_runs(fast):
+def test_r43_engine_walks_right_double_modified_clicks_held_legs_and_typed_runs(fast, monkeypatch):
     """SC 232 lane H (SDK side of pro-r43-07 / 09): on an engine that takes the r43 parameters, right / double /
     modified clicks, held legs (buttons, fromX/fromY once the SDK moved the pointer) and slip-free typed runs
     (ONE dispatchKeySequence with lane B's dwell and lane D's flight per key) go engine-side; a caller-chosen hold
-    stays SDK-side; the probe is asked once per browser; modifier keys are still pressed by the SDK."""
+    stays SDK-side; the probe is asked once per browser; modifier keys are still pressed by the SDK. Rollover is
+    pinned to 0 here: a run the persona rolls over stays per key since verifier A's R3b (its own test below)."""
+    monkeypatch.setattr(H, "rollover_rate", lambda persona: 0.0)
+
     async def go():
         p = await attached(_btn())
         s = _R43Session()
@@ -863,6 +867,214 @@ def test_engine_ext_off_keeps_the_r42_route_on_an_r43_engine(fast, monkeypatch):
         assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath"], "no probe"
         assert [(d[1]) for d in kinds(p, "down")] == ["right"]
     run(go())
+
+
+# ------------------------------------------------------------- fixes after verifier A (SC 232, R3-R5)
+class _InvalidTargetSession(_Session):
+    """A CDP proxy, or a PRO engine before r43, whose EMPTY dispatchKeySequence fails with other wording than
+    -32602's "Invalid parameters" -- not an r43 engine. Every pointer path's params kept."""
+
+    def __init__(self):
+        super().__init__()
+        self.params = []
+
+    async def send(self, method, params=None):
+        if method == "Browser.dispatchKeySequence":
+            self.calls.append(method)
+            raise Exception("Protocol error (Browser.dispatchKeySequence): Invalid target")
+        self.params.append((method, dict(params or {})))
+        return await super().send(method, params)
+
+
+def _key_seqs(s):
+    return [q for m, q in s.params if m == "Browser.dispatchKeySequence"]
+
+
+def _typed_keys(p):
+    """The characters the fake keyboard saw go down (a press, or a keydown of a rolled-over key)."""
+    return [e[1] for e in p.log if (e[0] == "press" or e[0] == "kdown") and len(e[1]) == 1]
+
+
+async def _attached_opts(options, *fields):
+    p = Page(*fields)
+    await H.attach_humanize(None, p, humanize=options, seed="forms-unit")
+    return p
+
+
+def _sync_page(options=True, *fields):
+    """The sync humanizer on the same simulated page (through _hz_sync_sim), engine session attachable."""
+    import clearcote._humanize as HS
+    from _hz_sync_sim import sync_page
+    sim, page = sync_page(*fields)
+    HS.attach_humanize(None, page, humanize=options, seed="forms-unit")
+    return sim, page
+
+
+@pytest.fixture
+def sync_fast(monkeypatch):
+    import clearcote._humanize as HS
+    monkeypatch.setattr(HS.time, "sleep", lambda s: None)
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "0")
+
+
+def test_engine_off_keeps_a_typed_run_per_key_on_an_r43_engine(fast):
+    """R3a: humanize {engine: "off"} -- the documented way to keep everything SDK-side -- also keeps the typed run
+    off the engine (no probe, no dispatchKeySequence). 949f5b1 only honoured CLEARCOTE_HUMANIZE_ENGINE_EXT=off there."""
+    async def go():
+        p = await _attached_opts({"engine": "off"}, _btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.keyboard.type("hello")
+        assert "Browser.dispatchKeySequence" not in s.calls, "no probe, no engine run"
+        assert _typed_keys(p) == list("hello")
+    run(go())
+
+
+def test_sync_engine_off_keeps_a_typed_run_per_key_on_an_r43_engine(sync_fast):
+    sim, page = _sync_page({"engine": "off"}, _btn())
+    s = _R43Session()
+    _with_session(sim, s)
+    page.keyboard.type("hello")
+    assert "Browser.dispatchKeySequence" not in s.calls, "no probe, no engine run"
+    assert _typed_keys(sim) == list("hello")
+
+
+def test_a_run_the_persona_rolls_over_stays_per_key_on_an_r43_engine(fast, monkeypatch):
+    """R3b: Browser.dispatchKeySequence cannot overlap keys (the engine clamps gapMs at 0), so a run with rollover
+    (lane B's rollover_rate: 12-38 % of eligible pairs per identity) types per key, with its overlaps; the engine
+    run is taken exactly for the runs that would have had none. On 949f5b1 every slip-free run went engine-side
+    with zero overlap: the credential fields of an identity typed with none, the text field next to them with
+    the persona's share."""
+    async def go():
+        p = await attached(_btn())
+        s = _R43Session()
+        _with_session(p, s)
+        monkeypatch.setattr(H, "rollover_rate", lambda persona: 1.0)
+        await p.keyboard.type("hello world")
+        assert _key_seqs(s) == [], "a rolled run stays per key"
+        assert _typed_keys(p) == list("hello world")
+        kd = [e[1] for e in kinds(p, "kdown") if len(e[1]) == 1]
+        assert len(kd) >= 6, kd                              # the rolled pairs went down as keydown/keyup pairs
+        monkeypatch.setattr(H, "rollover_rate", lambda persona: 0.0)
+        await p.keyboard.type("hello world")
+        assert len(_key_seqs(s)) == 1 and len(_key_seqs(s)[0]["keys"]) == 11, "a run with no rollover: the engine"
+    run(go())
+
+
+def test_sync_a_run_the_persona_rolls_over_stays_per_key_on_an_r43_engine(sync_fast, monkeypatch):
+    import clearcote._humanize as HS
+    sim, page = _sync_page(True, _btn())
+    s = _R43Session()
+    _with_session(sim, s)
+    monkeypatch.setattr(HS, "rollover_rate", lambda persona: 1.0)
+    page.keyboard.type("hello world")
+    assert _key_seqs(s) == [] and _typed_keys(sim) == list("hello world")
+    assert len([e[1] for e in kinds(sim, "kdown") if len(e[1]) == 1]) >= 6
+    monkeypatch.setattr(HS, "rollover_rate", lambda persona: 0.0)
+    page.keyboard.type("hello world")
+    assert len(_key_seqs(s)) == 1 and len(_key_seqs(s)[0]["keys"]) == 11
+
+
+@pytest.mark.parametrize("mode", ["async", "sync"])
+def test_an_engine_typed_run_records_a_typed_trace_line(fast, sync_fast, monkeypatch, tmp_path, mode):
+    """R3c: the score hook (lane G) hears an engine typed run as one "typed" line with the PLANNED down/up times,
+    as the per-key path records its dispatched ones; 949f5b1 wrote nothing for it (the hook under-reported on r43)."""
+    import clearcote._humanize as HS
+    out = tmp_path / "score.jsonl"
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_SCORE", "1")
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_SCORE_FILE", str(out))
+    monkeypatch.setenv("CLEARCOTE_NO_WARN", "1")
+    monkeypatch.setattr(H, "rollover_rate", lambda persona: 0.0)
+    monkeypatch.setattr(HS, "rollover_rate", lambda persona: 0.0)
+    if mode == "async":
+        async def go():
+            p = await attached(_btn())
+            s = _R43Session()
+            _with_session(p, s)
+            await p.keyboard.type("hello world")
+            assert len(_key_seqs(s)) == 1
+        run(go())
+    else:
+        sim, page = _sync_page(True, _btn())
+        s = _R43Session()
+        _with_session(sim, s)
+        page.keyboard.type("hello world")
+        assert len(_key_seqs(s)) == 1
+    lines = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines() if x.strip()] if out.exists() else []
+    typed = [ln for ln in lines if ln["kind"] == "typed"]
+    assert len(typed) == 1, [ln["kind"] for ln in lines]
+    assert typed[0]["n"] == 11
+    assert typed[0]["meta"] == {"n": 11, "typos": False, "floor_ms": 0.0, "engine": True}
+
+
+def test_the_r43_probe_accepts_only_cdp_invalid_parameters(fast):
+    """R4: only CDP -32602 says "r43": its "Invalid parameters" wording (Playwright strips the code from the
+    message) or the code itself. Any other failure of the empty-sequence probe -- a proxy's "Invalid target",
+    "Invalid session id" -- is NOT an r43 engine. 949f5b1 took any "invalid", memoised the browser as r43 and then
+    sent fromX/fromY on an out-of-sync plain click to an engine that ignores unknown params and walks from its own
+    stale point (the teleport the re-sync exists to remove), where 0.51.0 declined the engine route."""
+    ok = H._cdp_invalid_params
+    assert ok(Exception("Protocol error (Browser.dispatchKeySequence): Invalid parameters"))
+    assert ok(Exception("Protocol error (Browser.dispatchKeySequence): Invalid parameters Failed to deserialize params.keys"))
+    assert ok(Exception("CDP error -32602: invalid params"))
+    for m in ("Protocol error (Browser.dispatchKeySequence): Invalid target",
+              "Protocol error (Browser.dispatchKeySequence): Invalid session id",
+              "Protocol error (Browser.dispatchKeySequence): Not allowed: invalid state",
+              "Protocol error (Browser.dispatchKeySequence): 'Browser.dispatchKeySequence' wasn't found",
+              "Target page, context or browser has been closed"):
+        assert not ok(Exception(m)), m
+
+    async def go():
+        p = await attached(_btn())
+        s = _InvalidTargetSession()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)                    # plain and in sync: the r42 route
+        await p.mouse.click(300, 200, button="right")    # the probe fails with other wording: not r43 -> SDK-side
+        await p.mouse.move(500, 400)                     # an SDK glide: the engine is out of sync now
+        await p.mouse.click(520, 410)                    # declined (no fromX re-sync on a non-r43 engine): planner
+        pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+        assert len(pp) == 1 and "fromX" not in pp[0] and "button" not in pp[0], pp
+        assert [c for c in s.calls if c == "Browser.dispatchKeySequence"] == ["Browser.dispatchKeySequence"], "one probe"
+        assert [d[1] for d in kinds(p, "down")] == ["right", "left"]
+    run(go())
+
+
+def test_engine_all_walks_selector_clicks_with_buttons_and_modifiers_engine_side(fast):
+    """R5: with engine "all" a selector click with a button, a click count or modifiers takes the r43 extensions
+    the way mouse.click does (the modifier keys pressed by the SDK around it). On 949f5b1 only the plain left
+    selector click went engine-side; page.click(sel, button="right"), dblclick and modified clicks stayed on the
+    planner while the same clicks by coordinate walked in the engine."""
+    async def go():
+        p = await _attached_opts({"engine": "all"}, _btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.click("#b")
+        await p.click("#b", button="right")
+        await p.dblclick("#b")
+        await p.click("#b", modifiers=["Shift"])
+        pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+        assert len(pp) == 4, pp
+        assert pp[0]["noClick"] is False and "button" not in pp[0] and "clickCount" not in pp[0]
+        assert pp[1].get("button") == "right" and pp[2].get("clickCount") == 2 and pp[3].get("modifiers") == 8
+        assert kinds(p, "down") == [], "nothing pressed natively"
+        assert [k[1] for k in kinds(p, "kdown")] == ["Shift"] and [k[1] for k in kinds(p, "kup")] == ["Shift"]
+        assert non_trial(p) == []
+    run(go())
+
+
+def test_sync_engine_all_walks_selector_clicks_with_buttons_and_modifiers_engine_side(sync_fast):
+    sim, page = _sync_page({"engine": "all"}, _btn())
+    s = _R43Session()
+    _with_session(sim, s)
+    page.click("#b")
+    page.click("#b", button="right")
+    page.dblclick("#b")
+    page.click("#b", modifiers=["Shift"])
+    pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+    assert len(pp) == 4, pp
+    assert pp[1].get("button") == "right" and pp[2].get("clickCount") == 2 and pp[3].get("modifiers") == 8
+    assert kinds(sim, "down") == [] and non_trial(sim) == []
+    assert [k[1] for k in kinds(sim, "kdown")] == ["Shift"] and [k[1] for k in kinds(sim, "kup")] == ["Shift"]
 
 
 # ------------------------------------------------------------------------------------- text
