@@ -1061,7 +1061,8 @@ export function cloudSessionOf(target: Browser | BrowserContext): Json | undefin
   return (target as unknown as { cloudSession?: Json }).cloudSession;
 }
 
-function prepareLaunch(options: Record<string, unknown>, persistent: boolean, userDataDir?: string | null) {
+/** @internal exported for tests: launch options -> the SDK-side options and the POST body. */
+export function prepareLaunch(options: Record<string, unknown>, persistent: boolean, userDataDir?: string | null) {
   const opts: Record<string, unknown> = { ...options };
   delete opts.cloud;
   // widevine: false (or unset): the opt-out of the licensed LOCAL default. A hosted browser loads its own CDM, so
