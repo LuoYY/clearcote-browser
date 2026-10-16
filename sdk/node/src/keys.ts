@@ -103,11 +103,12 @@ export function flightMs(t: TypingTraits, prev: string | null | undefined, ch: s
 }
 
 /** The whole sleep between key `prev` coming up and key `ch` going down (_keys.plan_gap). */
-export function planGap(t: TypingTraits, prev: string | null | undefined, ch: string | null | undefined, rng: Rng): number {
+export function planGap(t: TypingTraits, prev: string | null | undefined, ch: string | null | undefined, rng: Rng,
+  tempo = 1, pauseScale = 1): number {
   let ms = flightMs(t, prev, ch, rng);
   if (prev != null && isWs(prev)) ms += lerp(20, 100, rng());
-  if (rng() < 0.06) ms += lerp(180, 450, rng());
-  return ms;
+  if (rng() < 0.06 * pauseScale) ms += lerp(180, 450, rng());
+  return ms * tempo; // tempo / pauseScale: lane A's presets (persona.tempo, persona.pauseScale); 1 = as planned
 }
 
 export const WORD_FIX_RATE = 0.3;

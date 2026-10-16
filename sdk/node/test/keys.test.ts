@@ -160,6 +160,7 @@ const onFakeClock = async <T>(fn: () => Promise<T>): Promise<T> => {
   vi.useFakeTimers({ toFake: ["setTimeout", "Date"], now: 1_000_000 });
   try {
     const p = fn();
+    p.catch(() => undefined); // a rejection is the caller's to assert, not an unhandled one
     await vi.runAllTimersAsync();
     return await p;
   } finally { vi.useRealTimers(); }
@@ -372,5 +373,42 @@ describe("humanized keyboard (Node wrapper, fake clock)", () => {
     const ga = charPresses(a).map((e) => e.ts - charPresses(a)[0].ts), gb = charPresses(b).map((e) => e.ts - charPresses(b)[0].ts);
     expect(ga).not.toEqual(gb);
     expect(K.typingTraits(makePersona("ha-1").seed)).toEqual(K.typingTraits(makePersona("ha-1").seed));
+  }, 30_000);
+
+  it("lane A's tempo scales the gaps (persona.tempo read at call time)", async () => {
+    const med: number[] = [];
+    for (const tempo of [1, 2]) {
+      const spy = seededRandom(3);
+      try {
+        forced.roll = 0;
+        process.env[ENV] = "0";
+        const f = fakePage();
+        await onFakeClock(async () => {
+          await attachHumanize({} as never, f.page, { humanize: true, seed: "ha-2" });
+          f.page._clearcotePersona.tempo = tempo;
+          await f.page.keyboard.type((VEC.ks_text as string).slice(0, 200));
+        });
+        const p = charPresses(f);
+        med.push(median(p.slice(1).map((e, i) => e.ts - p[i].ts)));
+      } finally { spy.mockRestore(); }
+    }
+    expect(med[1] / med[0]).toBeGreaterThanOrEqual(1.7);
+    expect(med[1] / med[0]).toBeLessThanOrEqual(2.3);
+  }, 30_000);
+
+  it("a strict error from the insertText fallback reaches the caller (not swallowed by the typing loop)", async () => {
+    forced.roll = 0;
+    process.env[ENV] = "0";
+    const f = fakePage();
+    const orig = f.page.keyboard.press;
+    f.page.keyboard.press = async (k: string, o: any) => { if (k === "ö") throw new Error('Unknown key: "ö"'); return orig(k, o); };
+    class ClearcoteStrictError extends Error { constructor(m: string) { super(m); this.name = "ClearcoteStrictError"; } }
+    const seen: string[] = [];
+    f.page._clearcoteReportFallback = (api: string) => { seen.push(api); throw new ClearcoteStrictError(api); };
+    await expect(onFakeClock(async () => {
+      await attachHumanize({} as never, f.page, { humanize: true, seed: "ha-1" });
+      await f.page.keyboard.type("aöb");
+    })).rejects.toThrow("keyboard.press");
+    expect(seen).toEqual(["keyboard.press"]);
   }, 30_000);
 });

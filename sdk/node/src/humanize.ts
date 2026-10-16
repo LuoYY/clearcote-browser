@@ -281,6 +281,9 @@ export function createInputLock(): <T>(fn: () => Promise<T>) => Promise<T> {
  * Targeted clicks stay on the SDK planner by default (SC 210 lane S, measured on r38): the engine
  * presses 9 ms after its last move (the planner's press waits 40-130 ms), and it walks from its own last
  * position, which an SDK glide does not update. Same values as Python `_engine_clicks_mode`. */
+/** Lane A's ClearcoteStrictError (strict mode): never swallowed by a best-effort path. */
+const isStrict = (e: unknown): boolean => !!e && ((e as any).name === "ClearcoteStrictError" || (e as any).constructor?.name === "ClearcoteStrictError");
+
 export function engineClicksMode(): "off" | "coords" | "all" {
   const v = (process.env.CLEARCOTE_HUMANIZE_ENGINE_CLICKS || "").trim().toLowerCase();
   if (["0", "off", "false", "no", "none"].includes(v)) return "off";
@@ -700,8 +703,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // (keyboard.type's delay is only inter-key flight), so per-char press gives the missing dwell.
   // Fall back to type() for anything press can't map (some symbols / composed chars).
   const emitKey = async (ch: string): Promise<void> => {
-    try { await nativeKbPress(ch, { delay: dwell() }); }
-    catch { try { await nativeKbType(ch); } catch { /* best-effort */ } }
+    try { await nativeKbPress(ch, { delay: dwell() }); return; } catch { /* below */ }
+    // Outside the catch: in strict mode lane A's report throws, and that must reach the caller.
+    fallback("keyboard.press", "insertText: a character keyboard.press cannot map");
+    try { await nativeKbType(ch); } catch { /* best-effort */ }
   };
 
   // Press `k` (n times) with the persona's hold on every press and a human gap between repeats.
@@ -905,7 +910,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
           if (tp !== null) {
             typo = true;
             const leave = search && tp.kind === "sub" && Math.random() < SEARCH_SLIP_RATE;
-            try { consumed = await doTypo(chars, i, tp, leave); } catch { /* typo path best-effort */ }
+            try { consumed = await doTypo(chars, i, tp, leave); } catch (e) { if (isStrict(e)) throw e; /* typo path best-effort */ }
           }
         }
         // Rollover of ch and the next char: unshifted single-key pairs only, never a key with itself,
@@ -936,13 +941,14 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
             i += 1; ch = nx; // nx is typed; the cadence below runs as if after it
           }
         }
-        if (!rolled && !consumed) { try { await emitKey(ch); } catch { break; } }
+        if (!rolled && !consumed) { try { await emitKey(ch); } catch (e) { if (isStrict(e)) throw e; break; } }
         if (shift && (i === n - 1 || !needsShift(chars[i + 1]))) {
           await sleep(rand(10, 70));
           await nativeKbUp!("Shift");
           shift = false;
         }
-        if (i < n - 1) await sleep(Math.max(floor, planGap(traits, ch, chars[i + 1], Math.random)));
+        if (i < n - 1) await sleep(Math.max(floor, planGap(traits, ch, chars[i + 1], Math.random,
+          (persona as any).tempo ?? 1, (persona as any).pauseScale ?? 1)));
       }
     } finally {
       // never leave Shift held for the caller's next keystroke
@@ -1651,6 +1657,9 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // A humanized route handed this call to Playwright: told to lane A's on_fallback hook when the page
   // carries one (page._clearcoteOnFallback), else nothing (as before).
   const fallback = (api: string, reason: string): void => {
+    // lane A's reporter when the merged build installs one on the page (it throws in strict mode: not caught)
+    const report = (page as any)._clearcoteReportFallback;
+    if (typeof report === "function") { report(api, reason); return; }
     const cb = (page as any)._clearcoteOnFallback;
     if (typeof cb === "function") { try { cb({ api, reason }); } catch { /* the hook's own problem */ } }
   };

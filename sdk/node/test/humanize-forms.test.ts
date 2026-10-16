@@ -1105,7 +1105,7 @@ describe("selectOption", () => {
     expect(downs.length).toBe(20);
     expect(f.of("kup").filter((e) => e.a === "ArrowDown").length).toBe(1);
     expect(f.of("press").filter((e) => e.a.k === "ArrowDown")).toEqual([]);
-    expect(downs[1].ts - downs[0].ts, "the keyboard's repeat delay").toBeGreaterThanOrEqual(350);
+    expect(downs[1].ts - downs[0].ts, "the keyboard's repeat delay").toBeGreaterThanOrEqual(245);   // keys.planRepeat: 250-500 ms
     const repeats = downs.slice(2).map((d, k) => d.ts - downs[k + 1].ts);
     expect(repeats.reduce((a, b) => a + b, 0) / repeats.length).toBeLessThan(60);   // ~30 a second
     // a short run stays single presses
