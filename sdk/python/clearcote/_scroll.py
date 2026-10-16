@@ -293,16 +293,18 @@ def plan_trackpad(dx, dy, rng: Optional[Callable[[], float]] = None):
 # ---------------------------------------------------------------- isolated-world read
 # The nearest scrollable ancestor of a plain-CSS selector's first match (read in the isolated world, like
 # every humanize read): the visible client rect of the container and which axes it scrolls, or null
-# when the window is what scrolls it. A container with overflow:hidden is not scrollable by a wheel.
+# when the window is what scrolls it. A container with overflow:hidden that clips its content is returned
+# with no scrollable axis: a wheel cannot move it, so the caller falls back (and reports it).
 SCROLLER = """(a) => { let e;
   try { e = document.querySelector(a.sel); } catch (x) { return null; }
   if (!e) return null;
   const top = document.scrollingElement || document.documentElement;
   for (let p = e.parentElement; p && p !== top && p !== document.body; p = p.parentElement) {
     const s = getComputedStyle(p), sc = v => v === 'auto' || v === 'scroll' || v === 'overlay';
-    const y = sc(s.overflowY) && p.scrollHeight > p.clientHeight + 1;
-    const x = sc(s.overflowX) && p.scrollWidth > p.clientWidth + 1;
-    if (x || y) { const r = p.getBoundingClientRect();
+    const oy = p.scrollHeight > p.clientHeight + 1, ox = p.scrollWidth > p.clientWidth + 1;
+    const y = sc(s.overflowY) && oy, x = sc(s.overflowX) && ox;
+    const clip = (oy && (s.overflowY === 'hidden' || s.overflowY === 'clip')) || (ox && (s.overflowX === 'hidden' || s.overflowX === 'clip'));
+    if (x || y || clip) { const r = p.getBoundingClientRect();
       return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y }; }
   }
   return null; }"""

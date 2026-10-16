@@ -199,3 +199,17 @@ describe("shared vectors (humanize_scroll_vectors.json)", () => {
     for (const v of VEC.device) expect(S.inputDevice(v.platform, v.option)).toBe(v.device);
   });
 });
+
+describe("seed = persona traits only", () => {
+  it("same seed: the same persona; every drag, scroll and swipe draws fresh", async () => {
+    const S: any = await import("../src/scroll.js");
+    const a = M.makePersona("ident-1"), b = M.makePersona("ident-1");
+    expect(a).toEqual(b);
+    const h1 = (M as any).dragHesitation({ x: 100, y: 100 }, { x: 400, y: 120 }, a);
+    const h2 = (M as any).dragHesitation({ x: 100, y: 100 }, { x: 400, y: 120 }, b);
+    expect(h1).not.toEqual(h2);
+    expect(S.planTrackpad(0, 500)).not.toEqual(S.planTrackpad(0, 500));
+    expect(S.anchorPoint(1280, 800)).not.toEqual(S.anchorPoint(1280, 800));
+    expect(S.targetFrac()).not.toBe(S.targetFrac());
+  });
+});

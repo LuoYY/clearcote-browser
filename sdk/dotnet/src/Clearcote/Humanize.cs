@@ -1195,7 +1195,9 @@ public static partial class Humanize
             // the native fallback site: Playwright's own drag (a covered end, no CDP, a vanished element)
             await source.DragToAsync(target, new LocatorDragToOptions
             {
-                Force = o.Force, Timeout = o.Timeout, SourcePosition = o.SourcePosition, TargetPosition = o.TargetPosition,
+                Force = o.Force, Timeout = o.Timeout,
+                SourcePosition = o.SourcePosition is { } sp0 ? new SourcePosition { X = sp0.X, Y = sp0.Y } : null,
+                TargetPosition = o.TargetPosition is { } tp0 ? new TargetPosition { X = tp0.X, Y = tp0.Y } : null,
             }).ConfigureAwait(false);
             return;
         }

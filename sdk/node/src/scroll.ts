@@ -232,9 +232,10 @@ export const ISO_SCROLLER = `(a) => { let e;
   const top = document.scrollingElement || document.documentElement;
   for (let p = e.parentElement; p && p !== top && p !== document.body; p = p.parentElement) {
     const s = getComputedStyle(p), sc = v => v === 'auto' || v === 'scroll' || v === 'overlay';
-    const y = sc(s.overflowY) && p.scrollHeight > p.clientHeight + 1;
-    const x = sc(s.overflowX) && p.scrollWidth > p.clientWidth + 1;
-    if (x || y) { const r = p.getBoundingClientRect();
+    const oy = p.scrollHeight > p.clientHeight + 1, ox = p.scrollWidth > p.clientWidth + 1;
+    const y = sc(s.overflowY) && oy, x = sc(s.overflowX) && ox;
+    const clip = (oy && (s.overflowY === 'hidden' || s.overflowY === 'clip')) || (ox && (s.overflowX === 'hidden' || s.overflowX === 'clip'));
+    if (x || y || clip) { const r = p.getBoundingClientRect();
       return { rect: [r.x + p.clientLeft, r.y + p.clientTop, p.clientWidth, p.clientHeight], x: x, y: y }; }
   }
   return null; }`;
