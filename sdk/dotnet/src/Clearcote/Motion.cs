@@ -667,11 +667,11 @@ public static class Motion
         return rng() < Clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98);
     }
 
-    /// <summary>The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–700 ms.</summary>
+    /// <summary>The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–660 ms (200–700 as the page measures it).</summary>
     public static double MoveOffDelayMs(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return Clamp(AfterTraitsOf(p).MoveOffDelayMs * Lerp(0.7, 1.3, rng()), 200, 700);
+        return Clamp(AfterTraitsOf(p).MoveOffDelayMs * Lerp(0.7, 1.3, rng()), 200, 660);
     }
 
     /// <summary>

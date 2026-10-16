@@ -640,9 +640,9 @@ export function moveOffRoll(p: Persona, rng: Rng = Math.random, hits = 0, n = 0)
   return rng() < clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98);
 }
 
-/** The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–700 ms. */
+/** The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–660 ms (200–700 as the page measures it). */
 export function moveOffDelayMs(p: Persona, rng: Rng = Math.random): number {
-  return clamp(afterTraits(p).moveOffDelayMs * lerp(0.7, 1.3, rng()), 200, 700);
+  return clamp(afterTraits(p).moveOffDelayMs * lerp(0.7, 1.3, rng()), 200, 660);
 }
 
 /** Where the hand drifts after a click: 40–200 px from `from` at an angle in the downward half-plane

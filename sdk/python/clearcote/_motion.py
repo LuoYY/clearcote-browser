@@ -644,10 +644,11 @@ def move_off_roll(p: Persona, rng: Optional[Rng] = None, hits: int = 0, n: int =
 
 
 def move_off_delay_ms(p: Persona, rng: Optional[Rng] = None) -> float:
-    """The release -> move-off gap: the persona's centre x 0.7..1.3, kept in 200..700 ms."""
+    """The release -> move-off gap: the persona's centre x 0.7..1.3, kept in 200..660 ms (200-700 as the page
+    measures it from its mouseup: the release round trip and the first move's dispatch add 20-60 ms)."""
     if rng is None:
         rng = random.random
-    return _clamp(after_traits(p).move_off_delay_ms * _lerp(0.7, 1.3, rng()), 200.0, 700.0)
+    return _clamp(after_traits(p).move_off_delay_ms * _lerp(0.7, 1.3, rng()), 200.0, 660.0)
 
 
 def plan_move_off(frm, viewport, p: Persona, rng: Optional[Rng] = None):
