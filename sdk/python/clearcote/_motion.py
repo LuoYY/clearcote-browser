@@ -416,6 +416,54 @@ def plan_drag(frm, to, p: Persona, settle: bool = False, rng: Optional[Rng] = No
     return out
 
 
+# Salt for the drag-start hesitation traits (per persona, like _SHAPE_SALT / _ROLLOVER_SALT): drawing
+# them from mulberry32(seed ^ salt) keeps make_persona's draw ORDER, so every seed's motor identity is
+# what it was, and plan_drag itself is untouched (its vectors still pin the three SDKs).
+_HESITATION_SALT = 0xC2B2AE35
+# A hand that has just closed on a handle does not set off at once: it holds 100-300 ms, creeping a
+# few px (never 8) in the direction it is about to go, before the leg proper. Measured on r38 / SDK
+# 0.51.0 (SC 232 review): every drag's first held move was already the full-speed leg start.
+HESITATION_MS = (100.0, 300.0)
+HESITATION_MAX_PX = 8.0
+
+
+def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None):
+    """Plan the still-but-not-frozen moment between the grab and the drag leg frm->to: (x, y, sleep_ms)
+    samples spanning 100-300 ms (centred per persona), the pointer creeping < 8 px toward ``to`` with a
+    little sideways wobble. The last sample is where :func:`plan_drag` then starts. The samples are
+    drawn from ``rng`` AFTER nothing: a caller plans the leg from the returned end point, so the leg's
+    own draws keep their order. Same numbers in motion.ts dragHesitation and Motion.DragHesitation."""
+    if rng is None:
+        rng = random.random
+    r = mulberry32((p.seed ^ _HESITATION_SALT) & _MASK)
+    centre = _lerp(130.0, 260.0, r())          # this hand's typical hesitation
+    amp = _lerp(2.0, 6.0, r())                 # how far it creeps (px)
+    wobble = _lerp(0.4, 1.2, r())              # sideways (px)
+    fx, fy = frm
+    tx, ty = to
+    d = math.hypot(tx - fx, ty - fy)
+    ux, uy = ((tx - fx) / d, (ty - fy) / d) if d >= 1e-6 else (1.0, 0.0)
+    dur = _clamp(centre * _lerp(0.8, 1.2, rng()), HESITATION_MS[0], HESITATION_MS[1])
+    reach = amp * _lerp(0.6, 1.0, rng())
+    step_ms = 1000.0 / p.device_hz
+    n = int(max(3, _js_round(dur / step_ms)))
+    dt = dur / n
+    phase = rng() * 2 * math.pi
+    out: list = []
+    side = 0.0
+    for i in range(1, n + 1):
+        tau = i / n
+        along = reach * min_jerk(tau)
+        side = 0.8 * side + gauss_from(rng) * wobble * 0.25
+        s = _clamp(side + wobble * 0.5 * math.sin(phase + 2 * math.pi * tau), -1.5, 1.5)
+        px, py = fx + ux * along - uy * s, fy + uy * along + ux * s
+        # the budget is a hard bound: the creep never leaves an 8 px circle around the grab
+        if math.hypot(px - fx, py - fy) >= HESITATION_MAX_PX - 0.5:
+            px, py = fx + ux * (HESITATION_MAX_PX - 1.0), fy + uy * (HESITATION_MAX_PX - 1.0)
+        out.append((px, py, dt * _lerp(0.9, 1.1, rng())))
+    return out
+
+
 def drag_dwell(p: Persona, rng: Optional[Rng] = None):
     """(grab_ms, release_ms) for a held-button drag, from the persona window."""
     if rng is None:
