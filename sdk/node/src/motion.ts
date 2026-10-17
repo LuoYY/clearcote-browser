@@ -88,21 +88,23 @@ export interface Persona {
   maxCorrections: number;
   /** Handedness/approach curvature bias (signed, radians-ish) applied to path bow. */
   approachBias: number;
-  /** Grab hesitation window after mouse.down (ms). */
+  /** The HUMAN BANDS every timing draw is clamped to (ms); the per-identity medians inside them come from
+   * the salted timing stream ({@link timingTraits}). Grab hesitation after mouse.down: */
   grabMinMs: number;
   grabMaxMs: number;
-  /** Pre-release settle window before mouse.up (ms). */
+  /** Pre-release settle before mouse.up (ms). */
   releaseMinMs: number;
   releaseMaxMs: number;
-  /** Click press-hold window — mousedown→mouseup (ms). Human ~60–150; a scripted click is ~2 ms. */
+  /** Click press-hold band — mousedown→mouseup (ms), 55–230; a scripted click is ~2 ms. */
   clickHoldMinMs: number;
   clickHoldMaxMs: number;
-  /** Per-key dwell window — keydown→keyup (ms). Human ~45–120 (right-skewed); scripted typing ~2–3 ms. */
+  /** Per-key dwell band — keydown→keyup (ms), 45–120; scripted typing ~2–3 ms. */
   keyDwellMinMs: number;
   keyDwellMaxMs: number;
 }
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const clampV = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
 /** Derive a stable motor persona from a fingerprint seed (or random when unseeded). */
 export function makePersona(seed?: string | number): Persona {
@@ -126,23 +128,88 @@ export function makePersona(seed?: string | number): Persona {
     grabMaxMs: 360,
     releaseMinMs: 90,
     releaseMaxMs: 230,
-    clickHoldMinMs: 60,
-    clickHoldMaxMs: 150,
+    clickHoldMinMs: 55,
+    clickHoldMaxMs: 230,
     keyDwellMinMs: 45,
     keyDwellMaxMs: 120,
   };
 }
 
-/** A human mousedown→mouseup click hold (ms), right-skewed (most clicks brief, some linger). Fixes
- * the ~2 ms instant-press tell shared by clicks. */
-export function clickHold(p: Persona, rng: Rng = Math.random): number {
-  return p.clickHoldMinMs + Math.min(1, Math.abs(gaussFrom(rng)) * 0.5) * (p.clickHoldMaxMs - p.clickHoldMinMs);
+// Salt for the timing stream. Like the rollover and shape salts, a separate mulberry32(seed ^ salt) stream
+// keeps makePersona's draw ORDER (and so every existing seed's motor identity) unchanged.
+const TIMING_SALT = 0xc2b2ae35;
+
+/** Per-identity timing medians (ms) and tempo, stable per seed (see timingTraits). */
+export interface TimingTraits {
+  /** Median mousedown→mouseup hold, 70–140. */
+  clickHoldMs: number;
+  /** Median keydown→keyup dwell, 60–95. */
+  keyDwellMs: number;
+  /** Median grab hesitation after a drag's mousedown, 180–280. */
+  grabMs: number;
+  /** Median settle before a drag's mouseup, 120–180. */
+  releaseMs: number;
+  /** Median gap between the two presses of a double click, 90–140. */
+  dblclickGapMs: number;
+  /** Scale on deliberation pauses (select popup, datetime segments), 0.8–1.25. */
+  pauseScale: number;
+  /** Per-character fat-finger rate, 0.005–0.04. */
+  typoRate: number;
 }
 
-/** A human per-key keydown→keyup dwell (ms), right-skewed (a floor + occasional longer holds — the
- * empirical human dwell shape). Fixes the ~2–3 ms instant-keystroke tell. */
+/** The persona's timing traits, drawn from a salted stream of its seed. Before this every identity shared
+ * ONE fixed window per timing (click hold 60–150, key dwell 45–120, grab 130–360, release 90–230,
+ * double-click gap 70–170, select-popup pauses, datetime gaps, the 2 % typo rate). Each value is the
+ * identity's MEDIAN; samples around it are log-normal and clamped to the persona's human band. Same values
+ * as Python `_motion.timing_traits` and .NET `Motion.TimingTraitsOf`. */
+export function timingTraits(p: Persona): TimingTraits {
+  const r = mulberry32((p.seed ^ TIMING_SALT) >>> 0);
+  const clickHoldMs = lerp(70, 140, r());
+  const keyDwellMs = lerp(60, 95, r());
+  const grabMs = lerp(180, 280, r());
+  const releaseMs = lerp(120, 180, r());
+  const dblclickGapMs = lerp(90, 140, r());
+  const pauseScale = lerp(0.8, 1.25, r());
+  const typoRate = lerp(0.005, 0.04, r());
+  return { clickHoldMs, keyDwellMs, grabMs, releaseMs, dblclickGapMs, pauseScale, typoRate };
+}
+
+/** `median * exp(sigma * N(0,1))` clamped to [lo, hi]: a right-skewed human timing around a per-identity median. */
+export function lognormalMs(median: number, sigma: number, lo: number, hi: number, rng: Rng): number {
+  return clampV(median * Math.exp(sigma * gaussFrom(rng)), lo, hi);
+}
+
+/** The preset's tempo on `p` (HumanizeOptions: careful 1.4 / default 1 / quick 0.7, set by applyToPersona after
+ * makePersona; 1 on a bare persona, so every vector is unchanged). */
+export function tempoOf(p: Persona | null | undefined): number {
+  const t = (p as any)?.tempo;
+  return typeof t === "number" && t > 0 ? t : 1;
+}
+
+/** A human mousedown→mouseup click hold (ms): log-normal (σ 0.25) around the persona's own median
+ * (70–140 ms), clamped to its band (55–230 ms). */
+export function clickHold(p: Persona, rng: Rng = Math.random): number {
+  return lognormalMs(timingTraits(p).clickHoldMs * tempoOf(p), 0.25, p.clickHoldMinMs, p.clickHoldMaxMs, rng);
+}
+
+/** A human per-key keydown→keyup dwell (ms): log-normal (σ 0.22) around the persona's own median
+ * (60–95 ms), clamped to its band (45–120 ms). */
 export function keyDwell(p: Persona, rng: Rng = Math.random): number {
-  return p.keyDwellMinMs + Math.min(1, Math.abs(gaussFrom(rng)) * 0.45) * (p.keyDwellMaxMs - p.keyDwellMinMs);
+  return lognormalMs(timingTraits(p).keyDwellMs * tempoOf(p), 0.22, p.keyDwellMinMs, p.keyDwellMaxMs, rng);
+}
+
+/** The gap between the two presses of a double click (ms): log-normal (σ 0.15) around the persona's
+ * median (90–140), clamped to 70–170. */
+export function dblclickGap(p: Persona, rng: Rng = Math.random): number {
+  const t = tempoOf(p);
+  return lognormalMs(timingTraits(p).dblclickGapMs * t, 0.15, 70 * t, 170 * t, rng);
+}
+
+/** A deliberation pause (ms) from [lo, hi], scaled by the persona's tempo (pauseScale 0.8–1.25).
+ * Without a persona: the plain window. */
+export function pauseMs(p: Persona | null | undefined, lo: number, hi: number, rng: Rng = Math.random): number {
+  const v = lerp(lo, hi, rng());
+  return p ? v * timingTraits(p).pauseScale * tempoOf(p) : v;
 }
 
 // Salt for the rollover stream. Drawing from mulberry32(seed ^ salt) instead of adding a field to
@@ -479,27 +546,142 @@ export function planDrag(from: Point, to: Point, p: Persona, opts: { settle?: bo
   return out;
 }
 
-/** Grab/release dwell times (ms) for a held-button drag, drawn from the persona window. */
+// Salt for the drag-start hesitation traits (Python _HESITATION_SALT, .NET HesitationSalt): a salted
+// stream keeps makePersona's draw ORDER, and planDrag itself is untouched.
+const HESITATION_SALT = 0xfd7046c5; // own stream (was the timing salt: hesitation moved with the click hold)
+/** The drag-start hesitation window (ms): a hand that has just closed on a handle holds 100-300 ms. */
+export const HESITATION_MS: readonly [number, number] = [100, 300];
+/** ... creeping a few px, never this far, before the leg proper. */
+export const HESITATION_MAX_PX = 8;
+
+/** The still-but-not-frozen moment between the grab and the drag leg from->to: samples spanning
+ * 100-300 ms (centred per persona; `durMs`, 40-300, overrides the length but the persona's draw is still
+ * made), creeping < 8 px toward `to` with a little sideways wobble. Same numbers as Python
+ * `_motion.drag_hesitation` and .NET `Motion.DragHesitation` (sdk/testdata/humanize_scroll_vectors.json).
+ * Measured on r38 / SDK 0.51.0 (SC 232): every drag's first held move was already the full-speed leg. */
+export function dragHesitation(from: Point, to: Point, p: Persona, rng: Rng = Math.random, durMs?: number | null): Step[] {
+  const r = mulberry32((p.seed ^ HESITATION_SALT) >>> 0);
+  const centre = lerp(130, 260, r());
+  const amp = lerp(2, 6, r());
+  const wobble = lerp(0.4, 1.2, r());
+  const d = Math.hypot(to.x - from.x, to.y - from.y);
+  const [ux, uy] = d >= 1e-6 ? [(to.x - from.x) / d, (to.y - from.y) / d] : [1, 0];
+  let dur = clamp(centre * lerp(0.8, 1.2, rng()), HESITATION_MS[0], HESITATION_MS[1]);
+  if (durMs !== undefined && durMs !== null) dur = clamp(durMs, 40, HESITATION_MS[1]);
+  const reach = amp * lerp(0.6, 1.0, rng());
+  const stepMs = 1000 / p.deviceHz;
+  const n = Math.max(3, jsRound(dur / stepMs));
+  const dt = dur / n;
+  const phase = rng() * 2 * Math.PI;
+  const out: Step[] = [];
+  let side = 0;
+  for (let i = 1; i <= n; i++) {
+    const tau = i / n;
+    const along = reach * minJerk(tau);
+    side = 0.8 * side + gaussFrom(rng) * wobble * 0.25;
+    const s = clamp(side + wobble * 0.5 * Math.sin(phase + 2 * Math.PI * tau), -1.5, 1.5);
+    let px = from.x + ux * along - uy * s, py = from.y + uy * along + ux * s;
+    if (Math.hypot(px - from.x, py - from.y) >= HESITATION_MAX_PX - 0.5) {
+      px = from.x + ux * (HESITATION_MAX_PX - 1); py = from.y + uy * (HESITATION_MAX_PX - 1);
+    }
+    out.push({ x: px, y: py, sleepMs: dt * lerp(0.9, 1.1, rng()) });
+  }
+  return out;
+}
+
+/** When (ms from the start of `steps`) the walk first leaves the `radius` circle around `from`. */
+export function legExitMs(from: Point, steps: Step[], radius = HESITATION_MAX_PX): number {
+  let t = 0;
+  for (const s of steps) {
+    if (Math.hypot(s.x - from.x, s.y - from.y) >= radius) return t;
+    t += s.sleepMs;
+  }
+  return t;
+}
+
+/** The held part of a drag: the hesitation creep, then the planDrag leg, planned together so the pointer
+ * stays inside 8 px of the press for `windowMs` (clamped 100-300: the persona's grab dwell) and then goes.
+ * Same as Python `hesitate_then_drag`. */
+export function hesitateThenDrag(from: Point, to: Point, p: Persona, windowMs: number, settle = true,
+  rng: Rng = Math.random): { steps: Step[]; creep: number } {
+  const w = clamp(windowMs, HESITATION_MS[0], HESITATION_MS[1]);
+  let creep = dragHesitation(from, to, p, rng, w);
+  let leg = planDrag(creep[creep.length - 1], to, p, { settle, rng });
+  const t8 = legExitMs(from, leg);
+  const want = Math.max(40, w - t8);
+  const have = creep.reduce((a, s) => a + s.sleepMs, 0);
+  if (Math.abs(have - want) > 1) {
+    const k = want / have, m = Math.min(1, k);
+    creep = creep.map((s) => ({ x: from.x + (s.x - from.x) * m, y: from.y + (s.y - from.y) * m, sleepMs: s.sleepMs * k }));
+    leg = planDrag(creep[creep.length - 1], to, p, { settle, rng });
+  }
+  return { steps: creep.concat(leg), creep: creep.length };
+}
+
+/** Where a reading hand parks the pointer before a wheel: x ~ 0.5w ± 0.10w clamped [0.12w, 0.88w], y ~ 0.34h
+ * ± 0.09h clamped [0.10h, 0.62h] (two gaussians, x first). One model in all three SDKs (Python
+ * `wheel_anchor_point`, .NET `Motion.WheelAnchorPoint`); before 0.52 Node used 0.48/0.36 and other clamps. */
+export function wheelAnchorPoint(vw: number, vh: number, rng: Rng = Math.random): [number, number] {
+  const x = clamp(vw * 0.5 + gaussFrom(rng) * vw * 0.10, vw * 0.12, vw * 0.88);
+  const y = clamp(vh * 0.34 + gaussFrom(rng) * vh * 0.09, vh * 0.10, vh * 0.62);
+  return [x, y];
+}
+
+/** Grab/release dwell times (ms) for a held-button drag: log-normal (σ 0.2) around the persona's medians,
+ * inside its grab/release bands. */
 export function dragDwell(p: Persona, rng: Rng = Math.random): { grabMs: number; releaseMs: number } {
-  return {
-    grabMs: lerp(p.grabMinMs, p.grabMaxMs, rng()),
-    releaseMs: lerp(p.releaseMinMs, p.releaseMaxMs, rng()),
-  };
+  const tt = timingTraits(p);
+  const t = tempoOf(p); // the preset scales the medians; applyToPersona already scaled the bands
+  const grabMs = lognormalMs(tt.grabMs * t, 0.2, p.grabMinMs, p.grabMaxMs, rng);
+  const releaseMs = lognormalMs(tt.releaseMs * t, 0.2, p.releaseMinMs, p.releaseMaxMs, rng);
+  return { grabMs, releaseMs };
 }
 
 export interface Box { x: number; y: number; width: number; height: number; }
 
-/** A human click point inside `box`: a 2D gaussian around center, nudged toward the approach side
- * (people undershoot toward where the cursor came from), clamped a couple px inside the edges. */
-export function clickPoint(box: Box, from: Point, p: Persona, rng: Rng = Math.random): Point {
+// Salt for the aim traits (clickPoint): the persona's landing dispersion, undershoot and handedness.
+const AIM_SALT = 0x27d4eb2f;
+
+/** Per-identity aiming traits, stable per seed (see aimTraits). */
+export interface AimTraits {
+  /** Landing dispersion, sd as a share of the box, 0.10–0.20. */
+  spread: number;
+  /** Pull toward the side the cursor came from, share of the box, 0.06–0.16. */
+  undershoot: number;
+  /** Handedness: lateral offset as a share of the box width (approachBias × 0.4, −0.1–0.1). */
+  sideBias: number;
+  /** Share of visible checkbox / radio clicks that land on the label text, 0.25–0.55 (lane F's label aim). */
+  labelShare: number;
+}
+
+/** The persona's aiming traits from a salted stream of its seed. Same values as Python `aim_traits` and
+ * .NET `Motion.AimTraitsOf`. */
+export function aimTraits(p: Persona): AimTraits {
+  const r = mulberry32((p.seed ^ AIM_SALT) >>> 0);
+  const spread = lerp(0.10, 0.20, r());
+  const undershoot = lerp(0.06, 0.16, r());
+  const labelShare = lerp(0.25, 0.55, r()); // SC 232 integration: a trait (was one 0.4 for every identity)
+  return { spread, undershoot, sideBias: p.approachBias * 0.4, labelShare };
+}
+
+/** A human click point inside `box`: a 2D gaussian toward the centre with the persona's dispersion
+ * (sd 0.10–0.20 of the box), nudged toward the approach side (undershoot 6–16 %) and sideways by its
+ * handedness (approachBias), clamped a couple px inside the edges. The SEED fixes the persona's spread,
+ * undershoot and handedness (it was one dispersion for everyone); each click's draw is unseeded (Math.random
+ * unless `rng` is given), like every per-action draw, so no two visits of one identity replay the same
+ * landing sequence. Without a persona: sd 0.15, 12 % undershoot, no handedness. */
+export function clickPoint(box: Box, from: Point, p?: Persona | null, rng: Rng = Math.random): Point {
+  let spread = 0.15, under = 0.12, side = 0;
+  if (p) {
+    const at = aimTraits(p);
+    spread = at.spread; under = at.undershoot; side = at.sideBias;
+  }
   const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
   const dx = cx - from.x, dy = cy - from.y;
   const d = Math.hypot(dx, dy) || 1;
-  // undershoot bias: pull ~12% of the half-width back toward the approach direction
   const ux = -dx / d, uy = -dy / d;
-  const bx = ux * box.width * 0.12, by = uy * box.height * 0.12;
-  const x = cx + bx + gaussFrom(rng) * box.width * 0.16;
-  const y = cy + by + gaussFrom(rng) * box.height * 0.16;
+  const x = cx + ux * box.width * under + side * box.width + gaussFrom(rng) * box.width * spread;
+  const y = cy + uy * box.height * under + gaussFrom(rng) * box.height * spread;
   // For a box narrower/shorter than the 4 px inset the clamp bounds would invert (lo > hi) and return
   // a point OUTSIDE the element — just use the center for such tiny targets.
   return {
@@ -548,4 +730,118 @@ export function planAmbient(from: Point, vp: Viewport, p: Persona, ms: number, r
     cur = target;
   }
   return out;
+}
+
+// ------------------------------------------------------------------ after-action (SC 232 lane C)
+// Salt for the after-action stream (hover dwell, move-off after a click, the attention model). A separate
+// mulberry32(seed ^ salt) stream keeps makePersona's draw ORDER (every existing seed's motor identity)
+// unchanged. Same values in Python `_motion.py` and .NET `Motion.cs`.
+const AFTER_SALT = 0x165667b1; // own stream (was the timing salt: dwell moved with the click hold)
+
+/** The pointer keeps within this many px of where a hover arrived while it dwells there. */
+export const DWELL_RADIUS_PX = 3;
+/** A move-off after a click is kept this far inside the viewport. */
+export const MOVE_OFF_MARGIN_PX = 8;
+
+/** Per-identity after-action traits, stable per seed (see afterTraits). */
+export interface AfterTraits {
+  /** Centre of this hand's hover dwell, 250–700 ms (draws stay in 150–900). */
+  dwellMs: number;
+  /** Share of clicks followed by a move-off, 0.64–0.82 (a 40-click run stays in 60–85 %). */
+  moveOffRate: number;
+  /** Centre of the release → move-off gap, 300–600 ms (draws stay in 200–700). */
+  moveOffDelayMs: number;
+  /** Scale on the attention model's read pause, 0.85–1.15. */
+  readTempo: number;
+}
+
+/** The persona's after-action traits: the first four draws of its salted after-action stream.
+ *
+ * Measured on r42 / SDK 0.51.0 (SC 232 review): a hover stopped dead on arrival (0 samples after the
+ * glide's last one) and the pointer never left the pressed pixel after a click. Same values as Python
+ * `after_traits` and .NET `Motion.AfterTraitsOf`. */
+export function afterTraits(p: Persona): AfterTraits {
+  const r = mulberry32((p.seed ^ AFTER_SALT) >>> 0);
+  const dwellMs = lerp(250, 700, r());
+  const moveOffRate = lerp(0.64, 0.82, r());
+  const moveOffDelayMs = lerp(300, 600, r());
+  const readTempo = lerp(0.85, 1.15, r());
+  return { dwellMs, moveOffRate, moveOffDelayMs, readTempo };
+}
+
+/** The persona's after-action stream positioned AFTER its four trait draws. Used by the shared vectors only, to
+ * compare the SDKs draw for draw: the humanizer's per-action draws are unseeded (Math.random), as in planMove --
+ * the seed fixes traits only, or every session of an identity would replay one sequence. */
+export function afterRng(p: Persona): Rng {
+  const r = mulberry32((p.seed ^ AFTER_SALT) >>> 0);
+  for (let i = 0; i < 4; i++) r();
+  return r;
+}
+
+/** How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–800 ms (150–900 as the page
+ * measures it, with the glide's slow tail). */
+export function dwellMs(p: Persona, rng: Rng = Math.random): number {
+  return clamp(afterTraits(p).dwellMs * lerp(0.6, 1.4, rng()), 150, 800);
+}
+
+/** Plan the pointer's rest on a hover target: OU drift + 8–12 Hz tremor around `at` for about `ms` (at
+ * least 3 samples), every sample within DWELL_RADIUS_PX of `at` and inside `box` (1 px in; null: no box).
+ * The hand is not braced on a hover the way it is before a press: drift ×2, tremor ×1.5 of a glide's. */
+export function planDwell(at: Point, box: Box | null, p: Persona, ms: number, rng: Rng = Math.random): Step[] {
+  const stepMs = 1000 / p.deviceHz;
+  const n = Math.max(3, jsRound(Math.max(0, ms) / (stepMs * 1.15))); // rest gaps average 1.15 frames
+  const out: Step[] = [];
+  let driftX = 0, driftY = 0;
+  const tphase = rng() * 2 * Math.PI;
+  let t = 0;
+  for (let i = 0; i < n; i++) {
+    const k = stepMs / p.driftTau;
+    driftX += -k * driftX + Math.sqrt(2 * k) * p.driftAmp * 2 * gaussFrom(rng);
+    driftY += -k * driftY + Math.sqrt(2 * k) * p.driftAmp * 2 * gaussFrom(rng);
+    const ph = tphase + (2 * Math.PI * p.tremorHz * t) / 1000;
+    let dx = driftX + p.tremorAmp * 1.5 * Math.sin(ph);
+    let dy = driftY + p.tremorAmp * 1.5 * Math.sin(ph + Math.PI / 2);
+    const r = Math.hypot(dx, dy);
+    if (r > DWELL_RADIUS_PX) { dx = (dx * DWELL_RADIUS_PX) / r; dy = (dy * DWELL_RADIUS_PX) / r; }
+    let x = at.x + dx, y = at.y + dy;
+    if (box) {
+      x = box.width >= 2 ? clamp(x, box.x + 1, box.x + box.width - 1) : at.x;
+      y = box.height >= 2 ? clamp(y, box.y + 1, box.y + box.height - 1) : at.y;
+    }
+    const sleepMs = stepMs * lerp(0.9, 1.4, rng());
+    out.push({ x, y, sleepMs });
+    t += sleepMs;
+  }
+  return out;
+}
+
+/** Does this click get a move-off? In `afterTraits(p).moveOffRate` of clicks: a draw against the rate,
+ * nudged by how far the page's running share (`hits` of `n` earlier clicks) has drifted from it. */
+export function moveOffRoll(p: Persona, rng: Rng = Math.random, hits = 0, n = 0): boolean {
+  const rate = afterTraits(p).moveOffRate;
+  return rng() < clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98);
+}
+
+/** The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–660 ms (200–700 as the page measures it). */
+export function moveOffDelayMs(p: Persona, rng: Rng = Math.random): number {
+  const t = tempoOf(p);
+  return clamp(afterTraits(p).moveOffDelayMs * t * lerp(0.7, 1.3, rng()), 200 * t, 660 * t);
+}
+
+/** Where the hand drifts after a click: 40–200 px from `from` at an angle in the downward half-plane
+ * (20–160°, y down: the gateway's moveOnTarget model), kept MOVE_OFF_MARGIN_PX inside `vp`; mirrored
+ * upward when the clamp would leave it on the spot (a click near the bottom edge). */
+export function planMoveOff(from: Point, vp: Viewport, p: Persona, rng: Rng = Math.random): Point {
+  void p;
+  const m = MOVE_OFF_MARGIN_PX;
+  const ang = lerp(20, 160, rng()) * (Math.PI / 180);   // as Python math.radians rounds it
+  const dist = lerp(40, 200, rng());
+  const dx = Math.cos(ang) * dist, dy = Math.sin(ang) * dist;
+  let x = clamp(from.x + dx, m, vp.width - m);
+  let y = clamp(from.y + dy, m, vp.height - m);
+  if (Math.hypot(x - from.x, y - from.y) < 12) {
+    x = clamp(from.x + dx, m, vp.width - m);
+    y = clamp(from.y - dy, m, vp.height - m);
+  }
+  return { x, y };
 }

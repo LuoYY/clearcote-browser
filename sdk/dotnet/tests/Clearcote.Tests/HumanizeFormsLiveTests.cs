@@ -920,7 +920,8 @@ public class HumanizeFormsLiveTests : IClassFixture<FormsLiveBrowser>
         Assert.Equal(new[] { value }, await page.HumanSelectOptionAsync("#lbmid", value));
         Assert.Equal(value, await page.InputValueAsync("#lbmid"));
         Assert.True((await Ev(page)).All(Tr), "every event trusted: no native fallback" + Why);
-        var wheels = (await Ev(page, "wheel")).Count;
+        // wheels OVER THE LIST (0.52: the page itself may first be wheeled to bring the box into view)
+        var wheels = (await Ev(page, "wheel")).Count(e => S(e, "id") is "lbmid" or "OPTION");
         Assert.True(wheels <= 6, $"{wheels} wheel events");
         Assert.NotEmpty(await Ev(page, "mousedown", "OPTION"));   // the row itself was clicked
     });

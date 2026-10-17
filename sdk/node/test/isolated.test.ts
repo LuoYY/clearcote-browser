@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import {
   IsolatedWorld, worldFor, nodeAtParams, ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_DESCRIBE, ISO_FORM_CONTROL, ISO_PLATFORM,
-  ISO_SCROLL, ISO_VIEWPORT, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_CSS_BOX, ISO_SCROLL_BY, topChildFrame,
+  ISO_SCROLL, ISO_VIEWPORT, ISO_HIT_IN_BOX, ISO_LABEL_OF, ISO_LISTBOX_ROW, ISO_CSS_BOX, ISO_SCROLL_BY, topChildFrame,
 } from "../src/isolated.js";
 
 // A read that takes an argument (the CSS-only ISO_IS_FOCUSED this used went with the hit-test port).
@@ -253,5 +254,58 @@ describe("IsolatedWorld hit test and node calls", () => {
     expect(ISO_LISTBOX_ROW).toBe(py("LISTBOX_ROW"));
     expect(ISO_CSS_BOX).toBe(py("CSS_BOX"));
     expect(ISO_SCROLL_BY).toBe(py("SCROLL_BY"));
+    // LABEL_OF holds a regex: the Python source escapes its backslashes the way the template literal does
+    expect(ISO_LABEL_OF).toBe(py("LABEL_OF").replace(/\\\\/g, "\\"));
+  });
+});
+
+// ISO_LABEL_OF run against a stand-in DOM (node:vm, no jsdom): the input, its <label>, and the label's content rects
+// the way Range.getClientRects() lists them. SC 239 box probe (10-17), `<label><input type=checkbox> Visible checkbox
+// with a label</label>`: the first content rect IS the input's border box ([44, 75, 13, 13]) and the helper took it as
+// "the text", so every label click aimed at the input (lab F_label_visible 0/60, verifier B 0/20). The live proof of
+// the fix is the lab's F_label_visible scenario.
+describe("ISO_LABEL_OF on a stand-in DOM", () => {
+  type R = { x: number; y: number; width: number; height: number; left: number; top: number; right: number; bottom: number };
+  const rect = (x: number, y: number, w: number, h: number): R => ({ x, y, width: w, height: h, left: x, top: y, right: x + w, bottom: y + h });
+  const visible = { display: "inline-block", visibility: "visible", opacity: "1", clip: "" };
+  const INPUT = rect(44, 75, 13, 13), LABEL = rect(40, 74, 214.8, 17), TEXT = rect(61, 75, 194, 15);
+  const labelOf = (wraps: boolean, contents: R[]) => {
+    const label: any = { tagName: "LABEL", getBoundingClientRect: () => LABEL, style: visible, contains: (n: unknown) => wraps && n === input };
+    const input: any = {
+      nodeType: 1, tagName: "INPUT", type: "checkbox", checked: false, disabled: false, style: visible,
+      getBoundingClientRect: () => INPUT, labels: [label], closest: () => label,
+    };
+    const sandbox = {
+      input, innerWidth: 1280, innerHeight: 800,
+      getComputedStyle: (el: any) => el.style,
+      document: { createRange: () => ({ selectNodeContents() { /* the label */ }, getClientRects: () => contents }) },
+    };
+    return vm.runInNewContext(`(${ISO_LABEL_OF}).call(input)`, sandbox);
+  };
+
+  it("a wrapping label: the text's rect is its content clear of the control's box, contains = true", () => {
+    const o = labelOf(true, [INPUT, TEXT]);
+    expect(o.rect).toEqual([44, 75, 13, 13]);
+    expect(o.hidden).toBe(false);
+    expect(o.label).toEqual({ rect: [40, 74, 214.8, 17], text: [61, 75, 194, 15], contains: true });
+  });
+
+  it("a wrapping label holding only the control has no text rect", () => {
+    expect(labelOf(true, [INPUT]).label).toEqual({ rect: [40, 74, 214.8, 17], text: null, contains: true });
+  });
+
+  it("a wrapping label whose text wraps under the control keeps the first clear line", () => {
+    const o = labelOf(true, [INPUT, TEXT, rect(40, 92, 120, 15)]);
+    expect(o.label.text).toEqual([61, 75, 194, 15]);
+  });
+
+  it("a <label for> beside the input: the union of its content rects, contains = false", () => {
+    const o = labelOf(false, [rect(61, 75, 100, 15), rect(161, 75, 94, 15)]);
+    expect(o.label).toEqual({ rect: [40, 74, 214.8, 17], text: [61, 75, 194, 15], contains: false });
+  });
+
+  it("not a checkbox or radio: null", () => {
+    const input: any = { nodeType: 1, tagName: "INPUT", type: "text" };
+    expect(vm.runInNewContext(`(${ISO_LABEL_OF}).call(input)`, { input })).toBeNull();
   });
 });

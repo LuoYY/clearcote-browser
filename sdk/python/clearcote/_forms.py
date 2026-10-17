@@ -330,6 +330,71 @@ def engine_path_ok(opts):
             and opts["delay"] is None)
 
 
+# r43 engine (SC 232 lane H): Browser.dispatchPointerPath also takes fromX/fromY, button, clickCount, modifiers,
+# buttons (held) and settle, and answers after the last event it sends; Browser.dispatchKeySequence types a run paced
+# in the browser. Both are detected together (see _humanize._engine_ext_ok).
+ENGINE_KEY_SEQUENCE = "Browser.dispatchKeySequence"
+_CDP_MODIFIER_BITS = {"Alt": 1, "Control": 2, "Meta": 4, "Shift": 8}
+_BUTTON_BITS = {"left": 1, "right": 2, "middle": 4}
+
+
+def engine_click_params(opts):
+    """The extra dispatchPointerPath parameters for a click an r43 engine can perform itself ({} for a plain left
+    click), or None when it cannot: a caller-chosen hold (`delay`), an unknown button, more than three clicks.
+    Modifier KEYS are still pressed by the SDK around the call (the engine only sets the event flags)."""
+    if opts["delay"] is not None or opts["button"] not in _BUTTON_BITS or not 1 <= opts["click_count"] <= 3:
+        return None
+    p = {}
+    if opts["button"] != "left":
+        p["button"] = opts["button"]
+    if opts["click_count"] != 1:
+        p["clickCount"] = int(opts["click_count"])
+    bits = 0
+    for m in opts["modifiers"]:
+        bits |= _CDP_MODIFIER_BITS.get(m, 0)
+    if bits:
+        p["modifiers"] = bits
+    return p
+
+
+def engine_held_bits(button):
+    """dispatchPointerPath `buttons` for a held button name."""
+    return _BUTTON_BITS.get(button or "left", 1)
+
+
+# US-layout DOM codes for the punctuation keys (letters, digits and space need none: the engine knows them).
+_US_CODES = {",": "Comma", ".": "Period", "/": "Slash", ";": "Semicolon", "'": "Quote", "[": "BracketLeft",
+             "]": "BracketRight", "-": "Minus", "=": "Equal", "`": "Backquote", "\\": "Backslash",
+             "<": "Comma", ">": "Period", "?": "Slash", ":": "Semicolon", '"': "Quote", "{": "BracketLeft",
+             "}": "BracketRight", "_": "Minus", "+": "Equal", "~": "Backquote", "|": "Backslash",
+             "!": "Digit1", "@": "Digit2", "#": "Digit3", "$": "Digit4", "%": "Digit5", "^": "Digit6",
+             "&": "Digit7", "*": "Digit8", "(": "Digit9", ")": "Digit0"}
+
+
+def engine_key_plan(text, dwell_ms, gap_ms, needs_shift):
+    """Browser.dispatchKeySequence keys for `text` on a US layout: dwell_ms() per key, gap_ms(ch, nxt) after each
+    key but the last (the caller's cadence model: lane D's bigram flight), Shift (modifiers 8) for the characters
+    needs_shift(ch) says. None when a character has no plain US key (the caller types it the old way)."""
+    keys = []
+    for i, ch in enumerate(text):
+        if ch == "\n":
+            k = {"key": "Enter", "code": "Enter"}
+        elif ch == "\t":
+            k = {"key": "Tab", "code": "Tab"}
+        elif ch.isascii() and (ch.isalnum() or ch == " "):
+            k = {"key": ch}
+        elif ch in _US_CODES:
+            k = {"key": ch, "code": _US_CODES[ch]}
+        else:
+            return None
+        k["dwellMs"] = float(dwell_ms())
+        k["gapMs"] = float(gap_ms(ch, text[i + 1])) if i < len(text) - 1 else 0.0
+        if needs_shift(ch):
+            k["modifiers"] = 8
+        keys.append(k)
+    return keys
+
+
 # ------------------------------------------------------------------- <select> type-ahead plan
 def _fold(s):
     """Blink compares FoldCase()d labels with leading whitespace stripped (type_ahead.cc)."""

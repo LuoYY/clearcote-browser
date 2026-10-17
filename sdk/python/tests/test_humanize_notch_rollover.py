@@ -112,9 +112,12 @@ def fast(monkeypatch):
     monkeypatch.setattr(_humanize.time, "sleep", lambda s: None)
 
 
-def _wheels(monkeypatch, platform, *calls):
+def _wheels(monkeypatch, platform, *calls, device="mouse"):
     monkeypatch.setattr(_humanize, "world_for", lambda page: _World(platform))
     page = _Page()
+    # A macOS persona defaults to a trackpad (pixel swipes, _scroll.plan_trackpad) since 0.52; these
+    # tests pin the MOUSE wheel: whole notches of the platform's size.
+    page._clearcote_input_device = device
     _humanize.attach_humanize(None, page, humanize=True, seed="t")
     page.mouse.wheels.clear()
     for dx, dy in calls:

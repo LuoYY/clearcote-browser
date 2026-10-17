@@ -18,7 +18,8 @@
 
 type CdpLike = { send(method: string, params?: Record<string, unknown>): Promise<any> };
 
-const resultValue = <T>(r: any): T | undefined => {
+/** @internal The JSON value of a Runtime.evaluate / callFunctionOn answer, or undefined. */
+export const resultValue = <T>(r: any): T | undefined => {
   if (!r || typeof r !== "object" || r.exceptionDetails) return undefined;
   return r.result?.value as T;
 };
@@ -136,6 +137,16 @@ export class IsolatedWorld {
     try {
       const cdp = await this.session();
       return (await cdp.send(method, params ?? {})) as T;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The main frame's id (the world is made on first use), or undefined without CDP. */
+  async mainFrameId(): Promise<string | undefined> {
+    try {
+      const { world } = await this.ensure();
+      return (await world).frame;
     } catch {
       return undefined;
     }
@@ -341,6 +352,51 @@ export const ISO_HIT_IN_BOX = `function (b) {
 // A list box's scroll state and one row's box, from any node inside the <select> (`this`): where its
 // visible rows are (top / bottom of the client area), how far it is scrolled (st, of max), the row's
 // rect, and which rows are selected.
+// A checkbox / radio and its <label>, from the input node (`this`): mirrors _isolated.py LABEL_OF (is the input
+// itself clickable -- `hidden` covers every "visually hidden" recipe a custom checkbox uses --, and the label the
+// browser associates with it, with the label's box and the box of its text).
+export const ISO_LABEL_OF = `function () {
+  const e = this.nodeType === 1 ? this : this.parentElement;
+  if (!e || e.tagName !== 'INPUT' || (e.type !== 'checkbox' && e.type !== 'radio')) return null;
+  const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
+  const clip = /rect\\(\\s*0(px)?[ ,]+0(px)?[ ,]+0(px)?[ ,]+0(px)?\\s*\\)/.test(cs.clip || '');
+  const hidden = cs.display === 'none' || cs.visibility !== 'visible' || parseFloat(cs.opacity) < 0.05 ||
+    r.width <= 1 || r.height <= 1 || clip || r.right < 0 || r.bottom < 0 ||
+    r.left > innerWidth + 1 || r.top > innerHeight + 1;
+  const o = { tag: 'input', type: e.type, rect: [r.x, r.y, r.width, r.height], hidden,
+    checked: !!e.checked, disabled: !!e.disabled, label: null };
+  const lab = (e.labels && e.labels.length) ? e.labels[0] : e.closest('label');
+  if (!lab) return o;
+  const lr = lab.getBoundingClientRect(), ls = getComputedStyle(lab);
+  if (ls.display === 'none' || ls.visibility !== 'visible' || lr.width < 2 || lr.height < 2) return o;
+  // The TEXT's box: the union of the label's content rects clear of the control's own box. A label that WRAPS its
+  // control lists the control's border box first (SC 239 box probe: text == the input's rect), and a click there is an
+  // input click, not a label click. Text wrapped to a line under the control: the first clear rect alone.
+  const wraps = lab.contains(e);
+  const over = q => wraps && q.left < r.right - 0.5 && q.right > r.left + 0.5 && q.top < r.bottom - 0.5 && q.bottom > r.top + 0.5;
+  let text = null;
+  try {
+    const rg = document.createRange(); rg.selectNodeContents(lab);
+    const clear = Array.from(rg.getClientRects()).filter(q => q.width >= 2 && q.height >= 2 && !over(q));
+    if (clear.length) {
+      const u = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+      for (const q of clear) {
+        u.left = Math.min(u.left, q.left); u.top = Math.min(u.top, q.top);
+        u.right = Math.max(u.right, q.right); u.bottom = Math.max(u.bottom, q.bottom);
+      }
+      const t = over(u) ? clear[0] : u;
+      text = [t.left, t.top, t.right - t.left, t.bottom - t.top];
+    }
+  } catch (x) { text = null; }
+  o.label = { rect: [lr.x, lr.y, lr.width, lr.height], text, contains: wraps };
+  return o; }`;
+// ISO_LABEL_OF for the first match of a plain-CSS selector, plus how many match; null when it is not CSS.
+export const ISO_LABEL_BY_SEL = `(a) => { let l;
+  try { l = document.querySelectorAll(a.sel); } catch (e) { return null; }
+  if (!l.length) return { n: 0 };
+  const o = (${ISO_LABEL_OF}).call(l[0]);
+  if (!o) return { n: l.length };
+  o.n = l.length; return o; }`;
 export const ISO_LISTBOX_ROW = `function (a) {
   const n = this.nodeType === 1 ? this : this.parentElement;
   const e = n && n.closest('select');

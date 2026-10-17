@@ -679,6 +679,8 @@ public class FormsTests
         foreach (var src in new[] { IsolatedWorld.ActiveValue, IsolatedWorld.ActiveField, IsolatedWorld.Describe, IsolatedWorld.FormControl,
                                     IsolatedWorld.HitInBox, IsolatedWorld.ListboxRow, IsolatedWorld.CssBox, IsolatedWorld.ScrollBy })
             Assert.Contains(src.Replace("\r\n", "\n"), py);
+        // LabelOf holds a regex: the Python source escapes its backslashes, this verbatim string does not (SC 239)
+        Assert.Contains(IsolatedWorld.LabelOf.Replace("\r\n", "\n"), py.Replace("\\\\", "\\"));
     }
 
     // ------------------------------------------------------------ maxlength + pre-press pause (SC 210)

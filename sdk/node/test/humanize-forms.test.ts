@@ -12,374 +12,33 @@
  * option forwarding, error propagation), the caller's timeout, `force`, focus through `:focus`, and the
  * per-page lock. page.evaluate throws throughout: no read may use the page's world.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as Motion from "../src/motion.js";
+import { pressAndHold } from "../src/hold.js";
+
+// planMove as a pass-through spy: lane B (SC 232) reads the Fitts width each targeted glide asked for.
+vi.mock("../src/motion.js", async (importOriginal) => {
+  const m = await importOriginal<typeof import("../src/motion.js")>();
+  return { ...m, planMove: vi.fn(m.planMove) };
+});
 import {
   apiErrors, asApiError, attachHumanize, createInputLock, isTimeout, pickOptions, sdkPlaywrightError, selectWants, typoRate,
   wantIndex,
 } from "../src/humanize.js";
 import { errors as pwErrors } from "playwright-core";
-import {
-  ISO_ACTIVE_FIELD, ISO_ACTIVE_VALUE, ISO_CSS_BOX, ISO_DESCRIBE, ISO_HIT_IN_BOX, ISO_LISTBOX_ROW, ISO_PLATFORM, ISO_SCROLL,
-  ISO_SCROLL_BY, ISO_VIEWPORT,
-} from "../src/isolated.js";
-import { typeaheadSimulate } from "../src/forms.js";
+import { ISO_CSS_BOX, ISO_HIT_IN_BOX } from "../src/isolated.js";
+// lane F names, read through the modules so this file still loads against an SDK without them
+import * as ISO from "../src/isolated.js";
+import * as HZ from "../src/humanize.js";
+const ISO_LABEL_BY_SEL: string = (ISO as any).ISO_LABEL_BY_SEL ?? "<no ISO_LABEL_BY_SEL>";
+const labelDraw = (p: any, r?: () => number): boolean => (HZ as any).labelDraw(p, r);
+const labelShare = (p: any): number => (HZ as any).labelShare(p);
+const LABEL_SHARE: number = (HZ as any).LABEL_SHARE;
+import { TAB_DISTANCE, typingTraits } from "../src/keys.js";
+import { aimTraits, makePersona } from "../src/motion.js";
+import { ISO_SCROLLER } from "../src/scroll.js";
 
-const SLOW = 30_000; // glides and holds use real sleeps
-
-type Ev = { t: string; a?: any; ts: number };
-type Box = { x: number; y: number; width: number; height: number };
-
-interface Field {
-  tag: string;
-  type: string;
-  value: string;
-  box: Box;
-  accept?: (ch: string) => boolean;   // an input mask: false = the key is swallowed
-  format?: (v: string) => string;     // a REFORMATTING mask, applied after every key
-  maxlength?: number;
-  inputmode?: string | null;
-  autocomplete?: string | null;
-  checked?: boolean;
-  stubborn?: boolean;                  // a checkbox that cancels its click
-  noSelectAll?: boolean;               // select-all does nothing here (the clear must fall back)
-  inFrame?: boolean;                   // focus inside it reads as {frame: true}
-  visible?: boolean;
-  min?: string; max?: string; step?: string;   // a range input
-  // <select>
-  options?: { value: string; label: string; disabled?: boolean; selected?: boolean }[];
-  selectedIndex?: number;
-  multiple?: boolean;
-  size?: number;
-  rowH?: number;                       // a list box: each row is rowH px, scrolled by scrollTop
-  scrollTop?: number;
-  appearAfterWait?: boolean;           // not visible until something waited for it
-}
-
-interface FakeOpts {
-  field?: Partial<Field>;                      // the single field every selector means
-  fields?: Record<string, Partial<Field>>;     // several fields, by selector
-  box?: Box;
-  engine?: boolean;          // the engine pointer path answers
-  count?: number;            // how many elements a locator matches
-  waitForError?: Error;      // locator.waitFor / isChecked reject with this
-  enabled?: boolean;
-  covered?: boolean;         // an overlay owns every point of the field: the hit test and clicks hit it
-  coveredCentre?: boolean;   // an overlay over the middle half of the field only
-  hitTestBlind?: boolean;    // the hit test finds nothing (an iframe), but clicks reach the field
-  labelPassesFocus?: boolean; // the overlay is a floating label: a click on it focuses the field
-  wheelPx?: number;          // how far one wheel notch scrolls a list box (default 60)
-  nativeThrows?: Record<string, Error>;
-}
-
-const timeoutError = (msg = "Timeout 1500ms exceeded.") => Object.assign(new Error(msg), { name: "TimeoutError" });
-
-// ONE locator prototype for this file: attachHumanize patches the Locator prototype once per module.
-const protoCalls: { m: string; args: any[] }[] = [];
-const ORIG = ["fill", "click", "type", "dblclick", "hover", "press", "pressSequentially", "clear", "tap", "check",
-  "uncheck", "setChecked", "selectOption", "dragTo"];
-const locatorProto: Record<string, any> = {};
-for (const m of ORIG) locatorProto[m] = async function (...args: any[]) { protoCalls.push({ m, args }); return `proto-${m}`; };
-
-const MAIN_FRAME = { name: "main" };
-const allExpressions: string[] = [];
-const FOCUS_QUERY = { focusQuery: true };
-
-function makeFake(opts: FakeOpts = {}) {
-  const defBox: Box = opts.box ?? { x: 100, y: 200, width: 160, height: 40 };
-  const mk = (p: Partial<Field>, box: Box): Field => ({ tag: "input", type: "text", value: "", box, ...p } as Field);
-  const fields: Record<string, Field> = {};
-  let single: Field | null = null;
-  if (opts.fields) {
-    let y = 100;
-    for (const [sel, p] of Object.entries(opts.fields)) { fields[sel] = mk(p, p.box ?? { x: 100, y, width: 160, height: 30 }); y += 60; }
-  } else {
-    single = mk(opts.field ?? {}, opts.field?.box ?? defBox);
-  }
-  const fieldFor = (selector: string): Field => single ?? fields[selector];
-  const allFields = (): Field[] => (single ? [single] : Object.values(fields));
-  const events: Ev[] = [];
-  let handles = 0;           // main-world element handles Playwright would make (each = a textContent preview)
-  let waited = false;
-  const engineCalls: any[] = [];
-  const waits: any[] = [];
-  const t0 = performance.now();
-  const rec = (t: string, a?: any) => events.push({ t, a, ts: performance.now() - t0 });
-  let focus: Field | null = null;
-  let selAll = false;
-  const mods = new Set<string>();
-  let pos = { x: 0, y: 0 };
-  let popup: { field: Field; buf: string; highlight: number } | null = null;
-
-  const inBox = (b: Box, x: number, y: number) => x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height;
-  const overlayAt = (f: Field, x: number, y: number) =>
-    opts.covered || (opts.coveredCentre && x > f.box.x + f.box.width * 0.25 && x < f.box.x + f.box.width * 0.75);
-  const fieldAt = (x: number, y: number) => allFields().find((f) => inBox(f.box, x, y)) ?? null;
-  const labels = (f: Field) => (f.options ?? []).map((o) => (o.disabled ? null : o.label));
-  const isSelect = (f: Field) => f.tag === "select";
-  const listbox = (f: Field) => isSelect(f) && (f.multiple || (f.size ?? 0) > 1);
-
-  const typeChar = (ch: string) => {
-    const f = focus;
-    if (!f) { rec("stray", ch); return; }
-    if (f.accept && !f.accept(ch)) return;
-    if (selAll) { f.value = ""; selAll = false; }
-    if (f.maxlength !== undefined && Array.from(f.value).length >= f.maxlength) return;
-    f.value += ch;
-    if (f.format) f.value = f.format(f.value);
-  };
-  const stepEnabled = (f: Field, from: number, dir: number) => {
-    const ls = labels(f);
-    let i = from;
-    do { i += dir; } while (i >= 0 && i < ls.length && ls[i] === null);
-    return i >= 0 && i < ls.length ? i : from;
-  };
-  const applyKey = (k: string) => {
-    if (popup) {
-      const f = popup.field;
-      if (k.length === 1) {
-        popup.buf += k;
-        popup.highlight = typeaheadSimulate(labels(f), f.selectedIndex ?? -1, popup.buf);
-      } else if (k === "ArrowDown") popup.highlight = stepEnabled(f, popup.highlight, 1);
-      else if (k === "ArrowUp") popup.highlight = stepEnabled(f, popup.highlight, -1);
-      else if (k === "Enter") {
-        if (popup.highlight !== f.selectedIndex) {
-          f.selectedIndex = popup.highlight;
-          f.value = f.options![popup.highlight].value;
-          rec("change", f.value);
-        }
-        popup = null;
-      }
-      return;
-    }
-    if (k === "ControlOrMeta+a" || (k === "a" && (mods.has("ControlOrMeta") || mods.has("Control") || mods.has("Meta")))) {
-      if (!focus?.noSelectAll) selAll = true;
-      return;
-    }
-    if (k === "Backspace") {
-      if (!focus) return;
-      if (selAll) { focus.value = ""; selAll = false; } else focus.value = Array.from(focus.value).slice(0, -1).join("");
-      return;
-    }
-    if (k === "End") { selAll = false; return; }
-    if (Array.from(k).length === 1) typeChar(k);
-  };
-  // a list box: rows of rowH px inside the box's client area, scrolled by scrollTop
-  const rowH = (f: Field) => f.rowH ?? 20;
-  const maxScroll = (f: Field) => Math.max(0, (f.options ?? []).length * rowH(f) - f.box.height);
-  const rowRect = (f: Field, i: number): [number, number, number, number] =>
-    [f.box.x, f.box.y + i * rowH(f) - (f.scrollTop ?? 0), f.box.width, rowH(f)];
-  const rowAt = (f: Field, y: number) => {
-    if (y < f.box.y || y > f.box.y + f.box.height) return -1;
-    const i = Math.floor((y - f.box.y + (f.scrollTop ?? 0)) / rowH(f));
-    return i >= 0 && i < (f.options ?? []).length ? i : -1;
-  };
-  const listboxState = (f: Field, i: number) => (!f.options || !f.options[i]) ? null : {
-    box: [f.box.x, f.box.y, f.box.width, f.box.height], row: rowRect(f, i),
-    top: f.box.y, bottom: f.box.y + f.box.height, st: f.scrollTop ?? 0, max: maxScroll(f),
-    sel: f.options.map((o) => !!o.selected),
-  };
-  const argOf = (expr: string, fn: string) => JSON.parse(expr.slice(fn.length + 3, -1)); // `(${fn})(${json})`
-  const pressed = (x: number, y: number, ctrl: boolean) => {
-    const f = fieldAt(x, y);
-    if (f && overlayAt(f, x, y)) { focus = opts.labelPassesFocus ? f : null; rec("overlay-click", { x, y }); return; }
-    if (!f) return;
-    focus = f;
-    if (f.type === "checkbox") {
-      if (f.stubborn) { rec("toggle-cancelled"); return; }
-      f.checked = !f.checked; rec("toggle", f.checked); return;
-    }
-    if (listbox(f)) {
-      const r = rowAt(f, y);
-      if (r < 0) return;
-      for (const [i, o] of f.options!.entries()) if (!ctrl) o.selected = i === r;
-      if (ctrl) f.options![r].selected = !f.options![r].selected;
-      rec("change", r);
-      return;
-    }
-    if (isSelect(f)) popup = { field: f, highlight: f.selectedIndex ?? 0, buf: "" };
-  };
-
-  const mouse = {
-    move: async (x: number, y: number) => { pos = { x, y }; rec("move", { x, y }); },
-    click: async (x: number, y: number, o: any = {}) => { pos = { x, y }; rec("click", { x, y, ...o }); pressed(x, y, false); },
-    down: async (o: any = {}) => { rec("down", o); },
-    up: async (o: any = {}) => { rec("up", o); pressed(pos.x, pos.y, mods.has("ControlOrMeta") || mods.has("Control")); },
-    wheel: async (dx: number, dy: number) => {
-      rec("wheel", { dx, dy });
-      const f = fieldAt(pos.x, pos.y);
-      if (f && listbox(f)) f.scrollTop = Math.min(maxScroll(f), Math.max(0, (f.scrollTop ?? 0) + Math.sign(dy) * (opts.wheelPx ?? 60)));
-    },
-    dblclick: async (x: number, y: number) => { rec("stock-dblclick", { x, y }); },
-  };
-  const keyboard = {
-    type: async (t: string) => { rec("ktype", t); for (const c of Array.from(t)) applyKey(c); },
-    press: async (k: string, o: any = {}) => { rec("press", { k, delay: o.delay }); applyKey(k); },
-    down: async (k: string) => {
-      rec("kdown", k);
-      if (["Shift", "Control", "Meta", "Alt", "ControlOrMeta"].includes(k)) mods.add(k); else applyKey(k);
-    },
-    up: async (k: string) => { rec("kup", k); mods.delete(k); },
-    insertText: async (t: string) => {
-      rec("insert", t);
-      const fo = focus;
-      if (!fo) return;
-      if (selAll) { fo.value = ""; selAll = false; }
-      const room = fo.maxlength === undefined ? Infinity : Math.max(0, fo.maxlength - Array.from(fo.value).length);
-      fo.value += Array.from(t).slice(0, room).join("");
-    },
-  };
-
-  const describeInfo = (f: Field, want: string | null) => {
-    if (want === "select" && !isSelect(f)) return null;
-    if (want && want !== "select" && !["input", "textarea", "select"].includes(f.tag)) return null;
-    const o: any = {
-      tag: f.tag, type: f.tag === "input" ? f.type : "", ce: false,
-      rect: [f.box.x, f.box.y, f.box.width, f.box.height], focused: focus === f, value: f.value, min: f.min ?? null, max: f.max ?? null,
-      step: f.step ?? null, maxlength: f.maxlength ?? -1, inputmode: f.inputmode ?? null, autocomplete: f.autocomplete ?? null,
-      readonly: false, disabled: false, dir: "ltr", wm: "horizontal-tb", bl: 2, bt: 3,
-    };
-    if (isSelect(f)) {
-      o.multiple = !!f.multiple; o.size = f.size ?? 0; o.selectedIndex = f.selectedIndex ?? -1;
-      o.options = f.options!.map((x) => ({ value: x.value, label: x.label, disabled: !!x.disabled, selected: !!x.selected }));
-      if (listbox(f)) o.optRects = f.options!.map((_, i) => rowRect(f, i));
-    }
-    return o;
-  };
-
-  const cdp = {
-    send: async (method: string, params: any = {}): Promise<any> => {
-      switch (method) {
-        case "Page.getFrameTree": return { frameTree: { frame: { id: "MAIN" } } };
-        case "Page.createIsolatedWorld": return { executionContextId: 1 };
-        case "Runtime.evaluate": {
-          const e: string = params.expression;
-          allExpressions.push(e);
-          if (e.startsWith(`(${ISO_ACTIVE_VALUE})`)) return { result: { value: focus && !focus.inFrame ? focus.value : null } };
-          if (e.startsWith(`(${ISO_ACTIVE_FIELD})`)) {
-            if (!focus) return { result: { value: null } };
-            if (focus.inFrame) return { result: { value: { frame: true } } };
-            return { result: { value: { type: focus.tag === "input" ? focus.type : "", inputmode: focus.inputmode ?? null,
-              autocomplete: focus.autocomplete ?? null } } };
-          }
-          if (e.startsWith(`(${ISO_SCROLL})`)) return { result: { value: [0, 0] } };
-          if (e.startsWith(`(${ISO_PLATFORM})`)) return { result: { value: "Win32" } };
-          if (e.startsWith(`(${ISO_VIEWPORT})`)) return { result: { value: [1280, 800] } };
-          if (e.startsWith(`(${ISO_SCROLL_BY})`)) return { result: { value: [0, 0] } };
-          if (e.startsWith(`(${ISO_CSS_BOX})`)) {
-            const a = argOf(e, ISO_CSS_BOX);
-            if (/internal:|>>/.test(a.sel)) return { result: { value: null } }; // not CSS the browser accepts
-            const f = fieldFor(a.sel);
-            if (!f) return { result: { value: { n: 0 } } };
-            return { result: { value: { n: 1, rect: f.visible === false ? [0, 0, 0, 0] : [f.box.x, f.box.y, f.box.width, f.box.height] } } };
-          }
-          return { exceptionDetails: { text: "unknown read" } };
-        }
-        case "DOM.getNodeForLocation": {
-          if (opts.hitTestBlind) return {};
-          const f = fieldAt(params.x, params.y);
-          if (!f) return {};
-          if (overlayAt(f, params.x, params.y)) return { backendNodeId: 999, frameId: "MAIN" };
-          return { backendNodeId: 100 + allFields().indexOf(f), frameId: "MAIN" };
-        }
-        case "DOM.resolveNode": return { object: { objectId: `o${params.backendNodeId}` } };
-        case "Runtime.callFunctionOn": {
-          allExpressions.push(params.functionDeclaration);
-          const id = Number(String(params.objectId).slice(1));
-          const f = allFields()[id - 100];
-          const arg = params.arguments[0].value;
-          if (params.functionDeclaration === ISO_HIT_IN_BOX) {
-            const b = f?.box; // the overlay (999) owns no field's box
-            return { result: { value: !!b && Math.abs(b.x - arg.x) <= 1.5 && Math.abs(b.y - arg.y) <= 1.5
-              && Math.abs(b.width - arg.width) <= 1.5 && Math.abs(b.height - arg.height) <= 1.5 } };
-          }
-          if (params.functionDeclaration === ISO_LISTBOX_ROW) return { result: { value: f ? listboxState(f, arg.i) : null } };
-          if (params.functionDeclaration !== ISO_DESCRIBE) return { exceptionDetails: { text: "unknown call" } };
-          return { result: { value: f ? describeInfo(f, arg?.want ?? null) : null } };
-        }
-        case "Runtime.releaseObject": return {};
-        case "Target.getTargetInfo": return { targetInfo: { targetId: "T1" } };
-        case "Browser.dispatchPointerPath":
-          engineCalls.push(params);
-          if (opts.engine) return {};
-          throw new Error("engine path unavailable here");
-        default: throw new Error(`unexpected CDP ${method}`);
-      }
-    },
-  };
-
-  const natives: { m: string; args: any[] }[] = [];
-  const nativeFn = (m: string) => async (...args: any[]) => {
-    natives.push({ m, args });
-    if (opts.nativeThrows?.[m]) throw opts.nativeThrows[m];
-    const f = fieldFor(args[0]);
-    if (m === "fill" && f) {
-      if (f.tag === "input" && f.type === "checkbox") throw new Error('Input of type "checkbox" cannot be filled');
-      if (!args[2]?.trial) f.value = args[1];
-    }
-    return `native-${m}`;
-  };
-
-  const page: any = {
-    mouse, keyboard,
-    click: nativeFn("click"), hover: nativeFn("hover"), dblclick: nativeFn("dblclick"), fill: nativeFn("fill"),
-    press: nativeFn("press"), type: nativeFn("type"), selectOption: nativeFn("selectOption"),
-    check: nativeFn("check"), uncheck: nativeFn("uncheck"), setChecked: nativeFn("setChecked"),
-    focus: async () => undefined, on: () => undefined, mainFrame: () => MAIN_FRAME, waitForTimeout: async () => undefined,
-    viewportSize: () => ({ width: 1280, height: 800 }),
-    evaluate: () => { throw new Error("humanize must not evaluate in the page's world"); },
-    context: () => ({ newCDPSession: async () => cdp, browser: () => null }),
-    locator: (selector: string) => {
-      if (selector === ":focus") return FOCUS_QUERY;
-      const f = fieldFor(selector);
-      const loc: any = Object.create(locatorProto);
-      Object.assign(loc, {
-        _selector: selector, _frame: MAIN_FRAME, page: () => page,
-        first: () => loc,
-        waitFor: async (o: any = {}) => {
-          handles++;
-          waits.push({ m: "waitFor", timeout: o.timeout });
-          waited = true;
-          if (opts.waitForError) throw opts.waitForError;
-          if (f && f.visible === false) throw new Error("waited for a hidden element");
-        },
-        scrollIntoViewIfNeeded: async (o: any = {}) => { handles++; waits.push({ m: "scroll", timeout: o.timeout }); },
-        // a missing element (waitForError) is not visible; appearAfterWait: visible once waited for
-        isVisible: async () => !opts.waitForError && (!f || (f.visible !== false && (!f.appearAfterWait || waited))),
-        isEnabled: async () => opts.enabled ?? true,
-        boundingBox: async (o: any = {}) => {
-          handles++;
-          if (o.timeout !== undefined) waits.push({ m: "box", timeout: o.timeout });
-          return f ? { ...f.box } : null;
-        },
-        inputValue: async () => f?.value ?? "",
-        getAttribute: async (n: string) => (n === "type" ? f?.type ?? null : null),
-        count: async () => opts.count ?? 1,
-        and: (other: any) => ({ count: async () => (other === FOCUS_QUERY && focus === f ? 1 : 0) }),
-        isChecked: async (o: any = {}) => {
-          waits.push({ m: "isChecked", timeout: o.timeout });
-          if (opts.waitForError) throw opts.waitForError;
-          return !!f?.checked;
-        },
-        locator: (s: string) => ({ count: async () => (f && s === `xpath=self::${f.tag}` ? 1 : 0) }),
-        evaluate: () => { throw new Error("humanize must not evaluate in the page's world"); },
-      });
-      return loc;
-    },
-  };
-  return {
-    page, events, natives, engineCalls, waits, box: defBox, handles: () => handles,
-    field: single as Field, fields,
-    setFocused: (v: boolean | string) => { focus = v === false ? null : typeof v === "string" ? fields[v] : single; },
-    of: (t: string) => events.filter((e) => e.t === t),
-  };
-}
-
-type Fake = ReturnType<typeof makeFake>;
-const attached = async (o: FakeOpts = {}): Promise<Fake> => {
-  const f = makeFake(o);
-  await attachHumanize({} as never, f.page, { humanize: true, seed: "forms-unit" });
-  return f;
-};
+import { SLOW, timeoutError, protoCalls, allExpressions, makeFake, attached, type Fake, type FakeOpts, type Field, type Box } from "./helpers/humanize-fake.js";
 
 const ENV = "CLEARCOTE_HUMANIZE_TYPO_RATE";
 const savedRate = process.env[ENV];
@@ -979,12 +638,24 @@ describe("type / press", () => {
     expect(f.of("down").length).toBe(1);   // already focused: no second click
   }, SLOW);
 
-  it("a press on a button is Playwright's: no click first, so it activates once", async () => {
-    const f = await attached({ field: { tag: "button", type: "" } });
+  it("a press on a button is never clicked first: the pointer goes to it, the focus is given, the key is held", async () => {
+    // Lane D (SC 232): a button out of Tab reach gets Playwright's focus, reported, and the key is a HELD press;
+    // never a click (it activated the button twice) and never Playwright's 0 ms focus-and-press. SC 232 triage:
+    // with nothing focused the SDK now Tabs in from the top and reaches a button within 3 stops of the ring, and
+    // clicks into a text stop within 3 of it -- so the fallback case is a button 5 stops from the top with only
+    // buttons before it (one probing Tab lands on #b1, out of reach, then the fallback).
+    const seen: any[] = [];
+    const b = (y: number) => ({ tag: "button", type: "", box: { x: 100, y, width: 60, height: 30 } });
+    const f = makeFake({ fields: { "#b1": b(100), "#b2": b(140), "#b3": b(180), "#b4": b(220),
+      "#counter": { tag: "button", type: "", box: { x: 100, y: 300, width: 160, height: 40 } } } });   // lane A's onFallback hears the reported focus
+    await attachHumanize({} as never, f.page, { humanize: { onFallback: (e: any) => seen.push(e) }, seed: "forms-unit" });
     await f.page.press("#counter", "Enter");
-    expect(f.natives.map((n) => n.m)).toEqual(["press"]);
+    expect(f.natives.map((n) => n.m)).toEqual(["focus"]);
     expect(f.of("click")).toEqual([]);
     expect(f.of("down")).toEqual([]);
+    expect(f.of("press").map((e) => e.a.k)).toEqual(["Tab", "Enter"]);
+    expect(f.of("press")[1].a.delay).toBeGreaterThanOrEqual(45);
+    expect(seen[0]?.api).toBe("page.press");
   }, SLOW);
 
   it("typing into a hidden helper textarea is Playwright's at once, with no wait", async () => {
@@ -1010,10 +681,19 @@ describe("type / press", () => {
     // plain-CSS selector, used only when Playwright counts the same elements, never the way a target
     // is resolved (the hit test is). ISO_HIT_IN_BOX (SC 210 fix 2) reads the caller's plain-CSS selector
     // only to tell whether the element the hit test found IS that element (its first match must still
-    // fill the box, else the box rule answers), and asks whether a twin holds a control.
+    // fill the box, else the box rule answers), and asks whether a twin holds a control. TAB_DISTANCE
+    // (lane D) walks the document's focusables for the Tab ORDER -- what a Tab press visits --, and reads
+    // the caller's plain-CSS selector the same way HIT_IN_BOX does (it must still fill the box).
     expect(allExpressions.length).toBeGreaterThan(0);
     for (const e of allExpressions) {
-      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.includes(ISO_HIT_IN_BOX)) expect(e).not.toContain("querySelector");
+      // ISO_LABEL_BY_SEL (lane F): a HIDDEN checkbox has no box to hit-test, so its <label> is found from the
+      // plain-CSS selector the same way, again only when Playwright counts the same elements. TAB_DISTANCE
+      // (lane D) walks the document's focusables for the Tab order. ISO_SCROLLER (lane E, scroll.ts) finds the
+      // scrolling container of the same plain-CSS first match CSS_BOX already counted.
+      if (!e.startsWith(`(${ISO_CSS_BOX})`) && !e.startsWith(`(${ISO_LABEL_BY_SEL})`) && !e.startsWith(`(${ISO_SCROLLER})`)
+        && !e.includes(ISO_HIT_IN_BOX) && !e.includes(TAB_DISTANCE)) {
+        expect(e).not.toContain("querySelector");
+      }
     }
     expect(allExpressions.some((e) => e.startsWith(`(${ISO_CSS_BOX})`))).toBe(true);
   });
@@ -1059,7 +739,7 @@ describe("selectOption", () => {
     expect(downs.length).toBe(20);
     expect(f.of("kup").filter((e) => e.a === "ArrowDown").length).toBe(1);
     expect(f.of("press").filter((e) => e.a.k === "ArrowDown")).toEqual([]);
-    expect(downs[1].ts - downs[0].ts, "the keyboard's repeat delay").toBeGreaterThanOrEqual(350);
+    expect(downs[1].ts - downs[0].ts, "the keyboard's repeat delay").toBeGreaterThanOrEqual(245);   // keys.planRepeat: 250-500 ms
     const repeats = downs.slice(2).map((d, k) => d.ts - downs[k + 1].ts);
     expect(repeats.reduce((a, b) => a + b, 0) / repeats.length).toBeLessThan(60);   // ~30 a second
     // a short run stays single presses
@@ -1274,3 +954,324 @@ describe("paths stay in the viewport; whole-pixel presses (SC 210 fix 2)", () =>
     }
   }, 60_000);
 });
+
+// ------------------------------------------------------------------ lane B (SC 232): aim + press point
+describe("lane B: aim, covered centre, mouse.click errors, press-and-hold point", () => {
+  const lastMoveBeforeDown = (f: Fake) => {
+    const evs = f.events;
+    const i = evs.findIndex((e) => e.t === "down");
+    const m = evs.slice(0, i).filter((e) => e.t === "move");
+    return m[m.length - 1].a as { x: number; y: number };
+  };
+  const coveredCentre = (b: Box, x: number) => x > b.x + b.width * 0.25 && x < b.x + b.width * 0.75;
+
+  it("targeted glides use the box's smaller side as the Fitts width (was 24)", async () => {
+    process.env[ENV] = "0";
+    const spy = vi.mocked(Motion.planMove);
+    const f = await attached({ fields: { "#a": { box: { x: 100, y: 100, width: 160, height: 40 } },
+      "#b": { box: { x: 100, y: 300, width: 300, height: 90 } } } });
+    spy.mockClear();
+    await f.page.click("#a");
+    const a = spy.mock.calls.at(-1)![3]?.targetW;
+    spy.mockClear();
+    await f.page.hover("#b");
+    const b = spy.mock.calls.at(-1)![3]?.targetW;
+    expect([a, b]).toEqual([40, 90]);
+  }, SLOW);
+
+  it("a badge over the centre: the click aims at a proven probe point, no native fallback", async () => {
+    for (let k = 0; k < 16; k++) {
+      const f = await attached({ coveredCentre: true });
+      await f.page.click("#btn");
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(1);
+      expect(f.of("overlay-click")).toEqual([]);
+      const pt = lastMoveBeforeDown(f);
+      expect(coveredCentre(f.box, pt.x), JSON.stringify(pt)).toBe(false);
+    }
+  }, 60_000);
+
+  it("mouse.click rejects when the press fails (it was swallowed)", async () => {
+    const f = makeFake();
+    (f.page as any).mouse.down = async () => { throw new Error("press failed: target closed"); };
+    await attachHumanize({} as never, f.page, { humanize: true, seed: "raise" });
+    await expect(f.page.mouse.click(150, 210, { button: "right" })).rejects.toThrow(/press failed/);
+  }, SLOW);
+
+  it("pressAndHold position is padding-box relative, like click's", async () => {
+    const f = await attached();
+    await pressAndHold(f.page.locator("#btn"), { duration: 120, position: { x: 10, y: 5 }, tremor: false });
+    // box (100, 200) + border (2, 3) + position; 0.51.0 pressed (110, 205)
+    expect(lastMoveBeforeDown(f)).toEqual({ x: 112, y: 208 });
+  }, SLOW);
+
+  it("pressAndHold on a covered centre presses a proven point", async () => {
+    for (let k = 0; k < 8; k++) {
+      const f = await attached({ coveredCentre: true });
+      await pressAndHold(f.page.locator("#btn"), { duration: 100, tremor: false });
+      const pt = lastMoveBeforeDown(f);
+      expect(coveredCentre(f.box, pt.x), JSON.stringify(pt)).toBe(false);
+    }
+  }, 60_000);
+});
+
+// ------------------------------------------------------------------------- lane F (SC 232): coverage
+describe("label-aware checkbox aim", () => {
+  const hidden = () => ({
+    "#cb": { type: "checkbox", visible: false, box: { x: 0, y: 0, width: 0, height: 0 } },
+    "#lab": { tag: "label", type: "", control: "#cb", box: { x: 96, y: 96, width: 140, height: 24 } },
+  });
+
+  it("a hidden custom checkbox is checked by a trusted click on its label", async () => {
+    const f = await attached({ fields: hidden() as any });
+    await f.page.check("#cb");
+    expect(f.fields["#cb"].checked).toBe(true);
+    expect(f.of("label-click").length).toBe(1);
+    expect(f.natives).toEqual([]);
+    await f.page.uncheck("#cb");
+    expect(f.fields["#cb"].checked).toBe(false);
+    expect(f.of("label-click").length).toBe(2);
+  }, SLOW);
+
+  it("a visible checkbox is clicked on its label text about 40 % of the time", async () => {
+    let onLabel = 0;
+    for (let i = 0; i < 40; i++) {
+      const fk = makeFake({ fields: {
+        "#cb": { type: "checkbox", box: { x: 100, y: 100, width: 16, height: 16 } },
+        "#lab": { tag: "label", type: "", control: "#cb", box: { x: 122, y: 98, width: 120, height: 20 } },
+      } as any });
+      await attachHumanize({} as never, fk.page, { humanize: true, seed: `label-${Math.floor(i / 8)}` });
+      await fk.page.check("#cb");
+      expect(fk.fields["#cb"].checked).toBe(true);
+      onLabel += fk.of("label-click").length;
+    }
+    expect(onLabel).toBeGreaterThanOrEqual(6);
+    expect(onLabel).toBeLessThanOrEqual(26);
+  }, 120_000);
+
+  it("a visible label's click is hit-tested on the label element, not its text rect (SC 232 triage)", async () => {
+    // The click AIMS inside the label's TEXT rect, but ISO_HIT_IN_BOX proves "the node at (x, y) is the element
+    // filling box b" -- and no element fills the text's own rect; only the <label> fills the label's. Asked with
+    // the text rect the test failed on every visible label and the click went to the input: 0 of 20 label clicks
+    // on verifier B's fixture, 0 of 18 in the lab, on d2b9ab6. The fake answers the hit test the way the browser
+    // does: the hit node's own box against the asked box.
+    const fk = makeFake({ fields: {
+      "#cb": { type: "checkbox", box: { x: 100, y: 100, width: 16, height: 16 } },
+      "#lab": { tag: "label", type: "", control: "#cb", box: { x: 96, y: 96, width: 420, height: 24 }, textRect: { x: 124, y: 100, width: 110, height: 16 } },
+    } as any });
+    await attachHumanize({} as never, fk.page, { humanize: true, seed: "label-hit" });
+    (fk.page as any)._clearcotePersona.labelShare = 1; // this click: the label (the trait is not the question)
+    await fk.page.check("#cb");
+    expect(fk.fields["#cb"].checked).toBe(true);
+    expect(fk.of("label-click").length).toBe(1);
+    const moves = fk.of("move");
+    const last = moves[moves.length - 1].a;
+    expect(last.x >= 124 && last.x <= 234 && last.y >= 100 && last.y <= 116, JSON.stringify(last)).toBe(true);
+  });
+
+  // SC 239 box probe (10-17), `<label><input type=checkbox> Visible checkbox with a label</label>`: ISO_LABEL_OF answered
+  // {rect: [40, 74, 214.8, 17], text: [44, 75, 13, 13], contains: true} -- the "text" rect IS the input's own box (the
+  // first client rect of a wrapping label's contents is the control's border box), so labelAim aimed inside the input
+  // and every "label" click landed on the input (lab F_label_visible 0/60, verifier B 0/20).
+  const WRAP_LABEL = { x: 40, y: 74, width: 214.8, height: 17 }, WRAP_INPUT = { x: 44, y: 75, width: 13, height: 13 };
+  const sameBox = (a: Box, b: Box) => Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.y - b.y) < 1e-6
+    && Math.abs(a.width - b.width) < 1e-6 && Math.abs(a.height - b.height) < 1e-6;
+  const wrapped = async (textRect: Box) => {
+    const fk = makeFake({ fields: {
+      "#cb": { type: "checkbox", box: WRAP_INPUT },
+      "#lab": { tag: "label", type: "", control: "#cb", box: WRAP_LABEL, wraps: true, textRect },
+    } as any });
+    await attachHumanize({} as never, fk.page, { humanize: true, seed: "label-wrap" });
+    (fk.page as any)._clearcotePersona.labelShare = 1; // this click would be the label's
+    await fk.page.check("#cb");
+    expect(fk.fields["#cb"].checked).toBe(true);
+    return fk;
+  };
+
+  it("a wrapping label's text rect over the input is no label aim: the click goes to the input itself", async () => {
+    // the helper's old answer (text == the input's box, contains): no hit test asked about the label's box
+    const fk = await wrapped(WRAP_INPUT);
+    expect(fk.of("label-click").length).toBe(0);
+    expect(fk.hits.filter((h) => sameBox(h.box, WRAP_LABEL)), "a label aim was tried on the input's own box").toEqual([]);
+    const moves = fk.of("move");
+    const last = moves[moves.length - 1].a;
+    expect(last.x >= 44 && last.x <= 57 && last.y >= 75 && last.y <= 88, JSON.stringify(last)).toBe(true);
+  });
+
+  it("a wrapping label's text beside the input is aimed and hit-tested on the label element", async () => {
+    // the fixed helper's answer: the text's rect clear of the control (its content rects outside the input's box)
+    const fk = await wrapped({ x: 61, y: 75, width: 193.8, height: 15 });
+    expect(fk.of("label-click").length).toBe(1);
+    expect(fk.hits.filter((h) => sameBox(h.box, WRAP_LABEL)).length).toBe(1);
+    const moves = fk.of("move");
+    const last = moves[moves.length - 1].a;
+    expect(last.x >= 61 && last.x <= 254.8 && last.y >= 75 && last.y <= 90, JSON.stringify(last)).toBe(true);
+  });
+});
+
+describe("label draws: the seed fixes the trait, each click is unseeded", () => {
+  it("two fresh personas of one seed share the trait and differ in their 20 choices", () => {
+    const a = makePersona("same-identity"), b = makePersona("same-identity");
+    expect(labelShare(a)).toBe(labelShare(b));
+    // a persona trait now (lane B's aim traits, 0.25-0.55), not one 0.4 for every identity
+    expect(labelShare(a)).toBe(aimTraits(a).labelShare);
+    expect(labelShare(a)).toBeGreaterThanOrEqual(0.25);
+    expect(labelShare(a)).toBeLessThanOrEqual(0.55);
+    const da = Array.from({ length: 20 }, () => labelDraw(a));
+    const db = Array.from({ length: 20 }, () => labelDraw(b));
+    expect(da).not.toEqual(db);
+  });
+  it("a persona's own share and a test's rng decide", () => {
+    const p: any = makePersona("x");
+    const share = labelShare(p);
+    expect(labelDraw(p, () => share - 0.01)).toBe(true);
+    expect(labelDraw(p, () => share + 0.01)).toBe(false);
+    p.labelShare = 1;
+    expect(Array.from({ length: 20 }, () => labelDraw(p)).every(Boolean)).toBe(true);
+  });
+});
+
+describe("tap on a touch context", () => {
+  it("raises in strict mode and sends nothing", async () => {
+    // strict through the real options object (lane A): ClearcoteStrictError names the reason
+    const f = makeFake({ field: { tag: "button", type: "" } });
+    await attachHumanize({} as never, f.page, { humanize: "strict", seed: "forms-unit" });
+    await expect(f.page.locator("#b").tap()).rejects.toThrow("tap is not humanized for touch contexts yet");
+    expect(f.of("down").length + f.of("move").length).toBe(0);
+  });
+
+  it("otherwise reports the fallback and clicks", async () => {
+    const f = await attached({ field: { tag: "button", type: "" } });
+    await f.page.locator("#b").tap();
+    expect(f.page._clearcoteLastFallback).toMatchObject({ api: "locator.tap", selector: "#b" });
+    expect(String(f.page._clearcoteLastFallback.reason)).toContain("not humanized for touch");
+    expect(f.of("down").length).toBe(1);
+  }, SLOW);
+});
+
+describe("frame locators take the frame route", () => {
+  it("a frame the hit test cannot prove goes to Playwright, reported", async () => {
+    const f = await attached({});
+    const loc: any = f.page.locator("#fr >> internal:control=enter-frame >> #x");
+    await loc.fill("new");
+    expect(protoCalls.map((c) => c.m)).toEqual(["fill"]);
+    expect(f.page._clearcoteLastFallback?.api).toBe("locator.fill");
+  });
+});
+
+// ------------------------------------------------------------------- lane D (SC 232): Tab and focus
+describe("lane D: Tab between fields, presses on buttons, focus / blur / selectText", () => {
+  const seeded = async (seed: string, o: FakeOpts) => {
+    const f = makeFake(o);
+    await attachHumanize({} as never, f.page, { humanize: true, seed });
+    return f;
+  };
+  // fake timers: every planned sleep resolves at once, the order of events is what is checked
+  const drive = async <T>(p: Promise<T>): Promise<T> => { await vi.runAllTimersAsync(); return p; };
+  const three = () => ({ fields: { "#a": {}, "#b": {}, "#c": {} } });
+
+  it("fill Tabs from field to adjacent field in the persona's share, focus verified", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const out: Record<string, [number, number]> = {};
+      for (const seed of ["ha-1", "ha-2", "ha-4", "ha-5"]) {
+        let tabs = 0, n = 0;
+        for (let k = 0; k < 25; k++) {
+          const f = await seeded(seed, three());
+          for (const [sel, v] of [["#a", "alpha"], ["#b", "bravo"], ["#c", "charlie"]] as const) {
+            const before = f.events.length;
+            await drive(f.page.fill(sel, v));
+            if (sel !== "#a") { n++; if (f.events.slice(before).some((e) => e.t === "press" && e.a.k === "Tab")) tabs++; }
+          }
+          expect(f.natives).toEqual([]);
+        }
+        const want = typingTraits(makePersona(seed).seed).tabPref;
+        out[seed] = [tabs / n, want];
+        expect(Math.abs(tabs / n - want), JSON.stringify(out)).toBeLessThanOrEqual(0.2);
+      }
+    } finally { vi.useRealTimers(); }
+  }, 120_000);
+
+  it("a press on a button within Tab reach Tabs to it: no click, no native", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const f = await seeded("ha-1", { fields: { "#q": {}, "#go": { tag: "button", type: "" } } });
+      await drive(f.page.fill("#q", "hello"));
+      const downs = f.of("down").length;
+      await drive(f.page.press("#go", "Enter"));
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(downs);
+      expect(f.of("press").map((e) => e.a.k).slice(-2)).toEqual(["Tab", "Enter"]);
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("a press on a button out of Tab reach clicks into the field before it and Tabs (SC 232 triage)", async () => {
+    // With the focus far away, a button got the pointer over it and Playwright's focus (a reported fallback):
+    // 0 of 4 on verifier B's buttons, 6 of 12 in the lab. A person clicks into the field next to it and Tabs.
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const b = (y: number) => ({ tag: "button", type: "", box: { x: 100, y, width: 60, height: 30 } });
+      const f = await seeded("ha-1", { fields: {
+        "#far": { box: { x: 100, y: 50, width: 200, height: 24 } }, "#b1": b(100), "#b2": b(150), "#b3": b(200),
+        "#q": { box: { x: 100, y: 300, width: 200, height: 24 } }, "#go": { tag: "button", type: "", box: { x: 100, y: 400, width: 160, height: 40 } },
+      } });
+      await drive(f.page.fill("#far", "x"));   // the focus sits 5 stops before #go
+      const downs = f.of("down").length;
+      await drive(f.page.press("#go", "Enter"));
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(downs + 1);
+      const moves = f.of("move");
+      const at = moves[moves.length - 1].a;   // the one click: into #q, the field before the button
+      expect(at.x >= 100 && at.x <= 300 && at.y >= 300 && at.y <= 324, JSON.stringify(at)).toBe(true);
+      expect(f.of("press").map((e) => e.a.k).slice(-2)).toEqual(["Tab", "Enter"]);
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("a press on a button with nothing focused Tabs in from the top (SC 232 triage)", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      const f = await seeded("ha-2", { fields: {
+        "#b1": { tag: "button", type: "", box: { x: 100, y: 100, width: 60, height: 30 } },
+        "#go": { tag: "button", type: "", box: { x: 100, y: 200, width: 160, height: 40 } },
+      } });
+      await drive(f.page.press("#go", "Enter"));
+      expect(f.natives).toEqual([]);
+      expect(f.of("down").length).toBe(0);
+      expect(f.of("press").map((e) => e.a.k)).toEqual(["Tab", "Tab", "Enter"]);
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("focus / blur / selectText go the humane way, with nothing native", async () => {
+    process.env[ENV] = "0";
+    vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
+    try {
+      for (const seed of ["ha-1", "ha-2", "ha-4", "ha-5"]) {   // blur click/tab, select triple/keys
+        const f = await seeded(seed, three());
+        await drive(f.page.fill("#a", "some text"));
+        await drive(f.page.focus("#b"));
+        await drive(f.page.focus("#a"));
+        await drive((f.page as any)._clearcoteSelectText("#a"));
+        expect(f.of("press").some((e) => e.a.k === "Home") || f.of("up").some((e) => e.a.clickCount === 3), seed).toBe(true);
+        await drive((f.page as any)._clearcoteBlur("#a"));
+        expect(f.natives, seed).toEqual([]);
+      }
+    } finally { vi.useRealTimers(); }
+  }, 60_000);
+
+  it("page.type keeps the caller's delay as a floor; page.press repeat holds the key", async () => {
+    process.env[ENV] = "0";
+    const f = await seeded("ha-2", { field: {} });
+    const t0 = Date.now();
+    await f.page.type("#f", "abcd", { delay: 300 });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+    expect(f.field.value).toBe("abcd");
+    await f.page.press("#f", "ArrowRight", { repeat: 6 });
+    expect(f.of("kdown").filter((e) => e.a === "ArrowRight").length).toBe(6);
+    expect(f.of("kup").filter((e) => e.a === "ArrowRight").length).toBe(1);
+  }, SLOW);
+});
+

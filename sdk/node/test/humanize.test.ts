@@ -141,3 +141,39 @@ describe("attachHumanize idempotency", () => {
     expect(page.__clearcoteHumanized).toBe(true);
   });
 });
+
+// Lane F (SC 232): browser.newPage() makes its context inside Playwright, so a popup that context opens
+// (window.open, target=_blank) reached no humanize at all; and a second install must add no second listener.
+describe("installHumanize hooks the implicit context of browser.newPage", () => {
+  const evContext = () => {
+    const handlers: ((p: object) => void)[] = [];
+    const pages: object[] = [];
+    const ctx = {
+      browser: () => null, pages: () => pages, addInitScript: async () => {},
+      on: (ev: string, fn: (p: object) => void) => { if (ev === "page") handlers.push(fn); },
+      emit: (p: object) => { pages.push(p); for (const h of handlers) h(p); },
+      handlers,
+    };
+    return ctx;
+  };
+
+  it("humanizes a popup of that context, and hooks it once", async () => {
+    const ctx = evContext();
+    // stub pages: the attach marker is set for showCursor too (a humanize attach needs a real mouse)
+    const stub = (): any => ({ context: () => ctx, evaluate: async () => {}, on: () => {}, mainFrame: () => null });
+    const b: any = {
+      newPage: async () => { const p = stub(); ctx.pages().push(p); return p; },
+      newContext: async () => evContext(),
+    };
+    installHumanize(b as never, { showCursor: true, seed: "popup" });
+    const page = await b.newPage();
+    expect(page.__clearcoteHumanized).toBe(true);
+    const popup: any = stub();
+    ctx.emit(popup);
+    expect(popup.__clearcoteHumanized).toBe(true);
+    await b.newPage();
+    expect(ctx.handlers.length).toBe(1);
+    installHumanizeOnContext(ctx as never, { showCursor: true, seed: "popup" });
+    expect(ctx.handlers.length).toBe(1);
+  });
+});

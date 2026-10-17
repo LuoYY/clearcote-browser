@@ -102,13 +102,15 @@ class Persona:
     overshoot: float
     max_corrections: int
     approach_bias: float
+    # The HUMAN BANDS every timing draw is clamped to (ms). The per-identity medians inside them come
+    # from the salted timing stream (timing_traits): grab 130-360, release 90-230, click hold 55-230,
+    # key dwell 45-120.
     grab_min_ms: float = 130.0
     grab_max_ms: float = 360.0
     release_min_ms: float = 90.0
     release_max_ms: float = 230.0
-    # click press-hold (mousedown->mouseup) and per-key dwell (keydown->keyup) windows, ms.
-    click_hold_min_ms: float = 60.0
-    click_hold_max_ms: float = 150.0
+    click_hold_min_ms: float = 55.0
+    click_hold_max_ms: float = 230.0
     key_dwell_min_ms: float = 45.0
     key_dwell_max_ms: float = 120.0
 
@@ -416,25 +418,204 @@ def plan_drag(frm, to, p: Persona, settle: bool = False, rng: Optional[Rng] = No
     return out
 
 
-def drag_dwell(p: Persona, rng: Optional[Rng] = None):
-    """(grab_ms, release_ms) for a held-button drag, from the persona window."""
+# Salt for the timing stream. Like the rollover and shape salts, a separate mulberry32(seed ^ salt)
+# stream keeps make_persona's draw ORDER (and so every existing seed's motor identity) unchanged.
+_TIMING_SALT = 0xC2B2AE35
+
+
+@dataclass(frozen=True)
+class TimingTraits:
+    """Per-identity timing medians (ms) and tempo, stable per seed (see timing_traits)."""
+
+    click_hold_ms: float     # median mousedown->mouseup hold, 70..140
+    key_dwell_ms: float      # median keydown->keyup dwell, 60..95
+    grab_ms: float           # median grab hesitation after a drag's mousedown, 180..280
+    release_ms: float        # median settle before a drag's mouseup, 120..180
+    dblclick_gap_ms: float   # median gap between the two presses of a double click, 90..140
+    pause_scale: float       # scale on deliberation pauses (select popup, datetime segments), 0.8..1.25
+    typo_rate: float         # per-character fat-finger rate, 0.005..0.04
+
+
+def timing_traits(p: Persona) -> TimingTraits:
+    """The persona's timing traits, drawn from a salted stream of its seed.
+
+    Before this every identity shared ONE fixed window for each timing (click hold 60-150, key dwell
+    45-120, grab 130-360, release 90-230, double-click gap 70-170, the select popup pauses, the
+    datetime gaps, the 2 % typo rate), so two personas were told apart by nothing in their timing.
+    Each draw below is the identity's MEDIAN; the samples around it are log-normal (click_hold,
+    key_dwell, drag_dwell, dblclick_gap) and clamped to the human band on the Persona. Same values in
+    motion.ts timingTraits and Motion.TimingTraitsOf."""
+    r = mulberry32((p.seed ^ _TIMING_SALT) & _MASK)
+    click_hold_ms = _lerp(70, 140, r())
+    key_dwell_ms = _lerp(60, 95, r())
+    grab_ms = _lerp(180, 280, r())
+    release_ms = _lerp(120, 180, r())
+    dblclick_gap_ms = _lerp(90, 140, r())
+    pause_scale = _lerp(0.8, 1.25, r())
+    typo_rate = _lerp(0.005, 0.04, r())
+    return TimingTraits(click_hold_ms=click_hold_ms, key_dwell_ms=key_dwell_ms, grab_ms=grab_ms,
+                        release_ms=release_ms, dblclick_gap_ms=dblclick_gap_ms, pause_scale=pause_scale,
+                        typo_rate=typo_rate)
+
+
+def _tempo(p) -> float:
+    """The preset's tempo on ``p`` (HumanizeOptions: careful 1.4 / default 1.0 / quick 0.7, set by
+    _hzoptions.apply_to_persona after make_persona; 1.0 on a bare persona, so every vector is unchanged)."""
+    t = getattr(p, "tempo", 1.0)
+    return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0 else 1.0
+
+
+def lognormal_ms(median: float, sigma: float, lo: float, hi: float, rng: Rng) -> float:
+    """``median * exp(sigma * N(0,1))`` clamped to [lo, hi]: a right-skewed human timing around a
+    per-identity median (the shape of measured hold and dwell distributions)."""
+    return _clamp(median * math.exp(sigma * gauss_from(rng)), lo, hi)
+# Salt for the drag-start hesitation traits (per persona, like _SHAPE_SALT / _ROLLOVER_SALT): drawing
+# them from mulberry32(seed ^ salt) keeps make_persona's draw ORDER, so every seed's motor identity is
+# what it was, and plan_drag itself is untouched (its vectors still pin the three SDKs).
+_HESITATION_SALT = 0xFD7046C5   # own stream (was the timing salt: hesitation moved with the click hold)
+# A hand that has just closed on a handle does not set off at once: it holds 100-300 ms, creeping a
+# few px (never 8) in the direction it is about to go, before the leg proper. Measured on r38 / SDK
+# 0.51.0 (SC 232 review): every drag's first held move was already the full-speed leg start.
+HESITATION_MS = (100.0, 300.0)
+HESITATION_MAX_PX = 8.0
+
+
+def hesitation_traits(p: Persona):
+    """This persona's hesitation TRAITS, from its salted stream: (typical length ms 130-260, creep reach
+    px 2-6, sideways wobble px 0.4-1.2). Only traits come from the seed; every per-drag draw in
+    :func:`drag_hesitation` is unseeded (``random.random``) unless a test passes ``rng``, so two sessions of
+    one identity do not replay identical drags."""
+    r = mulberry32((p.seed ^ _HESITATION_SALT) & _MASK)
+    return _lerp(130.0, 260.0, r()), _lerp(2.0, 6.0, r()), _lerp(0.4, 1.2, r())
+
+
+def drag_hesitation(frm, to, p: Persona, rng: Optional[Rng] = None, dur_ms: Optional[float] = None):
+    """Plan the still-but-not-frozen moment between the grab and the drag leg frm->to: (x, y, sleep_ms)
+    samples spanning 100-300 ms (centred per persona), the pointer creeping < 8 px toward ``to`` with a
+    little sideways wobble. The last sample is where :func:`plan_drag` then starts. The samples are
+    drawn from ``rng`` AFTER nothing: a caller plans the leg from the returned end point, so the leg's
+    own draws keep their order. ``dur_ms``: the caller's own length for the creep (40-300 ms; see
+    :func:`hesitate_then_drag`), in place of this persona's draw (which is still drawn, so the order holds).
+    Same numbers in motion.ts dragHesitation and Motion.DragHesitation."""
     if rng is None:
         rng = random.random
-    return (_lerp(p.grab_min_ms, p.grab_max_ms, rng()), _lerp(p.release_min_ms, p.release_max_ms, rng()))
+    centre, amp, wobble = hesitation_traits(p)
+    fx, fy = frm
+    tx, ty = to
+    d = math.hypot(tx - fx, ty - fy)
+    ux, uy = ((tx - fx) / d, (ty - fy) / d) if d >= 1e-6 else (1.0, 0.0)
+    dur = _clamp(centre * _lerp(0.8, 1.2, rng()), HESITATION_MS[0], HESITATION_MS[1])
+    if dur_ms is not None:
+        dur = _clamp(float(dur_ms), 40.0, HESITATION_MS[1])
+    reach = amp * _lerp(0.6, 1.0, rng())
+    step_ms = 1000.0 / p.device_hz
+    n = int(max(3, _js_round(dur / step_ms)))
+    dt = dur / n
+    phase = rng() * 2 * math.pi
+    out: list = []
+    side = 0.0
+    for i in range(1, n + 1):
+        tau = i / n
+        along = reach * min_jerk(tau)
+        side = 0.8 * side + gauss_from(rng) * wobble * 0.25
+        s = _clamp(side + wobble * 0.5 * math.sin(phase + 2 * math.pi * tau), -1.5, 1.5)
+        px, py = fx + ux * along - uy * s, fy + uy * along + ux * s
+        # the budget is a hard bound: the creep never leaves an 8 px circle around the grab
+        if math.hypot(px - fx, py - fy) >= HESITATION_MAX_PX - 0.5:
+            px, py = fx + ux * (HESITATION_MAX_PX - 1.0), fy + uy * (HESITATION_MAX_PX - 1.0)
+        out.append((px, py, dt * _lerp(0.9, 1.1, rng())))
+    return out
+
+
+def leg_exit_ms(frm, steps, radius=HESITATION_MAX_PX):
+    """When (ms from the start of ``steps``) the walk first leaves the ``radius`` circle around ``frm``;
+    the whole length when it never does."""
+    t = 0.0
+    for x, y, sl in steps:
+        if math.hypot(x - frm[0], y - frm[1]) >= radius:
+            return t
+        t += sl
+    return t
+
+
+def hesitate_then_drag(frm, to, p: Persona, window_ms: float, settle: bool = True, rng: Optional[Rng] = None):
+    """The held part of a drag: the hesitation creep, then the :func:`plan_drag` leg, planned together
+    so the pointer stays inside 8 px of the press for ``window_ms`` (clamped 100-300; the persona's grab
+    dwell) and then goes. The leg's own slow start counts toward the window: the creep is planned for
+    what the window leaves (at least 40 ms). Returns (steps, creep_count)."""
+    if rng is None:
+        rng = random.random
+    w = _clamp(float(window_ms), HESITATION_MS[0], HESITATION_MS[1])
+    creep = drag_hesitation(frm, to, p, rng, dur_ms=w)
+    leg = plan_drag(creep[-1][:2], to, p, settle=settle, rng=rng)
+    t8 = leg_exit_ms(frm, leg)
+    want = max(40.0, w - t8)
+    have = sum(s[2] for s in creep)
+    if abs(have - want) > 1.0:
+        # re-time the creep to what the window leaves (same shape, scaled in time and reach)
+        k = want / have
+        creep = [(frm[0] + (x - frm[0]) * min(1.0, k), frm[1] + (y - frm[1]) * min(1.0, k), sl * k)
+                 for x, y, sl in creep]
+        leg = plan_drag(creep[-1][:2], to, p, settle=settle, rng=rng)
+    return creep + leg, len(creep)
+
+
+def wheel_anchor_point(vw: float, vh: float, rng: Optional[Rng] = None):
+    """Where a reading hand parks the pointer before a wheel: x ~ 0.5w +- 0.10w clamped to [0.12w, 0.88w],
+    y ~ 0.34h +- 0.09h clamped to [0.10h, 0.62h] (two gaussians from ``rng``, x first). One model in all
+    three SDKs (motion.ts wheelAnchorPoint, Motion.WheelAnchorPoint / Scroll.WheelAnchorPoint); before 0.52
+    Node and .NET used other centres, spreads and clamps. _scroll.anchor_point is this function."""
+    if rng is None:
+        rng = random.random
+    x = _clamp(vw * 0.5 + gauss_from(rng) * vw * 0.10, vw * 0.12, vw * 0.88)
+    y = _clamp(vh * 0.34 + gauss_from(rng) * vh * 0.09, vh * 0.10, vh * 0.62)
+    return x, y
+
+
+def drag_dwell(p: Persona, rng: Optional[Rng] = None):
+    """(grab_ms, release_ms) for a held-button drag: log-normal (sigma 0.2) around the persona's
+    medians, inside its grab/release bands."""
+    if rng is None:
+        rng = random.random
+    tt = timing_traits(p)
+    t = _tempo(p)   # the preset scales the median; apply_to_persona already scaled the bands
+    return (lognormal_ms(tt.grab_ms * t, 0.2, p.grab_min_ms, p.grab_max_ms, rng),
+            lognormal_ms(tt.release_ms * t, 0.2, p.release_min_ms, p.release_max_ms, rng))
 
 
 def click_hold(p: Persona, rng: Optional[Rng] = None) -> float:
-    """A human mousedown->mouseup click hold (ms), right-skewed. Fixes the ~2 ms instant-press tell."""
+    """A human mousedown->mouseup click hold (ms): log-normal (sigma 0.25) around the persona's own
+    median (70-140 ms), clamped to its band (55-230 ms). Fixes the ~2 ms instant-press tell, and the
+    one-window-for-everyone tell that replaced it."""
     if rng is None:
         rng = random.random
-    return p.click_hold_min_ms + min(1.0, abs(gauss_from(rng)) * 0.5) * (p.click_hold_max_ms - p.click_hold_min_ms)
+    return lognormal_ms(timing_traits(p).click_hold_ms * _tempo(p), 0.25, p.click_hold_min_ms, p.click_hold_max_ms, rng)
 
 
 def key_dwell(p: Persona, rng: Optional[Rng] = None) -> float:
-    """A human per-key keydown->keyup dwell (ms), right-skewed. Fixes the ~2-3 ms instant-keystroke tell."""
+    """A human per-key keydown->keyup dwell (ms): log-normal (sigma 0.22) around the persona's own
+    median (60-95 ms), clamped to its band (45-120 ms)."""
     if rng is None:
         rng = random.random
-    return p.key_dwell_min_ms + min(1.0, abs(gauss_from(rng)) * 0.45) * (p.key_dwell_max_ms - p.key_dwell_min_ms)
+    return lognormal_ms(timing_traits(p).key_dwell_ms * _tempo(p), 0.22, p.key_dwell_min_ms, p.key_dwell_max_ms, rng)
+
+
+def dblclick_gap(p: Persona, rng: Optional[Rng] = None) -> float:
+    """The gap between the two presses of a double click (ms): log-normal (sigma 0.15) around the
+    persona's median (90-140 ms), clamped to 70-170 ms (the band the engine's clickCount:2 walk uses)."""
+    if rng is None:
+        rng = random.random
+    t = _tempo(p)
+    return lognormal_ms(timing_traits(p).dblclick_gap_ms * t, 0.15, 70.0 * t, 170.0 * t, rng)
+
+
+def pause_ms(p: Optional[Persona], lo: float, hi: float, rng: Optional[Rng] = None) -> float:
+    """A deliberation pause (ms) from the window [lo, hi], scaled by the persona's tempo
+    (timing_traits.pause_scale, 0.8-1.25). Without a persona: the plain window."""
+    if rng is None:
+        rng = random.random
+    v = _lerp(lo, hi, rng())
+    return v * timing_traits(p).pause_scale * _tempo(p) if p is not None else v
 
 
 # Salt for the rollover stream. Drawing from mulberry32(seed ^ salt) instead of adding a field to
@@ -486,20 +667,54 @@ def platform_from_navigator(value: Optional[str]) -> Optional[str]:
     return None
 
 
-def click_point(box, frm, p: Persona, rng: Optional[Rng] = None):
-    """A human click point inside ``box`` (dict with x/y/width/height): 2D gaussian toward center,
-    nudged toward the approach side (undershoot), clamped a couple px inside the edges."""
+# Salt for the aim traits (click_point): the persona's landing dispersion, undershoot and handedness.
+_AIM_SALT = 0x27D4EB2F
+
+
+@dataclass(frozen=True)
+class AimTraits:
+    """Per-identity aiming traits, stable per seed (see aim_traits)."""
+
+    spread: float       # landing dispersion, sd as a share of the box, 0.10..0.20
+    undershoot: float   # pull toward the side the cursor came from, share of the box, 0.06..0.16
+    side_bias: float    # handedness: lateral offset as a share of the box width, -0.1..0.1 (approach_bias * 0.4)
+    label_share: float  # share of visible checkbox / radio clicks that land on the label text, 0.25..0.55
+
+
+def aim_traits(p: Persona) -> AimTraits:
+    """The persona's aiming traits, drawn from a salted stream of its seed. Same values in motion.ts
+    aimTraits and Motion.AimTraitsOf."""
+    r = mulberry32((p.seed ^ _AIM_SALT) & _MASK)
+    spread = _lerp(0.10, 0.20, r())
+    undershoot = _lerp(0.06, 0.16, r())
+    label_share = _lerp(0.25, 0.55, r())   # SC 232 integration: lane F's label aim, a trait (was one 0.4 for all)
+    return AimTraits(spread=spread, undershoot=undershoot, side_bias=p.approach_bias * 0.4, label_share=label_share)
+
+
+def click_point(box, frm, p: Optional[Persona], rng: Optional[Rng] = None):
+    """A human click point inside ``box`` (dict with x/y/width/height): a 2D gaussian toward the
+    centre with the persona's dispersion (sd 0.10-0.20 of the box), nudged toward the approach side
+    (undershoot, 6-16 %) and sideways by its handedness (approach_bias), clamped a couple px inside
+    the edges. The SEED fixes the persona's spread, undershoot and handedness (it was one dispersion
+    for everyone); each click's draw is unseeded (random.random unless ``rng`` is given), like every
+    per-action draw, so no two visits of one identity replay the same landing sequence.
+    Without a persona: sd 0.15, 12 % undershoot, no handedness."""
     if rng is None:
         rng = random.random
+    if p is None:
+        spread, under, side = 0.15, 0.12, 0.0
+    else:
+        at = aim_traits(p)
+        spread, under, side = at.spread, at.undershoot, at.side_bias
     cx = box["x"] + box["width"] / 2
     cy = box["y"] + box["height"] / 2
     dx, dy = cx - frm[0], cy - frm[1]
     d = math.hypot(dx, dy) or 1.0
     ux, uy = -dx / d, -dy / d
-    x = cx + ux * box["width"] * 0.12 + gauss_from(rng) * box["width"] * 0.16
-    y = cy + uy * box["height"] * 0.12 + gauss_from(rng) * box["height"] * 0.16
+    x = cx + ux * box["width"] * under + side * box["width"] + gauss_from(rng) * box["width"] * spread
+    y = cy + uy * box["height"] * under + gauss_from(rng) * box["height"] * spread
     # For a box narrower/shorter than the 4px inset the clamp bounds invert (lo > hi) and would return
-    # a point OUTSIDE the element — use the center for such tiny targets.
+    # a point OUTSIDE the element -- use the center for such tiny targets.
     return (_clamp(x, box["x"] + 2, box["x"] + box["width"] - 2) if box["width"] >= 4 else cx,
             _clamp(y, box["y"] + 2, box["y"] + box["height"] - 2) if box["height"] >= 4 else cy)
 
@@ -538,3 +753,135 @@ def plan_ambient(frm, viewport, p: Persona, ms: float, rng: Optional[Rng] = None
             elapsed += step_ms
         cur = target
     return out
+
+
+# ------------------------------------------------------------------ after-action (SC 232 lane C)
+# Salt for the after-action stream (hover dwell, move-off after a click, the attention model). Like the
+# rollover and shape salts, a separate mulberry32(seed ^ salt) stream keeps make_persona's draw ORDER
+# (and so every existing seed's motor identity) unchanged. Same values in motion.ts / Motion.cs.
+_AFTER_SALT = 0x165667B1   # own stream (was the timing salt: dwell moved with the click hold)
+
+# The pointer keeps within this many px of where a hover arrived while it dwells there.
+DWELL_RADIUS_PX = 3.0
+# A move-off after a click is kept this far inside the viewport.
+MOVE_OFF_MARGIN_PX = 8.0
+
+
+@dataclass(frozen=True)
+class AfterTraits:
+    """Per-identity after-action traits, stable per seed (see after_traits)."""
+
+    dwell_ms: float          # centre of this hand's hover dwell, 250..700 (draws stay in 150..900)
+    move_off_rate: float     # share of clicks followed by a move-off, 0.64..0.82 (a 40-click run stays in 60-85 %)
+    move_off_delay_ms: float  # centre of the release -> move-off gap, 300..600 (draws stay in 200..700)
+    read_tempo: float        # scale on the attention model's read pause, 0.85..1.15
+
+
+def after_traits(p: Persona) -> AfterTraits:
+    """The persona's after-action traits, the first four draws of its salted after-action stream.
+
+    Measured on r42 / SDK 0.51.0 (SC 232 review): a hover stopped dead on arrival (0 samples after the
+    last glide sample) and the pointer never left the pressed pixel after a click, both tells against
+    a hand that keeps breathing on the mouse. Same values in motion.ts afterTraits and
+    Motion.AfterTraitsOf."""
+    r = mulberry32((p.seed ^ _AFTER_SALT) & _MASK)
+    return AfterTraits(dwell_ms=_lerp(250, 700, r()), move_off_rate=_lerp(0.64, 0.82, r()),
+                       move_off_delay_ms=_lerp(300, 600, r()), read_tempo=_lerp(0.85, 1.15, r()))
+
+
+def after_rng(p: Persona) -> Rng:
+    """The persona's after-action stream positioned AFTER its four trait draws: the per-action draws
+    (a dwell's length, a move-off's roll / angle / distance / delay, the attention model's pauses) come
+    from here in the shared vectors (sdk/testdata/humanize_after_vectors.json) so the three SDKs can be compared
+    draw for draw. The humanizers do NOT use it: the seed fixes traits only, and every per-action draw is
+    unseeded (random.random), as in plan_move -- a seeded per-action sequence would replay identically in
+    every session of an identity, a cross-session fingerprint."""
+    r = mulberry32((p.seed ^ _AFTER_SALT) & _MASK)
+    for _ in range(4):
+        r()
+    return r
+
+
+def dwell_ms(p: Persona, rng: Optional[Rng] = None) -> float:
+    """How long a hover dwells on arrival: the persona's centre x 0.6..1.4, kept in 150..800 ms (the band is
+    150-900 ms as the page measures it: the glide's slow tail inside 3 px adds up to ~70 ms)."""
+    if rng is None:
+        rng = random.random
+    return _clamp(after_traits(p).dwell_ms * _lerp(0.6, 1.4, rng()), 150.0, 800.0)
+
+
+def plan_dwell(at, box, p: Persona, ms: float, rng: Optional[Rng] = None):
+    """Plan the pointer's rest on a hover target: OU drift + 8-12 Hz tremor samples around ``at`` for
+    about ``ms`` (at least 3 samples), every sample within DWELL_RADIUS_PX of ``at`` and inside ``box``
+    (a dict with x/y/width/height, 1 px in; None: no box). Returns (x, y, sleep_ms) tuples.
+
+    The hand is not braced on a hover the way it is before a press, so the drift runs at twice the
+    glide's amplitude and the tremor at 1.5x; the radius clamp keeps the pointer on the element."""
+    if rng is None:
+        rng = random.random
+    step_ms = 1000.0 / p.device_hz
+    # rest gaps run 0.9-1.4 frames (mean 1.15): the sample count makes the walked dwell last about ms
+    n = int(max(3, _js_round(max(0.0, ms) / (step_ms * 1.15))))
+    out: list = []
+    drift = [0.0, 0.0]
+    tphase = rng() * 2 * math.pi
+    t = 0.0
+    ax, ay = at
+    for _ in range(n):
+        k = step_ms / p.drift_tau
+        drift[0] += -k * drift[0] + math.sqrt(2 * k) * p.drift_amp * 2.0 * gauss_from(rng)
+        drift[1] += -k * drift[1] + math.sqrt(2 * k) * p.drift_amp * 2.0 * gauss_from(rng)
+        ph = tphase + (2 * math.pi * p.tremor_hz * t) / 1000.0
+        dx = drift[0] + p.tremor_amp * 1.5 * math.sin(ph)
+        dy = drift[1] + p.tremor_amp * 1.5 * math.sin(ph + math.pi / 2)
+        r = math.hypot(dx, dy)
+        if r > DWELL_RADIUS_PX:
+            dx, dy = dx * DWELL_RADIUS_PX / r, dy * DWELL_RADIUS_PX / r
+        x, y = ax + dx, ay + dy
+        if box is not None:
+            bx, by, bw, bh = box["x"], box["y"], box["width"], box["height"]
+            x = _clamp(x, bx + 1, bx + bw - 1) if bw >= 2 else ax
+            y = _clamp(y, by + 1, by + bh - 1) if bh >= 2 else ay
+        sl = step_ms * _lerp(0.9, 1.4, rng())
+        out.append((x, y, sl))
+        t += sl
+    return out
+
+
+def move_off_roll(p: Persona, rng: Optional[Rng] = None, hits: int = 0, n: int = 0) -> bool:
+    """Does this click get a move-off? In ``after_traits(p).move_off_rate`` of clicks: a draw against
+    the rate, nudged by how far the page's running share (``hits`` of ``n`` earlier clicks) has drifted
+    from it, so 40 clicks land near the persona's rate instead of anywhere a coin allows (+-15 %)."""
+    if rng is None:
+        rng = random.random
+    rate = after_traits(p).move_off_rate
+    return rng() < _clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98)
+
+
+def move_off_delay_ms(p: Persona, rng: Optional[Rng] = None) -> float:
+    """The release -> move-off gap: the persona's centre x 0.7..1.3, kept in 200..660 ms (200-700 as the page
+    measures it from its mouseup: the release round trip and the first move's dispatch add 20-60 ms)."""
+    if rng is None:
+        rng = random.random
+    t = _tempo(p)
+    return _clamp(after_traits(p).move_off_delay_ms * t * _lerp(0.7, 1.3, rng()), 200.0 * t, 660.0 * t)
+
+
+def plan_move_off(frm, viewport, p: Persona, rng: Optional[Rng] = None):
+    """Where the hand drifts after a click: 40-200 px from ``frm`` at an angle in the downward
+    half-plane (20..160 deg, y down -- the gateway's moveOnTarget model), kept MOVE_OFF_MARGIN_PX inside
+    ``viewport`` (dict with width/height). Mirrored upward when the clamp would leave it on the spot
+    (a click near the bottom edge). Returns the (x, y) target; the glide there is plan_move's."""
+    if rng is None:
+        rng = random.random
+    vw, vh = viewport["width"], viewport["height"]
+    m = MOVE_OFF_MARGIN_PX
+    ang = math.radians(_lerp(20, 160, rng()))
+    dist = _lerp(40, 200, rng())
+    dx, dy = math.cos(ang) * dist, math.sin(ang) * dist
+    x = _clamp(frm[0] + dx, m, vw - m)
+    y = _clamp(frm[1] + dy, m, vh - m)
+    if math.hypot(x - frm[0], y - frm[1]) < 12.0:
+        x = _clamp(frm[0] + dx, m, vw - m)
+        y = _clamp(frm[1] - dy, m, vh - m)
+    return (x, y)

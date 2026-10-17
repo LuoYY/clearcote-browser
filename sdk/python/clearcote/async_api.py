@@ -45,6 +45,7 @@ from . import _personaenv
 from ._colorscheme import (default_color_scheme, engine_decides_color_scheme,
                            install_color_scheme_default_async)
 from ._humanize_async import install_humanize, install_humanize_on_context
+from ._hzoptions import ClearcoteStrictError, HumanizeOptions  # noqa: F401  (re-exported)
 from ._profile import Profile, list_profiles, load_profile
 from ._render_async import check_render_coherence
 from .download import ensure_binary, warm_files
@@ -56,6 +57,8 @@ from . import __version__ as __version__  # re-export the package version
 from ._hold import press_and_hold_async as press_and_hold
 
 __all__ = [
+    "HumanizeOptions",
+    "ClearcoteStrictError",
     "launch",
     "press_and_hold",
     "launch_persistent_context",

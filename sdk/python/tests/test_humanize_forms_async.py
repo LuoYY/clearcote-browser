@@ -11,6 +11,7 @@ than on the implementation's call sequence. Its isolated world is injected as pa
 the cache async_world_for() reads.
 """
 import asyncio
+import json
 import random
 
 import pytest
@@ -20,6 +21,11 @@ from clearcote import _humanize_async as H
 from clearcote._isolated import (
     ACTIVE_FIELD, ACTIVE_VALUE, CSS_BOX, DESCRIBE, HIT_IN_BOX, LISTBOX_ROW, PLATFORM, SCROLL, SCROLL_BY, VIEWPORT,
 )
+from clearcote import _isolated as _iso
+
+# the label reads (lane F); optional so this file still collects against an SDK without them
+LABEL_OF = getattr(_iso, "LABEL_OF", "<no LABEL_OF>")
+LABEL_BY_SEL = getattr(_iso, "LABEL_BY_SEL", "<no LABEL_BY_SEL>")
 
 PWTimeout = type("TimeoutError", (Exception,), {})   # what _is_timeout recognises (Playwright's name)
 ROW_H = 18.0
@@ -34,8 +40,14 @@ class Field:
                  maxlength=-1, autocomplete=None, inputmode=None, bl=2.0, bt=2.0, options=None,
                  selected_index=0, multiple=False, size=0, no_select_all=False, never_commit=False,
                  stubborn=False, visible=True, covered=False, fmt=None, rmin=None, rmax=None, rstep=None,
-                 cover_center=False, in_frame=False, appear_on_wait=False):
+                 cover_center=False, in_frame=False, appear_on_wait=False, control=None, text_rect=None, wraps=False):
         self.tag, self.type, self.value, self.rect = tag, type, value, rect
+        self.control = control                    # a <label>: the checkbox its click is passed on to
+        self.text_rect = text_rect                # a <label>: its TEXT's rect (LABEL_OF `text`), when it is not the whole box
+        self.wraps = wraps                        # a <label> that CONTAINS its control (LABEL_OF `contains`)
+        self.label = None                         # a checkbox: its <label> Field (set by the label)
+        if control is not None:
+            control.label = self
         self.in_frame = in_frame                  # its points lie in a child frame: the hit test sees nothing
         self.appear_on_wait = appear_on_wait      # hidden until Playwright's wait_for (it shows up)
         self.st = 0.0                             # a list box's scrollTop
@@ -104,8 +116,24 @@ class Field:
         return o
 
     # what the browser does with one trusted click / key
+    def label_of(self):
+        """What LABEL_OF reads from a checkbox: hidden when not visible or (nearly) zero-size."""
+        x, y, w, h = self.rect
+        o = {"tag": "input", "type": self.type, "rect": [x, y, w, h],
+             "hidden": (not self.visible) or w <= 1 or h <= 1, "checked": self.checked, "disabled": False,
+             "label": None}
+        if self.label is not None:
+            tr = getattr(self.label, "text_rect", None)
+            o["label"] = {"rect": list(self.label.rect), "text": list(tr) if tr else None,
+                          "contains": bool(getattr(self.label, "wraps", False))}
+        return o
+
     def click(self, x, y, mods):
         self.clicks = getattr(self, "clicks", 0) + 1
+        if self.tag == "label":
+            if self.control is not None:
+                self.control.click(x, y, mods)   # the label passes the click on to its control
+            return
         if self.type == "checkbox":
             if not self.stubborn:
                 self.checked = not self.checked
@@ -146,6 +174,10 @@ class Field:
             self.all = not self.no_select_all
         elif k == "Backspace":
             self.value = "" if self.all else self.value[:-1]
+            self.all = False
+        elif k == "WordBackspace":           # the browser's word delete: Backspace under Control (Alt on macOS)
+            v = self.value.rstrip(" ")
+            self.value = "" if self.all else v[:v.rfind(" ") + 1]
             self.all = False
         elif k == "End":
             self.all = False
@@ -195,6 +227,15 @@ class World:
                 self.p.scrolls.append(("css", sel))
                 self.p.bring_into_view(f)
             return {"n": 1, "rect": list(f.rect)}
+        if src == LABEL_BY_SEL:
+            f = self.p.by_sel.get(arg["sel"])
+            if f is None:
+                return {"n": 0}
+            o = f.label_of() if f.tag == "input" and f.type in ("checkbox", "radio") else None
+            if o is None:
+                return {"n": 1}
+            o["n"] = 1
+            return o
         if src == SCROLL_BY:
             dx, dy = arg
             self.p.scrolls.append(("window", dx, dy))
@@ -222,9 +263,12 @@ class World:
             return False if src == HIT_IN_BOX else None
         f = self.p.fields[nid - 1]
         if src == HIT_IN_BOX:
+            self.p.hits.append((f, (arg["x"], arg["y"], arg["width"], arg["height"])))   # (hit node, the box asked about)
             return all(abs(a - b) <= 1.5 for a, b in zip(f.rect, (arg["x"], arg["y"], arg["width"], arg["height"])))
         if src == LISTBOX_ROW:
             return f.row_state(arg["i"])
+        if src == LABEL_OF:
+            return f.label_of() if f.tag == "input" and f.type in ("checkbox", "radio") else None
         assert src == DESCRIBE, src
         if (arg or {}).get("want") == "select" and f.tag != "select":
             return None
@@ -394,6 +438,7 @@ class Page:
         self.mouse, self.keyboard = Mouse(self), Keyboard(self)
         self.log, self.native, self.mods, self.waits = [], [], set(), []
         self.handles, self.scrolls = [], []   # main-world handle calls; scrolls (css / window / playwright)
+        self.hits = []                        # HIT_IN_BOX asked: (the hit node's Field, the box asked about)
         self.pos, self.focused, self.frame_focus = (0.0, 0.0), None, False
         self.main_frame = object()
         self.viewport_size = {"width": 1280, "height": 800}
@@ -427,6 +472,8 @@ class Page:
     def key(self, k):
         if k == "a" and self.mods & {"ControlOrMeta", "Control", "Meta"}:
             k = "ControlOrMeta+a"   # an A pressed with the modifier held is the select-all chord
+        if k == "Backspace" and self.mods & {"Control", "Alt"}:
+            k = "WordBackspace"     # a Backspace with Control (Alt on macOS) held deletes the word
         if self.focused is not None:
             self.focused.key(k)
 
@@ -716,9 +763,330 @@ def test_mouse_click_xy_uses_the_engine_path_only_for_a_plain_left_click(fast):
         await p.mouse.click(300, 200, button="right")
         await p.mouse.click(300, 200, delay=250)
         await p.mouse.click(300, 200, modifiers=["Shift"])
-        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath"]
+        # r43 (SC 232 lane H): the right click asks once whether the engine takes the r43 parameters (an empty
+        # dispatchKeySequence); this fake answers {} -- not r43's -32602 -- so it stays SDK-side as before.
+        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath",
+                                                                    "Browser.dispatchKeySequence"]
         assert [(d[1]) for d in kinds(p, "down")] == ["right", "left", "left"]
     run(go())
+
+
+class _R43Session(_Session):
+    """An r43 engine: an empty Browser.dispatchKeySequence is invalid params (-32602); every call's params kept."""
+
+    def __init__(self):
+        super().__init__()
+        self.params = []
+
+    async def send(self, method, params=None):
+        if method == "Browser.dispatchKeySequence" and not (params or {}).get("keys"):
+            self.calls.append(method)
+            raise Exception("Protocol error (Browser.dispatchKeySequence): Invalid parameters")
+        self.params.append((method, dict(params or {})))
+        return await super().send(method, params)
+
+
+class _R42Session(_Session):
+    """A PRO engine before r43: the pointer path answers, Browser.dispatchKeySequence does not exist (-32601)."""
+
+    async def send(self, method, params=None):
+        if method == "Browser.dispatchKeySequence":
+            self.calls.append(method)
+            raise Exception("Protocol error (Browser.dispatchKeySequence): 'Browser.dispatchKeySequence' wasn't found")
+        return await super().send(method, params)
+
+
+def _with_session(p, s):
+    async def new_cdp_session(page):
+        return s
+    p.context = type("Ctx", (), {"new_cdp_session": staticmethod(new_cdp_session), "browser": None})()
+
+
+def test_r43_engine_walks_right_double_modified_clicks_held_legs_and_typed_runs(fast, monkeypatch):
+    """SC 232 lane H (SDK side of pro-r43-07 / 09): on an engine that takes the r43 parameters, right / double /
+    modified clicks, held legs (buttons, fromX/fromY once the SDK moved the pointer) and slip-free typed runs
+    (ONE dispatchKeySequence with lane B's dwell and lane D's flight per key) go engine-side; a caller-chosen hold
+    stays SDK-side; the probe is asked once per browser; modifier keys are still pressed by the SDK. Rollover is
+    pinned to 0 here: a run the persona rolls over stays per key since verifier A's R3b (its own test below)."""
+    monkeypatch.setattr(H, "rollover_rate", lambda persona: 0.0)
+
+    async def go():
+        p = await attached(_btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)                       # plain and in sync: the r42 route, no probe
+        await p.mouse.click(300, 200, button="right")       # the probe, then the engine walks it
+        await p.mouse.click(310, 200, click_count=2)
+        await p.mouse.click(320, 200, modifiers=["Shift"])
+        await p.mouse.click(300, 200, delay=250)            # a caller-chosen hold stays SDK-side
+        pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+        assert len(pp) == 4
+        assert "fromX" not in pp[0] and "button" not in pp[0] and pp[0]["noClick"] is False
+        assert pp[1].get("button") == "right" and pp[2].get("clickCount") == 2 and pp[3].get("modifiers") == 8
+        assert [c for c in s.calls if c == "Browser.dispatchKeySequence"] == ["Browser.dispatchKeySequence"], "one probe"
+        assert [(d[1]) for d in kinds(p, "down")] == ["left"], "only the held-delay click presses natively"
+        assert [k[1] for k in kinds(p, "kdown")] == ["Shift"] and [k[1] for k in kinds(p, "kup")] == ["Shift"]
+        # a held leg: dispatchPointerPath {buttons: 1, noClick}, starting where the SDK's own glide left the pointer
+        await p.mouse.down()
+        await p.mouse.move(360, 240)
+        await p.mouse.up()
+        held = [q for m, q in s.params if m == "Browser.dispatchPointerPath" and q.get("buttons")]
+        assert len(held) == 1 and held[0]["buttons"] == 1 and held[0]["noClick"] is True
+        assert (held[0]["fromX"], held[0]["fromY"], held[0]["x"], held[0]["y"]) == (300.0, 200.0, 360.0, 240.0)
+        # a typed run with no slip to plan: ONE dispatchKeySequence, US codes, Shift as modifiers 8
+        presses = len(kinds(p, "press"))
+        await p.keyboard.type("hello, World!")
+        ks = [q for m, q in s.params if m == "Browser.dispatchKeySequence"]
+        assert len(ks) == 1 and len(kinds(p, "press")) == presses
+        keys = ks[0]["keys"]
+        assert "".join(k["key"] for k in keys) == "hello, World!"
+        assert keys[5]["code"] == "Comma" and keys[7]["modifiers"] == 8 and "modifiers" not in keys[0]
+        assert keys[-1]["code"] == "Digit1" and keys[-1]["modifiers"] == 8 and keys[-1]["gapMs"] == 0.0
+        assert all(45.0 <= k["dwellMs"] <= 120.0 for k in keys)
+        assert all(k["gapMs"] >= 25.0 for k in keys[:-1])
+    run(go())
+
+
+def test_a_pro_engine_without_the_r43_extensions_is_reported_once_through_on_fallback(fast):
+    """A PRO engine before r43 (the pointer path answers, dispatchKeySequence does not exist): the SDK planner does
+    the work, lane A's on_fallback hears {api: "engine_ext"} ONCE per browser, strict mode does not raise (not a
+    native fallback), and no second probe is sent."""
+    async def go():
+        events = []
+        p = Page(_btn())
+        await H.attach_humanize(None, p, humanize={"on_fallback": events.append, "strict": True}, seed="forms-unit")
+        s = _R42Session()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)                       # the pointer path answers: a PRO engine
+        await p.mouse.click(300, 200, button="right")       # the probe says no: reported once, pressed SDK-side
+        await p.mouse.click(310, 200, click_count=2)        # no second probe, no second report
+        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath",
+                                                                    "Browser.dispatchKeySequence"]
+        assert events == [{"api": "engine_ext", "reason": H.ENGINE_EXT_MISSING, "selector": None}]
+        assert [(d[1], d[2]) for d in kinds(p, "down")] == [("right", 1), ("left", 1), ("left", 2)]
+    run(go())
+
+
+def test_engine_ext_off_keeps_the_r42_route_on_an_r43_engine(fast, monkeypatch):
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_ENGINE_EXT", "off")
+
+    async def go():
+        p = await attached(_btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)
+        await p.mouse.click(300, 200, button="right")
+        assert [c for c in s.calls if c.startswith("Browser.")] == ["Browser.dispatchPointerPath"], "no probe"
+        assert [(d[1]) for d in kinds(p, "down")] == ["right"]
+    run(go())
+
+
+# ------------------------------------------------------------- fixes after verifier A (SC 232, R3-R5)
+class _InvalidTargetSession(_Session):
+    """A CDP proxy, or a PRO engine before r43, whose EMPTY dispatchKeySequence fails with other wording than
+    -32602's "Invalid parameters" -- not an r43 engine. Every pointer path's params kept."""
+
+    def __init__(self):
+        super().__init__()
+        self.params = []
+
+    async def send(self, method, params=None):
+        if method == "Browser.dispatchKeySequence":
+            self.calls.append(method)
+            raise Exception("Protocol error (Browser.dispatchKeySequence): Invalid target")
+        self.params.append((method, dict(params or {})))
+        return await super().send(method, params)
+
+
+def _key_seqs(s):
+    return [q for m, q in s.params if m == "Browser.dispatchKeySequence"]
+
+
+def _typed_keys(p):
+    """The characters the fake keyboard saw go down (a press, or a keydown of a rolled-over key)."""
+    return [e[1] for e in p.log if (e[0] == "press" or e[0] == "kdown") and len(e[1]) == 1]
+
+
+async def _attached_opts(options, *fields):
+    p = Page(*fields)
+    await H.attach_humanize(None, p, humanize=options, seed="forms-unit")
+    return p
+
+
+def _sync_page(options=True, *fields):
+    """The sync humanizer on the same simulated page (through _hz_sync_sim), engine session attachable."""
+    import clearcote._humanize as HS
+    from _hz_sync_sim import sync_page
+    sim, page = sync_page(*fields)
+    HS.attach_humanize(None, page, humanize=options, seed="forms-unit")
+    return sim, page
+
+
+@pytest.fixture
+def sync_fast(monkeypatch):
+    import clearcote._humanize as HS
+    monkeypatch.setattr(HS.time, "sleep", lambda s: None)
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "0")
+
+
+def test_engine_off_keeps_a_typed_run_per_key_on_an_r43_engine(fast):
+    """R3a: humanize {engine: "off"} -- the documented way to keep everything SDK-side -- also keeps the typed run
+    off the engine (no probe, no dispatchKeySequence). 949f5b1 only honoured CLEARCOTE_HUMANIZE_ENGINE_EXT=off there."""
+    async def go():
+        p = await _attached_opts({"engine": "off"}, _btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.keyboard.type("hello")
+        assert "Browser.dispatchKeySequence" not in s.calls, "no probe, no engine run"
+        assert _typed_keys(p) == list("hello")
+    run(go())
+
+
+def test_sync_engine_off_keeps_a_typed_run_per_key_on_an_r43_engine(sync_fast):
+    sim, page = _sync_page({"engine": "off"}, _btn())
+    s = _R43Session()
+    _with_session(sim, s)
+    page.keyboard.type("hello")
+    assert "Browser.dispatchKeySequence" not in s.calls, "no probe, no engine run"
+    assert _typed_keys(sim) == list("hello")
+
+
+def test_a_run_the_persona_rolls_over_stays_per_key_on_an_r43_engine(fast, monkeypatch):
+    """R3b: Browser.dispatchKeySequence cannot overlap keys (the engine clamps gapMs at 0), so a run with rollover
+    (lane B's rollover_rate: 12-38 % of eligible pairs per identity) types per key, with its overlaps; the engine
+    run is taken exactly for the runs that would have had none. On 949f5b1 every slip-free run went engine-side
+    with zero overlap: the credential fields of an identity typed with none, the text field next to them with
+    the persona's share."""
+    async def go():
+        p = await attached(_btn())
+        s = _R43Session()
+        _with_session(p, s)
+        monkeypatch.setattr(H, "rollover_rate", lambda persona: 1.0)
+        await p.keyboard.type("hello world")
+        assert _key_seqs(s) == [], "a rolled run stays per key"
+        assert _typed_keys(p) == list("hello world")
+        kd = [e[1] for e in kinds(p, "kdown") if len(e[1]) == 1]
+        assert len(kd) >= 6, kd                              # the rolled pairs went down as keydown/keyup pairs
+        monkeypatch.setattr(H, "rollover_rate", lambda persona: 0.0)
+        await p.keyboard.type("hello world")
+        assert len(_key_seqs(s)) == 1 and len(_key_seqs(s)[0]["keys"]) == 11, "a run with no rollover: the engine"
+    run(go())
+
+
+def test_sync_a_run_the_persona_rolls_over_stays_per_key_on_an_r43_engine(sync_fast, monkeypatch):
+    import clearcote._humanize as HS
+    sim, page = _sync_page(True, _btn())
+    s = _R43Session()
+    _with_session(sim, s)
+    monkeypatch.setattr(HS, "rollover_rate", lambda persona: 1.0)
+    page.keyboard.type("hello world")
+    assert _key_seqs(s) == [] and _typed_keys(sim) == list("hello world")
+    assert len([e[1] for e in kinds(sim, "kdown") if len(e[1]) == 1]) >= 6
+    monkeypatch.setattr(HS, "rollover_rate", lambda persona: 0.0)
+    page.keyboard.type("hello world")
+    assert len(_key_seqs(s)) == 1 and len(_key_seqs(s)[0]["keys"]) == 11
+
+
+@pytest.mark.parametrize("mode", ["async", "sync"])
+def test_an_engine_typed_run_records_a_typed_trace_line(fast, sync_fast, monkeypatch, tmp_path, mode):
+    """R3c: the score hook (lane G) hears an engine typed run as one "typed" line with the PLANNED down/up times,
+    as the per-key path records its dispatched ones; 949f5b1 wrote nothing for it (the hook under-reported on r43)."""
+    import clearcote._humanize as HS
+    out = tmp_path / "score.jsonl"
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_SCORE", "1")
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_SCORE_FILE", str(out))
+    monkeypatch.setenv("CLEARCOTE_NO_WARN", "1")
+    monkeypatch.setattr(H, "rollover_rate", lambda persona: 0.0)
+    monkeypatch.setattr(HS, "rollover_rate", lambda persona: 0.0)
+    if mode == "async":
+        async def go():
+            p = await attached(_btn())
+            s = _R43Session()
+            _with_session(p, s)
+            await p.keyboard.type("hello world")
+            assert len(_key_seqs(s)) == 1
+        run(go())
+    else:
+        sim, page = _sync_page(True, _btn())
+        s = _R43Session()
+        _with_session(sim, s)
+        page.keyboard.type("hello world")
+        assert len(_key_seqs(s)) == 1
+    lines = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines() if x.strip()] if out.exists() else []
+    typed = [ln for ln in lines if ln["kind"] == "typed"]
+    assert len(typed) == 1, [ln["kind"] for ln in lines]
+    assert typed[0]["n"] == 11
+    assert typed[0]["meta"] == {"n": 11, "typos": False, "floor_ms": 0.0, "engine": True}
+
+
+def test_the_r43_probe_accepts_only_cdp_invalid_parameters(fast):
+    """R4: only CDP -32602 says "r43": its "Invalid parameters" wording (Playwright strips the code from the
+    message) or the code itself. Any other failure of the empty-sequence probe -- a proxy's "Invalid target",
+    "Invalid session id" -- is NOT an r43 engine. 949f5b1 took any "invalid", memoised the browser as r43 and then
+    sent fromX/fromY on an out-of-sync plain click to an engine that ignores unknown params and walks from its own
+    stale point (the teleport the re-sync exists to remove), where 0.51.0 declined the engine route."""
+    ok = H._cdp_invalid_params
+    assert ok(Exception("Protocol error (Browser.dispatchKeySequence): Invalid parameters"))
+    assert ok(Exception("Protocol error (Browser.dispatchKeySequence): Invalid parameters Failed to deserialize params.keys"))
+    assert ok(Exception("CDP error -32602: invalid params"))
+    for m in ("Protocol error (Browser.dispatchKeySequence): Invalid target",
+              "Protocol error (Browser.dispatchKeySequence): Invalid session id",
+              "Protocol error (Browser.dispatchKeySequence): Not allowed: invalid state",
+              "Protocol error (Browser.dispatchKeySequence): 'Browser.dispatchKeySequence' wasn't found",
+              "Target page, context or browser has been closed"):
+        assert not ok(Exception(m)), m
+
+    async def go():
+        p = await attached(_btn())
+        s = _InvalidTargetSession()
+        _with_session(p, s)
+        await p.mouse.click(300, 200)                    # plain and in sync: the r42 route
+        await p.mouse.click(300, 200, button="right")    # the probe fails with other wording: not r43 -> SDK-side
+        await p.mouse.move(500, 400)                     # an SDK glide: the engine is out of sync now
+        await p.mouse.click(520, 410)                    # declined (no fromX re-sync on a non-r43 engine): planner
+        pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+        assert len(pp) == 1 and "fromX" not in pp[0] and "button" not in pp[0], pp
+        assert [c for c in s.calls if c == "Browser.dispatchKeySequence"] == ["Browser.dispatchKeySequence"], "one probe"
+        assert [d[1] for d in kinds(p, "down")] == ["right", "left"]
+    run(go())
+
+
+def test_engine_all_walks_selector_clicks_with_buttons_and_modifiers_engine_side(fast):
+    """R5: with engine "all" a selector click with a button, a click count or modifiers takes the r43 extensions
+    the way mouse.click does (the modifier keys pressed by the SDK around it). On 949f5b1 only the plain left
+    selector click went engine-side; page.click(sel, button="right"), dblclick and modified clicks stayed on the
+    planner while the same clicks by coordinate walked in the engine."""
+    async def go():
+        p = await _attached_opts({"engine": "all"}, _btn())
+        s = _R43Session()
+        _with_session(p, s)
+        await p.click("#b")
+        await p.click("#b", button="right")
+        await p.dblclick("#b")
+        await p.click("#b", modifiers=["Shift"])
+        pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+        assert len(pp) == 4, pp
+        assert pp[0]["noClick"] is False and "button" not in pp[0] and "clickCount" not in pp[0]
+        assert pp[1].get("button") == "right" and pp[2].get("clickCount") == 2 and pp[3].get("modifiers") == 8
+        assert kinds(p, "down") == [], "nothing pressed natively"
+        assert [k[1] for k in kinds(p, "kdown")] == ["Shift"] and [k[1] for k in kinds(p, "kup")] == ["Shift"]
+        assert non_trial(p) == []
+    run(go())
+
+
+def test_sync_engine_all_walks_selector_clicks_with_buttons_and_modifiers_engine_side(sync_fast):
+    sim, page = _sync_page({"engine": "all"}, _btn())
+    s = _R43Session()
+    _with_session(sim, s)
+    page.click("#b")
+    page.click("#b", button="right")
+    page.dblclick("#b")
+    page.click("#b", modifiers=["Shift"])
+    pp = [q for m, q in s.params if m == "Browser.dispatchPointerPath"]
+    assert len(pp) == 4, pp
+    assert pp[1].get("button") == "right" and pp[2].get("clickCount") == 2 and pp[3].get("modifiers") == 8
+    assert kinds(sim, "down") == [] and non_trial(sim) == []
+    assert [k[1] for k in kinds(sim, "kdown")] == ["Shift"] and [k[1] for k in kinds(sim, "kup")] == ["Shift"]
 
 
 # ------------------------------------------------------------------------------------- text
@@ -1163,6 +1531,31 @@ def test_typo_rate_zero_disables_slips(fast, monkeypatch):
     assert not [e for e in kinds(p, "press") if e[1] == "Backspace"]
 
 
+def test_a_capital_put_back_after_the_word_fix_goes_behind_a_real_shift(fast, monkeypatch):
+    # SC 239 (lab contenteditable, SC 209 row "Capitals typed with Shift held 12/14"): a keydown 'M' right after
+    # Control+Backspace had no Shift keydown before it -- _restore typed the word it put back bare (sync twin and the
+    # late-notice case: test_humanize_keyboard). The planner is pinned to one substitution at the 'r' and the word fix
+    # to every slip; the simulator deletes the word under Control+Backspace as the browser does.
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "1")
+    monkeypatch.setattr(H, "WORD_FIX_RATE", 1.0)
+    monkeypatch.setattr(H, "plan_typo", lambda text, i, rng, rate: {"kind": "sub", "wrong": "t", "late": 0} if i == 1 else None)
+
+    async def go():
+        f = Field()
+        p = await attached(("#f", f))
+        p.focused = f
+        await p.keyboard.type("Mr")
+        return p, f
+    p, f = run(go())
+    assert f.value == "Mr"
+    log = kinds(p, "press", "kdown", "kup")
+    wd = next(i for i, e in enumerate(log) if e == ("kdown", "Control"))
+    back = [i for i, e in enumerate(log) if i > wd and e[0] == "press" and e[1] == "M"]
+    assert len(back) == 1, "the word fix put the M back"
+    nxt = next((i for i, e in enumerate(log) if i > back[0] and e[0] == "press"), len(log))
+    assert ("kdown", "Shift") in log[wd:back[0]] and ("kup", "Shift") in log[back[0]:nxt], log[wd:]
+
+
 # ------------------------------------------------------------------------------------ select
 COUNTRIES = [("afg0", "Afghanistan"), ("alb1", "Albania"), ("ger2", "Germany"), ("gha3", "Ghana"),
              ("gre4", "Greece"), ("bra5", "Bravo", True), ("uru6", "Uruguay")]
@@ -1223,9 +1616,8 @@ def test_select_the_current_option_fires_nothing(fast):
     run(go())
 
 
-@pytest.mark.parametrize("args,kw", [(("bra5",), {}), (("nowhere",), {}), (({"value": "gre4"},), {}),
-                                     ((None,), {"element": object()})])
-def test_disabled_missing_and_object_options_go_native(fast, args, kw):
+@pytest.mark.parametrize("args,kw", [(("bra5",), {}), (("nowhere",), {}), ((None,), {"element": object()})])
+def test_disabled_missing_and_element_options_go_native(fast, args, kw):
     async def go():
         sel = _select()
         p = await attached(sel)
@@ -1367,7 +1759,10 @@ def test_locator_actions_forward_their_options(Locator):
         await Locator.tap(s, position={"x": 3, "y": 4})
         return s
     s = run(go())
-    assert s.page.calls == [
+    # a tap on a touch context is reported as a fallback (lane A's report keeps it as
+    # page._clearcote_last_fallback), then routed as the humanized click
+    assert s.page._clearcote_last_fallback["api"] == "Locator.tap"
+    assert [c for c in s.page.calls if c[0] != "_report_fallback"] == [
         ("click", "#b", {"button": "right", "click_count": 2, "modifiers": ["Shift"], "position": {"x": 1, "y": 2},
                          "timeout": 1500}),
         ("dblclick", "#b", {"delay": 90}),
@@ -1407,23 +1802,42 @@ def test_a_routed_locator_action_lets_every_error_through_and_never_reruns_nativ
 
 @pytest.mark.parametrize("kw", [dict(parent=object()),
                                 dict(selector="#fr >> internal:control=enter-frame >> #fi")])
-def test_frame_locators_stay_native(Locator, kw):
-    # A FrameLocator's child keeps the MAIN frame as its _frame; only its selector shows the iframe.
+def test_frame_locators_take_the_frame_route_and_go_native_with_a_report_when_it_cannot_run(Locator, kw):
+    # A FrameLocator's child keeps the MAIN frame as its _frame; only its selector shows the iframe. It
+    # no longer goes through the page-level methods (they act on the main frame); it takes the frame
+    # route (_frames), which cannot run on this stub (no element waits, no CDP) -> Playwright's own
+    # method, with the fallback reported (lane F, SC 232; was: native, silently).
     async def go():
         s = _Self(**kw)
         await Locator.fill(s, "new")
         return s
     s = run(go())
-    assert s.page.calls == [] and [c[0] for c in s._impl_obj.calls] == ["fill"]
+    assert [c[0] for c in s._impl_obj.calls] == ["fill"], "Playwright's own fill, once"
+    assert [c[0] for c in s.page.calls] == [], "no page.* method"
+    assert s.page._clearcote_last_fallback["api"] == "Locator.fill", "the fallback reported"
 
 
 # ------------------------------------------------------------------- press / type / range targets
-def test_press_on_a_button_goes_to_playwright_without_a_click(fast):
+def test_press_on_a_button_is_never_clicked_first(fast):
+    # Lane D (SC 232): a button out of Tab reach (this simulator has no Tab order) gets the pointer over
+    # it and Playwright's focus -- reported --, then a HELD key; never a click (it activated the button a
+    # second time) and never Playwright's 0 ms focus-and-press.
     async def go():
-        p = await attached(_btn())
+        p = Page(_btn())
+        seen = []
+
+        async def focus(sel, **kw):
+            p.native.append(("focus", sel, kw))
+            p.focused = p.by_sel[sel]
+        p.focus = focus
+        await H.attach_humanize(None, p, humanize={"on_fallback": seen.append}, seed="forms-unit")
         await p.press("#b", "Enter")
-        assert [n[:3] for n in p.native] == [("press", "#b", "Enter")]
-        assert not kinds(p, "click", "down", "press"), "a click first activated the button a second time"
+        assert [n[:2] for n in p.native] == [("focus", "#b")]
+        assert not kinds(p, "click", "down"), "a click first activated the button a second time"
+        presses = kinds(p, "press")
+        assert [e[1] for e in presses] == ["Enter"] and presses[0][2] >= 45
+        assert kinds(p, "move"), "the pointer goes to the button"
+        assert seen and seen[0]["api"] == "Page.press"
     run(go())
 
 
@@ -1762,4 +2176,306 @@ def test_a_humanized_click_presses_the_whole_pixel_the_hit_test_proved(fast):
             moves = kinds(p, "move")
             x, y = moves[-1][1], moves[-1][2]
             assert x == int(x) and y == int(y), (x, y)
+    run(go())
+
+
+# ------------------------------------------------------------------------- lane F (SC 232): coverage
+# option dicts, label-aware checkbox aim, tap on touch contexts, attach on every context's page event.
+@pytest.mark.parametrize("args,kw,want", [
+    (({"value": "gre4"},), {}, "gre4"),
+    (({"label": "Uruguay"},), {}, "uru6"),
+    (({"index": 3},), {}, "gha3"),
+    (([{"label": "Ghana"}, {"value": "alb1"}],), {}, "alb1"),   # the first in document order wins
+])
+def test_option_dicts_are_humanized_not_native(fast, args, kw, want):
+    async def go():
+        sel = _select()
+        p = await attached(sel)
+        assert await p.select_option("#s", *args, **kw) == [want]
+        s = sel[1]
+        assert s.options[s.selected_index]["value"] == want
+        assert s.changes == 1 and s.opens == 1, "one trusted change through the opened drop-down"
+        assert p.native == [], "no native select_option"
+    run(go())
+
+
+def test_a_value_dict_matches_the_value_only_and_unmatched_dicts_reach_playwright_translated(fast):
+    async def go():
+        sel = _select()
+        p = await attached(sel)
+        # {"value": "Germany"}: Playwright matches an option object's value alone -- no option has it
+        assert await p.select_option("#s", {"value": "Germany"}) == ["native"]
+        assert p.native[-1][2] == ["Germany"], "the dict is translated for Playwright Python"
+        # two fields in one dict: not an option Playwright can name either -> native, untouched
+        assert await p.select_option("#s", {"value": "gre4", "label": "Greece"}) == ["native"]
+        assert sel[1].opens == 0
+    run(go())
+
+
+def test_select_wants_pins_the_node_shapes():
+    from clearcote._humanize import select_wants
+    assert select_wants("a") == [("value", "a")]
+    assert select_wants({"value": "a"}) == [("valueOnly", "a")]
+    assert select_wants([{"label": "L"}, {"index": 2}]) == [("label", "L"), ("index", 2)]
+    assert select_wants(None, index=[1, 2], label="x") == [("index", 1), ("index", 2), ("label", "x")]
+    assert select_wants({"index": "2"}) is None and select_wants({"index": True}) is None
+    assert select_wants({"value": "a", "label": "b"}) is None and select_wants({}) is None
+    assert select_wants(object()) is None and select_wants(None) is None
+
+
+def _cb_with_label(hidden):
+    cb = Field(type="checkbox", rect=(0.0, 0.0, 0.0, 0.0) if hidden else (100.0, 100.0, 16.0, 16.0),
+               visible=not hidden)
+    lab = Field(tag="label", type="", rect=(96.0, 96.0, 140.0, 24.0) if hidden else (122.0, 98.0, 120.0, 20.0),
+                control=cb)
+    return cb, lab
+
+
+def test_a_hidden_custom_checkbox_is_checked_by_a_trusted_click_on_its_label(fast):
+    async def go():
+        cb, lab = _cb_with_label(hidden=True)
+        p = await attached(("#cb", cb), ("#lab", lab))
+        await p.check("#cb")
+        assert cb.checked, "the label passed the click on"
+        downs = kinds(p, "down")
+        assert len(downs) == 1 and lab.inside(*downs[0][4]), "pressed inside the label's box"
+        assert not non_trial(p), "no native check"
+        await p.uncheck("#cb")
+        assert not cb.checked and len(kinds(p, "down")) == 2
+    run(go())
+
+
+def test_a_visible_checkbox_is_clicked_on_its_label_text_about_40_percent_of_the_time(fast):
+    async def go():
+        on_label = []
+        for i in range(60):
+            cb, lab = _cb_with_label(hidden=False)
+            p = Page(("#cb", cb), ("#lab", lab))
+            await H.attach_humanize(None, p, humanize=True, seed="label-share-%d" % (i // 6))
+            await p.check("#cb")
+            assert cb.checked and not non_trial(p)
+            on_label.append(lab.inside(*kinds(p, "down")[0][4]))
+        share = sum(on_label) / len(on_label)
+        assert 0.2 <= share <= 0.6, share
+        assert any(on_label) and not all(on_label)
+    run(go())
+
+
+def test_a_visible_labels_click_is_hit_tested_on_the_label_element_not_its_text_rect(fast, monkeypatch):
+    # SC 232 lab triage (10-16): the click AIMS inside the label's TEXT rect, but HIT_IN_BOX proves "the node at
+    # (x, y) is the element filling box b" -- and no element fills the text's own rect; only the <label> fills the
+    # label's. Asked with the text rect, the test failed on every visible label and the click went to the input:
+    # 0 of 20 label clicks on verifier B's fixture, 0 of 18 in the lab, on d2b9ab6. The simulator answers
+    # HIT_IN_BOX the way the browser does: the hit node's own rect against the asked box.
+    async def go():
+        monkeypatch.setattr(H, "label_draw", lambda *a, **k: True)   # this click: the label (the trait is not the question)
+        cb = Field(type="checkbox", rect=(100.0, 100.0, 16.0, 16.0))
+        lab = Field(tag="label", type="", rect=(96.0, 96.0, 420.0, 24.0), control=cb, text_rect=(124.0, 100.0, 110.0, 16.0))
+        p = Page(("#cb", cb), ("#lab", lab))
+        await H.attach_humanize(None, p, humanize=True, seed="label-hit")
+        await p.check("#cb")
+        assert cb.checked and not non_trial(p)
+        downs = kinds(p, "down")
+        assert len(downs) == 1
+        x, y = downs[0][4]
+        assert lab.inside(x, y) and not cb.inside(x, y), (x, y)
+        assert 124.0 <= x <= 234.0 and 100.0 <= y <= 116.0, "the press lands in the label's text"
+    run(go())
+
+
+# SC 239 box probe (10-17), `<label id=lcb3><input id=vcb type=checkbox> Visible checkbox with a label</label>`:
+# LABEL_OF answered {rect: [40, 74, 214.8, 17], text: [44, 75, 13, 13], contains: True} -- the "text" rect IS the
+# input's own box (the first client rect of a wrapping label's contents is the control's border box), so _label_aim
+# aimed inside the input and every "label" click landed on the input (lab F_label_visible 0/60, verifier B 0/20).
+WRAP_LABEL, WRAP_INPUT = (40.0, 74.0, 214.8, 17.0), (44.0, 75.0, 13.0, 13.0)
+
+
+def test_a_wrapping_labels_text_rect_over_the_input_is_no_label_aim(fast, monkeypatch):
+    # The helper's old answer (text == the input's box, contains): the wrapper must not take it for the label's text
+    # -- no hit test asked about the label's box, the click aimed at the input itself.
+    async def go():
+        monkeypatch.setattr(H, "label_draw", lambda *a, **k: True)   # this click would be the label's
+        cb = Field(type="checkbox", rect=WRAP_INPUT)
+        lab = Field(tag="label", type="", rect=WRAP_LABEL, control=cb, wraps=True, text_rect=WRAP_INPUT)
+        p = Page(("#cb", cb), ("#lab", lab))
+        await H.attach_humanize(None, p, humanize=True, seed="label-wrap")
+        await p.check("#cb")
+        assert cb.checked and not non_trial(p)
+        downs = kinds(p, "down")
+        assert len(downs) == 1 and cb.inside(*downs[0][4]), downs
+        assert not [h for h in p.hits if h[1] == WRAP_LABEL], "a label aim was tried on the input's own box"
+    run(go())
+
+
+def test_a_wrapping_labels_text_beside_the_input_is_aimed_and_hit_tested_on_the_label(fast, monkeypatch):
+    # The fixed helper's answer: the text's rect clear of the control (its content rects outside the input's box) --
+    # the click aims inside it and the hit test is asked about the label element's box.
+    async def go():
+        monkeypatch.setattr(H, "label_draw", lambda *a, **k: True)
+        cb = Field(type="checkbox", rect=WRAP_INPUT)
+        lab = Field(tag="label", type="", rect=WRAP_LABEL, control=cb, wraps=True, text_rect=(61.0, 75.0, 193.8, 15.0))
+        p = Page(("#cb", cb), ("#lab", lab))
+        await H.attach_humanize(None, p, humanize=True, seed="label-wrap")
+        await p.check("#cb")
+        assert cb.checked and not non_trial(p)
+        downs = kinds(p, "down")
+        assert len(downs) == 1
+        x, y = downs[0][4]
+        assert lab.inside(x, y) and not cb.inside(x, y) and 61.0 <= x <= 254.8 and 75.0 <= y <= 90.0, (x, y)
+        assert [h for h in p.hits if h[1] == WRAP_LABEL and h[0] is lab], "hit-tested on the label element's box"
+    run(go())
+
+
+def test_same_seed_same_label_trait_but_unseeded_per_click_choices():
+    # The seed fixes the TRAIT (how often this identity clicks the label); each click's choice is an
+    # unseeded draw, or every session of an identity would choose the same way in the same order.
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    a, b = make_persona("same-identity"), make_persona("same-identity")
+    from clearcote._motion import aim_traits
+    # a persona trait now (lane B's aim traits, 0.25-0.55), not one 0.4 for every identity
+    assert _humanize.label_share(a) == _humanize.label_share(b) == aim_traits(a).label_share
+    assert 0.25 <= _humanize.label_share(a) <= 0.55
+    da = [_humanize.label_draw(a) for _ in range(20)]
+    db = [_humanize.label_draw(b) for _ in range(20)]
+    assert da != db, "two sessions of one identity made the same 20 choices"
+
+
+def test_the_label_draw_leaves_the_global_random_stream_alone():
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    p = make_persona("x")
+    random.seed(11)
+    want = [random.random() for _ in range(5)]
+    random.seed(11)
+    for _ in range(50):
+        _humanize.label_draw(p)
+    assert [random.random() for _ in range(5)] == want
+
+
+def test_a_tests_own_rng_and_the_personas_share_decide():
+    from clearcote import _humanize
+    from clearcote._motion import make_persona
+    p = make_persona("x")
+    r1, r2 = random.Random(5), random.Random(5)
+    assert [_humanize.label_draw(p, r1) for _ in range(20)] == [_humanize.label_draw(p, r2) for _ in range(20)]
+    p.label_share = 1.0          # lane B may give personas their own share
+    assert all(_humanize.label_draw(p) for _ in range(20))
+    p.label_share = 0.0
+    assert not any(_humanize.label_draw(p) for _ in range(20))
+
+class _TouchCtx:
+    def __init__(self, touch):
+        self._impl_obj = type("I", (), {"_options": {"hasTouch": touch}})()
+
+
+class _TapPage:
+    _clearcote_humanized = True
+
+    def __init__(self, strict=False, touch=True):
+        self.calls = []
+        self.context = _TouchCtx(touch)
+        if strict:
+            self._clearcote_strict = True
+
+    async def click(self, sel, **kw):
+        self.calls.append(("click", sel, kw))
+
+
+class _TapSelf:
+    def __init__(self, page):
+        self._impl_obj, self.page = _Impl(None, "#b"), page
+
+    async def count(self):
+        return 1
+
+
+def test_tap_on_a_touch_context_raises_in_strict_mode(Locator):
+    from playwright.async_api import Error
+
+    async def go():
+        s = _TapSelf(_TapPage(strict=True))
+        with pytest.raises(Error, match="tap is not humanized for touch contexts yet"):
+            await Locator.tap(s)
+        assert s.page.calls == [] and s._impl_obj.calls == [], "nothing was sent"
+    run(go())
+
+
+def test_tap_on_a_touch_context_reports_the_fallback_and_clicks(Locator):
+    async def go():
+        page = _TapPage()
+        s = _TapSelf(page)
+        await Locator.tap(s, position={"x": 1, "y": 2})
+        assert page.calls == [("click", "#b", {"position": {"x": 1, "y": 2}})]
+        ev = page._clearcote_last_fallback
+        assert ev["api"] == "Locator.tap" and "not humanized for touch" in ev["reason"] and ev["selector"] == "#b"
+        seen = []
+        page2 = _TapPage()
+        from clearcote._hzoptions import HumanizeOptions
+        page2._clearcote_hz = HumanizeOptions(on_fallback=seen.append)   # lane A's on_fallback hears it
+        await Locator.tap(_TapSelf(page2))
+        assert len(seen) == 1 and seen[0]["api"] == "Locator.tap"
+    run(go())
+
+
+class _EvCtx:
+    """A context that emits "page" like Playwright's: no Browser (a persistent context's)."""
+
+    def __init__(self, pages=()):
+        self.pages, self.handlers, self.browser = list(pages), [], None
+
+    def on(self, ev, fn):
+        if ev == "page":
+            self.handlers.append(fn)
+
+    async def add_init_script(self, *_a, **_k):
+        return None
+
+    async def emit(self, page):
+        self.pages.append(page)
+        for fn in self.handlers:
+            r = fn(page)
+            if r is not None and hasattr(r, "__await__"):
+                await r
+
+
+def test_a_persistent_context_without_a_browser_attaches(fast):
+    async def go():
+        first = Page(_btn())
+        ctx = _EvCtx([first])
+        await H.install_humanize_on_context(ctx, humanize=True, seed="persist")
+        assert getattr(first, "_clearcote_humanized", False) is True, "context.browser is None: still attached"
+        later = Page(_btn())
+        await ctx.emit(later)
+        await _real_sleep(0)
+        assert getattr(later, "_clearcote_humanized", False) is True, "a page it opens later too"
+        await H.install_humanize_on_context(ctx, humanize=True, seed="persist")
+        assert len(ctx.handlers) == 1, "hooking a context twice adds no second listener"
+    run(go())
+
+
+def test_a_popup_of_the_implicit_context_of_browser_new_page_is_humanized(fast):
+    async def go():
+        ctx = _EvCtx()
+
+        class _B:
+            async def new_page(self, **kw):
+                pg = Page(_btn())
+                pg.context = ctx
+                ctx.pages.append(pg)
+                return pg
+
+            async def new_context(self, **kw):
+                return _EvCtx()
+
+        b = _B()
+        await H.install_humanize(b, humanize=True, seed="popup")
+        page = await b.new_page()
+        assert page._clearcote_humanized is True
+        mouse = page.mouse.move
+        popup = Page(_btn())
+        await ctx.emit(popup)             # window.open / target=_blank in that context
+        await _real_sleep(0)
+        assert getattr(popup, "_clearcote_humanized", False) is True
+        assert page.mouse.move is mouse, "the opener was not wrapped a second time"
     run(go())

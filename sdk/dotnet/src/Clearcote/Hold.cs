@@ -18,8 +18,10 @@ public sealed record PressAndHoldOptions
     /// number (else <see cref="ArgumentException"/>).</summary>
     public double? Duration { get; init; }
 
-    /// <summary>The point to press, relative to the element's top-left corner (its bounding box). Default: a
-    /// persona-shaped point near the centre on a humanized page, the centre otherwise.</summary>
+    /// <summary>The point to press, relative to the element's PADDING box (as Playwright's <c>Position</c> and the
+    /// humanized click's; on a humanized page the border widths are added -- before 0.52 it was the border box here).
+    /// Default: a persona-shaped point near the centre on a humanized page (a covered one moves to the first probe point
+    /// the hit test proves), the centre otherwise.</summary>
     public Position? Position { get; init; }
 
     /// <summary>The button held down (default <see cref="MouseButton.Left"/>).</summary>
@@ -107,11 +109,13 @@ internal static class HoldPlan
         return ReactionMinMs + rng() * (ReactionMaxMs - ReactionMinMs);
     }
 
-    /// <summary>The viewport point to press: <paramref name="position"/> (relative to the box's top-left), else the
-    /// persona's click point when there is a persona, else the centre.</summary>
-    public static Point HoldPoint(Box box, Point? from = null, Persona? persona = null, Position? position = null)
+    /// <summary>The viewport point to press: <paramref name="position"/> (relative to the PADDING box: the
+    /// <paramref name="border"/> widths (left, top) are added, as the humanized click does), else the persona's click
+    /// point when there is a persona, else the centre.</summary>
+    public static Point HoldPoint(Box box, Point? from = null, Persona? persona = null, Position? position = null,
+        (double L, double T) border = default)
     {
-        if (position is not null) return new Point(box.X + position.X, box.Y + position.Y);
+        if (position is not null) return new Point(box.X + border.L + position.X, box.Y + border.T + position.Y);
         if (persona is not null && from is Point f) return Motion.ClickPoint(box, f, persona);
         return new Point(box.X + box.Width / 2.0, box.Y + box.Height / 2.0);
     }
@@ -131,7 +135,10 @@ public static partial class Humanize
     /// Press and hold this element: one long button press, for controls that act only while the button stays down
     /// (a hold-to-confirm button, a long-press menu, a "press and hold" verification button). Not a Playwright method.
     /// <list type="number">
-    /// <item>waits for the element to be visible (<see cref="PressAndHoldOptions.Timeout"/>) and brings it into view;</item>
+    /// <item>waits for the element to be visible (<see cref="PressAndHoldOptions.Timeout"/>) and brings it into view -- on a
+    /// humanized page with the WHEEL (<see cref="Scroll.BringIntoViewAsync"/>: whole notches or a trackpad swipe to 25-60 % of
+    /// the viewport; before 0.52 this was a programmatic scroll), falling back to the programmatic scroll -- reported -- only
+    /// for a container the wheel cannot move; Playwright's scroll on any other page;</item>
     /// <item>moves the pointer to a point inside it (<see cref="PressAndHoldOptions.Position"/>, else a persona-shaped
     /// point near the centre on a humanized page, the centre otherwise);</item>
     /// <item>presses and holds for <see cref="PressAndHoldOptions.Duration"/> ms, or until
@@ -225,12 +232,31 @@ public static partial class Humanize
         ct.ThrowIfCancellationRequested();
 
         Point? from = st is null ? null : st.Known ? new Point(st.X, st.Y) : new Point(bb.X - 120, bb.Y - 90);
-        var pt = HoldPlan.HoldPoint(new Box(bb.X, bb.Y, bb.Width, bb.Height), from, persona, o.Position);
+        // A humanized main-frame page reads the element through the isolated world: border widths for a padding-box
+        // `Position` (like click's), and the covered-point check on the press point (the same hit test as a click).
+        bool iso = persona is not null && InMainFrame(loc);
+        (double, double) border = default;
+        if (iso && o.Position is not null)
+        {
+            try
+            {
+                var info = await DescribeAsync(page, bb, null).ConfigureAwait(false);
+                if (info is not null) border = (info.Bl, info.Bt);
+            }
+            catch (Exception) { border = default; }
+        }
+        var pt = HoldPlan.HoldPoint(new Box(bb.X, bb.Y, bb.Width, bb.Height), from, persona, o.Position, border);
         double x = Math.Round(pt.X), y = Math.Round(pt.Y);
+        if (iso && o.Position is null
+            && await ReachesPointAsync(page, bb, x, y, CssOf(loc)).ConfigureAwait(false) == false
+            && await ProvenClickPointAsync(page, bb, CssOf(loc)).ConfigureAwait(false) is { } alt)
+        {
+            (x, y) = (alt.X, alt.Y);   // a covered persona point: the first probe point the hit test proves
+        }
 
         if (persona is not null && st is not null)
         {
-            await GlideAsync(page, persona, st, x, y, Math.Max(6, bb.Width)).ConfigureAwait(false);
+            await GlideAsync(page, persona, st, x, y, AimW(bb)).ConfigureAwait(false);
             await PrePressAsync(persona).ConfigureAwait(false);   // the hand confirms the target before it presses
         }
         else

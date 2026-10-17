@@ -76,6 +76,8 @@ public class HumanizeWheelTests
         ((IsolatedWorldTests.FakeContext)(object)ctx).Cdp = withCdp ? cdp : null;
         ((Page)(object)page).Context = ctx;
         ((Page)(object)page).Mouse = mouse;
+        // A macOS persona defaults to a trackpad since 0.52 (Scroll.PlanTrackpad); these pin the MOUSE wheel.
+        Humanize.InputDeviceOverride.AddOrUpdate(page, "mouse");
         return (page, (Mouse)(object)mouse, (Cdp)(object)cdp);
     }
 

@@ -31,6 +31,8 @@ const fakePage = (platform: string | null) => {
     dragTo: noop, page: () => null,
   };
   const page = {
+    // a macOS persona defaults to a trackpad since 0.52 (scroll.ts planTrackpad); these pin the MOUSE wheel
+    _clearcoteInputDevice: "mouse",
     mouse: {
       move: noop, click: noop, down: noop, up: noop,
       wheel: async (x: number, y: number) => { wheels.push([x, y]); },

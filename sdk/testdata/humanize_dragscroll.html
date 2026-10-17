@@ -1,0 +1,44 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>dragscroll</title><style>
+/* Lane E (SC 232) live fixture: drag ends, a pointer-following knob, an off-screen target, a nested
+   scrolling container that starts off-screen, and a non-scrollable (overflow:hidden) panel. */
+body { margin: 0; height: 4000px; font: 14px sans-serif; position: relative; }
+.a { position: absolute; }
+#src { left: 100px; top: 200px; width: 120px; height: 60px; background: #2563eb; }
+#dst { left: 700px; top: 420px; width: 200px; height: 140px; background: #f59e0b; }
+#track { left: 60px; top: 620px; width: 420px; height: 44px; background: #ddd; }
+#knob { position: absolute; left: 2px; top: 2px; width: 40px; height: 40px; border-radius: 20px; background: #16a34a; }
+#far { left: 500px; top: 3000px; width: 160px; height: 40px; }
+#box { left: 100px; top: 1100px; width: 400px; height: 200px; overflow: auto; background: #eef; }
+#box .inner { position: relative; height: 2000px; }
+#deep { position: absolute; left: 20px; top: 1500px; width: 200px; height: 30px; }
+#ns { position: fixed; right: 20px; top: 40px; width: 300px; height: 200px; overflow: hidden; background: #fee; }
+#ns .inner { position: relative; height: 900px; }
+#hid { position: absolute; left: 20px; top: 600px; width: 160px; height: 30px; }
+</style></head><body>
+<div class="a" id="src">src</div>
+<div class="a" id="dst">dst</div>
+<div class="a" id="track"><div id="knob"></div></div>
+<button class="a" id="far">far</button>
+<div class="a" id="box"><div class="inner"><button id="deep">deep</button></div></div>
+<div id="ns"><div class="inner"><button id="hid">hidden</button></div></div>
+<script>
+window.__ev = [];
+const P = (o) => window.__ev.push(o);
+addEventListener('pointermove', e => {
+  const cs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+  for (const c of cs) P({t: 'move', ts: c.timeStamp, x: c.clientX, y: c.clientY, b: c.buttons, tr: e.isTrusted});
+}, true);
+for (const ty of ['pointerdown', 'pointerup', 'click'])
+  addEventListener(ty, e => P({t: ty, ts: e.timeStamp, x: e.clientX, y: e.clientY, tr: e.isTrusted,
+                               id: e.target.id || e.target.tagName}), true);
+addEventListener('wheel', e => P({t: 'wheel', ts: e.timeStamp, dx: e.deltaX, dy: e.deltaY, mode: e.deltaMode,
+                                  x: e.clientX, y: e.clientY, tr: e.isTrusted}), {capture: true, passive: true});
+document.addEventListener('scroll', e => P({t: 'scroll', ts: e.timeStamp,
+  id: e.target === document ? 'window' : (e.target.id || e.target.tagName)}), true);
+(() => { const k = document.getElementById('knob'); let sx = null, x0 = 2;
+  k.addEventListener('pointerdown', e => { sx = e.clientX; x0 = k.offsetLeft; k.setPointerCapture(e.pointerId); });
+  k.addEventListener('pointermove', e => { if (sx === null) return;
+    k.style.left = Math.max(2, Math.min(378, x0 + e.clientX - sx)) + 'px'; });
+  k.addEventListener('pointerup', () => { sx = null; }); })();
+</script></body></html>

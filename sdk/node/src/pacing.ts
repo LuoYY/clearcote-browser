@@ -25,6 +25,8 @@
 // Nothing here changes what the planner returns; only WHEN each sample goes out and which late ones
 // are dropped.
 
+import { record as traceRecord, traceEnabled } from "./trace.js";
+
 export const MAX_JUMP_PX = 40;
 // A single dispatch slower than this is a STALL (the page or the box was busy), not latency: nothing
 // reached the page while it lasted, so the plan pauses with it instead of skipping ahead afterwards.
@@ -44,6 +46,11 @@ export interface WalkOpts<S extends PacedStep> {
   sleep?: (ms: number) => Promise<unknown>;
   maxJump?: number;
   pinned?: (s: S, i: number) => boolean;    // a step that changes button state: never skipped
+  /** The action kind for the score hook (trace.ts: glide | drag | ambient | hover). With CLEARCOTE_HUMANIZE_SCORE
+   *  set, the dispatched samples and their actual dispatch times are scored after the walk. Read-only. */
+  kind?: string;
+  /** The button bitmask held through the walk (a drag leg: 1), carried on every recorded sample. */
+  buttons?: number;
 }
 
 const realNow = (): number => performance.now();
@@ -81,8 +88,12 @@ export async function walk<S extends PacedStep>(
   const maxJump = o.maxJump ?? MAX_JUMP_PX;
   const pinned = o.pinned ?? (() => false);
   if (!steps.length) return 0;
+  const trace: { x: number; y: number; t: number; buttons?: number }[] | null = traceEnabled() ? [] : null;
+  const kind = o.kind ?? "glide";
+  const buttons = o.buttons ?? 0;
   const { due, total } = schedule(steps);
   let t0 = now();
+  const tStart = t0;
   let tLast = t0;
   let i = 0, sent = 0;
   let last: { x: number; y: number } | null = null;
@@ -92,8 +103,12 @@ export async function walk<S extends PacedStep>(
     else i = nextIndex(steps, due, i, last, el, jumpCap(maxJump, now() - tLast), pinned);
     const s = steps[i];
     const tb = now();
-    try { await move(s.x, s.y); } catch { return sent; }
+    try { await move(s.x, s.y); } catch {
+      if (trace?.length) traceRecord(kind, trace, { planned_n: steps.length, sent, aborted: true });
+      return sent;
+    }
     sent++;
+    trace?.push(buttons ? { x: s.x, y: s.y, t: tb - tStart, buttons } : { x: s.x, y: s.y, t: tb - tStart });
     t0 += stallMs(now() - tb);
     last = { x: s.x, y: s.y };
     tLast = tb;
@@ -101,6 +116,7 @@ export async function walk<S extends PacedStep>(
   }
   const el = now() - t0;
   if (el < total) await sleep(total - el);   // the last sample's own dwell (a settle hold, a frame)
+  if (trace?.length) traceRecord(kind, trace, { planned_n: steps.length, planned_ms: total, sent });
   return sent;
 }
 

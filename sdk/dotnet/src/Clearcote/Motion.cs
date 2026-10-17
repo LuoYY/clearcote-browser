@@ -18,8 +18,8 @@ namespace Clearcote;
 //   * `>>> 0` coerces to uint32. C# `>>` on int is arithmetic (sign-propagating), so every place the
 //     TS reads `>>> n` uses a uint here.
 //
-// PlanAmbient is deliberately not ported yet — it exists in the other two SDKs for pre-challenge idle
-// entropy and nothing in the .NET surface calls it. Porting it without a caller would be untested code.
+// PlanAmbient is ported (SC 232 lane C) with its caller, Humanize.HumanAmbientMotionAsync, and pinned to the
+// other two SDKs by sdk/testdata/humanize_after_vectors.json.
 
 /// <summary>Deterministic 0..1 generator, matching the other SDKs' mulberry32.</summary>
 public delegate double Rng();
@@ -44,14 +44,16 @@ public sealed class Persona
     public double Overshoot { get; init; }
     public int MaxCorrections { get; init; }
     public double ApproachBias { get; init; }
+    /// <summary>The HUMAN BANDS every timing draw is clamped to (ms); the per-identity medians inside them come
+    /// from the salted timing stream (<see cref="Motion.TimingTraitsOf"/>). Grab hesitation after mouse down:</summary>
     public double GrabMinMs { get; init; } = 130;
     public double GrabMaxMs { get; init; } = 360;
     public double ReleaseMinMs { get; init; } = 90;
     public double ReleaseMaxMs { get; init; } = 230;
-    /// <summary>Click press-hold (mousedown→mouseup). Human ~60–150ms; a scripted click is ~2ms.</summary>
-    public double ClickHoldMinMs { get; init; } = 60;
-    public double ClickHoldMaxMs { get; init; } = 150;
-    /// <summary>Per-key dwell (keydown→keyup). Human ~45–120ms; scripted typing ~2–3ms.</summary>
+    /// <summary>Click press-hold band (mousedown→mouseup), 55–230 ms; a scripted click is ~2ms.</summary>
+    public double ClickHoldMinMs { get; init; } = 55;
+    public double ClickHoldMaxMs { get; init; } = 230;
+    /// <summary>Per-key dwell band (keydown→keyup), 45–120 ms; scripted typing ~2–3ms.</summary>
     public double KeyDwellMinMs { get; init; } = 45;
     public double KeyDwellMaxMs { get; init; } = 120;
 }
@@ -62,6 +64,11 @@ public readonly record struct Step(double X, double Y, double SleepMs);
 public readonly record struct Box(double X, double Y, double Width, double Height);
 /// <summary>Per-identity path-shape traits (see Motion.ShapeTraitsOf).</summary>
 public readonly record struct ShapeTraits(double OvershootRate, double Curve, double DragTempo);
+/// <summary>Per-identity timing medians (ms) and tempo (see Motion.TimingTraitsOf).</summary>
+public readonly record struct TimingTraits(double ClickHoldMs, double KeyDwellMs, double GrabMs, double ReleaseMs,
+    double DblclickGapMs, double PauseScale, double TypoRate);
+/// <summary>Per-identity aiming traits (see Motion.AimTraitsOf).</summary>
+public readonly record struct AimTraits(double Spread, double Undershoot, double SideBias, double LabelShare);
 
 public static class Motion
 {
@@ -164,25 +171,182 @@ public static class Motion
         };
     }
 
-    /// <summary>A human mousedown→mouseup hold (ms), right-skewed. Fixes the ~2ms instant-press tell.</summary>
+    // Salt for the timing stream. Like the rollover and shape salts, a separate Mulberry32(seed ^ salt) stream keeps
+    // MakePersona's draw ORDER (and so every existing seed's motor identity) unchanged.
+    private const uint TimingSalt = 0xC2B2AE35;
+
+    /// <summary>
+    /// The persona's timing traits, drawn from a salted stream of its seed: the median click hold (70–140 ms), key
+    /// dwell (60–95), drag grab (180–280) and release (120–180), double-click gap (90–140), a tempo on deliberation
+    /// pauses (0.8–1.25) and the typo rate (0.5–4 %). Before this every identity shared one fixed window per timing.
+    /// Same values as Python <c>timing_traits</c> and Node <c>timingTraits</c>.
+    /// </summary>
+    public static TimingTraits TimingTraitsOf(Persona p)
+    {
+        Rng r = Mulberry32(p.Seed ^ TimingSalt);
+        double clickHold = Lerp(70, 140, r());
+        double keyDwell = Lerp(60, 95, r());
+        double grab = Lerp(180, 280, r());
+        double release = Lerp(120, 180, r());
+        double dbl = Lerp(90, 140, r());
+        double pause = Lerp(0.8, 1.25, r());
+        double typo = Lerp(0.005, 0.04, r());
+        return new TimingTraits(clickHold, keyDwell, grab, release, dbl, pause, typo);
+    }
+
+    /// <summary><c>median * exp(sigma * N(0,1))</c> clamped to [lo, hi]: a right-skewed human timing.</summary>
+    public static double LognormalMs(double median, double sigma, double lo, double hi, Rng rng)
+        => Clamp(median * Math.Exp(sigma * GaussFrom(rng)), lo, hi);
+
+    /// <summary>A human mousedown→mouseup hold (ms): log-normal (σ 0.25) around the persona's median, clamped to its band.</summary>
     public static double ClickHold(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return p.ClickHoldMinMs + Math.Min(1, Math.Abs(GaussFrom(rng)) * 0.5) * (p.ClickHoldMaxMs - p.ClickHoldMinMs);
+        // the preset scales the median (Humanize.TempoOf); ApplyOptions already scaled the band
+        return LognormalMs(TimingTraitsOf(p).ClickHoldMs * Humanize.TempoOf(p), 0.25, p.ClickHoldMinMs, p.ClickHoldMaxMs, rng);
     }
 
-    /// <summary>A human per-key keydown→keyup dwell (ms), right-skewed. Fixes the ~2–3ms tell.</summary>
+    /// <summary>A human per-key keydown→keyup dwell (ms): log-normal (σ 0.22) around the persona's median, clamped to its band.</summary>
     public static double KeyDwell(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return p.KeyDwellMinMs + Math.Min(1, Math.Abs(GaussFrom(rng)) * 0.45) * (p.KeyDwellMaxMs - p.KeyDwellMinMs);
+        return LognormalMs(TimingTraitsOf(p).KeyDwellMs * Humanize.TempoOf(p), 0.22, p.KeyDwellMinMs, p.KeyDwellMaxMs, rng);
     }
 
-    /// <summary>Grab/release dwell times (ms) for a held-button drag.</summary>
+    /// <summary>
+    /// Where a reading hand parks the pointer before a wheel: x ~ 0.5w ± 0.10w clamped [0.12w, 0.88w], y ~ 0.34h
+    /// ± 0.09h clamped [0.10h, 0.62h] (two gaussians, x first). One model in all three SDKs (Python
+    /// <c>wheel_anchor_point</c>, motion.ts <c>wheelAnchorPoint</c>); before 0.52 .NET used 0.5/0.38, sd 0.12/0.10.
+    /// </summary>
+    public static (double X, double Y) WheelAnchorPoint(double vw, double vh, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double x = Clamp(vw * 0.5 + GaussFrom(rng) * vw * 0.10, vw * 0.12, vw * 0.88);
+        double y = Clamp(vh * 0.34 + GaussFrom(rng) * vh * 0.09, vh * 0.10, vh * 0.62);
+        return (x, y);
+    }
+
+    // Salt for the drag-start hesitation traits (Python _HESITATION_SALT, motion.ts HESITATION_SALT): a
+    // salted stream keeps MakePersona's draw ORDER, and PlanDrag itself is untouched.
+    private const uint HesitationSalt = 0xFD7046C5; // own stream (was the timing salt)
+    /// <summary>The drag-start hesitation window (ms): a hand that has just closed on a handle holds 100-300 ms.</summary>
+    public const double HesitationMinMs = 100, HesitationMaxMs = 300;
+    /// <summary>... creeping a few px, never this far, before the leg proper.</summary>
+    public const double HesitationMaxPx = 8;
+
+    /// <summary>
+    /// The still-but-not-frozen moment between the grab and the drag leg from->to: samples spanning
+    /// 100-300 ms (centred per persona; <paramref name="durMs"/>, 40-300, overrides the length while the
+    /// persona's draw is still made), creeping under 8 px toward <paramref name="to"/> with a little sideways
+    /// wobble. Same numbers as Python <c>_motion.drag_hesitation</c> and motion.ts <c>dragHesitation</c>
+    /// (sdk/testdata/humanize_scroll_vectors.json). Measured on r38 / SDK 0.51.0 (SC 232): every drag's first
+    /// held move was already the full-speed leg.
+    /// </summary>
+    public static List<Step> DragHesitation(Point from, Point to, Persona p, Rng? rng = null, double? durMs = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        Rng r = Mulberry32(p.Seed ^ HesitationSalt);
+        double centre = Lerp(130, 260, r());
+        double amp = Lerp(2, 6, r());
+        double wobble = Lerp(0.4, 1.2, r());
+        double d = Hypot(to.X - from.X, to.Y - from.Y);
+        double ux = d >= 1e-6 ? (to.X - from.X) / d : 1, uy = d >= 1e-6 ? (to.Y - from.Y) / d : 0;
+        double dur = Clamp(centre * Lerp(0.8, 1.2, rng()), HesitationMinMs, HesitationMaxMs);
+        if (durMs is double dm) dur = Clamp(dm, 40, HesitationMaxMs);
+        double reach = amp * Lerp(0.6, 1.0, rng());
+        double stepMs = 1000 / p.DeviceHz;
+        int n = (int)Math.Max(3, JsRound(dur / stepMs));
+        double dt = dur / n;
+        double phase = rng() * 2 * Math.PI;
+        var outSteps = new List<Step>();
+        double side = 0;
+        for (int i = 1; i <= n; i++)
+        {
+            double tau = (double)i / n;
+            double along = reach * MinJerk(tau);
+            side = 0.8 * side + GaussFrom(rng) * wobble * 0.25;
+            double s = Clamp(side + wobble * 0.5 * Math.Sin(phase + 2 * Math.PI * tau), -1.5, 1.5);
+            double px = from.X + ux * along - uy * s, py = from.Y + uy * along + ux * s;
+            if (Hypot(px - from.X, py - from.Y) >= HesitationMaxPx - 0.5)
+            {
+                px = from.X + ux * (HesitationMaxPx - 1);
+                py = from.Y + uy * (HesitationMaxPx - 1);
+            }
+            outSteps.Add(new Step(px, py, dt * Lerp(0.9, 1.1, rng())));
+        }
+        return outSteps;
+    }
+
+    /// <summary>When (ms from the start of <paramref name="steps"/>) the walk first leaves the
+    /// <paramref name="radius"/> circle around <paramref name="from"/>; the whole length when it never does.</summary>
+    public static double LegExitMs(Point from, IReadOnlyList<Step> steps, double radius = HesitationMaxPx)
+    {
+        double t = 0;
+        foreach (var s in steps)
+        {
+            if (Hypot(s.X - from.X, s.Y - from.Y) >= radius) return t;
+            t += s.SleepMs;
+        }
+        return t;
+    }
+
+    /// <summary>
+    /// The held part of a drag: the hesitation creep, then the <see cref="PlanDrag"/> leg, planned together so
+    /// the pointer stays inside 8 px of the press for <paramref name="windowMs"/> (clamped 100-300: the
+    /// persona's grab dwell) and then goes. Same as Python <c>hesitate_then_drag</c>.
+    /// </summary>
+    public static (List<Step> Steps, int Creep) HesitateThenDrag(Point from, Point to, Persona p, double windowMs,
+        bool settle = true, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double w = Clamp(windowMs, HesitationMinMs, HesitationMaxMs);
+        var creep = DragHesitation(from, to, p, rng, w);
+        var leg = PlanDrag(new Point(creep[^1].X, creep[^1].Y), to, p, settle, rng);
+        double t8 = LegExitMs(from, leg);
+        double want = Math.Max(40, w - t8);
+        double have = 0;
+        foreach (var s in creep) have += s.SleepMs;
+        if (Math.Abs(have - want) > 1)
+        {
+            double k = want / have, m = Math.Min(1, k);
+            for (int i = 0; i < creep.Count; i++)
+            {
+                var s = creep[i];
+                creep[i] = new Step(from.X + (s.X - from.X) * m, from.Y + (s.Y - from.Y) * m, s.SleepMs * k);
+            }
+            leg = PlanDrag(new Point(creep[^1].X, creep[^1].Y), to, p, settle, rng);
+        }
+        var all = new List<Step>(creep);
+        all.AddRange(leg);
+        return (all, creep.Count);
+    }
+
+    /// <summary>Grab/release dwell times (ms) for a held-button drag: log-normal (σ 0.2) around the persona's medians.</summary>
     public static (double GrabMs, double ReleaseMs) DragDwell(Persona p, Rng? rng = null)
     {
         rng ??= Random.Shared.NextDouble;
-        return (Lerp(p.GrabMinMs, p.GrabMaxMs, rng()), Lerp(p.ReleaseMinMs, p.ReleaseMaxMs, rng()));
+        var tt = TimingTraitsOf(p);
+        double t = Humanize.TempoOf(p);
+        double grab = LognormalMs(tt.GrabMs * t, 0.2, p.GrabMinMs, p.GrabMaxMs, rng);
+        double release = LognormalMs(tt.ReleaseMs * t, 0.2, p.ReleaseMinMs, p.ReleaseMaxMs, rng);
+        return (grab, release);
+    }
+
+    /// <summary>The gap between the two presses of a double click (ms): log-normal (σ 0.15) around the persona's
+    /// median, clamped to 70–170.</summary>
+    public static double DblclickGap(Persona p, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double t = Humanize.TempoOf(p);
+        return LognormalMs(TimingTraitsOf(p).DblclickGapMs * t, 0.15, 70 * t, 170 * t, rng);
+    }
+
+    /// <summary>A deliberation pause (ms) from [lo, hi], scaled by the persona's tempo; without a persona the plain window.</summary>
+    public static double PauseMs(Persona? p, double lo, double hi, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double v = Lerp(lo, hi, rng());
+        return p is null ? v : v * TimingTraitsOf(p).PauseScale * Humanize.TempoOf(p);
     }
 
     // Salt for the rollover stream. Drawing from Mulberry32(seed ^ salt) instead of adding a field to
@@ -235,23 +399,44 @@ public static class Motion
         return null;
     }
 
-    /// <summary>
-    /// A human click point inside <paramref name="box"/>: a 2D gaussian around centre, nudged toward
-    /// the approach side (people undershoot toward where the cursor came from), clamped inside the edges.
-    /// This is what defeats a landing-dispersion check — a driver that clicks the computed centre lands
-    /// on the identical sub-pixel point every time, which aiming never does.
-    /// </summary>
-    public static Point ClickPoint(Box box, Point from, Persona p, Rng? rng = null)
+    // Salt for the aim traits (ClickPoint): the persona's landing dispersion, undershoot and handedness.
+    private const uint AimSalt = 0x27D4EB2F;
+    /// <summary>The persona's aiming traits from a salted stream of its seed: dispersion (sd 0.10–0.20 of the box),
+    /// undershoot toward the approach side (0.06–0.16) and handedness (ApproachBias × 0.4). Same values as Python
+    /// <c>aim_traits</c> and Node <c>aimTraits</c>.</summary>
+    public static AimTraits AimTraitsOf(Persona p)
     {
+        Rng r = Mulberry32(p.Seed ^ AimSalt);
+        double spread = Lerp(0.10, 0.20, r());
+        double under = Lerp(0.06, 0.16, r());
+        double label = Lerp(0.25, 0.55, r());   // SC 232 integration: lane F's label aim, a trait (was one 0.4 for all)
+        return new AimTraits(spread, under, p.ApproachBias * 0.4, label);
+    }
+
+    /// <summary>
+    /// A human click point inside <paramref name="box"/>: a 2D gaussian toward the centre with the persona's
+    /// dispersion, nudged toward the approach side (undershoot) and sideways by its handedness, clamped inside the
+    /// edges. The SEED fixes the persona's spread, undershoot and handedness (it was one dispersion for everyone); each
+    /// click's draw is unseeded (Random.Shared unless <paramref name="rng"/> is given), like every per-action draw, so
+    /// no two visits of one identity replay the same landing sequence. Without a persona: sd 0.15, 12 % undershoot,
+    /// no handedness.
+    /// </summary>
+    public static Point ClickPoint(Box box, Point from, Persona? p, Rng? rng = null)
+    {
+        double spread = 0.15, under = 0.12, side = 0;
+        if (p is not null)
+        {
+            var at = AimTraitsOf(p);
+            spread = at.Spread; under = at.Undershoot; side = at.SideBias;
+        }
         rng ??= Random.Shared.NextDouble;
         double cx = box.X + box.Width / 2, cy = box.Y + box.Height / 2;
         double dx = cx - from.X, dy = cy - from.Y;
         double d = Hypot(dx, dy);
         if (d == 0) d = 1;
         double ux = -dx / d, uy = -dy / d;
-        double bx = ux * box.Width * 0.12, by = uy * box.Height * 0.12;
-        double x = cx + bx + GaussFrom(rng) * box.Width * 0.16;
-        double y = cy + by + GaussFrom(rng) * box.Height * 0.16;
+        double x = cx + ux * box.Width * under + side * box.Width + GaussFrom(rng) * box.Width * spread;
+        double y = cy + uy * box.Height * under + GaussFrom(rng) * box.Height * spread;
         // Below the 4px inset the clamp bounds invert and would return a point OUTSIDE the element.
         return new Point(
             box.Width >= 4 ? Clamp(x, box.X + 2, box.X + box.Width - 2) : cx,
@@ -524,4 +709,182 @@ public static class Motion
         }
         return outSteps;
     }
+
+    // ---- ambient (port of plan_ambient / planAmbient, SC 232 lane C) -----------------------------
+
+    /// <summary>
+    /// Plan ambient / pre-challenge cursor activity: idle drift + a few non-goal moves inside a central band
+    /// of the viewport (12–88 % across, 14–80 % down), so a behavioral collector sees pointer entropy before
+    /// the first goal action. About <paramref name="ms"/> long (it runs past it by whole excursions and rests;
+    /// <see cref="Pacing.TrimTo"/> cuts it). Bit-identical to Python <c>plan_ambient</c> and Node
+    /// <c>planAmbient</c> for the same persona and RNG (sdk/testdata/humanize_after_vectors.json).
+    /// </summary>
+    public static List<Step> PlanAmbient(Point from, double vw, double vh, Persona p, double ms, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        var outSteps = new List<Step>();
+        var cur = from;
+        double elapsed = 0;
+        double budget = Math.Max(200, ms);
+        double bx0 = vw * 0.12, bx1 = vw * 0.88;
+        double by0 = vh * 0.14, by1 = vh * 0.8;
+        while (elapsed < budget && outSteps.Count < 4000)
+        {
+            double tx = Lerp(bx0, bx1, rng());
+            double ty = Lerp(by0, by1, rng());
+            var target = new Point(tx, ty);
+            foreach (var s in PlanMove(cur, target, p, 80, rng: rng))
+            {
+                outSteps.Add(s);
+                elapsed += s.SleepMs;
+            }
+            double restMs = Lerp(120, 600, rng());
+            double d0 = 0, d1 = 0;
+            double stepMs = 1000 / p.DeviceHz;
+            double held = 0;
+            double tphase = rng() * 2 * Math.PI;
+            while (held < restMs)
+            {
+                double k = stepMs / p.DriftTau;
+                d0 += -k * d0 + Math.Sqrt(2 * k) * p.DriftAmp * GaussFrom(rng);
+                d1 += -k * d1 + Math.Sqrt(2 * k) * p.DriftAmp * GaussFrom(rng);
+                double ph = tphase + (2 * Math.PI * p.TremorHz * held) / 1000;
+                outSteps.Add(new Step(target.X + d0 + p.TremorAmp * Math.Sin(ph),
+                                      target.Y + d1 + p.TremorAmp * Math.Sin(ph + Math.PI / 2),
+                                      stepMs * Lerp(0.9, 1.4, rng())));
+                held += stepMs;
+                elapsed += stepMs;
+            }
+            cur = target;
+        }
+        return outSteps;
+    }
+
+    // ---- after-action (SC 232 lane C) ------------------------------------------------------------
+    // Salt for the after-action stream (hover dwell, move-off after a click, the attention model): a separate
+    // Mulberry32(seed ^ salt) stream keeps MakePersona's draw order (every seed's motor identity) unchanged.
+    // Same values in Python _motion.py and Node motion.ts.
+    private const uint AfterSalt = 0x165667B1; // own stream (was the timing salt)
+
+    /// <summary>The pointer keeps within this many px of where a hover arrived while it dwells there.</summary>
+    public const double DwellRadiusPx = 3;
+    /// <summary>A move-off after a click is kept this far inside the viewport.</summary>
+    public const double MoveOffMarginPx = 8;
+
+    /// <summary>
+    /// The persona's after-action traits: the first four draws of its salted after-action stream. Measured on
+    /// r42 / SDK 0.51.0 (SC 232 review): a hover stopped dead on arrival and the pointer never left the pressed
+    /// pixel after a click. Same values as Python <c>after_traits</c> and Node <c>afterTraits</c>.
+    /// </summary>
+    public static AfterTraits AfterTraitsOf(Persona p)
+    {
+        var r = Mulberry32(p.Seed ^ AfterSalt);
+        double dwell = Lerp(250, 700, r());
+        double rate = Lerp(0.64, 0.82, r());
+        double delay = Lerp(300, 600, r());
+        double tempo = Lerp(0.85, 1.15, r());
+        return new AfterTraits(dwell, rate, delay, tempo);
+    }
+
+    /// <summary>The persona's after-action stream positioned after its four trait draws. Used by the shared vectors
+    /// only, to compare the SDKs draw for draw: the humanizer's per-action draws are unseeded, as in PlanMove -- the
+    /// seed fixes traits only, or every session of an identity would replay one sequence.</summary>
+    public static Rng AfterRng(Persona p)
+    {
+        var r = Mulberry32(p.Seed ^ AfterSalt);
+        for (int i = 0; i < 4; i++) r();
+        return r;
+    }
+
+    /// <summary>How long a hover dwells on arrival: the persona's centre × 0.6–1.4, kept in 150–800 ms (150–900 as the
+    /// page measures it, with the glide's slow tail).</summary>
+    public static double DwellMs(Persona p, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        return Clamp(AfterTraitsOf(p).DwellMs * Lerp(0.6, 1.4, rng()), 150, 800);
+    }
+
+    /// <summary>
+    /// Plan the pointer's rest on a hover target: OU drift + 8–12 Hz tremor around <paramref name="at"/> for about
+    /// <paramref name="ms"/> (at least 3 samples), every sample within <see cref="DwellRadiusPx"/> of it and inside
+    /// <paramref name="box"/> (1 px in; null: no box). Drift ×2 and tremor ×1.5 of a glide's: a hovering hand is
+    /// not braced the way it is before a press.
+    /// </summary>
+    public static List<Step> PlanDwell(Point at, Box? box, Persona p, double ms, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double stepMs = 1000 / p.DeviceHz;
+        int n = (int)Math.Max(3, JsRound(Math.Max(0, ms) / (stepMs * 1.15)));   // rest gaps average 1.15 frames
+        var outSteps = new List<Step>(n);
+        double d0 = 0, d1 = 0;
+        double tphase = rng() * 2 * Math.PI;
+        double t = 0;
+        for (int i = 0; i < n; i++)
+        {
+            double k = stepMs / p.DriftTau;
+            d0 += -k * d0 + Math.Sqrt(2 * k) * p.DriftAmp * 2.0 * GaussFrom(rng);
+            d1 += -k * d1 + Math.Sqrt(2 * k) * p.DriftAmp * 2.0 * GaussFrom(rng);
+            double ph = tphase + (2 * Math.PI * p.TremorHz * t) / 1000;
+            double dx = d0 + p.TremorAmp * 1.5 * Math.Sin(ph);
+            double dy = d1 + p.TremorAmp * 1.5 * Math.Sin(ph + Math.PI / 2);
+            double r = Hypot(dx, dy);
+            if (r > DwellRadiusPx) { dx = dx * DwellRadiusPx / r; dy = dy * DwellRadiusPx / r; }
+            double x = at.X + dx, y = at.Y + dy;
+            if (box is Box b)
+            {
+                x = b.Width >= 2 ? Clamp(x, b.X + 1, b.X + b.Width - 1) : at.X;
+                y = b.Height >= 2 ? Clamp(y, b.Y + 1, b.Y + b.Height - 1) : at.Y;
+            }
+            double sl = stepMs * Lerp(0.9, 1.4, rng());
+            outSteps.Add(new Step(x, y, sl));
+            t += sl;
+        }
+        return outSteps;
+    }
+
+    /// <summary>Does this click get a move-off? In <see cref="AfterTraits.MoveOffRate"/> of clicks: a draw against the
+    /// rate, nudged by how far the page's running share (<paramref name="hits"/> of <paramref name="n"/> earlier clicks)
+    /// has drifted from it.</summary>
+    public static bool MoveOffRoll(Persona p, Rng? rng = null, int hits = 0, int n = 0)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double rate = AfterTraitsOf(p).MoveOffRate;
+        return rng() < Clamp(rate + 0.5 * (rate * n - hits), 0.05, 0.98);
+    }
+
+    /// <summary>The release → move-off gap: the persona's centre × 0.7–1.3, kept in 200–660 ms (200–700 as the page measures it).</summary>
+    public static double MoveOffDelayMs(Persona p, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double t = Humanize.TempoOf(p);
+        return Clamp(AfterTraitsOf(p).MoveOffDelayMs * t * Lerp(0.7, 1.3, rng()), 200 * t, 660 * t);
+    }
+
+    /// <summary>
+    /// Where the hand drifts after a click: 40–200 px from <paramref name="from"/> at an angle in the downward
+    /// half-plane (20–160°, y down: the gateway's moveOnTarget model), kept <see cref="MoveOffMarginPx"/> inside the
+    /// viewport; mirrored upward when the clamp would leave it on the spot (a click near the bottom edge).
+    /// </summary>
+    public static Point PlanMoveOff(Point from, double vw, double vh, Persona p, Rng? rng = null)
+    {
+        _ = p;
+        rng ??= Random.Shared.NextDouble;
+        double m = MoveOffMarginPx;
+        double ang = Lerp(20, 160, rng()) * (Math.PI / 180);   // as Python's math.radians rounds it
+        double dist = Lerp(40, 200, rng());
+        double dx = Math.Cos(ang) * dist, dy = Math.Sin(ang) * dist;
+        double x = Clamp(from.X + dx, m, vw - m);
+        double y = Clamp(from.Y + dy, m, vh - m);
+        if (Hypot(x - from.X, y - from.Y) < 12)
+        {
+            x = Clamp(from.X + dx, m, vw - m);
+            y = Clamp(from.Y - dy, m, vh - m);
+        }
+        return new Point(x, y);
+    }
 }
+
+/// <summary>Per-identity after-action traits (see <see cref="Motion.AfterTraitsOf"/>): the centre of the hover dwell
+/// (250–700 ms), the share of clicks followed by a move-off (0.64–0.82), the centre of the release → move-off gap
+/// (300–600 ms) and the scale on the attention model's read pause (0.85–1.15).</summary>
+public readonly record struct AfterTraits(double DwellMs, double MoveOffRate, double MoveOffDelayMs, double ReadTempo);

@@ -112,7 +112,7 @@ public class MotionTests
         {
             double d = Motion.ClickHold(p, rng);
             Assert.InRange(d, p.ClickHoldMinMs, p.ClickHoldMaxMs);
-            Assert.True(d >= 60, $"click hold {d}ms is below the human floor");
+            Assert.True(d >= 55, $"click hold {d}ms is below the human floor");
         }
     }
 
