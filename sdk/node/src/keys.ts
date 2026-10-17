@@ -18,6 +18,14 @@ import { gaussFrom, mulberry32, type Rng } from "./motion.js";
 const KEYS_SALT = 0xd3a2646c; // own stream (was 0x27d4eb2f = the aim salt: WPM moved with the aim spread)
 const NOMINAL_DWELL_MS = 80;
 export const MIN_FLIGHT_MS = 25;
+// Calibration of the flight base (SC 232 triage, 10-16): the drawn WPM is the REALIZED speed on neutral English text --
+// the class mix of consecutive key pairs on a 500-pair English sample (same finger 6 %, same hand 21 %, alternating 34 %,
+// 39 % with a space or punctuation on one side; ~27 % of the same-finger / same-hand pairs are row jumps, x1.15), the
+// flight noise's mean exp(0.35^2 / 2) and ~48 ms of pauses per character. Same constants as _keys.py / Keys.cs.
+const EN_SAME_FINGER = 0.06, EN_SAME_HAND = 0.21, EN_ALTERNATE = 0.34, EN_NONE = 0.39;
+const EN_ROW_JUMP = 1.04;
+const EN_PAUSE_MS = 48.0;
+const LOGNORMAL_MEAN = Math.exp(0.35 * 0.35 / 2);
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
@@ -92,8 +100,15 @@ export function bigramClass(prev: string | null | undefined, ch: string | null |
 const PUNCT = ".,;:!?";
 const isWs = (c: string | null | undefined) => c === " " || c === "\t" || c === "\n";
 
+/** How much this persona's finger factors and the flight noise stretch a neutral flight on English text (_keys.english_inflation). */
+export function englishInflation(t: TypingTraits): number {
+  return (EN_SAME_FINGER * t.sameFinger * EN_ROW_JUMP + EN_SAME_HAND * t.sameHand * EN_ROW_JUMP
+    + EN_ALTERNATE * t.alternate + EN_NONE) * LOGNORMAL_MEAN;
+}
+
+/** The neutral bigram's flight, calibrated so the mean keydown interval on English text is 60000 / (wpm x 5) (_keys.base_flight_ms). */
 export function baseFlightMs(t: TypingTraits): number {
-  return Math.max(30, 60000 / (t.wpm * 5) - NOMINAL_DWELL_MS);
+  return Math.max(30, (60000 / (t.wpm * 5) - NOMINAL_DWELL_MS - EN_PAUSE_MS) / englishInflation(t));
 }
 
 /** Flight (ms) from key `prev` to key `ch`; draw order as _keys.flight_ms. */

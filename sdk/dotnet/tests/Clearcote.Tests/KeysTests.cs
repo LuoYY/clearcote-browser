@@ -409,4 +409,27 @@ public class KeysTests
         for (int i = 0; i < a.Length; i++) Assert.Equal(2 * a[i], b[i], 9);
         await Task.CompletedTask;
     }
+
+    // SC 232 triage (10-16): the calibration of the flight base -- the drawn WPM is the realized speed on neutral English.
+    // Before it the trait read 28-75 WPM but typed 23-60 (the finger factors, the flight noise and the pauses stacked on a
+    // base that was already the whole per-character budget).
+    [Fact]
+    public void The_drawn_wpm_is_the_realized_speed_on_neutral_english()
+    {
+        const string neutral = "most people read a page before they act on it: their eyes move over the heading, the first lines and the "
+            + "buttons, and the pointer drifts a little while they do. a script that clicks the first control the moment "
+            + "the page has loaded never reads anything.";
+        foreach (var seed in new[] { "ha-1", "ha-2", "ha-3", "ha-4", "ha-5", "ha-6", "user-7423" })
+        {
+            var p = Motion.MakePersona(seed);
+            var t = Keys.TypingTraitsOf(p.Seed);
+            var rng = Motion.Mulberry32(7);
+            var iv = new List<double>();
+            for (int k = 0; k < 30; k++)
+                for (int i = 1; i < neutral.Length; i++)
+                    iv.Add(Keys.PlanGap(t, neutral[i - 1].ToString(), neutral[i].ToString(), rng) + Motion.KeyDwell(p, rng));
+            double mean = iv.Average(), want = 60000 / (t.Wpm * 5);
+            Assert.True(Math.Abs(mean / want - 1) <= 0.10, $"{seed}: wpm {t.Wpm:F1} planned keydown interval {mean:F0} ms, want {want:F0}");
+        }
+    }
 }

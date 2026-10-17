@@ -16,7 +16,7 @@ vi.mock("../src/motion.js", async (importOriginal) => {
 });
 
 import * as K from "../src/keys.js";
-import { makePersona, mulberry32 } from "../src/motion.js";
+import { keyDwell, makePersona, mulberry32 } from "../src/motion.js";
 import { attachHumanize, typoRate } from "../src/humanize.js";
 
 const VEC = JSON.parse(readFileSync(fileURLToPath(new URL("../../testdata/humanize_typing_vectors.json", import.meta.url)), "utf8"));
@@ -423,4 +423,22 @@ describe("humanized keyboard (Node wrapper, fake clock)", () => {
       await f.page.keyboard.type("aöb");
     })).rejects.toThrow(/insertText/);
   }, 30_000);
+});
+
+// SC 232 triage (10-16): the calibration of the flight base -- the drawn WPM is the realized speed on neutral English.
+describe("the drawn WPM is the realized speed on neutral English", () => {
+  const NEUTRAL = "most people read a page before they act on it: their eyes move over the heading, the first lines and the "
+    + "buttons, and the pointer drifts a little while they do. a script that clicks the first control the moment "
+    + "the page has loaded never reads anything.";
+  for (const seed of ["ha-1", "ha-2", "ha-3", "ha-4", "ha-5", "ha-6", "user-7423"]) {
+    it(`${seed}: planned keydown->keydown mean = 60000 / (wpm x 5) within 10 %`, () => {
+      // before the calibration the trait read 28-75 WPM but typed 23-60 (the finger factors, the flight noise and the
+      // pauses stacked on a base that was already the whole per-character budget)
+      const p = makePersona(seed), t = K.typingTraits(p.seed), rng = mulberry32(7);
+      const iv: number[] = [];
+      for (let k = 0; k < 30; k++) for (let i = 1; i < NEUTRAL.length; i++) iv.push(K.planGap(t, NEUTRAL[i - 1], NEUTRAL[i], rng) + keyDwell(p, rng));
+      const mean = iv.reduce((a, b) => a + b, 0) / iv.length, want = 60000 / (t.wpm * 5);
+      expect(Math.abs(mean / want - 1), `${seed} wpm ${t.wpm} mean ${mean} want ${want}`).toBeLessThanOrEqual(0.10);
+    });
+  }
 });

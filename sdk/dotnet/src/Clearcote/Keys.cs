@@ -26,6 +26,14 @@ public static class Keys
     private const uint KeysSalt = 0xD3A2646C; // own stream (was 0x27D4EB2F = the aim salt)
     private const double NominalDwellMs = 80;
     public const double MinFlightMs = 25;
+    // Calibration of the flight base (SC 232 triage, 10-16): the drawn WPM is the REALIZED speed on neutral English text --
+    // the class mix of consecutive key pairs on a 500-pair English sample (same finger 6 %, same hand 21 %, alternating
+    // 34 %, 39 % with a space or punctuation on one side; ~27 % of the same-finger / same-hand pairs are row jumps, x1.15),
+    // the flight noise's mean exp(0.35^2 / 2) and ~48 ms of pauses per character. Same constants as _keys.py / keys.ts.
+    private const double EnSameFinger = 0.06, EnSameHand = 0.21, EnAlternate = 0.34, EnNone = 0.39;
+    private const double EnRowJump = 1.04;
+    private const double EnPauseMs = 48.0;
+    private static readonly double LogNormalMean = Math.Exp(0.35 * 0.35 / 2);
     /// <summary>Share of whole-word slip corrections made with the word-delete chord and a retype.</summary>
     public const double WordFixRate = 0.30;
     /// <summary>Share of substitutions in a type=search field left uncorrected (never on fill).</summary>
@@ -97,7 +105,16 @@ public static class Keys
 
     private static bool IsWs(string? c) => c is " " or "\t" or "\n";
 
-    public static double BaseFlightMs(TypingTraits t) => Math.Max(30, 60000 / (t.Wpm * 5) - NominalDwellMs);
+    /// <summary>How much this persona's finger factors and the flight noise stretch a neutral flight on English text
+    /// (_keys.english_inflation).</summary>
+    public static double EnglishInflation(TypingTraits t)
+        => (EnSameFinger * t.SameFinger * EnRowJump + EnSameHand * t.SameHand * EnRowJump
+            + EnAlternate * t.Alternate + EnNone) * LogNormalMean;
+
+    /// <summary>The neutral bigram's flight, calibrated so the mean keydown interval on English text is 60000 / (wpm x 5)
+    /// (_keys.base_flight_ms).</summary>
+    public static double BaseFlightMs(TypingTraits t)
+        => Math.Max(30, (60000 / (t.Wpm * 5) - NominalDwellMs - EnPauseMs) / EnglishInflation(t));
 
     /// <summary>Flight (ms) from key <paramref name="prev"/> to key <paramref name="ch"/>; draw order as _keys.flight_ms.</summary>
     public static double FlightMs(TypingTraits t, string? prev, string? ch, Rng rng)

@@ -31,6 +31,17 @@ _KEYS_SALT = 0xD3A2646C   # own stream (was 0x27D4EB2F = the aim salt: WPM moved
 _NOMINAL_DWELL_MS = 80.0
 # No two keydowns closer than this: the planner's floor, as the old max(25, N(85, 45)) had.
 MIN_FLIGHT_MS = 25.0
+# Calibration of the flight base (SC 232 triage, 10-16): the drawn WPM is the REALIZED speed on neutral English text.
+# On such text the bigram model stretches a neutral flight by the class mix below -- shares of consecutive key pairs
+# on a 500-pair English sample: same finger 6 %, same hand 21 %, alternating 34 %, 39 % with a space or punctuation on
+# one side (factor 1); ~27 % of the same-finger / same-hand pairs are row jumps (x1.15) -- times the flight noise's
+# mean exp(0.35^2 / 2), and the pauses (word-initial, after punctuation, after whitespace, thinking) add ~48 ms per
+# character. Before the calibration the trait read 28-75 WPM but typed 23-60 (lab D_cadence on d2b9ab6: ha-1 at
+# 28.9 WPM planned 529 ms per key = 23 WPM). Same constants in keys.ts and Keys.cs.
+_EN_SAME_FINGER, _EN_SAME_HAND, _EN_ALTERNATE, _EN_NONE = 0.06, 0.21, 0.34, 0.39
+_EN_ROW_JUMP = 1.04          # 1 + 0.15 x the row-jump share of the same-finger / same-hand pairs
+_EN_PAUSE_MS = 48.0
+_LOGNORMAL_MEAN = math.exp(0.35 * 0.35 / 2)
 
 
 @dataclass(frozen=True)
@@ -120,10 +131,19 @@ def bigram_class(prev, ch):
 _PUNCT = ".,;:!?"
 
 
+def english_inflation(traits):
+    """How much this persona's finger factors and the flight noise stretch a neutral flight on English text
+    (the class shares above): 1.0 would be a typist whose bigrams all cost the same."""
+    return (_EN_SAME_FINGER * traits.same_finger * _EN_ROW_JUMP + _EN_SAME_HAND * traits.same_hand * _EN_ROW_JUMP
+            + _EN_ALTERNATE * traits.alternate + _EN_NONE) * _LOGNORMAL_MEAN
+
+
 def base_flight_ms(traits):
-    """The keyup->keydown flight the persona's WPM implies for a neutral bigram: the keydown interval
-    60000 / (wpm x 5) less the nominal dwell, floored."""
-    return max(30.0, 60000.0 / (traits.wpm * 5.0) - _NOMINAL_DWELL_MS)
+    """The keyup->keydown flight of a NEUTRAL bigram (class factor 1), set so that with the persona's finger
+    factors, the flight noise, the pauses and the nominal dwell the mean keydown interval on English text is
+    60000 / (wpm x 5): the drawn WPM is the realized speed. Floored at 30 ms, so ~75 WPM is the fastest the
+    model types. Before 10-16 the base was the whole interval less the dwell and everything else stacked on it."""
+    return max(30.0, (60000.0 / (traits.wpm * 5.0) - _NOMINAL_DWELL_MS - _EN_PAUSE_MS) / english_inflation(traits))
 
 
 def flight_ms(traits, prev, ch, rng):

@@ -145,3 +145,23 @@ def test_tab_distance_reads_are_plain_functions():
     for src in (K.TAB_DISTANCE, K.BLANK_POINT, K.SELECTION_STATE):
         assert src.lstrip().startswith(("function", "(a) =>", "() =>"))
     assert "'%s'" not in K.TAB_DISTANCE and "a[href]" in K.TAB_DISTANCE
+
+
+# SC 232 triage (10-16): the calibration of the flight base -- the drawn WPM is the realized speed on neutral English.
+NEUTRAL_ENGLISH = ("most people read a page before they act on it: their eyes move over the heading, the first lines and the "
+                   "buttons, and the pointer drifts a little while they do. a script that clicks the first control the moment "
+                   "the page has loaded never reads anything.")
+
+
+@pytest.mark.parametrize("seed", ["ha-1", "ha-2", "ha-3", "ha-4", "ha-5", "ha-6", "user-7423"])
+def test_the_drawn_wpm_is_the_realized_speed_on_neutral_english(seed):
+    # The WPM trait read 28-75 but typed 23-60: the finger factors, the flight noise and the pauses stacked on a base
+    # that was already the whole per-character budget (ha-1 at 28.9 WPM planned 529 ms per key = 23 WPM; verifier B:
+    # a 72-character field in 29 s). The base is calibrated for neutral English text (_keys.base_flight_ms), so the
+    # planned keydown->keydown mean -- the gap plus the persona's own dwell -- is 60000 / (wpm x 5) within 10 %.
+    p = make_persona(seed)
+    t = K.typing_traits(p.seed)
+    rng = mulberry32(7)
+    iv = [K.plan_gap(t, a, b, rng) + key_dwell(p, rng) for _ in range(30) for a, b in zip(NEUTRAL_ENGLISH, NEUTRAL_ENGLISH[1:])]
+    want = 60000.0 / (t.wpm * 5.0)
+    assert abs(statistics.mean(iv) / want - 1.0) <= 0.10, (seed, round(t.wpm, 1), round(statistics.mean(iv)), round(want))
