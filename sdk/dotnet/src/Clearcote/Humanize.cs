@@ -256,6 +256,10 @@ public static partial class Humanize
     // assert an exact key sequence pin 0; the live typo tests pin a high rate).
     internal static readonly ConditionalWeakTable<IPage, StrongBox<double>> TypoRateOverride = new();
 
+    // Test seam: a forced word-fix share for one page, in place of Keys.WordFixRate (the SC 239 Shift test takes
+    // the word-delete path on every slip).
+    internal static readonly ConditionalWeakTable<IPage, StrongBox<double>> WordFixOverride = new();
+
     /// <summary>
     /// The environment variable that sets the per-character fat-finger rate of the humanized typing
     /// (<c>HumanTypeAsync</c>, <c>HumanFillAsync</c>): a number from 0 to 1, read at every call. Typos are ON by
@@ -1945,12 +1949,47 @@ public static partial class Humanize
             await BackspacesAsync(page, p, g.Length - k).ConfigureAwait(false);
             await Task.Delay((int)Rand(80, 200)).ConfigureAwait(false);
         }
-        string? prev = null;
-        foreach (var c in t.Skip(k))
+        await EmitRunAsync(page, p, t.Skip(k).ToList(), null).ConfigureAwait(false);
+    }
+
+    /// <summary><paramref name="run"/> typed in order, one human flight apart (<paramref name="prev"/>: the key typed
+    /// just before, for the first flight), every capital / shifted symbol behind a real ShiftLeft held across a run
+    /// of them -- the type loop's Shift dance. RestoreAsync and the late-notice keys of DoTypoAsync pressed them
+    /// bare: a keydown 'M' right after Control+Backspace with no Shift down (lab contenteditable, SC 209 row
+    /// "Capitals typed with Shift held 12/14"; SC 239).</summary>
+    private static async Task EmitRunAsync(IPage page, Persona p, IReadOnlyList<string> run, string? prev)
+    {
+        bool extShift = KeysOf(page).Held.ContainsKey("Shift");
+        bool shift = false;
+        try
         {
-            if (prev is not null) await KeySleep(Keys.FlightMs(TraitsFor(page), prev, c, Unseeded)).ConfigureAwait(false);
-            await PressOrInsertAsync(page, c, p).ConfigureAwait(false);
-            prev = c;
+            for (int j = 0; j < run.Count; j++)
+            {
+                var c = run[j];
+                if (prev is not null) await KeySleep(Keys.FlightMs(TraitsFor(page), prev, c, Unseeded)).ConfigureAwait(false);
+                if (NeedsShift(c) && !shift && !extShift)
+                {
+                    await page.Keyboard.DownAsync("Shift").ConfigureAwait(false);
+                    shift = true;
+                    await Task.Delay((int)Rand(35, 120)).ConfigureAwait(false);
+                }
+                await PressOrInsertAsync(page, c, p).ConfigureAwait(false);
+                if (shift && (j == run.Count - 1 || !NeedsShift(run[j + 1])))
+                {
+                    await Task.Delay((int)Rand(10, 70)).ConfigureAwait(false);
+                    await page.Keyboard.UpAsync("Shift").ConfigureAwait(false);
+                    shift = false;
+                }
+                prev = c;
+            }
+        }
+        finally
+        {
+            if (shift)   // never leave Shift held
+            {
+                try { await page.Keyboard.UpAsync("Shift").ConfigureAwait(false); }
+                catch (PlaywrightException) { /* best-effort */ }
+            }
         }
     }
 
@@ -1979,15 +2018,9 @@ public static partial class Humanize
                 var got = Landed(before, await ActiveValueAsync(page).ConfigureAwait(false));
                 if (got is int g0 && g0 <= 0) return false;   // swallowed: nothing to correct
                 if (leave) return true;                        // a search field: the slip stays in place of text[i]
-                int typed = 1;
-                string prevKey = tp.Wrong ?? text[i];
-                foreach (var c in text.Skip(i + 1).Take(tp.Late))   // late notice: a key or two more
-                {
-                    await KeySleep(Keys.FlightMs(TraitsFor(page), prevKey, c, Unseeded)).ConfigureAwait(false);
-                    await PressOrInsertAsync(page, c, p).ConfigureAwait(false);
-                    prevKey = c;
-                    typed++;
-                }
+                var late = text.Skip(i + 1).Take(tp.Late).ToList();
+                await EmitRunAsync(page, p, late, tp.Wrong ?? text[i]).ConfigureAwait(false);   // late notice: a key or two more
+                int typed = 1 + late.Count;
                 await Task.Delay((int)Rand(140, 340)).ConfigureAwait(false);   // noticing
                 // lane D: a slip inside a word is fixed with the word-delete chord and the word typed again in
                 // Keys.WordFixRate of the cases, when the field can be read to put it back exactly
@@ -1996,7 +2029,7 @@ public static partial class Humanize
                 // a WORD (letters only: no word delete in a code, a zip or a number), two keys of it on screen
                 if (before is not null && i - ws + typed >= 2
                     && text.Skip(ws).Take(i + 1 - ws).All(c => c.Length > 0 && char.IsLetter(c[0]))
-                    && Rnd.NextDouble() < Keys.WordFixRate)
+                    && Rnd.NextDouble() < (WordFixOverride.TryGetValue(page, out var wf) ? wf.Value : Keys.WordFixRate))
                 {
                     await PressKeyAsync(page, p, (OperatingSystem.IsMacOS() ? "Alt" : "Control") + "+Backspace").ConfigureAwait(false);
                     await Task.Delay((int)Rand(120, 260)).ConfigureAwait(false);

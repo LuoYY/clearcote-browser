@@ -1451,12 +1451,37 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
         if len(got) > k:
             _backspaces(len(got) - k)
             time.sleep(_rand(80, 200) / 1000.0)
-        prev = None
-        for c in target[k:]:
-            if prev is not None:
-                time.sleep(_flight_s(prev, c))
-            _emit_key(c)
-            prev = c
+        _emit_keys(target[k:])
+
+    def _emit_keys(chars, prev=None):
+        """``chars`` typed in order, one human flight apart (``prev``: the key typed just before, for the first
+        flight; None = none), every capital / shifted symbol behind a real ShiftLeft held across a run of them --
+        the main loop's Shift dance (_human_type_text). _restore and the late-notice keys of _do_typo emitted
+        them bare: a keydown 'M' right after Control+Backspace with no Shift down (lab contenteditable, SC 209
+        row "Capitals typed with Shift held 12/14"; SC 239)."""
+        n = len(chars)
+        shift = False
+        try:
+            for j, c in enumerate(chars):
+                if prev is not None:
+                    time.sleep(_flight_s(prev, c))
+                if (_needs_shift(c) and not shift and "Shift" not in held_keys
+                        and native_kb_down is not None and native_kb_up is not None):
+                    native_kb_down("Shift")
+                    shift = True
+                    time.sleep(_shift_lead_s())
+                _emit_key(c)
+                if shift and (j == n - 1 or not _needs_shift(chars[j + 1])):
+                    time.sleep(_shift_lag_s())
+                    native_kb_up("Shift")
+                    shift = False
+                prev = c
+        finally:
+            if shift:   # never leave Shift held
+                try:
+                    native_kb_up("Shift")
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _word_delete():
         """The word-delete chord the ENGINE's editing honours: Alt+Backspace on macOS, else Ctrl."""
@@ -1483,13 +1508,9 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 return False                     # swallowed: nothing to correct
             if leave:
                 return True                      # the slip stays: the wrong key took this place
-            typed = 1
-            prev = tp["wrong"]
-            for c in text[i + 1:i + 1 + tp.get("late", 0)]:   # late notice: a key or two more
-                time.sleep(_flight_s(prev, c))
-                _emit_key(c)
-                prev = c
-                typed += 1
+            late = text[i + 1:i + 1 + tp.get("late", 0)]
+            _emit_keys(late, prev=tp["wrong"])      # late notice: a key or two more
+            typed = 1 + len(late)
             time.sleep(_rand(140, 340) / 1000.0)  # noticing
             ws = max(text.rfind(" ", 0, i), text.rfind("\n", 0, i)) + 1
             # a WORD (letters only: no word delete in a code, a zip or a number), two keys of it on screen

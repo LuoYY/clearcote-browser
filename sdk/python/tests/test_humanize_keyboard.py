@@ -339,6 +339,55 @@ def test_word_slips_are_sometimes_fixed_with_ctrl_backspace_and_the_value_stays_
     assert word and plain
 
 
+# SC 239 (lab contenteditable, SC 209 row "Capitals typed with Shift held 12/14"): a keydown 'M' at t=5686 ms came
+# right after Control+Backspace with no Shift keydown before it. _restore (the word put back after the word-delete
+# fix) and the late-notice keys of _do_typo emitted every key bare, while the main loop types a capital behind a real
+# ShiftLeft. The planner is pinned to one substitution, so the path is taken every time.
+def _forced_sub(at, late=0):
+    """A planner that slips (a substitution, a neighbour key) at index ``at`` only."""
+    return lambda text, i, rng, rate: {"kind": "sub", "wrong": "t", "late": late} if i == at else None
+
+
+def _shift_held_around(ev, idx):
+    """Was Shift held across the press at ev[idx]: its last Shift event before is a keydown, and a Shift keyup
+    follows it before the next press."""
+    before = [e for e in ev[:idx] if e[1] == "Shift" and e[0] in ("down", "up")]
+    after = ev[idx + 1:]
+    nxt = next((j for j, e in enumerate(after) if e[0] == "press"), len(after))
+    return bool(before) and before[-1][0] == "down" and any(e[0] == "up" and e[1] == "Shift" for e in after[:nxt])
+
+
+def test_a_capital_put_back_after_the_word_fix_goes_behind_a_real_shift(clock, monkeypatch):
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "1")
+    monkeypatch.setattr(hz, "rollover_rate", lambda persona: 0.0)
+    monkeypatch.setattr(hz, "WORD_FIX_RATE", 1.0)
+    monkeypatch.setattr(hz, "plan_typo", _forced_sub(1))
+    p = spage("ha-3", clock)
+    p.keyboard.type("Mr")
+    assert p.keyboard.value == "Mr"
+    ev = p.keyboard.ev
+    wd = next(i for i, e in enumerate(ev) if e[0] == "press" and e[1] == "Backspace" and "Control" in e[4])
+    back = [i for i, e in enumerate(ev) if i > wd and e[0] == "press" and e[1] == "M"]
+    assert len(back) == 1, "the word fix put the M back"
+    assert "Shift" in ev[back[0]][4] and _shift_held_around(ev, back[0]), ev[wd:]
+
+
+def test_a_late_notice_capital_goes_behind_a_real_shift(clock, monkeypatch):
+    # plan_typo keeps late notice over plain keys today; the helper's contract holds when a shifted one is asked for
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "1")
+    monkeypatch.setattr(hz, "rollover_rate", lambda persona: 0.0)
+    monkeypatch.setattr(hz, "WORD_FIX_RATE", 0.0)
+    monkeypatch.setattr(hz, "plan_typo", _forced_sub(0, late=1))
+    p = spage("ha-3", clock)
+    p.keyboard.type("aB")
+    assert p.keyboard.value == "aB"
+    ev = p.keyboard.ev
+    bs = next(i for i, e in enumerate(ev) if e[0] == "press" and e[1] == "Backspace")
+    late = [i for i, e in enumerate(ev) if i < bs and e[0] == "press" and e[1] == "B"]
+    assert len(late) == 1, "the slip was noticed one key late, after the B"
+    assert "Shift" in ev[late[0]][4] and _shift_held_around(ev, late[0]), ev[:bs + 1]
+
+
 def test_a_search_field_sometimes_keeps_a_slip_and_a_text_field_never(clock, monkeypatch):
     monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "0.3")
     monkeypatch.setattr(hz, "rollover_rate", lambda persona: 0.0)

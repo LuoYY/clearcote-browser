@@ -163,7 +163,14 @@ export function makeFake(opts: FakeOpts = {}) {
     }
     if (k === "Backspace") {
       if (!focus) return;
-      if (selAll) { focus.value = ""; selAll = false; } else focus.value = Array.from(focus.value).slice(0, -1).join("");
+      if (selAll) { focus.value = ""; selAll = false; }
+      else if (mods.has("Control") || mods.has("Alt")) {   // the browser's word delete: Backspace under Control (Alt on macOS)
+        const v = Array.from(focus.value);
+        let i = v.length;
+        while (i && v[i - 1] === " ") i--;
+        while (i && v[i - 1] !== " ") i--;
+        focus.value = v.slice(0, i).join("");
+      } else focus.value = Array.from(focus.value).slice(0, -1).join("");
       return;
     }
     if (k === "End") { selAll = false; return; }

@@ -1012,12 +1012,35 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         if len(got) > k:
             await _backspaces(len(got) - k)
             await asyncio.sleep(_rand(80, 200) / 1000.0)
-        prev = None
-        for c in target[k:]:
-            if prev is not None:
-                await asyncio.sleep(_flight_s(prev, c))
-            await _emit_key(c)
-            prev = c
+        await _emit_keys(target[k:])
+
+    async def _emit_keys(chars, prev=None):
+        """``chars`` typed in order, one human flight apart, every capital / shifted symbol behind a real
+        ShiftLeft held across a run of them (see _humanize._emit_keys; SC 239). The flags move before the
+        awaits, as in the main loop: a keydown in flight when cancelled was still sent."""
+        n = len(chars)
+        shift = False
+        try:
+            for j, c in enumerate(chars):
+                if prev is not None:
+                    await asyncio.sleep(_flight_s(prev, c))
+                if (_needs_shift(c) and not shift and "Shift" not in held_keys
+                        and native_kb_down is not None and native_kb_up is not None):
+                    shift = True
+                    await native_kb_down("Shift")
+                    await asyncio.sleep(_shift_lead_s())
+                await _emit_key(c)
+                if shift and (j == n - 1 or not _needs_shift(chars[j + 1])):
+                    await asyncio.sleep(_shift_lag_s())
+                    shift = False
+                    await native_kb_up("Shift")
+                prev = c
+        finally:
+            if shift:   # never leave Shift held (nor on cancellation)
+                try:
+                    await _release(native_kb_up("Shift"))
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _word_delete():
         """The word-delete chord the ENGINE's editing honours: Alt+Backspace on macOS, else Ctrl."""
@@ -1044,13 +1067,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 return False                     # swallowed: nothing to correct
             if leave:
                 return True                      # the slip stays: the wrong key took this place
-            typed = 1
-            prev = tp["wrong"]
-            for c in text[i + 1:i + 1 + tp.get("late", 0)]:   # late notice: a key or two more
-                await asyncio.sleep(_flight_s(prev, c))
-                await _emit_key(c)
-                prev = c
-                typed += 1
+            late = text[i + 1:i + 1 + tp.get("late", 0)]
+            await _emit_keys(late, prev=tp["wrong"])      # late notice: a key or two more
+            typed = 1 + len(late)
             await asyncio.sleep(_rand(140, 340) / 1000.0)  # noticing
             ws = max(text.rfind(" ", 0, i), text.rfind("\n", 0, i)) + 1
             # a WORD (letters only: no word delete in a code, a zip or a number), two keys of it on screen

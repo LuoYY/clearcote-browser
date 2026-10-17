@@ -175,6 +175,10 @@ class Field:
         elif k == "Backspace":
             self.value = "" if self.all else self.value[:-1]
             self.all = False
+        elif k == "WordBackspace":           # the browser's word delete: Backspace under Control (Alt on macOS)
+            v = self.value.rstrip(" ")
+            self.value = "" if self.all else v[:v.rfind(" ") + 1]
+            self.all = False
         elif k == "End":
             self.all = False
         elif len(k) == 1:
@@ -468,6 +472,8 @@ class Page:
     def key(self, k):
         if k == "a" and self.mods & {"ControlOrMeta", "Control", "Meta"}:
             k = "ControlOrMeta+a"   # an A pressed with the modifier held is the select-all chord
+        if k == "Backspace" and self.mods & {"Control", "Alt"}:
+            k = "WordBackspace"     # a Backspace with Control (Alt on macOS) held deletes the word
         if self.focused is not None:
             self.focused.key(k)
 
@@ -1523,6 +1529,31 @@ def test_typo_rate_zero_disables_slips(fast, monkeypatch):
         return p
     p = run(go())
     assert not [e for e in kinds(p, "press") if e[1] == "Backspace"]
+
+
+def test_a_capital_put_back_after_the_word_fix_goes_behind_a_real_shift(fast, monkeypatch):
+    # SC 239 (lab contenteditable, SC 209 row "Capitals typed with Shift held 12/14"): a keydown 'M' right after
+    # Control+Backspace had no Shift keydown before it -- _restore typed the word it put back bare (sync twin and the
+    # late-notice case: test_humanize_keyboard). The planner is pinned to one substitution at the 'r' and the word fix
+    # to every slip; the simulator deletes the word under Control+Backspace as the browser does.
+    monkeypatch.setenv("CLEARCOTE_HUMANIZE_TYPO_RATE", "1")
+    monkeypatch.setattr(H, "WORD_FIX_RATE", 1.0)
+    monkeypatch.setattr(H, "plan_typo", lambda text, i, rng, rate: {"kind": "sub", "wrong": "t", "late": 0} if i == 1 else None)
+
+    async def go():
+        f = Field()
+        p = await attached(("#f", f))
+        p.focused = f
+        await p.keyboard.type("Mr")
+        return p, f
+    p, f = run(go())
+    assert f.value == "Mr"
+    log = kinds(p, "press", "kdown", "kup")
+    wd = next(i for i, e in enumerate(log) if e == ("kdown", "Control"))
+    back = [i for i, e in enumerate(log) if i > wd and e[0] == "press" and e[1] == "M"]
+    assert len(back) == 1, "the word fix put the M back"
+    nxt = next((i for i, e in enumerate(log) if i > back[0] and e[0] == "press"), len(log))
+    assert ("kdown", "Shift") in log[wd:back[0]] and ("kup", "Shift") in log[back[0]:nxt], log[wd:]
 
 
 # ------------------------------------------------------------------------------------ select

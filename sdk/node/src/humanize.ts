@@ -1059,11 +1059,34 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     while (k < Math.min(g.length, t.length) && g[k] === t[k]) k++;
     if (g.length - k > 64 || t.length - k > 64) return;
     if (g.length > k) { await backspaces(g.length - k); await sleep(rand(80, 200)); }
-    let prev: string | null = null;
-    for (const c of t.slice(k)) {
-      if (prev !== null) await sleep(flight(prev, c));
-      await emitKey(c);
-      prev = c;
+    await emitKeys(t.slice(k));
+  };
+
+  // `chars` typed in order, one human flight apart (`prev`: the key typed just before, for the first flight), every
+  // capital / shifted symbol behind a real ShiftLeft held across a run of them -- the type loop's Shift dance.
+  // restore and the late-notice keys of doTypo emitted them bare: a keydown 'M' right after Control+Backspace with
+  // no Shift down (lab contenteditable, SC 209 row "Capitals typed with Shift held 12/14"; SC 239).
+  const emitKeys = async (chars: readonly string[], prev: string | null = null): Promise<void> => {
+    let shift = false;
+    try {
+      for (let j = 0; j < chars.length; j++) {
+        const c = chars[j];
+        if (prev !== null) await sleep(flight(prev, c));
+        if (needsShift(c) && !shift && !heldKeys.has("Shift") && nativeKbDown && nativeKbUp) {
+          await nativeKbDown("Shift");
+          shift = true;
+          await sleep(rand(35, 120));
+        }
+        await emitKey(c);
+        if (shift && (j === chars.length - 1 || !needsShift(chars[j + 1]))) {
+          await sleep(rand(10, 70));
+          await nativeKbUp!("Shift");
+          shift = false;
+        }
+        prev = c;
+      }
+    } finally {
+      if (shift) { try { await nativeKbUp!("Shift"); } catch { /* never leave Shift held */ } }
     }
   };
 
@@ -1086,14 +1109,9 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       let got = landed(before, await activeValue());
       if (got !== null && got <= 0) return false; // swallowed: nothing to correct
       if (leave) return true;                     // the slip stays: the wrong key took this place
-      let typed = 1;
-      let prev = tp.wrong;
-      for (const c of chars.slice(i + 1, i + 1 + tp.late)) { // late notice: a key or two more
-        await sleep(flight(prev, c));
-        await emitKey(c);
-        prev = c;
-        typed++;
-      }
+      const late = chars.slice(i + 1, i + 1 + tp.late);
+      await emitKeys(late, tp.wrong); // late notice: a key or two more
+      const typed = 1 + late.length;
       await sleep(rand(140, 340)); // noticing
       let ws = 0;
       for (let j = i - 1; j >= 0; j--) if (chars[j] === " " || chars[j] === "\n") { ws = j + 1; break; }
