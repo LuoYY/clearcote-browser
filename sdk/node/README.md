@@ -106,7 +106,8 @@ Headless, `serve()` gives the browser a real-size display (the persona's, or one
 desktops) and maximizes its window onto the work area before any client attaches, so every page,
 tab and popup reports a window that fits its screen. Pass `windowSize: { width, height }` for a
 smaller window (clamped to the work area), or your own `--window-size` / `--screen-info` in `args` to
-opt out.
+opt out. On an engine with persona windows a seeded `serve()` opens the persona's own window instead
+(see [Window geometry](#window-geometry-the-personas-own-window)); `windowSize` still wins.
 
 **Drive it from an AI agent (MCP).** Point Claude Desktop / Cursor / Cline at the
 [`clearcote-mcp`](https://github.com/clearcotelabs/clearcote-browser/tree/main/mcp) server
@@ -567,7 +568,42 @@ All optional. Anything not listed here is passed straight through to Playwright
 > `fingerprint` seed the engine's own screen and work area are used and the window is sized to them; without a
 > seed the SDK sets the headless display to a screen size drawn from real captured desktops (with a
 > taskbar on Windows) and sizes the window to its work area the same way. It is applied at launch,
-> before your first navigation. Pass an explicit `viewport` or `screen` to opt out entirely.
+> before your first navigation. Pass an explicit `viewport` or `screen` to opt out entirely. On an engine with
+> persona windows (below) a seeded launch is handled by the engine instead.
+
+### Window geometry: the persona's own window
+
+On an engine with persona window support (licensed builds from r39), a `fingerprint` seed decides the
+browser window too, not only the screen. The engine derives the window that machine has open on its
+screen — maximized for most seeds, a restored window of a seed-derived size and position for the rest,
+always inside the work area — and creates the **real** window with those bounds and that state before the
+first page exists. In headless mode it also makes the headless display the persona's display (screen size
+plus taskbar). `outerWidth`/`outerHeight`/`screenX`/`screenY` are then the real window's, so they agree with
+`innerWidth`/`innerHeight`, `visualViewport`, screenshots, mouse-event coordinates, pop-up placement and
+`device-width` media queries without any of them being patched. The same seed opens the same window in
+every process and on every launch path (`launch()`, `launchPersistentContext()`, `serve()` /
+`clearcote serve`, raw CLI and CDP, Docker); different seeds open different windows. The SDK then sends no
+display switch and runs no window fit for that launch (older engines keep the fit). A seedless launch has
+no persona and keeps the behaviour described above.
+
+Where several things decide the window, the first one that applies wins:
+
+1. **Your explicit configuration.** `viewport` (including `viewport: null`) / `screen`, `serve({ windowSize })`,
+   and the switches `--window-size`, `--window-position`, `--start-maximized`. An explicit `viewport` is
+   honoured as given: the SDK makes the real window the viewport plus the browser's own frame, at the
+   persona's position, moved back onto the work area if it would hang over an edge, so outer and inner sizes
+   still agree.
+2. **The placement this identity saved in its profile.** A `userDataDir` reused with the same seed restores
+   the window it closed with, as Chrome does. A profile last used with another seed (or by an older engine)
+   gets the new seed's window instead.
+3. **The persona's window**, derived from the seed and its final screen and work area (an explicit
+   `screenWidth`/`availWidth`/... included).
+4. **No persona** (no seed, or `lightStealth`): the SDK's display and a window maximized onto its work area.
+
+`args: ["--fingerprint-window=off"]` keeps a seeded launch on the previous behaviour. A pinned persona
+schema (`--fingerprint-schema=1`..`3`) keeps its previous window too, unless you add
+`--fingerprint-window=on`.
+
 >
 > **Proxies:** a SOCKS5 proxy with credentials — written in the URL (`socks5://user:pass@host:port`) or passed as `username`/`password` — is routed via `--proxy-server` (Playwright rejects credentials in its SOCKS descriptor), and the credentials are passed to the engine, which implements SOCKS5 username/password authentication (RFC 1929). Stock Chromium does not, so no local relay is needed.
 

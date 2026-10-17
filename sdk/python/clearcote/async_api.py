@@ -32,12 +32,12 @@ import time
 from . import (  # shared sync helpers
     _headed_no_viewport, _headless_geometry_kwargs, _prepare, _acquire_lease_from_kwargs,
     _is_win_launch_race, _is_stale_token_refusal, _with_geometry_args, _profile_dir_remover,
-    _browser_process_files, _drop_cloud_credentials, _release_launch_token,
+    _browser_process_files, _drop_cloud_credentials, _release_launch_token, _FIT, _call_geometry,
 )
 from .cloud import AsyncCloud, CloudError, CloudTimeoutError, cloud_requested, launch_cloud_async, verify_webhook
 from ._docker import docker_requested, launch_docker_async
 from ._launchopts import DEFAULT_IGNORED_ARGS
-from ._geometry import apply_headless_geometry, fit_window_to_work_area_async
+from ._geometry import apply_headless_geometry, place_window_async
 from ._license import inject_run_token
 from ._fonts import apply_font_env, check_font_dirs
 from ._shaderdialect import apply_shader_dialect
@@ -150,16 +150,16 @@ def _install_headed_viewport(browser):
     browser.new_page, browser.new_context = new_page, new_context
 
 
-async def _install_window_fixup(container, args):
-    """Async mirror of the sync ``_install_window_fixup``: fit the window to the display's work
-    area, once, on the first page."""
+async def _install_window_fixup(container, args, geom=_FIT):
+    """Async mirror of the sync ``_install_window_fixup``: the geometry plan's window step (the
+    work-area fit, or an r39+ persona window's position reconcile), once, on the first page."""
     done = []
 
     async def fit(page):
         if done:
             return page
         done.append(True)
-        await fit_window_to_work_area_async(page, args)
+        await place_window_async(page, args, geom)
         return page
 
     pages = getattr(container, "pages", None)
@@ -174,10 +174,10 @@ async def _install_window_fixup(container, args):
     container.new_page = new_page
 
 
-def _install_headless_geometry(browser, args=None):
-    """Default a headless browser's new pages/contexts to ``no_viewport`` plus a window fit per new
-    window (async mirror of the sync installer). Any per-call geometry option keeps the caller in
-    control."""
+def _install_headless_geometry(browser, args=None, geom=None):
+    """Default a headless browser's new pages/contexts to ``no_viewport`` plus the window step per
+    new window (async mirror of the sync installer). Any per-call geometry option keeps the caller
+    in control of the viewport."""
     orig_new_page, orig_new_context = browser.new_page, browser.new_context
 
     def _merge(kw):
@@ -186,13 +186,15 @@ def _install_headless_geometry(browser, args=None):
         return kw
 
     async def new_page(**kw):
-        page = await orig_new_page(**_merge(kw))
-        await fit_window_to_work_area_async(page, args)
+        kw = _merge(kw)
+        page = await orig_new_page(**kw)
+        await place_window_async(page, args, _call_geometry(geom, kw))
         return page
 
     async def new_context(**kw):
-        context = await orig_new_context(**_merge(kw))
-        await _install_window_fixup(context, args)
+        kw = _merge(kw)
+        context = await orig_new_context(**kw)
+        await _install_window_fixup(context, args, _call_geometry(geom, kw))
         return context
 
     browser.new_page, browser.new_context = new_page, new_context
@@ -288,7 +290,7 @@ async def launch(cloud=None, **kwargs):
     headed = _headed_no_viewport(pw_kwargs)  # launch() takes no viewport kwarg -> wrap new_page/context
     # Headless: the display switches go on the command line, no_viewport rides on
     # new_page/new_context (see _geometry).
-    geom = None if headed else _headless_geometry_kwargs(pw_kwargs, seed, args)
+    geom = None if headed else _headless_geometry_kwargs(pw_kwargs, seed, args, exe)
     launch_args = _with_geometry_args(args, geom)
     launch_args = _personaenv.apply_to_pw_kwargs(exe, launch_args, pw_kwargs, persona_env)
     pw = await _start_driver()
@@ -310,7 +312,7 @@ async def launch(cloud=None, **kwargs):
     if headed:
         _install_headed_viewport(browser)
     elif geom:
-        _install_headless_geometry(browser, args)
+        _install_headless_geometry(browser, args, geom)
     if await asyncio.to_thread(engine_decides_color_scheme, exe):  # r32+ (mirror sync)
         install_color_scheme_default_async(browser)
     await install_humanize(browser, humanize, show_cursor, seed=seed)
@@ -357,7 +359,7 @@ async def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
     if _headed_no_viewport(pw_kwargs):  # no_viewport IS a valid persistent-context option
         pw_kwargs["no_viewport"] = True
     else:  # headless: persona owns screen -> fit the window; no persona -> set the display too
-        geom = apply_headless_geometry(pw_kwargs, seed, args)
+        geom = apply_headless_geometry(pw_kwargs, seed, args, exe=exe)
     if await asyncio.to_thread(engine_decides_color_scheme, exe):  # r32+ (mirror sync)
         default_color_scheme(pw_kwargs)
     launch_args = _with_geometry_args(args, geom)  # carries --widevine-cdm-path when on (see _prepare)
@@ -380,7 +382,7 @@ async def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
             _lt[1]()
         context.on("close", _on_close)
     if geom:
-        await _install_window_fixup(context, args)
+        await _install_window_fixup(context, args, geom)
     await install_humanize_on_context(context, humanize, show_cursor, seed=seed)
     return context
 

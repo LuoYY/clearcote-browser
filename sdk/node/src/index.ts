@@ -74,7 +74,8 @@ import { checkFontDirs, fontLaunchEnv } from "./fonts.js";
 import { withShaderDialect, type ShaderDialect } from "./shaderdialect.js";
 import { apply as applyPersonaEnv } from "./personaenv.js";
 import {
-  applyHeadlessGeometry, fitServedWindow, fitWindowToWorkArea, headedLinuxFit, installWindowFixup, servedGeometry,
+  applyHeadlessGeometry, fitServedWindow, headedLinuxFit, installWindowFixup, placeWindow, servedGeometry,
+  FIT_PLAN, type WindowPlan,
 } from "./geometry.js";
 import { acquireLease, resolveLicenseKey, withRunToken, STALE_TOKEN_REFUSAL, type LicenseOptions, type LeaseSession } from "./license.js";
 import { offlineKeyPath, requireOfflineBinary } from "./offline.js";
@@ -470,23 +471,35 @@ export async function download(
  * `chromium.launch()` takes none, so it rides on newPage/newContext instead, with the window fit to
  * the work area (the persona's, the display `--screen-info` set, or headed the X display's). See
  * ./geometry.ts for why each is needed. */
-function installHeadlessGeometry(browser: Browser, args?: readonly string[] | null): void {
+function installHeadlessGeometry(browser: Browser, args?: readonly string[] | null, plan: WindowPlan | null = FIT_PLAN): void {
   // Same shape as installHeadedViewport. Each new context is a new window, so each also gets the
-  // window fit. Any per-call geometry option wins.
+  // window step: the fit on older engines, nothing for an r39+ persona window (the engine opened it at
+  // the persona's bounds) except a position reconcile when a call passes its own viewport. Any
+  // per-call geometry option wins.
   const merge = (o: Record<string, unknown> = {}) =>
     "viewport" in o || "screen" in o ? o : { ...o, viewport: null };
+  const perCall = (o: Record<string, unknown>): WindowPlan | null =>
+    plan && plan.mode === "persona-native"
+      ? {
+          ...plan,
+          reconcile: o.viewport !== null && o.viewport !== undefined,
+          viewport: o.viewport !== null && o.viewport !== undefined ? (o.viewport as { width: number; height: number }) : null,
+        }
+      : plan;
   const origNewPage = browser.newPage.bind(browser);
   const origNewContext = browser.newContext.bind(browser);
   (browser as unknown as { newPage: (o?: Record<string, unknown>) => Promise<Page> }).newPage =
     async (o = {}) => {
-      const page = await origNewPage(merge(o) as Parameters<typeof origNewPage>[0]);
-      await fitWindowToWorkArea(page, args);
+      const merged = merge(o);
+      const page = await origNewPage(merged as Parameters<typeof origNewPage>[0]);
+      await placeWindow(page, args, perCall(merged));
       return page;
     };
   (browser as unknown as { newContext: (o?: Record<string, unknown>) => Promise<BrowserContext> }).newContext =
     async (o = {}) => {
-      const context = await origNewContext(merge(o) as Parameters<typeof origNewContext>[0]);
-      await installWindowFixup(context, args);
+      const merged = merge(o);
+      const context = await origNewContext(merged as Parameters<typeof origNewContext>[0]);
+      await installWindowFixup(context, args, perCall(merged));
       return context;
     };
 }
@@ -1126,7 +1139,7 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   // switches go on the command line; the fit keeps reading the caller's own engineArgs.
   const geom = headed
     ? null
-    : applyHeadlessGeometry({ ...(pwOptions as Record<string, unknown>) }, fingerprint.fingerprint, engineArgs, fingerprint);
+    : applyHeadlessGeometry({ ...(pwOptions as Record<string, unknown>) }, fingerprint.fingerprint, engineArgs, fingerprint, exe);
   const launchArgs = [...engineArgs, ...(geom?.args ?? []), ...widevineCdm];
   const browser = await releaseLeaseOnFailure(lease, () => retryOnStaleRunToken(lease, () => winAvRetry((exePath) => {
     // Last step on both: on a 1021 engine the persona leaves the command line for the env (./personaenv.ts).
@@ -1144,12 +1157,12 @@ async function launchIncognito(options: LaunchOptions = {}): Promise<Browser> {
   }, exe)), launchToken);
   // Release the concurrency slot + remove the run-token file when the browser closes.
   if (lease) browser.on("disconnected", () => { void lease.stop(); launchToken?.release(); });
-  if (headed && headedLinuxFit(engineArgs)) {
+  if (headed && headedLinuxFit(engineArgs, process.platform, exe)) {
     // Headed Linux with no window manager (Xvfb: every Docker/VPS headful run) leaves Chrome's
     // 945x1060 default window at (10,10); the same first-page fit as headless maximizes it (SC 180).
     installHeadlessGeometry(browser, engineArgs);
   } else if (headed) installHeadedViewport(browser); // launch() takes no viewport option -> wrap newPage/newContext
-  else if (geom) installHeadlessGeometry(browser, engineArgs);
+  else if (geom) installHeadlessGeometry(browser, engineArgs, geom);
   // r32+: the persona's colour scheme reaches the page instead of Playwright's emulated light.
   if (engineDecidesColorScheme(exe)) installColorSchemeDefault(browser);
   installHumanize(browser, { humanize, showCursor, seed: fingerprint.fingerprint }); // seed => stable motor persona
@@ -1274,8 +1287,8 @@ async function launchLocalPersistentContext(
   // window fit, which maximizes the window as headless does (SC 180).
   const geom = opts.headless === false
     ? null
-    : applyHeadlessGeometry(opts as unknown as Record<string, unknown>, fingerprint.fingerprint, engineArgs, fingerprint);
-  const headedFit = opts.headless === false && headedLinuxFit(engineArgs);
+    : applyHeadlessGeometry(opts as unknown as Record<string, unknown>, fingerprint.fingerprint, engineArgs, fingerprint, exe);
+  const headedFit = opts.headless === false && headedLinuxFit(engineArgs, process.platform, exe);
   const launchArgs = [...engineArgs, ...(geom?.args ?? []), ...widevineCdm];
   const context = await releaseLeaseOnFailure(lease, () => retryOnStaleRunToken(lease, () => winAvRetry((exePath) => {
     // Last step on both: on a 1021 engine the persona leaves the command line for the env (./personaenv.ts).
@@ -1290,7 +1303,7 @@ async function launchLocalPersistentContext(
     });
   }, exe)), launchToken);
   if (lease) context.on("close", () => { void lease.stop(); launchToken?.release(); });
-  if (geom || headedFit) await installWindowFixup(context, engineArgs);
+  if (geom || headedFit) await installWindowFixup(context, engineArgs, geom ?? FIT_PLAN);
   installHumanizeOnContext(context, { humanize, showCursor, seed: fingerprint.fingerprint }); // seed => stable motor persona
   await egressDrift;
   return context;
@@ -1563,7 +1576,7 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
   cdpArgs.push(...serveInfobarArgs(headless, [...engineArgs, ...cdpArgs]));
   // Headless geometry for a raw endpoint: the display and window are set browser-wide, since no
   // client's context options or CDP overrides would reach every page (see ./geometry.ts).
-  const geometry = servedGeometry(engineArgs, fingerprint, headless);
+  const geometry = servedGeometry(engineArgs, fingerprint, headless, exe, windowSize);
   if (geometry) cdpArgs.push(...geometry.args);
   cdpArgs.push(...widevineCdm);
 
@@ -1611,7 +1624,10 @@ export async function serve(options: ServeOptions = {}): Promise<Server> {
   // Before any client attaches: the window onto the work area (and, under a persona, the headless
   // display onto the persona's). Its own connection, closed again; never fails the launch. A caller's
   // own --window-position keeps its place (fit: false).
-  if (geometry?.fit) await fitServedWindow(await srv.wsUrl().catch(() => undefined), { persona: geometry.persona, windowSize });
+  if (geometry?.fit) {
+    await fitServedWindow(await srv.wsUrl().catch(() => undefined),
+      { persona: geometry.persona, windowSize, native: geometry.native });
+  }
   if (!quiet) {
     process.stderr.write(
       `[clearcote] CDP endpoint ready: ${srv.cdpUrl}\n` +

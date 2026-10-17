@@ -114,6 +114,35 @@ _PERSONA_ENV_SWITCH = "--persona-from-env"
 # Switches that mean the caller set the headless display themselves.
 _CALLER_DISPLAY_FLAGS = ("--screen-info",)
 
+# r39+: the ENGINE owns a persona's window (components/ungoogled/persona_window.h). With a persona it
+# makes the headless display the persona's display (screen size + taskbar) and opens the first
+# browser window with the persona's own bounds and show state -- maximized for most seeds, a
+# restored window of a seed-derived size and position for the rest (_windowgeom mirrors the
+# derivation) -- before any page exists. The SDK then sends no --screen-info and runs no fit for a
+# persona: either would only move a real window that is already right, and the fit was the one
+# step a page could see (a late resize event on ~1 page in 10, measured on r37). Probed per engine,
+# like every new switch (sdk-gate-new-engine-switches): older engines keep the fit.
+PERSONA_WINDOW_SWITCH = "fingerprint-window"
+_OFF = ("off", "0", "false")
+
+
+def engine_places_persona_window(exe, args):
+    """Whether the engine that will run opens a persona's window itself (r39+).
+
+    True when a persona is active on this command line, the binary implements
+    ``--fingerprint-window``, and the engine's own rule turns it on: ``--fingerprint-window=on``, or
+    no/``auto`` value on schema 4 (a ``--fingerprint-schema=1..3`` pin keeps the old window, byte for
+    byte). ``--fingerprint-window=off`` and phone personas (android) are False."""
+    if not exe or not persona_active(args):
+        return False
+    mode = (_switch_value(args, PERSONA_WINDOW_SWITCH) or "auto").strip().lower()
+    if mode in _OFF or (_switch_value(args, "fingerprint-platform") or "").lower() == "android":
+        return False
+    if mode not in ("on", "1", "true") and (_switch_value(args, "fingerprint-schema") or "") in ("1", "2", "3"):
+        return False
+    from ._launchopts import engine_supports_switch
+    return engine_supports_switch(exe, PERSONA_WINDOW_SWITCH)
+
 
 def persona_active(args):
     """Whether a persona is active for this launch, i.e. the engine will spoof ``screen``/``avail``
@@ -260,7 +289,7 @@ def screen_info_switch(display):
     return f"--screen-info={{{display['width']}x{display['height']}{insets}}}"
 
 
-def apply_headless_geometry(pw_kwargs, seed=None, args=None):
+def apply_headless_geometry(pw_kwargs, seed=None, args=None, exe=None):
     """Default a headless launch's geometry in place. Returns what was applied, or None.
 
     Both regimes set ``no_viewport`` (``inner`` tracks the real window) and leave the window to be
@@ -268,17 +297,29 @@ def apply_headless_geometry(pw_kwargs, seed=None, args=None):
     ``"args"`` are switches to APPEND to the command line — in regime 2 the ones that give the
     browser its headless display; the fit and skip checks keep reading the caller's own ``args``.
 
-    ``{"mode": "persona", "args": [...]}`` is regime 1. On Linux its args include
+    ``{"mode": "persona-native", "args": [], "fit": False, "reconcile": bool}`` is a persona on an
+    engine that opens the persona's window itself (r39+, ``engine_places_persona_window``): no
+    display switch, no fit; only ``no_viewport`` when the caller chose no viewport. With an explicit
+    ``viewport`` ``"reconcile"`` is True: the window keeps the caller's viewport and is only moved
+    back onto the work area if it hangs over an edge (``reconcile_window_position``).
+    ``{"mode": "persona", "args": [...]}`` is regime 1 on an older engine. Its args include
     ``--screen-info`` so the real headless display matches the persona before the first page.
     ``{"mode": "display", "display": ..., "args":
     [...]}`` is regime 2; ``display`` is None when the caller passed their own ``--screen-info``.
     A caller's own window switch keeps their window (the display is still set under it).
 
-    Skipped when the launch is headed (the real window is already coherent) and when the caller
-    expressed ANY geometry intent. ``headless`` unset means headless, matching Playwright.
+    Skipped when the launch is headed (the real window is already coherent) and, except for the
+    persona-native case, when the caller expressed ANY geometry intent. ``headless`` unset means
+    headless, matching Playwright.
     """
     if pw_kwargs.get("headless") is False:
         return None
+    if engine_places_persona_window(exe, args):
+        if not any(k in pw_kwargs for k in _CALLER_GEOMETRY_KEYS):
+            pw_kwargs["no_viewport"] = True
+        reconcile = pw_kwargs.get("viewport") is not None and not pw_kwargs.get("no_viewport")
+        return {"mode": "persona-native", "args": [], "fit": False, "reconcile": reconcile,
+                "viewport": pw_kwargs.get("viewport") if reconcile else None}
     if any(k in pw_kwargs for k in _CALLER_GEOMETRY_KEYS):
         return None
     pw_kwargs["no_viewport"] = True
@@ -509,6 +550,116 @@ async def fit_window_to_work_area_async(page, args=None):
         return None
 
 
+def _reconcile_plan(bounds, avail):
+    """The ``(left, top)`` that puts a normal window of ``bounds`` back on a work area of ``avail``
+    (moving it, never resizing it), or None when it is on it already or not a normal window."""
+    if (bounds or {}).get("windowState", "normal") != "normal":
+        return None
+    w, h = int(bounds["width"]), int(bounds["height"])
+    left, top = int(bounds["left"]), int(bounds["top"])
+    aw, ah = int(avail[0]), int(avail[1])
+    if w > aw or h > ah:
+        logger.warning("clearcote: the requested viewport makes the window %dx%d, larger than the "
+                       "persona's work area %dx%d; the viewport is kept as asked", w, h, aw, ah)
+    new = (max(0, min(left, aw - w)), max(0, min(top, ah - h)))
+    return None if new == (left, top) else new
+
+
+# The frame (outer - inner) the engine draws around a HEADLESS window in the normal state, by the
+# host OS the engine runs on (measured on r37 and the r39 test build: a no_viewport restored window).
+# Windows 16 x 129, Linux 0 x 121 -- the Linux frame is Linux's own, never Windows' borders.
+HEADLESS_NORMAL_FRAME = (16, 129) if sys.platform.startswith("win") else (0, 121)
+
+
+def _viewport_size(viewport):
+    if isinstance(viewport, dict):
+        return int(viewport.get("width") or 0), int(viewport.get("height") or 0)
+    return None
+
+
+def _reconcile_steps(win, avail, viewport):
+    """The ``Browser.setWindowBounds`` payloads (in order) that make a persona window agree with an
+    explicit viewport, plus the bounds they leave.
+
+    Playwright asks for the viewport's size with zero insets in headless. On a MAXIMIZED persona
+    window Chromium only restores the window and drops the size (BrowserHandler::SetWindowBounds), so
+    the window ends up at its restore rectangle, unrelated to the emulated viewport (measured on the
+    r39 test build: outer 1493x830 around inner 1280x720; another seed outer height == inner height).
+    Asking for the viewport size again gives a window with no frame at all (outer == inner). So: the
+    normal state, then the viewport plus the engine's own normal-window frame, at the window's
+    position, then moved back onto the work area if it hangs over an edge (a move only)."""
+    b = dict((win or {}).get("bounds") or {})
+    steps = []
+    vp = _viewport_size(viewport)
+    if vp and vp[0] > 0 and vp[1] > 0:
+        if b.get("windowState", "normal") != "normal":
+            steps.append({"windowState": "normal"})
+            b["windowState"] = "normal"
+        want = (vp[0] + HEADLESS_NORMAL_FRAME[0], vp[1] + HEADLESS_NORMAL_FRAME[1])
+        if (b.get("width"), b.get("height")) != want:
+            steps.append({"width": want[0], "height": want[1]})
+            b["width"], b["height"] = want
+    plan = _reconcile_plan(b, avail) if {"left", "top", "width", "height"} <= set(b) else None
+    if plan:
+        steps.append({"left": plan[0], "top": plan[1]})
+        b["left"], b["top"] = plan
+    return steps, b
+
+
+def reconcile_window_position(page, viewport=None):
+    """A persona window (r39+) under an explicit ``viewport``: make the real window agree with it
+    (``_reconcile_steps``): the viewport plus the engine's normal frame, kept on the persona's work
+    area. A viewport larger than the work area is the caller's choice and is only logged. Headless,
+    where the display is the persona's and window coordinates are work-area coordinates. Runs on the
+    first page while it is still on about:blank. Returns the final bounds, or None. Never raises."""
+    try:
+        avail = page.evaluate(_WORKAREA_JS)
+        cdp = page.context.new_cdp_session(page)
+        win = cdp.send("Browser.getWindowForTarget")
+        steps, final = _reconcile_steps(win, avail, viewport)
+        for bounds in steps:
+            cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"], "bounds": bounds})
+        return final
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("window reconcile skipped: %s", exc)
+        return None
+
+
+async def reconcile_window_position_async(page, viewport=None):
+    """Async mirror of ``reconcile_window_position``."""
+    try:
+        avail = await page.evaluate(_WORKAREA_JS)
+        cdp = await page.context.new_cdp_session(page)
+        win = await cdp.send("Browser.getWindowForTarget")
+        steps, final = _reconcile_steps(win, avail, viewport)
+        for bounds in steps:
+            await cdp.send("Browser.setWindowBounds", {"windowId": win["windowId"], "bounds": bounds})
+        return final
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("window reconcile skipped: %s", exc)
+        return None
+
+
+def place_window(page, args, geom):
+    """The first-page window step a launch's geometry plan (``apply_headless_geometry``) asks for:
+    the work-area fit (older engines, no persona), a position reconcile (an r39+ persona window
+    under an explicit viewport), or nothing (an r39+ persona window: the engine placed it)."""
+    if not geom:
+        return None
+    if geom.get("mode") == "persona-native":
+        return reconcile_window_position(page, geom.get("viewport")) if geom.get("reconcile") else None
+    return fit_window_to_work_area(page, args)
+
+
+async def place_window_async(page, args, geom):
+    """Async mirror of ``place_window``."""
+    if not geom:
+        return None
+    if geom.get("mode") == "persona-native":
+        return (await reconcile_window_position_async(page, geom.get("viewport"))) if geom.get("reconcile") else None
+    return await fit_window_to_work_area_async(page, args)
+
+
 def geometry_is_coherent(screen, avail, inner, outer):
     """``inner <= outer <= avail <= screen`` on both axes — the chain a real window satisfies.
 
@@ -544,7 +695,8 @@ def geometry_is_coherent(screen, avail, inner, outer):
 # it forces every popup to that size, ignoring the window.open() features real Chrome honours.
 # ---------------------------------------------------------------------------------------------------
 
-def served_geometry(engine_args, seed=None, light_stealth=False, headless=True):
+def served_geometry(engine_args, seed=None, light_stealth=False, headless=True, exe=None,
+                    window_size=None):
     """What serve() adds for a headless launch, or None to leave geometry alone (headed, or the
     caller passed a display switch or fixed the window's size; the SDK's own android
     ``--window-size`` counts, since a phone persona sizes itself).
@@ -557,14 +709,24 @@ def served_geometry(engine_args, seed=None, light_stealth=False, headless=True):
     (measured on r32 Linux and r33 Windows), so the row is a fallback for a persona that does not
     engage rather than a contradiction; without one it IS the display.
 
-    Returns ``{"persona": bool, "display": dict, "args": [...], "fit": bool}``.
+    On an engine that opens a persona's window itself (r39+) a persona launch gets nothing: no
+    display switch and no ``--window-position``; the engine already put the display and the window
+    where the persona has them. Only an explicit ``window_size`` is still applied (``"fit": True``,
+    ``"native": True``): the caller's size, at the persona window's own position, kept on the work
+    area.
+
+    Returns ``{"persona": bool, "native": bool, "display": dict, "args": [...], "fit": bool}``.
     """
     if not headless or caller_fixed_the_size(engine_args) or caller_set_the_display(engine_args):
         return None
+    if engine_places_persona_window(exe, engine_args):
+        return {"persona": True, "native": True, "display": None, "args": [],
+                "fit": bool(window_size) and not caller_sized_the_window(engine_args)}
     placed = caller_sized_the_window(engine_args)  # a bare --window-position: keep theirs, skip the fit
     display = headless_display(seed, engine_args, light_stealth=light_stealth)
     args = [screen_info_switch(display)] + ([] if placed else ["--window-position=0,0"])
-    return {"persona": persona_active(engine_args), "display": display, "args": args, "fit": not placed}
+    return {"persona": persona_active(engine_args), "native": False, "display": display, "args": args,
+            "fit": not placed}
 
 
 def validate_window_size(window_size):
@@ -589,9 +751,13 @@ _DISPLAY_JS = ("[screen.width, screen.height, screen.availLeft, screen.availTop,
                "screen.availWidth, screen.availHeight]")
 
 
-def fit_window_over_cdp(cdp, persona, window_size=None, settle_timeout=None):
+def fit_window_over_cdp(cdp, persona, window_size=None, settle_timeout=None, native=False):
     """Put the served browser's first window on its display's work area (or ``window_size``, clamped
     into it); under a persona, first make the headless display the persona's own.
+
+    ``native`` (r39+ engine, persona): the display already is the persona's and the window already
+    the persona's, so only an explicit ``window_size`` is applied: that size, at the window's own
+    position moved just enough to stay on the work area.
 
     Over a browser-level CDP connection (anything with ``send(method, params, session_id)``), on the
     first page target. Only Target/Emulation/Browser commands plus Runtime.evaluate reads (never
@@ -620,6 +786,27 @@ def fit_window_over_cdp(cdp, persona, window_size=None, settle_timeout=None):
         sw, sh, al, at, aw, ah = read(_DISPLAY_JS)
         if not _plausible([aw, ah]) or aw > sw or ah > sh:
             return None
+        if native:
+            if not window_size:
+                return None
+            win = cdp.send("Browser.getWindowForTarget", {"targetId": page["targetId"]})
+            window_id, cur = win["windowId"], win.get("bounds") or {}
+            w = min(int(round(window_size[0])), aw)
+            h = min(int(round(window_size[1])), ah)
+            left = min(max(int(cur.get("left", al)), al), al + aw - w)
+            top = min(max(int(cur.get("top", at)), at), at + ah - h)
+            if cur.get("windowState", "normal") != "normal":  # size cannot be set on a maximized window
+                cdp.send("Browser.setWindowBounds", {"windowId": window_id,
+                                                     "bounds": {"windowState": "normal"}})
+
+            def set_native(bw, bh):
+                cdp.send("Browser.setWindowBounds", {"windowId": window_id, "bounds": {
+                    "left": left, "top": top, "width": int(round(bw)), "height": int(round(bh))}})
+
+            outer = _fit_window(set_native, lambda: read(_OUTER_JS), (w, h),
+                                (al + aw - left, at + ah - top), settle_timeout)
+            return {"display": {"width": sw, "height": sh, "avail_width": aw, "avail_height": ah},
+                    "outer": (outer[0], outer[1])}
         if persona:
             screens = cdp.send("Emulation.getScreenInfos").get("screenInfos") or []
             primary = next((s for s in screens if s.get("isPrimary")), screens[0] if screens else None)
@@ -659,7 +846,7 @@ def fit_window_over_cdp(cdp, persona, window_size=None, settle_timeout=None):
                 pass
 
 
-def fit_served_window(ws_url, persona, window_size=None, timeout=5.0):
+def fit_served_window(ws_url, persona, window_size=None, timeout=5.0, native=False):
     """``fit_window_over_cdp`` on the SDK's own short connection to a served browser. Never raises."""
     if not ws_url:
         return None
@@ -667,7 +854,7 @@ def fit_served_window(ws_url, persona, window_size=None, timeout=5.0):
     cdp = None
     try:
         cdp = CdpConnection(ws_url, timeout=timeout)
-        return fit_window_over_cdp(cdp, persona, window_size)
+        return fit_window_over_cdp(cdp, persona, window_size, native=native)
     except Exception as exc:  # noqa: BLE001
         logger.debug("served window fit skipped: %s", exc)
         return None

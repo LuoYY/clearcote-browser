@@ -56,6 +56,7 @@ import { gunzipSync } from "node:zlib";
 import type { BrowserContext, Page } from "playwright-core";
 import { connectCdp, type CdpConnection } from "./cdpws.js";
 import { lightStealthScreen } from "./fingerprint.js";
+import { engineSupportsSwitch } from "./launchopts.js";
 
 /**
  * The linux-x64 engine's window frame around an EMULATED viewport: outer = inner + (WIDTH, HEIGHT).
@@ -131,8 +132,48 @@ export function callerFixedTheSize(args?: readonly string[] | null): boolean {
  * first navigation gives `outer == avail` at (0,0) with zero resize events. Other headed platforms
  * keep the plain `viewport: null`: their window manager sizes the window.
  */
-export function headedLinuxFit(args?: readonly string[] | null, platform: NodeJS.Platform = process.platform): boolean {
-  return platform === "linux" && !callerSizedTheWindow(args);
+export function headedLinuxFit(
+  args?: readonly string[] | null,
+  platform: NodeJS.Platform = process.platform,
+  exe?: string,
+): boolean {
+  // Not for a persona on an engine that opens the persona's window itself (r39+): it sizes it at creation.
+  return platform === "linux" && !callerSizedTheWindow(args) && !enginePlacesPersonaWindow(exe, args);
+}
+
+/**
+ * r39+: the ENGINE owns a persona's window (components/ungoogled/persona_window.h). With a persona it
+ * makes the headless display the persona's display (screen size + taskbar) and opens the first
+ * browser window with the persona's own bounds and show state -- maximized for most seeds, a restored
+ * window of a seed-derived size and position for the rest (./windowgeom.ts mirrors the derivation) --
+ * before any page exists. The SDK then sends no `--screen-info` and runs no fit for a persona: either
+ * would only move a real window that is already right, and the fit was the one step a page could see
+ * (a late resize event on ~1 page in 10, measured on r37). Probed per engine, like every new switch:
+ * older engines keep the fit.
+ */
+export const PERSONA_WINDOW_SWITCH = "fingerprint-window";
+const OFF = ["off", "0", "false"];
+
+function lastSwitch(args: readonly string[] | null | undefined, name: string): string | undefined {
+  let found: string | undefined;
+  for (const a of args ?? []) if (String(a).startsWith(`--${name}=`)) found = String(a).slice(name.length + 3);
+  return found;
+}
+
+/**
+ * Whether the engine that will run opens a persona's window itself (r39+): a persona is active on this
+ * command line, the binary implements `--fingerprint-window`, and the engine's own rule turns it on:
+ * `--fingerprint-window=on`, or no/`auto` value on schema 4 (a `--fingerprint-schema=1..3` pin keeps the
+ * old window, byte for byte). `--fingerprint-window=off` and phone personas (android) are false.
+ */
+export function enginePlacesPersonaWindow(exe: string | undefined, args?: readonly string[] | null): boolean {
+  if (!exe || !personaActive(args)) return false;
+  const mode = (lastSwitch(args, PERSONA_WINDOW_SWITCH) ?? "auto").trim().toLowerCase();
+  if (OFF.includes(mode) || (lastSwitch(args, "fingerprint-platform") ?? "").toLowerCase() === "android") return false;
+  if (!["on", "1", "true"].includes(mode) && ["1", "2", "3"].includes(lastSwitch(args, "fingerprint-schema") ?? "")) {
+    return false;
+  }
+  return engineSupportsSwitch(exe, PERSONA_WINDOW_SWITCH);
 }
 
 /**
@@ -218,6 +259,9 @@ export interface DisplayFingerprint {
 }
 
 export type AppliedGeometry =
+  /** r39+ engine, persona: no display switch, no fit. `reconcile`: an explicit viewport, whose window is
+   *  only moved back onto the work area if it hangs over an edge ({@link reconcileWindowPosition}). */
+  | { mode: "persona-native"; args: string[]; fit: false; reconcile: boolean; viewport?: Size | null }
   /** args carries the seed's fallback headless display (`--screen-info`) on every platform (the
    *  engine's own persona display wins over it); empty when the caller set the display. */
   | { mode: "persona"; args: string[] }
@@ -245,8 +289,16 @@ export function applyHeadlessGeometry(
   seed?: string | number | null,
   args?: readonly string[] | null,
   fp: DisplayFingerprint = {},
+  exe?: string,
 ): AppliedGeometry | null {
   if (opts.headless === false) return null;
+  if (enginePlacesPersonaWindow(exe, args)) {
+    // The engine opened the persona's window: keep a caller's own geometry options, default to the
+    // real window (viewport: null) otherwise. An explicit viewport only gets the position reconcile.
+    const reconcile = "viewport" in opts && opts.viewport !== null && opts.viewport !== undefined;
+    if (!("viewport" in opts) && !("screen" in opts)) opts.viewport = null;
+    return { mode: "persona-native", args: [], fit: false, reconcile, viewport: reconcile ? (opts.viewport as Size) : null };
+  }
   if ("viewport" in opts || "screen" in opts) return null;
   opts.viewport = null;
   if (personaActive(args)) {
@@ -398,20 +450,119 @@ export async function fitWindowToWorkArea(
   }
 }
 
+/** A normal window's `{ left, top }` back on a work area of `avail` (moved, never resized), or null. */
+export function reconcilePlan(
+  b: { left: number; top: number; width: number; height: number; windowState?: string } | null | undefined,
+  avail: readonly number[],
+): [number, number] | null {
+  if (!b || (b.windowState ?? "normal") !== "normal") return null;
+  const left = Math.max(0, Math.min(b.left, avail[0] - b.width));
+  const top = Math.max(0, Math.min(b.top, avail[1] - b.height));
+  return left === b.left && top === b.top ? null : [left, top];
+}
+
 /**
- * Apply the headless window fit once, on the first page (each context is its own window). A
- * persistent context already owns a page, so act immediately; a browser-level context does not, so
- * defer to its first `newPage`. `args` are the caller's, so a window switch of theirs is respected.
+ * The frame (outer - inner) the engine draws around a HEADLESS window in the normal state, by the host
+ * OS the engine runs on (measured on r37 and the r39 test build: a no-viewport restored window). Windows
+ * 16 x 129, Linux 0 x 121 -- the Linux frame is Linux's own, never Windows' borders.
+ */
+export const HEADLESS_NORMAL_FRAME: readonly [number, number] = process.platform === "win32" ? [16, 129] : [0, 121];
+
+type WindowBounds = { left?: number; top?: number; width?: number; height?: number; windowState?: string };
+
+/**
+ * The `Browser.setWindowBounds` payloads (in order) that make a persona window agree with an explicit
+ * viewport, plus the bounds they leave. Playwright asks for the viewport's size with zero insets in
+ * headless; on a MAXIMIZED persona window Chromium only restores the window and drops the size
+ * (BrowserHandler::SetWindowBounds), so it ends up at its restore rectangle, unrelated to the emulated
+ * viewport (measured on the r39 test build: outer 1493x830 around inner 1280x720). Asking for the bare
+ * viewport size again gives a window with no frame at all. So: the normal state, then the viewport plus
+ * the engine's own normal-window frame, then a move back onto the work area if it hangs over an edge.
+ */
+export function reconcileSteps(
+  bounds: WindowBounds | null | undefined,
+  avail: readonly number[],
+  viewport?: Size | null,
+): { steps: WindowBounds[]; final: WindowBounds } {
+  const b: WindowBounds = { ...(bounds ?? {}) };
+  const steps: WindowBounds[] = [];
+  if (viewport && viewport.width > 0 && viewport.height > 0) {
+    if ((b.windowState ?? "normal") !== "normal") {
+      steps.push({ windowState: "normal" });
+      b.windowState = "normal";
+    }
+    const w = viewport.width + HEADLESS_NORMAL_FRAME[0];
+    const h = viewport.height + HEADLESS_NORMAL_FRAME[1];
+    if (b.width !== w || b.height !== h) {
+      steps.push({ width: w, height: h });
+      b.width = w;
+      b.height = h;
+    }
+  }
+  const complete = b.left !== undefined && b.top !== undefined && b.width !== undefined && b.height !== undefined;
+  const plan = complete ? reconcilePlan(b as Required<Omit<WindowBounds, "windowState">> & WindowBounds, avail) : null;
+  if (plan) {
+    steps.push({ left: plan[0], top: plan[1] });
+    b.left = plan[0];
+    b.top = plan[1];
+  }
+  return { steps, final: b };
+}
+
+/**
+ * A persona window (r39+) under an explicit `viewport`: make the real window agree with it
+ * ({@link reconcileSteps}): the viewport plus the engine's normal frame, kept on the persona's work area.
+ * Headless, where the display is the persona's; runs on the first page while it is on about:blank.
+ * Never throws.
+ */
+export async function reconcileWindowPosition(page: Page, viewport?: Size | null): Promise<WindowBounds | null> {
+  try {
+    const avail = (await page.evaluate(WORKAREA_JS)) as number[];
+    const cdp = await page.context().newCDPSession(page);
+    const win = (await cdp.send("Browser.getWindowForTarget")) as { windowId: number; bounds?: WindowBounds };
+    const { steps, final } = reconcileSteps(win.bounds, avail, viewport);
+    for (const bounds of steps) {
+      await cdp.send("Browser.setWindowBounds", { windowId: win.windowId, bounds: bounds as Record<string, unknown> });
+    }
+    return final;
+  } catch {
+    return null;   // deliberately silent: never fail a launch over geometry
+  }
+}
+
+/** The plan for a window step: the plain work-area fit (headed Linux, older engines, no persona). */
+export const FIT_PLAN = { mode: "fit" } as const;
+export type WindowPlan = AppliedGeometry | typeof FIT_PLAN;
+
+/**
+ * The first-page window step a launch's geometry plan asks for: the work-area fit (older engines, no
+ * persona), a position reconcile (an r39+ persona window under an explicit viewport), or nothing (an
+ * r39+ persona window: the engine placed it).
+ */
+export async function placeWindow(page: Page, args: readonly string[] | null | undefined, plan: WindowPlan | null): Promise<void> {
+  if (!plan) return;
+  if (plan.mode === "persona-native") {
+    if (plan.reconcile) await reconcileWindowPosition(page, plan.viewport);
+    return;
+  }
+  await fitWindowToWorkArea(page, args);
+}
+
+/**
+ * Apply the plan's window step once, on the first page (each context is its own window). A persistent
+ * context already owns a page, so act immediately; a browser-level context does not, so defer to its
+ * first `newPage`. `args` are the caller's, so a window switch of theirs is respected.
  */
 export async function installWindowFixup(
   context: BrowserContext,
   args?: readonly string[] | null,
+  plan: WindowPlan | null = FIT_PLAN,
 ): Promise<void> {
   let done = false;
   const fix = async (page: Page) => {
     if (done) return page;
     done = true;
-    await fitWindowToWorkArea(page, args);
+    await placeWindow(page, args, plan);
     return page;
   };
   try {
@@ -483,8 +634,10 @@ export interface Display { width: number; height: number; availWidth: number; av
 export interface ServedGeometry {
   /** true: the persona owns the display, which is matched after launch (see fitServedWindow). */
   persona: boolean;
-  /** The display `--screen-info` sets: regime 2's own, or the fallback row under a persona. */
-  display: Display;
+  /** true: an r39+ engine opened the persona's display and window itself; only a windowSize is applied. */
+  native?: boolean;
+  /** The display `--screen-info` sets: regime 2's own, or the fallback row under a persona; null native. */
+  display: Display | null;
   /** Switches for the command line. */
   args: string[];
   /** false when the caller placed the window (`--window-position`): serve() skips the window fit. */
@@ -565,8 +718,14 @@ export function servedGeometry(
     screenWidth?: number; screenHeight?: number; availWidth?: number; availHeight?: number;
   },
   headless = true,
+  exe?: string,
+  windowSize?: Size | null,
 ): ServedGeometry | null {
   if (!headless || callerFixedTheSize(engineArgs) || callerSetTheDisplay(engineArgs)) return null;
+  if (enginePlacesPersonaWindow(exe, engineArgs)) {
+    // r39+: the display and the window already are the persona's; only an explicit size is applied.
+    return { persona: true, native: true, display: null, args: [], fit: !!windowSize && !callerSizedTheWindow(engineArgs) };
+  }
   const placed = callerSizedTheWindow(engineArgs);  // a bare --window-position: keep theirs, skip the fit
   const display = servedDisplay({ ...fp, seed: fp.fingerprint, args: engineArgs });
   return {
@@ -600,7 +759,7 @@ export interface ServedFit { display: Display; outer: [number, number] }
  */
 export async function fitWindowOverCdp(
   cdp: CdpSend,
-  opts: { persona: boolean; windowSize?: Size | null; settleMs?: number },
+  opts: { persona: boolean; windowSize?: Size | null; settleMs?: number; native?: boolean },
 ): Promise<ServedFit | null> {
   let sessionId: string | undefined;
   try {
@@ -612,6 +771,26 @@ export async function fitWindowOverCdp(
       ((await cdp.send("Runtime.evaluate", { expression, returnByValue: true }, sessionId)).result as { value: number[] }).value;
     const [sw, sh, al, at, aw, ah] = await read(DISPLAY_JS);
     if (!plausible([aw, ah]) || aw > sw || ah > sh) return null;
+    if (opts.native) {
+      // r39+ persona window: only an explicit size, at the window's own position kept on the work area.
+      if (!opts.windowSize) return null;
+      const win = (await cdp.send("Browser.getWindowForTarget", { targetId: page.targetId })) as {
+        windowId: number; bounds?: { left?: number; top?: number; windowState?: string };
+      };
+      const cur = win.bounds ?? {};
+      const w = Math.min(Math.round(opts.windowSize.width), aw);
+      const h = Math.min(Math.round(opts.windowSize.height), ah);
+      const left = Math.min(Math.max(cur.left ?? al, al), al + aw - w);
+      const top = Math.min(Math.max(cur.top ?? at, at), at + ah - h);
+      if ((cur.windowState ?? "normal") !== "normal") {
+        await cdp.send("Browser.setWindowBounds", { windowId: win.windowId, bounds: { windowState: "normal" } });
+      }
+      const setNative = (bw: number, bh: number) =>
+        cdp.send("Browser.setWindowBounds", { windowId: win.windowId, bounds: { left, top, width: Math.round(bw), height: Math.round(bh) } });
+      const outer = await fitWindow(setNative, () => read(OUTER_JS), [w, h],
+        [al + aw - left, at + ah - top], opts.settleMs ?? SETTLE_MS);
+      return { display: { width: sw, height: sh, availWidth: aw, availHeight: ah }, outer: [outer[0], outer[1]] };
+    }
     if (opts.persona) {
       const { screenInfos = [] } = (await cdp.send("Emulation.getScreenInfos")) as { screenInfos?: { id: string; isPrimary?: boolean }[] };
       const primary = screenInfos.find((s) => s.isPrimary) ?? screenInfos[0];
@@ -645,7 +824,7 @@ export async function fitWindowOverCdp(
 /** {@link fitWindowOverCdp} on the SDK's own short connection to a served browser. Never throws. */
 export async function fitServedWindow(
   wsUrl: string | undefined,
-  opts: { persona: boolean; windowSize?: Size | null; timeoutMs?: number },
+  opts: { persona: boolean; windowSize?: Size | null; timeoutMs?: number; native?: boolean },
 ): Promise<ServedFit | null> {
   if (!wsUrl) return null;
   let cdp: CdpConnection | null = null;

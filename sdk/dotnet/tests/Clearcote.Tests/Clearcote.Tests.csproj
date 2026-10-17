@@ -22,4 +22,9 @@
     <ProjectReference Include="..\..\src\Clearcote\Clearcote.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The engine's persona-window parity vector (same file as sdk/python and sdk/node tests/data). -->
+    <None Update="data\window_vectors.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

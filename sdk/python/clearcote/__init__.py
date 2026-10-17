@@ -40,7 +40,8 @@ from ._fontpersona import ensure_persona_fonts, font_reachability, profile_with_
 from ._fonts import apply_font_env, check_font_dirs
 from ._shaderdialect import apply_shader_dialect
 from . import _personaenv
-from ._geometry import apply_headless_geometry, caller_sized_the_window, fit_window_to_work_area
+from ._geometry import (apply_headless_geometry, caller_sized_the_window, engine_places_persona_window,
+                        place_window)
 from ._colorscheme import (default_color_scheme, engine_decides_color_scheme,
                            install_color_scheme_default)
 from ._humanize import install_humanize, install_humanize_on_context
@@ -617,12 +618,14 @@ def _headed_no_viewport(pw_kwargs):
             and "viewport" not in pw_kwargs and "no_viewport" not in pw_kwargs)
 
 
-def _headed_linux_fit(args):
+def _headed_linux_fit(args, exe=None):
     """Whether a HEADED launch gets the first-page window fit: a Linux host (no window manager under
     Xvfb/Docker, so nothing else maximizes the window) and no window switch of the caller's own.
     Measured (SC 180): ``--start-maximized`` is a no-op there; CDP ``Browser.setWindowBounds`` before
-    the first navigation gives ``outer == avail`` at (0,0) with zero resize events."""
-    return sys.platform.startswith("linux") and not caller_sized_the_window(args)
+    the first navigation gives ``outer == avail`` at (0,0) with zero resize events. Not for a persona
+    on an engine that opens the persona's window itself (r39+): the engine sizes it at creation."""
+    return (sys.platform.startswith("linux") and not caller_sized_the_window(args)
+            and not engine_places_persona_window(exe, args))
 
 
 def _install_headed_viewport(browser):
@@ -642,13 +645,13 @@ def _install_headed_viewport(browser):
     browser.new_page, browser.new_context = new_page, new_context
 
 
-def _headless_geometry_kwargs(pw_kwargs, seed, args=None):
+def _headless_geometry_kwargs(pw_kwargs, seed, args=None, exe=None):
     """The headless geometry defaults for this launch, or None if they don't apply.
 
     ``apply_headless_geometry`` mutates, and ``chromium.launch()`` accepts no ``no_viewport`` (a
     context option), so probe a copy and carry the result to the context.
     """
-    return apply_headless_geometry(dict(pw_kwargs), seed, args)
+    return apply_headless_geometry(dict(pw_kwargs), seed, args, exe=exe)
 
 
 def _with_geometry_args(args, geom):
@@ -656,8 +659,12 @@ def _with_geometry_args(args, geom):
     return list(args) + list((geom or {}).get("args") or [])
 
 
-def _install_window_fixup(container, args):
-    """Fit the headless window to the display's work area once, on the first page.
+_FIT = {"mode": "fit"}  # the plain work-area fit (headed Linux, no persona window)
+
+
+def _install_window_fixup(container, args, geom=_FIT):
+    """Run the geometry plan's first-page window step once (``place_window``): the work-area fit,
+    or for an r39+ persona window only a position reconcile under an explicit viewport.
 
     A persistent context already owns a page, so act immediately; a browser-level context does not,
     so defer to its first ``new_page``. Idempotent — later tabs share the window. ``args`` are the
@@ -669,7 +676,7 @@ def _install_window_fixup(container, args):
         if done:
             return page
         done.append(True)
-        fit_window_to_work_area(page, args)
+        place_window(page, args, geom)
         return page
 
     pages = getattr(container, "pages", None)
@@ -686,14 +693,25 @@ def _install_window_fixup(container, args):
     return None
 
 
-def _install_headless_geometry(browser, args=None):
-    """Default a headless browser's new pages/contexts to ``no_viewport`` plus a window fit.
+def _call_geometry(geom, kw):
+    """The plan for one new_page/new_context call: an r39+ persona window reconciles only when this
+    call asks for its own viewport; every other plan is the launch's."""
+    if geom and geom.get("mode") == "persona-native":
+        reconcile = kw.get("viewport") is not None and not kw.get("no_viewport")
+        return dict(geom, reconcile=reconcile, viewport=kw.get("viewport") if reconcile else None)
+    return geom or _FIT
+
+
+def _install_headless_geometry(browser, args=None, geom=None):
+    """Default a headless browser's new pages/contexts to ``no_viewport`` plus the window step.
 
     ``chromium.launch()`` accepts no context options, so the default has to ride on
     ``new_page``/``new_context`` — the same shape as ``_install_headed_viewport``. Each new context
-    is a new window, so each also gets the window fit (to the persona's work area, or the display
-    ``--screen-info`` set). A caller who passes any of ``viewport`` / ``no_viewport`` / ``screen``
-    per call keeps full control.
+    is a new window, so each also gets the window step: the fit (to the persona's work area, or the
+    display ``--screen-info`` set) on older engines, nothing for an r39+ persona window (the engine
+    opened it at the persona's bounds), whose only step is a position reconcile when a call passes
+    its own ``viewport``. A caller who passes any of ``viewport`` / ``no_viewport`` / ``screen``
+    per call keeps full control of the viewport.
     """
     orig_new_page, orig_new_context = browser.new_page, browser.new_context
 
@@ -703,13 +721,15 @@ def _install_headless_geometry(browser, args=None):
         return kw
 
     def new_page(**kw):
-        page = orig_new_page(**_merge(kw))
-        fit_window_to_work_area(page, args)
+        kw = _merge(kw)
+        page = orig_new_page(**kw)
+        place_window(page, args, _call_geometry(geom, kw))
         return page
 
     def new_context(**kw):
-        context = orig_new_context(**_merge(kw))
-        _install_window_fixup(context, args)
+        kw = _merge(kw)
+        context = orig_new_context(**kw)
+        _install_window_fixup(context, args, _call_geometry(geom, kw))
         return context
 
     browser.new_page, browser.new_context = new_page, new_context
@@ -1164,7 +1184,7 @@ def launch(cloud=None, **kwargs):
     # Headless: screen.* has to be handled alongside the viewport or the window reports
     # outer > screen (see _geometry). The display switches go on the command line; no_viewport is a
     # context option, so it rides on new_page/new_context.
-    geom = None if headed else _headless_geometry_kwargs(pw_kwargs, seed, args)
+    geom = None if headed else _headless_geometry_kwargs(pw_kwargs, seed, args, exe)
     launch_args = _with_geometry_args(args, geom)
     launch_args = _personaenv.apply_to_pw_kwargs(exe, launch_args, pw_kwargs, persona_env)
     browser = _release_lease_on_failure(lease if owns_lease else None, lambda: _retry_on_stale_run_token(
@@ -1177,14 +1197,14 @@ def launch(cloud=None, **kwargs):
                 _lease.stop()
             _lt[1]()
         browser.on("disconnected", _on_disconnect)
-    if headed and _headed_linux_fit(args):
+    if headed and _headed_linux_fit(args, exe):
         # Headed Linux with no window manager (Xvfb: every Docker/VPS headful run) leaves Chrome's
         # 945x1060 default window at (10,10); the same first-page fit as headless maximizes it.
         _install_headless_geometry(browser, args)
     elif headed:
         _install_headed_viewport(browser)
     elif geom:
-        _install_headless_geometry(browser, args)
+        _install_headless_geometry(browser, args, geom)
     if engine_decides_color_scheme(exe):  # r32+: the persona's colour scheme, not Playwright's light
         install_color_scheme_default(browser)
     install_humanize(browser, humanize, show_cursor, seed=seed)
@@ -1244,9 +1264,9 @@ def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
     headed_fit = False
     if _headed_no_viewport(pw_kwargs):  # no_viewport IS a valid persistent-context option
         pw_kwargs["no_viewport"] = True
-        headed_fit = _headed_linux_fit(args)  # Xvfb/Docker headful: maximize on the first page too
+        headed_fit = _headed_linux_fit(args, exe)  # Xvfb/Docker headful: maximize on the first page too
     else:  # headless: persona owns screen -> fit the window; no persona -> set the display too
-        geom = apply_headless_geometry(pw_kwargs, seed, args)
+        geom = apply_headless_geometry(pw_kwargs, seed, args, exe=exe)
     if engine_decides_color_scheme(exe):  # r32+: the persona's colour scheme, not Playwright's light
         default_color_scheme(pw_kwargs)
     launch_args = _with_geometry_args(args, geom)  # carries --widevine-cdm-path when on (see _prepare)
@@ -1265,7 +1285,7 @@ def launch_persistent_context(user_data_dir=None, cloud=None, **kwargs):
             _lt[1]()
         context.on("close", _on_close)
     if geom or headed_fit:
-        _install_window_fixup(context, args)
+        _install_window_fixup(context, args, geom or _FIT)
     install_humanize_on_context(context, humanize, show_cursor, seed=seed)
     return context
 

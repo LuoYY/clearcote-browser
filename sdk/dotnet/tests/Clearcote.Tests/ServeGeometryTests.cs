@@ -64,7 +64,7 @@ public class ServeGeometryTests
         Assert.True(g.Persona);
         Assert.True(g.Fit);
         Assert.Equal(Geometry.HeadlessDisplay("seed", new[] { personaSwitch }), g.Display);
-        Assert.Equal(new[] { Geometry.ScreenInfoSwitch(g.Display), "--window-position=0,0" }, g.Args);
+        Assert.Equal(new[] { Geometry.ScreenInfoSwitch(g.Display!), "--window-position=0,0" }, g.Args);
     }
 
     [Fact]
@@ -92,7 +92,7 @@ public class ServeGeometryTests
             Assert.NotNull(g);
             Assert.False(g!.Fit);
             Assert.Equal(Geometry.PersonaActive(args), g.Persona);
-            Assert.Equal(new[] { Geometry.ScreenInfoSwitch(g.Display) }, g.Args);
+            Assert.Equal(new[] { Geometry.ScreenInfoSwitch(g.Display!) }, g.Args);
             Assert.DoesNotContain(g.Args, a => a.StartsWith("--window-position"));
         }
     }

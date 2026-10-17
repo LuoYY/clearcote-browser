@@ -228,7 +228,8 @@ def serve(port=None, host="127.0.0.1", allow_origins=None, user_data_dir=None,
     cdp.extend(serve_infobar_args(headless, args + cdp))
     # Headless geometry for a raw endpoint: the display and window are set browser-wide, since no
     # client's context options or CDP overrides would reach every page (see _geometry).
-    geometry = served_geometry(args, _seed, light_stealth=light_stealth, headless=headless)
+    geometry = served_geometry(args, _seed, light_stealth=light_stealth, headless=headless, exe=exe,
+                               window_size=window_size)
     if geometry:
         cdp.extend(geometry["args"])
 
@@ -276,7 +277,7 @@ def serve(port=None, host="127.0.0.1", allow_origins=None, user_data_dir=None,
     # Before any client attaches: the window onto the work area (and, under a persona, the headless
     # display onto the persona's). Its own connection, closed again; never fails the launch.
     if geometry and geometry.get("fit", True):  # a caller's own --window-position keeps its place
-        fit_served_window(srv.ws_url, geometry["persona"], window_size)
+        fit_served_window(srv.ws_url, geometry["persona"], window_size, native=geometry.get("native", False))
     if not quiet:
         sys.stderr.write(
             "[clearcote] CDP endpoint ready: %s\n"
