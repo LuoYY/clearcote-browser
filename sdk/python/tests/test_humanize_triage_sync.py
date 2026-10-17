@@ -43,6 +43,36 @@ def test_sync_visible_label_click_is_hit_tested_on_the_label_element(fast, monke
     assert lab.inside(x, y) and not cb.inside(x, y) and 124.0 <= x <= 234.0 and 100.0 <= y <= 116.0, (x, y)
 
 
+# SC 239 box probe (10-17): a label WRAPPING its visible checkbox -- LABEL_OF's text rect was the input's own box
+# (see test_humanize_forms_async.WRAP_LABEL); the same two cases through the SYNC humanizer (what the lab drives).
+def test_sync_wrapping_labels_text_rect_over_the_input_is_no_label_aim(fast, monkeypatch):
+    from test_humanize_forms_async import WRAP_INPUT, WRAP_LABEL
+    monkeypatch.setattr(HS, "label_draw", lambda *a, **k: True)
+    cb = Field(type="checkbox", rect=WRAP_INPUT)
+    lab = Field(tag="label", type="", rect=WRAP_LABEL, control=cb, wraps=True, text_rect=WRAP_INPUT)
+    sim, page = _attached("label-wrap", Page, ("#cb", cb), ("#lab", lab))
+    page.check("#cb")
+    assert cb.checked and not non_trial(sim)
+    downs = kinds(sim, "down")
+    assert len(downs) == 1 and cb.inside(*downs[0][4]), downs
+    assert not [h for h in sim.hits if h[1] == WRAP_LABEL], "a label aim was tried on the input's own box"
+
+
+def test_sync_wrapping_labels_text_beside_the_input_is_aimed_and_hit_tested_on_the_label(fast, monkeypatch):
+    from test_humanize_forms_async import WRAP_INPUT, WRAP_LABEL
+    monkeypatch.setattr(HS, "label_draw", lambda *a, **k: True)
+    cb = Field(type="checkbox", rect=WRAP_INPUT)
+    lab = Field(tag="label", type="", rect=WRAP_LABEL, control=cb, wraps=True, text_rect=(61.0, 75.0, 193.8, 15.0))
+    sim, page = _attached("label-wrap", Page, ("#cb", cb), ("#lab", lab))
+    page.check("#cb")
+    assert cb.checked and not non_trial(sim)
+    downs = kinds(sim, "down")
+    assert len(downs) == 1
+    x, y = downs[0][4]
+    assert lab.inside(x, y) and not cb.inside(x, y) and 61.0 <= x <= 254.8 and 75.0 <= y <= 90.0, (x, y)
+    assert [h for h in sim.hits if h[1] == WRAP_LABEL and h[0] is lab], "hit-tested on the label element's box"
+
+
 def test_sync_press_on_a_button_out_of_tab_reach_clicks_the_field_before_it_and_tabs(fast):
     btn = Field(tag="button", type="", rect=(100.0, 400.0, 160.0, 40.0))
     q = Field(rect=(100.0, 300.0, 200.0, 24.0))

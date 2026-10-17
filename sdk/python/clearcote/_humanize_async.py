@@ -27,7 +27,8 @@ from ._forms import (
 from ._humanize import (
     CURSOR_OVERLAY, ENGINE_POINTER_PATH, _ROLL_KEYS, _Native, _cdp_method_missing, _engine_clicks_mode, _host_platform,
     ENGINE_EXT_MISSING, _cdp_invalid_params, _engine_ext_mode,
-    FRAMES_WAIT_MS, _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s, as_api_error,
+    FRAMES_WAIT_MS, _boxes_overlap, _is_timeout, _needs_shift, _no_touch, _rand, _sel_kw, _shift_lag_s, _shift_lead_s,
+    as_api_error,
     default_timeout_ms, engine_path_memo, trial_timeout_error, typo_rate, _MOD_KEYS,
     TAP_NOT_HUMANIZED, label_draw, native_select_args, report_fallback, select_wants, strict_mode, want_index,
 )
@@ -2448,9 +2449,15 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
                 return None
             if not label_draw(persona):   # the persona's share; THIS click's choice is unseeded
                 return None
-            r = lab["label"].get("text") or lab["label"]["rect"]
+            lb = lab["label"]
+            r = lb.get("text")
+            # a wrapping label's text is its content clear of the input's box; no text, or an aim box still over the
+            # input: the input is the only target (see _humanize._label_aim; SC 239)
+            if r is None and lb.get("contains"):
+                return None
+            r = r or lb["rect"]
             lbox = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
-            if lbox["width"] < 2 or lbox["height"] < 2:
+            if lbox["width"] < 2 or lbox["height"] < 2 or _boxes_overlap(lbox, lab.get("rect")):
                 return None
             # aim inside the text, hit-test the LABEL ELEMENT's box (see _humanize._label_aim; SC 232 triage)
             lr = lab["label"]["rect"]

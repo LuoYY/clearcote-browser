@@ -184,6 +184,15 @@ def _needs_shift(ch):
     return "A" <= ch <= "Z" or ch in _SHIFTED_SYMBOLS
 
 
+def _boxes_overlap(box, rect):
+    """Does ``box`` ({x, y, width, height}) cover any of ``rect`` ([x, y, w, h]) beyond a hairline? A label aim
+    that still lies over the input's own box is an input click, not a label click (SC 239)."""
+    if not rect or len(rect) < 4:
+        return False
+    return (box["x"] < rect[0] + rect[2] - 0.5 and box["x"] + box["width"] > rect[0] + 0.5
+            and box["y"] < rect[1] + rect[3] - 0.5 and box["y"] + box["height"] > rect[1] + 0.5)
+
+
 # The engine's trajectory command, new name first. r34 renamed it to a neutral name ("humanizedClick" is
 # a known tool's vocabulary). The served /json/protocol still lists "humanizedClick" (measured on r38,
 # SC 210); r40 keeps "dispatchPointerPath" out of it. The old name still works and is the only one r33
@@ -2921,9 +2930,17 @@ def attach_humanize(browser, page, humanize=False, show_cursor=False, seed=None)
                 return None
             if not label_draw(persona):   # the persona's share; THIS click's choice is unseeded
                 return None
-            r = lab["label"].get("text") or lab["label"]["rect"]
+            lb = lab["label"]
+            r = lb.get("text")
+            # A label that WRAPS its control: LABEL_OF's text rect is the content clear of the input's box (SC 239 box
+            # probe, 10-17: the first content rect IS the input's box, and taking it for the text put every "label"
+            # click on the input -- lab F_label_visible 0/60, verifier B 0/20). No text left (a label holding only
+            # the control), or an aim box still over the input's box: the input is the only target.
+            if r is None and lb.get("contains"):
+                return None
+            r = r or lb["rect"]
             lbox = {"x": r[0], "y": r[1], "width": r[2], "height": r[3]}
-            if lbox["width"] < 2 or lbox["height"] < 2:
+            if lbox["width"] < 2 or lbox["height"] < 2 or _boxes_overlap(lbox, lab.get("rect")):
                 return None
             # The click AIMS inside the label's text, but the hit test is asked about the LABEL ELEMENT's box:
             # HIT_IN_BOX proves "the node at (x, y) is the element filling box b", and no element fills the text's

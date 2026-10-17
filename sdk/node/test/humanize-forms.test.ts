@@ -1068,6 +1068,45 @@ describe("label-aware checkbox aim", () => {
     const last = moves[moves.length - 1].a;
     expect(last.x >= 124 && last.x <= 234 && last.y >= 100 && last.y <= 116, JSON.stringify(last)).toBe(true);
   });
+
+  // SC 239 box probe (10-17), `<label><input type=checkbox> Visible checkbox with a label</label>`: ISO_LABEL_OF answered
+  // {rect: [40, 74, 214.8, 17], text: [44, 75, 13, 13], contains: true} -- the "text" rect IS the input's own box (the
+  // first client rect of a wrapping label's contents is the control's border box), so labelAim aimed inside the input
+  // and every "label" click landed on the input (lab F_label_visible 0/60, verifier B 0/20).
+  const WRAP_LABEL = { x: 40, y: 74, width: 214.8, height: 17 }, WRAP_INPUT = { x: 44, y: 75, width: 13, height: 13 };
+  const sameBox = (a: Box, b: Box) => Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.y - b.y) < 1e-6
+    && Math.abs(a.width - b.width) < 1e-6 && Math.abs(a.height - b.height) < 1e-6;
+  const wrapped = async (textRect: Box) => {
+    const fk = makeFake({ fields: {
+      "#cb": { type: "checkbox", box: WRAP_INPUT },
+      "#lab": { tag: "label", type: "", control: "#cb", box: WRAP_LABEL, wraps: true, textRect },
+    } as any });
+    await attachHumanize({} as never, fk.page, { humanize: true, seed: "label-wrap" });
+    (fk.page as any)._clearcotePersona.labelShare = 1; // this click would be the label's
+    await fk.page.check("#cb");
+    expect(fk.fields["#cb"].checked).toBe(true);
+    return fk;
+  };
+
+  it("a wrapping label's text rect over the input is no label aim: the click goes to the input itself", async () => {
+    // the helper's old answer (text == the input's box, contains): no hit test asked about the label's box
+    const fk = await wrapped(WRAP_INPUT);
+    expect(fk.of("label-click").length).toBe(0);
+    expect(fk.hits.filter((h) => sameBox(h.box, WRAP_LABEL)), "a label aim was tried on the input's own box").toEqual([]);
+    const moves = fk.of("move");
+    const last = moves[moves.length - 1].a;
+    expect(last.x >= 44 && last.x <= 57 && last.y >= 75 && last.y <= 88, JSON.stringify(last)).toBe(true);
+  });
+
+  it("a wrapping label's text beside the input is aimed and hit-tested on the label element", async () => {
+    // the fixed helper's answer: the text's rect clear of the control (its content rects outside the input's box)
+    const fk = await wrapped({ x: 61, y: 75, width: 193.8, height: 15 });
+    expect(fk.of("label-click").length).toBe(1);
+    expect(fk.hits.filter((h) => sameBox(h.box, WRAP_LABEL)).length).toBe(1);
+    const moves = fk.of("move");
+    const last = moves[moves.length - 1].a;
+    expect(last.x >= 61 && last.x <= 254.8 && last.y >= 75 && last.y <= 90, JSON.stringify(last)).toBe(true);
+  });
 });
 
 describe("label draws: the seed fixes the trait, each click is unseeded", () => {

@@ -40,10 +40,11 @@ class Field:
                  maxlength=-1, autocomplete=None, inputmode=None, bl=2.0, bt=2.0, options=None,
                  selected_index=0, multiple=False, size=0, no_select_all=False, never_commit=False,
                  stubborn=False, visible=True, covered=False, fmt=None, rmin=None, rmax=None, rstep=None,
-                 cover_center=False, in_frame=False, appear_on_wait=False, control=None, text_rect=None):
+                 cover_center=False, in_frame=False, appear_on_wait=False, control=None, text_rect=None, wraps=False):
         self.tag, self.type, self.value, self.rect = tag, type, value, rect
         self.control = control                    # a <label>: the checkbox its click is passed on to
         self.text_rect = text_rect                # a <label>: its TEXT's rect (LABEL_OF `text`), when it is not the whole box
+        self.wraps = wraps                        # a <label> that CONTAINS its control (LABEL_OF `contains`)
         self.label = None                         # a checkbox: its <label> Field (set by the label)
         if control is not None:
             control.label = self
@@ -123,7 +124,8 @@ class Field:
              "label": None}
         if self.label is not None:
             tr = getattr(self.label, "text_rect", None)
-            o["label"] = {"rect": list(self.label.rect), "text": list(tr) if tr else None, "contains": False}
+            o["label"] = {"rect": list(self.label.rect), "text": list(tr) if tr else None,
+                          "contains": bool(getattr(self.label, "wraps", False))}
         return o
 
     def click(self, x, y, mods):
@@ -257,6 +259,7 @@ class World:
             return False if src == HIT_IN_BOX else None
         f = self.p.fields[nid - 1]
         if src == HIT_IN_BOX:
+            self.p.hits.append((f, (arg["x"], arg["y"], arg["width"], arg["height"])))   # (hit node, the box asked about)
             return all(abs(a - b) <= 1.5 for a, b in zip(f.rect, (arg["x"], arg["y"], arg["width"], arg["height"])))
         if src == LISTBOX_ROW:
             return f.row_state(arg["i"])
@@ -431,6 +434,7 @@ class Page:
         self.mouse, self.keyboard = Mouse(self), Keyboard(self)
         self.log, self.native, self.mods, self.waits = [], [], set(), []
         self.handles, self.scrolls = [], []   # main-world handle calls; scrolls (css / window / playwright)
+        self.hits = []                        # HIT_IN_BOX asked: (the hit node's Field, the box asked about)
         self.pos, self.focused, self.frame_focus = (0.0, 0.0), None, False
         self.main_frame = object()
         self.viewport_size = {"width": 1280, "height": 800}
@@ -2245,6 +2249,49 @@ def test_a_visible_labels_click_is_hit_tested_on_the_label_element_not_its_text_
         x, y = downs[0][4]
         assert lab.inside(x, y) and not cb.inside(x, y), (x, y)
         assert 124.0 <= x <= 234.0 and 100.0 <= y <= 116.0, "the press lands in the label's text"
+    run(go())
+
+
+# SC 239 box probe (10-17), `<label id=lcb3><input id=vcb type=checkbox> Visible checkbox with a label</label>`:
+# LABEL_OF answered {rect: [40, 74, 214.8, 17], text: [44, 75, 13, 13], contains: True} -- the "text" rect IS the
+# input's own box (the first client rect of a wrapping label's contents is the control's border box), so _label_aim
+# aimed inside the input and every "label" click landed on the input (lab F_label_visible 0/60, verifier B 0/20).
+WRAP_LABEL, WRAP_INPUT = (40.0, 74.0, 214.8, 17.0), (44.0, 75.0, 13.0, 13.0)
+
+
+def test_a_wrapping_labels_text_rect_over_the_input_is_no_label_aim(fast, monkeypatch):
+    # The helper's old answer (text == the input's box, contains): the wrapper must not take it for the label's text
+    # -- no hit test asked about the label's box, the click aimed at the input itself.
+    async def go():
+        monkeypatch.setattr(H, "label_draw", lambda *a, **k: True)   # this click would be the label's
+        cb = Field(type="checkbox", rect=WRAP_INPUT)
+        lab = Field(tag="label", type="", rect=WRAP_LABEL, control=cb, wraps=True, text_rect=WRAP_INPUT)
+        p = Page(("#cb", cb), ("#lab", lab))
+        await H.attach_humanize(None, p, humanize=True, seed="label-wrap")
+        await p.check("#cb")
+        assert cb.checked and not non_trial(p)
+        downs = kinds(p, "down")
+        assert len(downs) == 1 and cb.inside(*downs[0][4]), downs
+        assert not [h for h in p.hits if h[1] == WRAP_LABEL], "a label aim was tried on the input's own box"
+    run(go())
+
+
+def test_a_wrapping_labels_text_beside_the_input_is_aimed_and_hit_tested_on_the_label(fast, monkeypatch):
+    # The fixed helper's answer: the text's rect clear of the control (its content rects outside the input's box) --
+    # the click aims inside it and the hit test is asked about the label element's box.
+    async def go():
+        monkeypatch.setattr(H, "label_draw", lambda *a, **k: True)
+        cb = Field(type="checkbox", rect=WRAP_INPUT)
+        lab = Field(tag="label", type="", rect=WRAP_LABEL, control=cb, wraps=True, text_rect=(61.0, 75.0, 193.8, 15.0))
+        p = Page(("#cb", cb), ("#lab", lab))
+        await H.attach_humanize(None, p, humanize=True, seed="label-wrap")
+        await p.check("#cb")
+        assert cb.checked and not non_trial(p)
+        downs = kinds(p, "down")
+        assert len(downs) == 1
+        x, y = downs[0][4]
+        assert lab.inside(x, y) and not cb.inside(x, y) and 61.0 <= x <= 254.8 and 75.0 <= y <= 90.0, (x, y)
+        assert [h for h in p.hits if h[1] == WRAP_LABEL and h[0] is lab], "hit-tested on the label element's box"
     run(go())
 
 

@@ -45,6 +45,7 @@ export interface Field {
   appearAfterWait?: boolean;           // not visible until something waited for it
   control?: string;                    // a <label>: the selector of the checkbox its click is passed on to
   textRect?: Box;                      // a <label>: its TEXT's rect (ISO_LABEL_OF `text`), when it is not the whole box
+  wraps?: boolean;                     // a <label> that CONTAINS its control (ISO_LABEL_OF `contains`)
 }
 
 export interface FakeOpts {
@@ -91,6 +92,7 @@ export function makeFake(opts: FakeOpts = {}) {
   const fieldFor = (selector: string): Field => single ?? fields[selector];
   const allFields = (): Field[] => (single ? [single] : Object.values(fields));
   const events: Ev[] = [];
+  const hits: { node: number; box: Box }[] = [];   // ISO_HIT_IN_BOX asked: the hit node, the box asked about (a read, not an event)
   let handles = 0;           // main-world element handles Playwright would make (each = a textContent preview)
   let waited = false;
   const engineCalls: any[] = [];
@@ -116,7 +118,7 @@ export function makeFake(opts: FakeOpts = {}) {
     return { tag: "input", type: f.type, rect: [f.box.x, f.box.y, f.box.width, f.box.height],
       hidden: f.visible === false || f.box.width <= 1, checked: !!f.checked, disabled: false,
       label: lab ? { rect: [lab.box.x, lab.box.y, lab.box.width, lab.box.height],
-        text: lab.textRect ? [lab.textRect.x, lab.textRect.y, lab.textRect.width, lab.textRect.height] : null, contains: false } : null };
+        text: lab.textRect ? [lab.textRect.x, lab.textRect.y, lab.textRect.width, lab.textRect.height] : null, contains: !!lab.wraps } : null };
   };
   const labels = (f: Field) => (f.options ?? []).map((o) => (o.disabled ? null : o.label));
   const isSelect = (f: Field) => f.tag === "select";
@@ -329,6 +331,7 @@ export function makeFake(opts: FakeOpts = {}) {
           const arg = params.arguments[0].value;
           if (params.functionDeclaration === ISO_HIT_IN_BOX) {
             const b = f?.box; // the overlay (999) owns no field's box
+            hits.push({ node: id, box: { x: arg.x, y: arg.y, width: arg.width, height: arg.height } });   // the box asked about
             return { result: { value: !!b && Math.abs(b.x - arg.x) <= 1.5 && Math.abs(b.y - arg.y) <= 1.5
               && Math.abs(b.width - arg.width) <= 1.5 && Math.abs(b.height - arg.height) <= 1.5 } };
           }
@@ -431,7 +434,7 @@ export function makeFake(opts: FakeOpts = {}) {
     },
   };
   return {
-    page, events, natives, engineCalls, keySequences, waits, box: defBox, handles: () => handles,
+    page, events, hits, natives, engineCalls, keySequences, waits, box: defBox, handles: () => handles,
     field: single as Field, fields,
     setFocused: (v: boolean | string) => { focus = v === false ? null : typeof v === "string" ? fields[v] : single; },
     of: (t: string) => events.filter((e) => e.t === t),

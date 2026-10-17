@@ -3700,6 +3700,12 @@ public static partial class Humanize
     /// visible-checkbox clicks that land on the label text. <see cref="LabelShare"/> is the old single value.</summary>
     internal static double LabelShareOf(Persona p) => Motion.AimTraitsOf(p).LabelShare;
 
+    /// <summary>Does <paramref name="a"/> cover any of <paramref name="b"/> beyond a hairline? A label aim still over
+    /// the input's own box is an input click, not a label click (SC 239).</summary>
+    private static bool Overlaps(LocatorBoundingBoxResult a, LocatorBoundingBoxResult? b)
+        => b is not null && a.X < b.X + b.Width - 0.5 && a.X + a.Width > b.X + 0.5
+           && a.Y < b.Y + b.Height - 0.5 && a.Y + a.Height > b.Y + 0.5;
+
     private static LocatorBoundingBoxResult? Quad(JsonElement e)
         => e.ValueKind == JsonValueKind.Array && e.GetArrayLength() == 4
             ? new LocatorBoundingBoxResult { X = (float)e[0].GetDouble(), Y = (float)e[1].GetDouble(),
@@ -3726,8 +3732,15 @@ public static partial class Humanize
                 || lb.ValueKind != JsonValueKind.Object || (l.TryGetProperty("hidden", out var h) && h.ValueKind == JsonValueKind.True))
                 return null;
             if (!LabelDraw(PersonaFor(page))) return null;   // the persona's share; THIS click's choice is unseeded
-            var r = lb.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.Array ? Quad(tx) : Quad(lb.GetProperty("rect"));
-            if (r is not { Width: >= 2, Height: >= 2 }) return null;
+            // A label that WRAPS its control: LabelOf's text rect is the content clear of the input's box (SC 239 box
+            // probe, 10-17: the first content rect IS the input's box, and taking it for the text put every "label"
+            // click on the input -- lab F_label_visible 0/60, verifier B 0/20). No text left (a label holding only the
+            // control), or an aim box still over the input's box: the input is the only target.
+            bool contains = lb.TryGetProperty("contains", out var ct) && ct.ValueKind == JsonValueKind.True;
+            var text = lb.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.Array ? Quad(tx) : null;
+            if (text is null && contains) return null;
+            var r = text ?? Quad(lb.GetProperty("rect"));
+            if (r is not { Width: >= 2, Height: >= 2 } || Overlaps(r, l.TryGetProperty("rect", out var ir) ? Quad(ir) : null)) return null;
             // The click AIMS inside the label's text, but the hit test must be asked about the LABEL ELEMENT's box:
             // HitInBox proves "the node at (x, y) is the element filling box b", and no element fills the text's
             // own rect. Asked with the text rect it failed on every visible label, so the click went to the input

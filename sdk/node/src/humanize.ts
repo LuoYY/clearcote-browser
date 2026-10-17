@@ -247,6 +247,10 @@ export function trialTimeoutError(selector: string, ms: number, why: string): Er
 const SHIFTED_SYMBOLS = new Set('~!@#$%^&*()_+{}|:"<>?');
 /** @internal exported for tests */
 export const needsShift = (ch: string): boolean => (ch >= "A" && ch <= "Z" && ch.length === 1) || SHIFTED_SYMBOLS.has(ch);
+// Does box a ([x, y, w, h]) cover any of box b beyond a hairline? A label aim still over the input's own box is an
+// input click, not a label click (SC 239).
+const boxesOverlap = (a: readonly number[], b?: readonly number[]): boolean =>
+  !!b && b.length >= 4 && a[0] < b[0] + b[2] - 0.5 && a[0] + a[2] > b[0] + 0.5 && a[1] < b[1] + b[3] - 0.5 && a[1] + a[3] > b[1] + 0.5;
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 // Same unseeded live source as rand() — the seeded persona rng stays inside motion.ts, this is only
 // for placing a point in a plausible spread instead of on an exact landmark.
@@ -2483,7 +2487,10 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     if ((await loc.isChecked()) === checked) return;
     throw sdkPlaywrightError("Clicking the checkbox did not change its state");
   };
-  type LabelRead = { n?: number; hidden?: boolean; label?: { rect: number[]; text: number[] | null } | null } | null;
+  type LabelRead = {
+    n?: number; hidden?: boolean; rect?: number[];
+    label?: { rect: number[]; text: number[] | null; contains?: boolean } | null;
+  } | null;
   // The box a label click aims at, plus (a visible label) the LABEL ELEMENT's box the hit test is asked about.
   type LabelBox = Rect & { hit?: Rect };
   // Where a person clicks a checkbox / radio when not on its own box: its <label> (see Python _label_aim).
@@ -2496,8 +2503,13 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
       const lab = await w.callOnNode<LabelRead>(info.node, ISO_LABEL_OF);
       if (!lab || !lab.label || lab.hidden) return null;
       if (!labelDraw(persona)) return null; // the persona's share; THIS click's choice is unseeded
+      // A label that WRAPS its control: ISO_LABEL_OF's text rect is the content clear of the input's box (SC 239 box
+      // probe, 10-17: the first content rect IS the input's box, and taking it for the text put every "label" click on
+      // the input -- lab F_label_visible 0/60, verifier B 0/20). No text left (a label holding only the control), or an
+      // aim box still over the input's box: the input is the only target.
+      if (lab.label.text == null && lab.label.contains) return null;
       const r = lab.label.text ?? lab.label.rect;
-      if (!(r[2] >= 2 && r[3] >= 2)) return null;
+      if (!(r[2] >= 2 && r[3] >= 2) || boxesOverlap(r, lab.rect)) return null;
       // The click AIMS inside the label's text, but the hit test must be asked about the LABEL ELEMENT's box:
       // HIT_IN_BOX proves "the node at (x, y) is the element filling box b", and no element fills the text's own
       // rect. Asked with the text rect it failed on every visible label, so the click went to the input (0 of 20,

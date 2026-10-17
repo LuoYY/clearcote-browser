@@ -395,12 +395,26 @@ public sealed class IsolatedWorld
   if (!lab) return o;
   const lr = lab.getBoundingClientRect(), ls = getComputedStyle(lab);
   if (ls.display === 'none' || ls.visibility !== 'visible' || lr.width < 2 || lr.height < 2) return o;
+  // The TEXT's box: the union of the label's content rects clear of the control's own box. A label that WRAPS its
+  // control lists the control's border box first (SC 239 box probe: text == the input's rect), and a click there is an
+  // input click, not a label click. Text wrapped to a line under the control: the first clear rect alone.
+  const wraps = lab.contains(e);
+  const over = q => wraps && q.left < r.right - 0.5 && q.right > r.left + 0.5 && q.top < r.bottom - 0.5 && q.bottom > r.top + 0.5;
   let text = null;
   try {
     const rg = document.createRange(); rg.selectNodeContents(lab);
-    for (const q of rg.getClientRects()) if (q.width >= 2 && q.height >= 2) { text = [q.x, q.y, q.width, q.height]; break; }
+    const clear = Array.from(rg.getClientRects()).filter(q => q.width >= 2 && q.height >= 2 && !over(q));
+    if (clear.length) {
+      const u = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity };
+      for (const q of clear) {
+        u.left = Math.min(u.left, q.left); u.top = Math.min(u.top, q.top);
+        u.right = Math.max(u.right, q.right); u.bottom = Math.max(u.bottom, q.bottom);
+      }
+      const t = over(u) ? clear[0] : u;
+      text = [t.left, t.top, t.right - t.left, t.bottom - t.top];
+    }
   } catch (x) { text = null; }
-  o.label = { rect: [lr.x, lr.y, lr.width, lr.height], text, contains: lab.contains(e) };
+  o.label = { rect: [lr.x, lr.y, lr.width, lr.height], text, contains: wraps };
   return o; }";
     // LabelOf for the first match of a plain-CSS selector (a hidden input has no box to hit-test), plus how many
     // match; null when the selector is not CSS.
