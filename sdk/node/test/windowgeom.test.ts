@@ -7,10 +7,10 @@
  * (test/data/window_vectors.txt) is the engine's own output, from the standalone C++ test; the Python
  * and .NET suites assert the same file.
  */
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   HEADLESS_NORMAL_FRAME,
   applyHeadlessGeometry,
@@ -87,8 +87,13 @@ describe("windowgeom port", () => {
   });
 });
 
+// Fake engines live in temp directories that the suite must leave empty (CI checks the temp dir after the run).
+const fakeEngineDirs: string[] = [];
+afterAll(() => { for (const d of fakeEngineDirs) rmSync(d, { recursive: true, force: true }); });
+
 function engine(withSwitch = true): string {
   const dir = mkdtempSync(path.join(os.tmpdir(), "cc-r39-"));
+  fakeEngineDirs.push(dir);
   const body = Buffer.from(withSwitch ? "\0junk\0fingerprint-window\0" : "\0junk\0fingerprint\0", "latin1");
   const exe = path.join(dir, "fake-chrome");
   writeFileSync(exe, body);
