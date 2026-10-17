@@ -217,8 +217,12 @@ describe("R2: the trackpad rate and inertia decay are persona traits", () => {
     const e1 = S.planTrackpad(0, 500, a), e2 = S.planTrackpad(0, 500, a);
     expect(e1).not.toEqual(e2);
     const dt = 1000 / a.hz;
+    // (a fifth of scrolls stall ONCE for 120-400 ms, and the stall may land in the first three events)
     for (const ev of [e1, e2, S.planTrackpad(0, 300, a), S.planTrackpad(200, 0, a)]) {
-      for (const e of ev.slice(0, 3)) { expect(e.sleepMs).toBeGreaterThanOrEqual(0.92 * dt - 1e-9); expect(e.sleepMs).toBeLessThanOrEqual(1.08 * dt + 1e-9); }
+      const sl = ev.slice(0, 3).map((e: any) => e.sleepMs);
+      const off = sl.filter((s: number) => s < 0.92 * dt - 1e-9 || s > 1.08 * dt + 1e-9);
+      expect(off.length).toBeLessThanOrEqual(1);
+      for (const s of off) { expect(s).toBeGreaterThanOrEqual(0.92 * dt + 120 - 1e-9); expect(s).toBeLessThanOrEqual(1.08 * dt + 400 + 1e-9); }
     }
     const hz = new Set(Array.from({ length: 300 }, (_, i) => Math.round(S.trackpadTraits(M.makePersona(`seed-${i}`).seed).hz * 1000)));
     expect(hz.size).toBeGreaterThan(290);

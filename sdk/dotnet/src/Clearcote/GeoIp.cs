@@ -311,7 +311,9 @@ public static class GeoIp
             : "the geoip database could not be downloaded";
         var reason = ip is not null && info.Db is not null && !ipapi
             ? $"{dbReason} -- or set {IpApiEnv}=1 to ask ip-api.com (non-commercial use only)"
-            : sw.ElapsedMilliseconds >= budget
+            // The per-fetch cancellation timers tick in whole milliseconds, so a fetch cut off at the budget can hand
+            // control back with the stopwatch still reading budget-1 ms: that is the timeout, not a dead echo.
+            : sw.ElapsedMilliseconds >= budget - 1
                 ? $"timed out after {Math.Round(budget / 1000.0)}s (CLEARCOTE_GEOIP_TIMEOUT_SECONDS)"
                 : ip is null
                     ? $"could not determine the exit IP{(spec is not null ? " through the proxy" : "")}"

@@ -283,9 +283,12 @@ def test_trackpad_rate_and_inertia_decay_are_persona_traits_with_fresh_swipes():
     assert e1 != e2, "the swipe itself is unseeded"
     # the finger phase runs at the persona's rate (per-event jitter 0.92-1.08 around 1000/hz) in every scroll
     dt = 1000.0 / a.hz
+    # (a fifth of scrolls stall ONCE for 120-400 ms, and the stall may land in the first three events)
     for ev in (e1, e2, S.plan_trackpad(0, 300, a), S.plan_trackpad(200, 0, a)):
         finger = [sl for _, _, sl in ev[:3]]
-        assert all(0.92 * dt - 1e-9 <= sl <= 1.08 * dt + 1e-9 for sl in finger), (finger, dt)
+        off = [sl for sl in finger if not (0.92 * dt - 1e-9 <= sl <= 1.08 * dt + 1e-9)]
+        assert len(off) <= 1, (finger, dt)
+        assert all(0.92 * dt + 120 - 1e-9 <= sl <= 1.08 * dt + 400 + 1e-9 for sl in off), (finger, dt)
     ts = [S.trackpad_traits(make_persona("seed-%d" % i).seed) for i in range(300)]
     assert len({round(t.hz, 3) for t in ts}) > 290
 

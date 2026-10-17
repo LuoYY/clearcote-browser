@@ -146,8 +146,13 @@ public class HumanizeDragScrollTests
         var e1 = Scroll.PlanTrackpad(0, 500, a); var e2 = Scroll.PlanTrackpad(0, 500, a);
         Assert.NotEqual(e1.Select(e => e.Dy).ToArray(), e2.Select(e => e.Dy).ToArray());
         double dt = 1000 / a.Hz;
+        // (a fifth of scrolls stall ONCE for 120-400 ms, and the stall may land in the first three events)
         foreach (var ev in new[] { e1, e2, Scroll.PlanTrackpad(0, 300, a), Scroll.PlanTrackpad(200, 0, a) })
-            foreach (var e in ev.Take(3)) Assert.InRange(e.SleepMs, 0.92 * dt - 1e-9, 1.08 * dt + 1e-9);
+        {
+            var off = ev.Take(3).Select(e => e.SleepMs).Where(s => s < 0.92 * dt - 1e-9 || s > 1.08 * dt + 1e-9).ToList();
+            Assert.True(off.Count <= 1, string.Join(",", ev.Take(3).Select(e => e.SleepMs)));
+            foreach (var s in off) Assert.InRange(s, 0.92 * dt + 120 - 1e-9, 1.08 * dt + 400 + 1e-9);
+        }
         var hz = Enumerable.Range(0, 300).Select(i => Math.Round(Scroll.TrackpadTraitsOf(Motion.MakePersona($"seed-{i}").Seed).Hz, 3)).Distinct().Count();
         Assert.True(hz > 290);
     }
