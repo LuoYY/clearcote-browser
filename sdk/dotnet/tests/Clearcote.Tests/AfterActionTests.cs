@@ -358,6 +358,7 @@ public class AfterActionTests
         Assert.True(mv.Count > 40, $"{mv.Count} moves");
         Assert.InRange(took, 600, 1800);
         Assert.All(mv, e => Assert.True(e.X >= 0 && e.X <= 1280 && e.Y >= 0 && e.Y <= 800));
+        Assert.InRange(mv[0].Y, 0, 4);   // a fresh page's drift comes in over the top edge, inside its budget (SC 239)
     }
 
     [Fact]

@@ -12,8 +12,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from clearcote._motion import (  # noqa: E402
-    click_hold, drag_dwell, gauss_from, key_dwell, make_persona, mulberry32, plan_ambient, plan_drag, plan_move,
-    rollover_rate, shape_traits,
+    click_hold, drag_dwell, enter_from_top, ENTRY_LEAD_MS, entry_point, gauss_from, key_dwell, make_persona, mulberry32, plan_ambient,
+    plan_drag, plan_move, rollover_rate, shape_traits,
 )
 from clearcote import _motionscore  # noqa: E402
 
@@ -184,7 +184,66 @@ def sc232_sections():
         "timings": timings,
         "wheel_anchor": {"model": ANCHOR, "cases": anchors},
         "scores": score_cases(),
+        "entry": entry_cases(),
+        "entry_ambient": entry_ambient_cases(),
     }
+
+
+# SC 239: a fresh page's first glide enters over the top edge (pro-r43-13's rule, lab row H 13). Every case runs
+# the pipeline the SDKs run -- entry_point(target, view_w, rng) -> plan_move(from, target, ..., rng) ->
+# enter_from_top(steps, from, rng), ONE rng in that order -- and pins the start, the kept sample count and the first,
+# middle and last samples. ``view_w`` 0 = no readable viewport (the 1000 px default).
+ENTRY_CASES = [
+    # persona, rng, target, view_w, target_w
+    ("ha-1", 41, (640, 380), 1180, 24),
+    ("ha-2", 42, (60, 700), 1180, 24),
+    ("ha-3", 43, (1120, 40), 1180, 36),
+    ("ha-4", 44, (300, 12), 1366, 24),    # a target just under the top edge
+    ("ha-5", 45, (900, 500), 0, 24),      # no viewport read: 1000 px default width
+    ("ha-6", 46, (500, 200), 320, 24),    # a narrow view
+]
+
+
+def entry_cases():
+    cases = []
+    for pid, seed, target, vw, w in ENTRY_CASES:
+        rng = mulberry32(seed)
+        frm = entry_point(target, vw or None, rng)
+        planned = plan_move(frm, target, make_persona(pid), target_w=w, rng=rng)
+        steps = enter_from_top(planned, frm, rng)
+        n = len(steps)
+        idx = sorted({0, n // 2, n - 1})
+        cases.append({"persona": pid, "rng": seed, "target": list(target), "view_w": vw, "target_w": w,
+                      "from": [frm[0], frm[1]], "planned_n": len(planned), "n": n,
+                      "samples": [[i, steps[i][0], steps[i][1], steps[i][2]] for i in idx]})
+    return cases
+
+
+# SC 239: an ambient drift on a fresh page comes in over the top edge INSIDE its budget -- entry_point(pos, view_w, rng)
+# -> plan_ambient(start, view, persona, ms + ENTRY_LEAD_MS, rng) -> enter_from_top(plan, start, rng), one rng in that
+# order (_humanize._ambient_plan; Node ambientPlan, .NET AmbientPlan).
+ENTRY_AMBIENT_CASES = [
+    # persona, rng, tracked pos, view (w, h), ms
+    ("ha-1", 51, (260, 160), (1180, 760), 600),
+    ("ha-2", 52, (140, 90), (1366, 768), 1200),
+    ("ha-3", 53, (380, 240), (320, 640), 300),    # a narrow view; a short ask
+]
+
+
+def entry_ambient_cases():
+    cases = []
+    for pid, seed, pos, (vw, vh), ms in ENTRY_AMBIENT_CASES:
+        rng = mulberry32(seed)
+        start = entry_point(pos, vw, rng)
+        planned = plan_ambient(start, {"width": vw, "height": vh}, make_persona(pid), ms + ENTRY_LEAD_MS, rng)
+        steps = enter_from_top(planned, start, rng)
+        n = len(steps)
+        idx = sorted({0, 1, n // 2, n - 1})
+        cases.append({"persona": pid, "rng": seed, "pos": list(pos), "view": [vw, vh], "ms": ms,
+                      "start": [start[0], start[1]], "planned_n": len(planned), "n": n,
+                      "total_ms": sum(s[2] for s in steps),
+                      "samples": [[i, steps[i][0], steps[i][1], steps[i][2]] for i in idx]})
+    return cases
 
 
 if __name__ == "__main__":

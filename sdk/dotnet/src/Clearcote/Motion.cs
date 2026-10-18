@@ -882,6 +882,51 @@ public static class Motion
         }
         return new Point(x, y);
     }
+
+    // ------------------------------------------------------------------ fresh-page entry (SC 239 / pro-r43-13)
+    /// <summary>The first in-view sample of an entering path sits at y 0–4 (<see cref="EnterFromTop"/>).</summary>
+    public const double EntryCrossPx = 4.0;
+
+    /// <summary>An ambient drift on a fresh page is planned from the entry point too (its first excursion comes in over
+    /// the top edge, Humanize.AmbientPlan); the dropped lead-in is ~100–200 ms, so it is planned this much longer and
+    /// then trimmed to the ask.</summary>
+    public const double EntryLeadMs = 250.0;
+
+    /// <summary>Where a hand comes from on a page the pointer has not been over yet: 30–120 px ABOVE the view, within
+    /// ±30 % of the view width of <paramref name="target"/> (8 px inside the view's sides) — in from the tab strip /
+    /// address bar, as pro-r43-13 does for the engine's own first path. Python <c>entry_point</c> / Node <c>entryPoint</c>:
+    /// x first, then y, two draws from <paramref name="rng"/>. A <paramref name="viewW"/> of 16 or less means a 1000 px view.</summary>
+    public static Point EntryPoint(Point target, double viewW, Rng? rng = null)
+    {
+        rng ??= Random.Shared.NextDouble;
+        double w = viewW > 16 ? viewW : 1000.0;
+        double x = Clamp(target.X + (rng() - 0.5) * 0.6 * w, 8.0, w - 8.0);
+        double y = -(30.0 + rng() * 90.0);
+        return new Point(x, y);
+    }
+
+    /// <summary>The steps of a path planned from the off-view <paramref name="start"/> with the samples still above the
+    /// view dropped and the first one put where the path crosses the top edge (y 0–4; one draw from <paramref name="rng"/>
+    /// when a crossing sample is made). The crossing sample takes the timing of the sample it replaces (or of the first
+    /// kept one). A path whose start is inside the view, or that never comes in, is returned as it is.</summary>
+    public static List<Step> EnterFromTop(List<Step> steps, Point start, Rng? rng = null)
+    {
+        if (steps.Count == 0 || start.Y >= 0) return steps;
+        int i = 0;
+        while (i < steps.Count && steps[i].Y < 0) i++;
+        if (i >= steps.Count) return steps;
+        var a = i == 0 ? start : new Point(steps[i - 1].X, steps[i - 1].Y);
+        var b = steps[i];
+        if (b.Y <= EntryCrossPx) return steps.GetRange(i, steps.Count - i);
+        rng ??= Random.Shared.NextDouble;
+        double yIn = rng() * EntryCrossPx;
+        double f = b.Y > a.Y ? (yIn - a.Y) / (b.Y - a.Y) : 1.0;
+        double cx = a.X + (b.X - a.X) * f;
+        var outSteps = new List<Step>(steps.Count + 1);
+        if (i == 0) { outSteps.Add(steps[0] with { X = cx, Y = yIn }); outSteps.AddRange(steps); }
+        else { outSteps.Add(steps[i - 1] with { X = cx, Y = yIn }); outSteps.AddRange(steps.GetRange(i, steps.Count - i)); }
+        return outSteps;
+    }
 }
 
 /// <summary>Per-identity after-action traits (see <see cref="Motion.AfterTraitsOf"/>): the centre of the hover dwell

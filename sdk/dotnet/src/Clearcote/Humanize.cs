@@ -445,14 +445,14 @@ public static partial class Humanize
         return (vp?.Width ?? 1280, vp?.Height ?? 800);
     }
 
-    private static async Task SeedPointerAsync(IPage page, PointerState st)
+    private static async Task SeedPointerAsync(IPage page, Persona p, PointerState st)
     {
         if (st.Known) return;
+        // The pointer has not been over this page yet: come in over the top edge onto a reading position (the
+        // entering path of GlideAsync, pro-r43-13's rule) instead of one bare move to an interior point, which was
+        // the page's first pointer event before 0.54 (lab row H 13).
         var (vw, vh) = await ViewportAsync(page).ConfigureAwait(false);
-        st.X = Rand(vw * 0.2, vw * 0.8);
-        st.Y = Rand(vh * 0.2, vh * 0.8);
-        st.Known = true;
-        await page.Mouse.MoveAsync((float)st.X, (float)st.Y).ConfigureAwait(false);
+        await GlideAsync(page, p, st, Rand(vw * 0.2, vw * 0.8), Rand(vh * 0.2, vh * 0.8), 60).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -464,8 +464,15 @@ public static partial class Humanize
         double targetW, bool settle = false)
     {
         KeysOf(page).Typed = null;   // the hand left the keyboard: no submit / Tab pause owed
-        await SeedPointerAsync(page, st).ConfigureAwait(false);
-        var steps = Motion.PlanMove(new Point(st.X, st.Y), new Point(toX, toY), p, targetW, settle);
+        // A page the pointer has not been over yet (nothing placed it): the path comes in over the top edge, as the
+        // engine's own first path does (pro-r43-13), and the samples still above the view are not sent
+        // (Motion.EntryPoint / EnterFromTop) -- the page's first pointer event is at the edge, not mid-page (lab row
+        // H 13). A seating drag never starts a page: its press glided first.
+        bool entering = !st.Known && !settle;
+        var vp = await ViewBoundsAsync(page, st).ConfigureAwait(false);
+        var from = entering ? Motion.EntryPoint(new Point(toX, toY), vp?.W ?? 0) : new Point(st.X, st.Y);
+        var steps = Motion.PlanMove(from, new Point(toX, toY), p, targetW, settle);
+        if (entering) steps = Motion.EnterFromTop(steps, from);
         double tempo = Tempo(page);   // HumanizeOptions.Preset: every planned duration x1.4 / x1.0 / x0.7
         if (tempo != 1.0) steps = steps.ConvertAll(s => s with { SleepMs = s.SleepMs * tempo });
         // Native moves carry button state, so a button held via Mouse.DownAsync stays pressed
@@ -476,11 +483,11 @@ public static partial class Humanize
         // dispatched for 40 ms: Pacing.MaxJumpPx / IdleHopPx). "Move, then sleep the planned gap" added
         // the ~27 ms move round trip to every 6-8 ms sample: a 1.05 s planned glide took 3.5-5.4 s on
         // PRO r38 (SC 209).
-        var vp = await ViewBoundsAsync(page, st).ConfigureAwait(false);
         await Pacing.WalkAsync(vp is { } v ? Pacing.KeepInView(steps, v.W, v.H) : steps,
             (x, y) => page.Mouse.MoveAsync((float)x, (float)y)).ConfigureAwait(false);
         st.X = toX;
         st.Y = toY;
+        st.Known = true;
     }
 
     /// <summary>
@@ -527,7 +534,7 @@ public static partial class Humanize
     {
         if (st.Known) return;
         await AmbientPlaceAsync(page, p, st).ConfigureAwait(false);
-        await SeedPointerAsync(page, st).ConfigureAwait(false);   // no-op once ambient has placed it
+        await SeedPointerAsync(page, p, st).ConfigureAwait(false);   // no-op once ambient has placed it
     }
 
     /// <summary>

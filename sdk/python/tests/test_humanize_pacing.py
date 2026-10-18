@@ -123,12 +123,22 @@ class Page:
 def _spy_plans(monkeypatch, mod):
     plans = []
     real = mod.plan_move
+    real_enter = mod.enter_from_top
 
     def spy(frm, *a, **k):
         p = real(frm, *a, **k)
         plans.append((tuple(frm), p))
         return p
+
+    def spy_enter(steps, start, *a, **k):
+        # A fresh page's first glide (SC 239): the samples above the view are not dispatched, so the walk the
+        # test checks is the kept part, from its first (crossing) sample.
+        out = real_enter(steps, start, *a, **k)
+        if plans and plans[-1][1] is steps and out is not steps:
+            plans[-1] = ((out[0][0], out[0][1]), out)
+        return out
     monkeypatch.setattr(mod, "plan_move", spy)
+    monkeypatch.setattr(mod, "enter_from_top", spy_enter)
     return plans
 
 
@@ -210,6 +220,8 @@ def test_ambient_motion_lasts_what_was_asked(clock, lat, ms):
     page.ambient_motion(ms)
     took = clock.now() * 1000.0 - t0
     assert _moves(m), "ambient dispatched nothing"
+    # a fresh page's drift comes in over the top edge, inside its budget (SC 239): the first event is at y 0-4
+    assert 0 <= _moves(m)[0][3] <= 4, f"first ambient sample at y {_moves(m)[0][3]}"
     # With 25 ms dispatch latency a late walk now stretches instead of catching up with jumps (SC 210
     # fix 2, lab v2: no hop over 40 px): ambient's fast flicks run long. Measured over 30 plans: median
     # 1.04-1.06x, worst 1.67x (600 ms), 1.38x (1500), 1.13x (3000).

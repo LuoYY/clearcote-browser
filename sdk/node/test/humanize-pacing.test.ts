@@ -19,6 +19,14 @@ vi.mock("../src/motion.js", async (importOriginal) => {
       spy.plans.push({ from: { x: from.x, y: from.y }, plan });
       return plan;
     },
+    enterFromTop: (steps: any[], start: any, rng?: any) => {
+      // A fresh page's first glide (SC 239): the samples above the view are not dispatched, so the walk the test
+      // checks is the kept part, from its first (crossing) sample.
+      const out = m.enterFromTop(steps, start, rng);
+      const last = spy.plans[spy.plans.length - 1];
+      if (last && last.plan === steps && out !== steps) { last.from = { x: out[0].x, y: out[0].y }; last.plan = out; }
+      return out;
+    },
   };
 });
 
@@ -158,6 +166,8 @@ describe("humanize pacing: planned paths keep their planned duration", () => {
         const took = performance.now() - t0;
         const mv = f.log.filter((e) => e.op === "move");
         expect(mv.length).toBeGreaterThan(0);
+        // a fresh page's drift comes in over the top edge, inside its budget (SC 239): the first event is at y 0-4
+        expect(mv[0].y).toBeGreaterThanOrEqual(0); expect(mv[0].y).toBeLessThanOrEqual(4);
         expect(took, `ambientMotion(${ms}) took ${took.toFixed(0)} ms`).toBeGreaterThanOrEqual(0.8 * ms);
         // With 25 ms latency a late walk stretches instead of catching up with jumps (SC 210 fix 2, no hop
         // over 40 px): ambient's fast flicks run long (Python, 30 plans: worst 1.67x at 600 ms).

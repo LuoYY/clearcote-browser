@@ -10,6 +10,8 @@ import math
 from clearcote._motion import (
     click_point,
     drag_dwell,
+    enter_from_top,
+    entry_point,
     gauss_from,
     make_persona,
     min_jerk,
@@ -188,3 +190,36 @@ def test_plan_ambient_produces_entropy_within_viewport():
     # distinct positions (real entropy, not a frozen cursor)
     distinct = {f"{round(s[0])},{round(s[1])}" for s in steps}
     assert len(distinct) > 20
+
+
+# --- fresh-page entry (SC 239 / pro-r43-13) --------------------------------------------------------
+
+def test_entry_point_is_above_the_view_near_the_target():
+    for k in range(200):
+        x, y = entry_point((640, 380), 1180, mulberry32(k))
+        assert -120 <= y <= -30
+        assert 8 <= x <= 1180 - 8
+        assert abs(x - 640) <= 0.3 * 1180 + 1e-9
+    # no readable viewport: a 1000 px view
+    x, y = entry_point((900, 500), None, mulberry32(1))
+    assert 8 <= x <= 992
+
+
+def test_enter_from_top_first_sample_is_at_the_edge_and_nothing_stays_above():
+    p = make_persona("entry")
+    for k in range(50):
+        r = mulberry32(100 + k)
+        frm = entry_point((640, 380), 1180, r)
+        planned = plan_move(frm, (640, 380), p, rng=r)
+        steps = enter_from_top(planned, frm, r)
+        assert 0 <= steps[0][1] <= 4
+        assert all(s[1] >= 0 for s in steps)
+        assert tuple(steps[-1][:2]) == tuple(planned[-1][:2]) == (640, 380)
+        assert len(steps) <= len(planned) + 1
+
+
+def test_enter_from_top_leaves_an_inside_start_alone():
+    p = make_persona("entry")
+    planned = plan_move((300, 300), (640, 380), p, rng=mulberry32(5))
+    assert enter_from_top(planned, (300, 300), mulberry32(6)) is planned
+    assert enter_from_top([], (300, -40)) == []

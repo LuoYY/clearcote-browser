@@ -149,6 +149,19 @@ public static partial class Humanize
         catch (Exception) { /* best effort: the page may be gone */ }
     }
 
+    /// <summary><see cref="Motion.PlanAmbient"/> from the tracked position — or, on a page the pointer has not been over
+    /// yet, from a point above the view with the samples still above it dropped (<see cref="Motion.EntryPoint"/> /
+    /// <see cref="Motion.EnterFromTop"/>): the drift's first excursion comes in over the top edge, as GlideAsync's first
+    /// move does (pro-r43-13's rule, lab row H 13). Planned <see cref="Motion.EntryLeadMs"/> longer then, so the dropped
+    /// lead-in (~100–200 ms) leaves the walk no shorter than <paramref name="ms"/>; the caller trims to it. <paramref
+    /// name="rng"/> null: unseeded (the attention model passes its own). Python <c>_ambient_plan</c>, Node <c>ambientPlan</c>.</summary>
+    private static List<Step> AmbientPlan(PointerState st, Persona p, double w, double h, double ms, Rng? rng = null)
+    {
+        if (st.Known) return Motion.PlanAmbient(new Point(st.X, st.Y), w, h, p, ms, rng);
+        var start = Motion.EntryPoint(new Point(st.X, st.Y), w, rng);
+        return Motion.EnterFromTop(Motion.PlanAmbient(start, w, h, p, ms + Motion.EntryLeadMs, rng), start, rng);
+    }
+
     /// <summary>
     /// Ambient cursor activity for about <paramref name="ms"/>: idle drift and a few non-goal moves inside the central
     /// band of the viewport (<see cref="Motion.PlanAmbient"/>, cut by <see cref="Pacing.TrimTo"/>), so a behavioral
@@ -162,9 +175,11 @@ public static partial class Humanize
         {
             var p = PersonaFor(page);
             var st = StateFor(page);
-            await SeedPointerAsync(page, st).ConfigureAwait(false);
             var (w, h) = await ViewportAsync(page).ConfigureAwait(false);
-            var steps = Pacing.TrimTo(Motion.PlanAmbient(new Point(st.X, st.Y), w, h, p, ms), ms);
+            // PlanAmbient overruns its budget (whole excursions, rests drawn at 0.9–1.4x a frame): cut the plan at a
+            // slow sample near ms so the walk lasts about ms. On a page the pointer has not been over yet the drift
+            // comes in over the top edge (AmbientPlan).
+            var steps = Pacing.TrimTo(AmbientPlan(st, p, w, h, ms), ms);
             await WalkStepsAsync(page, st, steps).ConfigureAwait(false);
         }).ConfigureAwait(false);
     }
@@ -259,9 +274,9 @@ public static partial class Humanize
     private static async Task IdleDriftAsync(IPage page, Persona p, PointerState st, double ms)
     {
         Trace(AfterOf(page), "drift", ms);
-        await SeedPointerAsync(page, st).ConfigureAwait(false);
+        await SeedPointerAsync(page, p, st).ConfigureAwait(false);
         var (w, h) = await ViewportAsync(page).ConfigureAwait(false);
-        var steps = Pacing.TrimTo(Motion.PlanAmbient(new Point(st.X, st.Y), w, h, p, ms, AfterRngOf(page, p)), ms);
+        var steps = Pacing.TrimTo(AmbientPlan(st, p, w, h, ms, AfterRngOf(page, p)), ms);
         await WalkStepsAsync(page, st, steps).ConfigureAwait(false);
     }
 

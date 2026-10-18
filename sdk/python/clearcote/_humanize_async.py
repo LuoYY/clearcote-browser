@@ -44,7 +44,7 @@ from ._motion import (
     dblclick_gap, pause_ms, timing_traits,
     platform_from_navigator, rollover_rate, wheel_notches,
     dwell_ms, move_off_delay_ms, move_off_roll, plan_dwell, plan_move_off,
-    drag_hesitation, hesitate_then_drag,
+    drag_hesitation, hesitate_then_drag, entry_point, enter_from_top, ENTRY_LEAD_MS,
 )
 from ._scroll import (
     ANCHOR_TARGET_W, SCROLLER as ISO_SCROLLER, SCROLL_RANGE as ISO_SCROLL_RANGE, anchor_needed, anchor_point, bring_into_view_async,
@@ -270,11 +270,31 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         return c[1]
 
     async def _glide(x, y, settle=False, target_w=24, held=False):
-        # minimum-jerk sum-of-submovements path with colored noise + Fitts duration (_motion.plan_move)
-        await _dispatch(plan_move(st["pos"], (x, y), persona, target_w=target_w, settle=settle, held=held),
-                        kind="drag" if held else "glide", buttons=1 if held else 0)
+        # minimum-jerk sum-of-submovements path with colored noise + Fitts duration (_motion.plan_move).
+        # A page the pointer has not been over yet: in over the top edge, the samples still above the view
+        # not sent (_motion.entry_point / enter_from_top; pro-r43-13's rule) -- see _humanize._glide.
+        frm = st["pos"]
+        entering = not st["placed"] and not held and not settle
+        if entering:
+            vp = await _view_bounds()
+            frm = entry_point((x, y), vp[0] if vp else None)
+        steps = plan_move(frm, (x, y), persona, target_w=target_w, settle=settle, held=held)
+        if entering:
+            steps = enter_from_top(steps, frm)
+        await _dispatch(steps, kind="drag" if held else "glide", buttons=1 if held else 0)
         st["pos"] = (x, y)
         st["typed"] = None   # the hand left the keyboard: no submit / Tab pause owed (_after_typing)
+
+    def _ambient_plan(ms, box, rng=None):
+        """_humanize._ambient_plan: plan_ambient from the tracked position -- or, on a page the pointer has not been over yet, from a point
+        above the view with the samples still above it dropped (_motion.entry_point / enter_from_top): the drift's
+        first excursion comes in over the top edge, as _glide's first move does (pro-r43-13's rule, lab row H 13).
+        Planned ENTRY_LEAD_MS longer then, so the dropped lead-in (~100-200 ms) leaves the walk no shorter than
+        ``ms``; the caller trims to ``ms``. ``rng`` None: unseeded (the attention model passes its own)."""
+        if st["placed"]:
+            return plan_ambient(st["pos"], box, persona, ms, rng)
+        start = entry_point(st["pos"], box["width"], rng)
+        return enter_from_top(plan_ambient(start, box, persona, ms + ENTRY_LEAD_MS, rng), start, rng)
 
     # Engine real-trajectory routing (PRO): send point-to-point moves/clicks through
     # Browser.dispatchPointerPath, humanizedClick before r34 (real recorded human paths for PRO, engine bezier for free,
@@ -599,9 +619,9 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
         try:
             vp = page.viewport_size or {"width": 1280, "height": 800}
             # plan_ambient overruns its budget (whole excursions, rests drawn at 0.9-1.4x a frame):
-            # cut the plan at a slow sample near ms so ambient_motion(ms) lasts about ms.
-            steps = _trim_ambient(plan_ambient(st["pos"], {"width": vp["width"], "height": vp["height"]},
-                                               persona, ms), ms)
+            # cut the plan at a slow sample near ms so ambient_motion(ms) lasts about ms. On a page the
+            # pointer has not been over yet the drift comes in over the top edge (_ambient_plan).
+            steps = _trim_ambient(_ambient_plan(ms, {"width": vp["width"], "height": vp["height"]}), ms)
             await _dispatch(steps, kind="ambient")
             if steps:
                 st["pos"] = (steps[-1][0], steps[-1][1])
@@ -694,7 +714,7 @@ async def attach_humanize(browser, page, humanize=False, show_cursor=False, seed
     async def _idle_drift(ms):
         trace.append(("drift", ms))
         vw, vh = (await _view_bounds()) or (await _viewport())
-        steps = _trim_ambient(plan_ambient(st["pos"], {"width": vw, "height": vh}, persona, ms, arng), ms)
+        steps = _trim_ambient(_ambient_plan(ms, {"width": vw, "height": vh}, arng), ms)
         await _dispatch(steps, kind="ambient")
         if steps:
             st["pos"] = (steps[-1][0], steps[-1][1])

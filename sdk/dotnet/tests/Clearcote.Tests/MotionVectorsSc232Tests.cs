@@ -91,4 +91,65 @@ public class MotionVectorsSc232Tests
             }
         }
     }
+
+    /// <summary>SC 239: a fresh page's first glide — EntryPoint → PlanMove → EnterFromTop with ONE rng in that order —
+    /// pinned across the SDKs (the "entry" section).</summary>
+    [Fact]
+    public void Entry_vectors_match_the_pipeline()
+    {
+        foreach (var c in Vec.GetProperty("entry").EnumerateArray())
+        {
+            var r = Motion.Mulberry32((uint)c.GetProperty("rng").GetInt32());
+            var tg = c.GetProperty("target");
+            var target = new Point(tg[0].GetDouble(), tg[1].GetDouble());
+            var from = Motion.EntryPoint(target, c.GetProperty("view_w").GetDouble(), r);
+            var f = c.GetProperty("from");
+            Assert.Equal(f[0].GetDouble(), from.X, 6);
+            Assert.Equal(f[1].GetDouble(), from.Y, 6);
+            var planned = Motion.PlanMove(from, target, Motion.MakePersona(c.GetProperty("persona").GetString()),
+                targetW: c.GetProperty("target_w").GetDouble(), rng: r);
+            Assert.Equal(c.GetProperty("planned_n").GetInt32(), planned.Count);
+            var steps = Motion.EnterFromTop(planned, from, r);
+            Assert.Equal(c.GetProperty("n").GetInt32(), steps.Count);
+            foreach (var smp in c.GetProperty("samples").EnumerateArray())
+            {
+                int i = smp[0].GetInt32();
+                Assert.Equal(smp[1].GetDouble(), steps[i].X, 6);
+                Assert.Equal(smp[2].GetDouble(), steps[i].Y, 6);
+                Assert.Equal(smp[3].GetDouble(), steps[i].SleepMs, 6);
+            }
+        }
+    }
+
+    /// <summary>SC 239: an ambient drift on a fresh page — EntryPoint → PlanAmbient(ms + EntryLeadMs) → EnterFromTop with
+    /// ONE rng in that order (Humanize.AmbientPlan) — pinned across the SDKs (the "entry_ambient" section).</summary>
+    [Fact]
+    public void Entry_ambient_vectors_match_the_pipeline()
+    {
+        foreach (var c in Vec.GetProperty("entry_ambient").EnumerateArray())
+        {
+            var r = Motion.Mulberry32((uint)c.GetProperty("rng").GetInt32());
+            var pos = c.GetProperty("pos");
+            var view = c.GetProperty("view");
+            double vw = view[0].GetDouble(), vh = view[1].GetDouble();
+            var start = Motion.EntryPoint(new Point(pos[0].GetDouble(), pos[1].GetDouble()), vw, r);
+            var s0 = c.GetProperty("start");
+            Assert.Equal(s0[0].GetDouble(), start.X, 6);
+            Assert.Equal(s0[1].GetDouble(), start.Y, 6);
+            var planned = Motion.PlanAmbient(start, vw, vh, Motion.MakePersona(c.GetProperty("persona").GetString()),
+                c.GetProperty("ms").GetDouble() + Motion.EntryLeadMs, r);
+            Assert.Equal(c.GetProperty("planned_n").GetInt32(), planned.Count);
+            var steps = Motion.EnterFromTop(planned, start, r);
+            Assert.Equal(c.GetProperty("n").GetInt32(), steps.Count);
+            Assert.InRange(steps[0].Y, 0, Motion.EntryCrossPx);
+            Assert.Equal(c.GetProperty("total_ms").GetDouble(), steps.Sum(s => s.SleepMs), 3);
+            foreach (var smp in c.GetProperty("samples").EnumerateArray())
+            {
+                int i = smp[0].GetInt32();
+                Assert.Equal(smp[1].GetDouble(), steps[i].X, 6);
+                Assert.Equal(smp[2].GetDouble(), steps[i].Y, 6);
+                Assert.Equal(smp[3].GetDouble(), steps[i].SleepMs, 6);
+            }
+        }
+    }
 }

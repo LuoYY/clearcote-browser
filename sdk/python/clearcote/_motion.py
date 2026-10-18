@@ -885,3 +885,59 @@ def plan_move_off(frm, viewport, p: Persona, rng: Optional[Rng] = None):
         x = _clamp(frm[0] + dx, m, vw - m)
         y = _clamp(frm[1] - dy, m, vh - m)
     return (x, y)
+
+
+# ------------------------------------------------------------------ fresh-page entry (SC 239 / pro-r43-13)
+# Where a hand comes from on a page the pointer has not been over yet: 30-120 px ABOVE the view, within +-30 % of
+# the view width of the target -- in from the tab strip / address bar, as pro-r43-13 does for the engine's own
+# first path. The samples still above the view are not sent; the page's first event is where the path crosses
+# the top edge (y 0-4). Before 0.54 the SDK's first glide started at an interior point 140-380 x 90-240 px in, so
+# a page's first pointer event appeared mid-page (lab row H 13). Node entryPoint/enterFromTop and .NET
+# EntryPoint/EnterFromTop are ports; sdk/testdata/humanize_motion_vectors.json "entry" pins them.
+ENTRY_ABOVE_PX = (30.0, 120.0)
+ENTRY_SPREAD = 0.6
+ENTRY_CROSS_PX = 4.0
+ENTRY_EDGE_PX = 8.0
+ENTRY_DEFAULT_VIEW_W = 1000.0
+# An ambient drift on a fresh page is planned from the entry point too (its first excursion comes in over the top
+# edge, _humanize._ambient_plan); the dropped lead-in is ~100-200 ms, so it is planned this much longer and then
+# trimmed to the ask.
+ENTRY_LEAD_MS = 250.0
+
+
+def entry_point(target, view_w=None, rng: Optional[Rng] = None):
+    """The off-view point a fresh page's first glide starts from: x within +-30 % of the view width of ``target``
+    (8 px inside the view's sides), y 30-120 px above the view. Two draws from ``rng``: x first, then y. Without a
+    usable ``view_w`` the view is taken as 1000 px wide."""
+    if rng is None:
+        rng = random.random
+    w = float(view_w) if view_w and view_w > 16 else ENTRY_DEFAULT_VIEW_W
+    x = _clamp(target[0] + (rng() - 0.5) * ENTRY_SPREAD * w, ENTRY_EDGE_PX, w - ENTRY_EDGE_PX)
+    y = -(ENTRY_ABOVE_PX[0] + rng() * (ENTRY_ABOVE_PX[1] - ENTRY_ABOVE_PX[0]))
+    return (x, y)
+
+
+def enter_from_top(steps, start, rng: Optional[Rng] = None):
+    """``steps`` of a path planned from the off-view ``start`` with the samples still above the view dropped and
+    the first one put where the path crosses the top edge (y 0-4; one draw from ``rng`` when a crossing sample
+    is made). The crossing sample takes the timing of the sample it replaces (or of the first kept one). A path
+    whose start is inside the view, or that never comes in, is returned as it is."""
+    if not steps or start[1] >= 0:
+        return steps
+    i = 0
+    while i < len(steps) and steps[i][1] < 0:
+        i += 1
+    if i >= len(steps):
+        return steps
+    a = (start[0], start[1]) if i == 0 else (steps[i - 1][0], steps[i - 1][1])
+    b = steps[i]
+    if b[1] <= ENTRY_CROSS_PX:
+        return list(steps[i:])
+    if rng is None:
+        rng = random.random
+    y_in = rng() * ENTRY_CROSS_PX
+    f = (y_in - a[1]) / (b[1] - a[1]) if b[1] > a[1] else 1.0
+    cross = (a[0] + (b[0] - a[0]) * f, y_in)
+    if i == 0:
+        return [cross + tuple(steps[0][2:])] + list(steps)
+    return [cross + tuple(steps[i - 1][2:])] + list(steps[i:])

@@ -845,3 +845,46 @@ export function planMoveOff(from: Point, vp: Viewport, p: Persona, rng: Rng = Ma
   }
   return { x, y };
 }
+
+
+// ------------------------------------------------------------------ fresh-page entry (SC 239 / pro-r43-13)
+// Where a hand comes from on a page the pointer has not been over yet: 30-120 px ABOVE the view, within +-30 % of the
+// view width of the target (in from the tab strip / address bar, as pro-r43-13 does for the engine's own first path).
+// The samples still above the view are not sent; the page's first event is where the path crosses the top edge
+// (y 0-4). Port of Python _motion.entry_point / enter_from_top; sdk/testdata/humanize_motion_vectors.json "entry" pins both.
+export const ENTRY_ABOVE_PX: readonly [number, number] = [30, 120];
+export const ENTRY_SPREAD = 0.6;
+export const ENTRY_CROSS_PX = 4;
+export const ENTRY_EDGE_PX = 8;
+export const ENTRY_DEFAULT_VIEW_W = 1000;
+/** An ambient drift on a fresh page is planned from the entry point too (its first excursion comes in over the top
+ *  edge, humanize.ts ambientPlan); the dropped lead-in is ~100-200 ms, so it is planned this much longer and then
+ *  trimmed to the ask. */
+export const ENTRY_LEAD_MS = 250;
+
+/** The off-view point a fresh page's first glide starts from (x first, then y: two draws from `rng`). */
+export function entryPoint(target: Point, viewW?: number | null, rng: Rng = Math.random): Point {
+  const w = viewW && viewW > 16 ? viewW : ENTRY_DEFAULT_VIEW_W;
+  const x = clamp(target.x + (rng() - 0.5) * ENTRY_SPREAD * w, ENTRY_EDGE_PX, w - ENTRY_EDGE_PX);
+  const y = -(ENTRY_ABOVE_PX[0] + rng() * (ENTRY_ABOVE_PX[1] - ENTRY_ABOVE_PX[0]));
+  return { x, y };
+}
+
+/** `steps` of a path planned from the off-view `start` with the samples still above the view dropped and the first
+ *  one put where the path crosses the top edge (y 0-4; one draw from `rng` when a crossing sample is made). The
+ *  crossing sample takes the timing of the sample it replaces (or of the first kept one). A path whose start is
+ *  inside the view, or that never comes in, is returned as it is. */
+export function enterFromTop<S extends Step>(steps: S[], start: Point, rng: Rng = Math.random): S[] {
+  if (!steps.length || start.y >= 0) return steps;
+  let i = 0;
+  while (i < steps.length && steps[i].y < 0) i++;
+  if (i >= steps.length) return steps;
+  const a = i === 0 ? start : steps[i - 1];
+  const b = steps[i];
+  if (b.y <= ENTRY_CROSS_PX) return steps.slice(i);
+  const yIn = rng() * ENTRY_CROSS_PX;
+  const f = b.y > a.y ? (yIn - a.y) / (b.y - a.y) : 1;
+  const cx = a.x + (b.x - a.x) * f;
+  if (i === 0) return [{ ...steps[0], x: cx, y: yIn }, ...steps];
+  return [{ ...steps[i - 1], x: cx, y: yIn }, ...steps.slice(i)];
+}

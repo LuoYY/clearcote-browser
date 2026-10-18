@@ -70,3 +70,43 @@ def test_wheel_anchor_point_vectors(case):
     for x, y in case["points"]:
         got = fn(case["viewport"][0], case["viewport"][1], r)
         assert got[0] == pytest.approx(x, abs=1e-6) and got[1] == pytest.approx(y, abs=1e-6)
+
+
+def test_entry_vectors_match_the_pipeline():
+    """SC 239: a fresh page's first glide -- entry_point -> plan_move -> enter_from_top with ONE rng in that order --
+    pinned across the SDKs (the "entry" section)."""
+    for c in VEC["entry"]:
+        rng = mulberry32(c["rng"])
+        frm = _motion.entry_point(tuple(c["target"]), c["view_w"] or None, rng)
+        assert frm[0] == pytest.approx(c["from"][0], abs=1e-6)
+        assert frm[1] == pytest.approx(c["from"][1], abs=1e-6)
+        planned = _motion.plan_move(frm, tuple(c["target"]), make_persona(c["persona"]), target_w=c["target_w"], rng=rng)
+        assert len(planned) == c["planned_n"]
+        steps = _motion.enter_from_top(planned, frm, rng)
+        assert len(steps) == c["n"]
+        for i, x, y, sl in c["samples"]:
+            assert steps[i][0] == pytest.approx(x, abs=1e-6)
+            assert steps[i][1] == pytest.approx(y, abs=1e-6)
+            assert steps[i][2] == pytest.approx(sl, abs=1e-6)
+
+
+def test_entry_ambient_vectors_match_the_pipeline():
+    """SC 239: an ambient drift on a fresh page -- entry_point -> plan_ambient(ms + ENTRY_LEAD_MS) -> enter_from_top
+    with ONE rng in that order (_humanize._ambient_plan) -- pinned across the SDKs (the "entry_ambient" section)."""
+    for c in VEC["entry_ambient"]:
+        rng = mulberry32(c["rng"])
+        vw, vh = c["view"]
+        start = _motion.entry_point(tuple(c["pos"]), vw, rng)
+        assert start[0] == pytest.approx(c["start"][0], abs=1e-6)
+        assert start[1] == pytest.approx(c["start"][1], abs=1e-6)
+        planned = _motion.plan_ambient(start, {"width": vw, "height": vh}, make_persona(c["persona"]),
+                                       c["ms"] + _motion.ENTRY_LEAD_MS, rng)
+        assert len(planned) == c["planned_n"]
+        steps = _motion.enter_from_top(planned, start, rng)
+        assert len(steps) == c["n"]
+        assert 0 <= steps[0][1] <= _motion.ENTRY_CROSS_PX
+        assert sum(s[2] for s in steps) == pytest.approx(c["total_ms"], abs=1e-3)
+        for i, x, y, sl in c["samples"]:
+            assert steps[i][0] == pytest.approx(x, abs=1e-6)
+            assert steps[i][1] == pytest.approx(y, abs=1e-6)
+            assert steps[i][2] == pytest.approx(sl, abs=1e-6)

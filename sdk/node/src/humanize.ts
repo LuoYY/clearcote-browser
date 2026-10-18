@@ -30,7 +30,7 @@
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { errors as pwErrors } from "playwright-core";
 import {
-  makePersona, planMove, aimTraits, dragDwell, dragHesitation, hesitateThenDrag, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
+  makePersona, planMove, entryPoint, enterFromTop, ENTRY_LEAD_MS, aimTraits, dragDwell, dragHesitation, hesitateThenDrag, clickHold, keyDwell, clickPoint, planAmbient, gaussFrom, rolloverRate,
   dblclickGap, pauseMs, timingTraits,
   wheelNotches, platformFromNavigator, WHEEL_NOTCH_PX, type Box, type Persona, type Point, type Step, type WheelPlatform,
 } from "./motion.js";
@@ -496,8 +496,16 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // Move to (x, y) as a minimum-jerk sum-of-submovements path (primary ballistic + corrective homing)
   // with colored sub-pixel noise and Fitts-scaled duration. `settle` adds a seating jiggle (drag).
   const glide = async (x: number, y: number, o: { settle?: boolean; targetW?: number; held?: boolean } = {}): Promise<void> => {
-    await dispatch(planMove(st, { x, y }, persona, { settle: o.settle, targetW: o.targetW, held: o.held }),
-      o.held ? "drag" : "glide", o.held ? 1 : 0);
+    // A page the pointer has not been over yet (nothing placed it): the path comes in over the top edge, as the
+    // engine's own first path does (pro-r43-13), and the samples still above the view are not sent (motion.ts
+    // entryPoint / enterFromTop) -- the page's first pointer event is at the edge, not mid-page (lab row H 13).
+    // A drag leg never starts a page: its press glided first.
+    const entering = !st.placed && !o.held && !o.settle;
+    let from: Point = { x: st.x, y: st.y };
+    if (entering) { const vp = await viewBounds(); from = entryPoint({ x, y }, vp?.width ?? null); }
+    let steps = planMove(from, { x, y }, persona, { settle: o.settle, targetW: o.targetW, held: o.held });
+    if (entering) steps = enterFromTop(steps, from);
+    await dispatch(steps, o.held ? "drag" : "glide", o.held ? 1 : 0);
     st.x = x; st.y = y;
     st.typed = null; // the hand left the keyboard: no submit / Tab pause owed
   };
@@ -625,11 +633,23 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
   // Non-goal cursor activity (idle drift + a few excursions). It never presses a button and never
   // approaches a caller-named target, so it is also the safe way to give the cursor a position when
   // an action needs one but names no coordinates.
+  // planAmbient from the tracked position -- or, on a page the pointer has not been over yet, from a point above the
+  // view with the samples still above it dropped (entryPoint / enterFromTop): the drift's first excursion comes in
+  // over the top edge, as glide()'s first move does (pro-r43-13's rule, lab row H 13). Planned ENTRY_LEAD_MS longer
+  // then, so the dropped lead-in (~100-200 ms) leaves the walk no shorter than ms; the caller trims to ms.
+  // `rng` undefined: unseeded (the attention model passes its own). Python _ambient_plan, .NET AmbientPlan.
+  const ambientPlan = (ms: number, vp: { width: number; height: number }, rng?: () => number): Step[] => {
+    if (st.placed) return planAmbient({ x: st.x, y: st.y }, vp, persona, ms, rng);
+    const start = entryPoint({ x: st.x, y: st.y }, vp.width, rng);
+    return enterFromTop(planAmbient(start, vp, persona, ms + ENTRY_LEAD_MS, rng), start, rng);
+  };
+
   const ambient = async (ms: number): Promise<void> => {
     try {
       // planAmbient overruns its budget (whole excursions, rests drawn at 0.9-1.4x a frame): cut the
-      // plan at a slow sample near ms so ambientMotion(ms) lasts about ms.
-      const steps = trimTo(planAmbient(st, await viewport(), persona, ms), ms);
+      // plan at a slow sample near ms so ambientMotion(ms) lasts about ms. On a page the pointer has not
+      // been over yet the drift comes in over the top edge (ambientPlan).
+      const steps = trimTo(ambientPlan(ms, await viewport()), ms);
       await dispatch(steps, "ambient");
       if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
     } catch { /* best-effort ambient */ }
@@ -3080,7 +3100,7 @@ export async function attachHumanize(browser: Browser | null, page: Page, opts: 
     af.trace.push(["drift", ms]);
     trimTrace();
     const vp = (await viewBounds()) ?? (await viewport());
-    const steps = trimTo(planAmbient({ x: st.x, y: st.y }, vp, persona, ms, af.rng), ms);
+    const steps = trimTo(ambientPlan(ms, vp, af.rng), ms);
     await dispatch(steps, "ambient");
     if (steps.length) { st.x = steps[steps.length - 1].x; st.y = steps[steps.length - 1].y; }
   }

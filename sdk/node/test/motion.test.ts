@@ -189,3 +189,36 @@ describe("planAmbient", () => {
     expect(distinct.size).toBeGreaterThan(20);
   });
 });
+
+
+// --- fresh-page entry (SC 239 / pro-r43-13) --------------------------------------------------------
+import { entryPoint, enterFromTop } from "../src/motion.js";
+
+describe("fresh-page entry (SC 239 / pro-r43-13)", () => {
+  it("entryPoint is 30-120 px above the view, within 30 % of the width of the target, inside the sides", () => {
+    for (let k = 0; k < 200; k++) {
+      const { x, y } = entryPoint({ x: 640, y: 380 }, 1180, mulberry32(k));
+      expect(y).toBeGreaterThanOrEqual(-120); expect(y).toBeLessThanOrEqual(-30);
+      expect(x).toBeGreaterThanOrEqual(8); expect(x).toBeLessThanOrEqual(1172);
+      expect(Math.abs(x - 640)).toBeLessThanOrEqual(0.3 * 1180 + 1e-9);
+    }
+    const d = entryPoint({ x: 900, y: 500 }, null, mulberry32(1));   // no readable viewport: a 1000 px view
+    expect(d.x).toBeGreaterThanOrEqual(8); expect(d.x).toBeLessThanOrEqual(992);
+  });
+  it("enterFromTop: the first kept sample sits at y 0-4, nothing stays above, the target is untouched", () => {
+    const p = makePersona("entry");
+    for (let k = 0; k < 50; k++) {
+      const r = mulberry32(100 + k);
+      const from = entryPoint({ x: 640, y: 380 }, 1180, r);
+      const planned = planMove(from, { x: 640, y: 380 }, p, { rng: r });
+      const steps = enterFromTop(planned, from, r);
+      expect(steps[0].y).toBeGreaterThanOrEqual(0); expect(steps[0].y).toBeLessThanOrEqual(4);
+      for (const s of steps) expect(s.y).toBeGreaterThanOrEqual(0);
+      expect([steps[steps.length - 1].x, steps[steps.length - 1].y]).toEqual([640, 380]);
+      expect(steps.length).toBeLessThanOrEqual(planned.length + 1);
+    }
+    const inside = planMove({ x: 300, y: 300 }, { x: 640, y: 380 }, p, { rng: mulberry32(5) });
+    expect(enterFromTop(inside, { x: 300, y: 300 }, mulberry32(6))).toBe(inside);
+    expect(enterFromTop([], { x: 300, y: -40 })).toEqual([]);
+  });
+});

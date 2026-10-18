@@ -246,4 +246,40 @@ public class MotionTests
             prev = v;
         }
     }
+
+    // --- fresh-page entry (SC 239 / pro-r43-13) ---------------------------------------------------
+
+    [Fact]
+    public void EntryPoint_is_above_the_view_near_the_target()
+    {
+        for (uint k = 0; k < 200; k++)
+        {
+            var e = Motion.EntryPoint(new Point(640, 380), 1180, Motion.Mulberry32(k));
+            Assert.InRange(e.Y, -120, -30);
+            Assert.InRange(e.X, 8, 1172);
+            Assert.True(Math.Abs(e.X - 640) <= 0.3 * 1180 + 1e-9);
+        }
+        var d = Motion.EntryPoint(new Point(900, 500), 0, Motion.Mulberry32(1));   // no readable viewport: a 1000 px view
+        Assert.InRange(d.X, 8, 992);
+    }
+
+    [Fact]
+    public void EnterFromTop_first_sample_at_the_edge_nothing_above_target_untouched()
+    {
+        var p = Motion.MakePersona("entry");
+        for (uint k = 0; k < 50; k++)
+        {
+            var r = Motion.Mulberry32(100 + k);
+            var from = Motion.EntryPoint(new Point(640, 380), 1180, r);
+            var planned = Motion.PlanMove(from, new Point(640, 380), p, rng: r);
+            var steps = Motion.EnterFromTop(planned, from, r);
+            Assert.InRange(steps[0].Y, 0, 4);
+            Assert.All(steps, s => Assert.True(s.Y >= 0));
+            Assert.Equal((640.0, 380.0), (steps[^1].X, steps[^1].Y));
+            Assert.True(steps.Count <= planned.Count + 1);
+        }
+        var inside = Motion.PlanMove(new Point(300, 300), new Point(640, 380), p, rng: Motion.Mulberry32(5));
+        Assert.Same(inside, Motion.EnterFromTop(inside, new Point(300, 300), Motion.Mulberry32(6)));
+        Assert.Empty(Motion.EnterFromTop(new List<Step>(), new Point(300, -40)));
+    }
 }

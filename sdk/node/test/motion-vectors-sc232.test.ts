@@ -62,3 +62,43 @@ describe("SC 232 vectors", () => {
     });
   }
 });
+
+
+describe("SC 239 entry vectors (entryPoint -> planMove -> enterFromTop, one rng)", () => {
+  for (const c of VEC.entry) {
+    it(`${c.persona} rng ${c.rng}`, () => {
+      const r = mulberry32(c.rng);
+      const target = { x: c.target[0], y: c.target[1] };
+      const from = M.entryPoint(target, c.view_w || null, r);
+      expect(from.x).toBeCloseTo(c.from[0], 6); expect(from.y).toBeCloseTo(c.from[1], 6);
+      const planned = M.planMove(from, target, makePersona(c.persona), { targetW: c.target_w, rng: r });
+      expect(planned.length).toBe(c.planned_n);
+      const steps = M.enterFromTop(planned, from, r);
+      expect(steps.length).toBe(c.n);
+      for (const [i, x, y, sl] of c.samples as [number, number, number, number][]) {
+        expect(steps[i].x).toBeCloseTo(x, 6); expect(steps[i].y).toBeCloseTo(y, 6); expect(steps[i].sleepMs).toBeCloseTo(sl, 6);
+      }
+    });
+  }
+});
+
+
+describe("SC 239 entry_ambient vectors (entryPoint -> planAmbient(ms + ENTRY_LEAD_MS) -> enterFromTop, one rng)", () => {
+  for (const c of VEC.entry_ambient) {
+    it(`${c.persona} rng ${c.rng}`, () => {
+      const r = mulberry32(c.rng);
+      const [vw, vh] = c.view as [number, number];
+      const start = M.entryPoint({ x: c.pos[0], y: c.pos[1] }, vw, r);
+      expect(start.x).toBeCloseTo(c.start[0], 6); expect(start.y).toBeCloseTo(c.start[1], 6);
+      const planned = M.planAmbient(start, { width: vw, height: vh }, makePersona(c.persona), c.ms + M.ENTRY_LEAD_MS, r);
+      expect(planned.length).toBe(c.planned_n);
+      const steps = M.enterFromTop(planned, start, r);
+      expect(steps.length).toBe(c.n);
+      expect(steps[0].y).toBeGreaterThanOrEqual(0); expect(steps[0].y).toBeLessThanOrEqual(M.ENTRY_CROSS_PX);
+      expect(steps.reduce((a, s) => a + s.sleepMs, 0)).toBeCloseTo(c.total_ms, 3);
+      for (const [i, x, y, sl] of c.samples as [number, number, number, number][]) {
+        expect(steps[i].x).toBeCloseTo(x, 6); expect(steps[i].y).toBeCloseTo(y, 6); expect(steps[i].sleepMs).toBeCloseTo(sl, 6);
+      }
+    });
+  }
+});
