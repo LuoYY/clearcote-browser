@@ -52,12 +52,13 @@ import zipfile
 WIDEVINE_APP_ID = "oimompecagnajdejgnnjijobebaeigek"
 OMAHA_URL = "https://update.googleapis.com/service/update2/json"
 # update.googleapis.com is behind Google's edge; send a browser-ish UA (a bare urllib UA can 403).
-# Match the request UA to the OS we ask the CDM for, so the Omaha call is coherent.
-if sys.platform == "linux":
-    _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
-else:
-    _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+# Match the request UA to the OS we ask the CDM for, so the Omaha call is coherent (_user_agent).
+_UA_LINUX = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+_UA_WINDOWS = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+# Chrome on Apple Silicon still says "Intel Mac OS X 10_15_7".
+_UA_MAC = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 HINT_FILE = "latest-component-updated-widevine-cdm"
 
@@ -76,13 +77,46 @@ _TRUTHY = ("1", "true", "yes", "on")
 _FALSY = ("0", "false", "no", "off")
 
 
-def _cdm_platform():
+def _mac_arm(machine=None):
+    """True when this Mac's CPU is Apple Silicon (release.host_machine, the SDK's one CPU seam)."""
+    from .release import MACOS_ARCHES, host_machine
+
+    return (machine if machine is not None else host_machine()) in MACOS_ARCHES
+
+
+def _cdm_platform(plat=None, machine=None):
     """(@os, os.platform, os.version, platform_subdir, cdm_filename) for the current OS. Linux ships
     libwidevinecdm.so under linux_x64 and registers via the hint file; Windows ships widevinecdm.dll
-    under win_x64 and registers via the component-updater scan (see apply_widevine_launch)."""
-    if sys.platform == "linux":
+    under win_x64 and registers via the component-updater scan (see apply_widevine_launch), and so
+    does macOS: libwidevinecdm.dylib under mac_arm64 on Apple Silicon (the native PRO build), mac_x64
+    on an Intel Mac. Asked as an arm64 Mac, Google's server answers with ``…_mac_arm64_….crx3``, whose
+    library sits at _platform_specific/mac_arm64/libwidevinecdm.dylib (checked 2026-10-17, CDM
+    4.10.3112.0). Before this every Mac was sent the Windows CDM, which no Mac can load."""
+    plat = plat or sys.platform
+    if plat == "linux":
         return ("Linux", "Linux", "6.1.0", "linux_x64", "libwidevinecdm.so")
+    if plat == "darwin":
+        sub = "mac_arm64" if _mac_arm(machine) else "mac_x64"
+        return ("mac", "Mac OS X", "14.0.0", sub, "libwidevinecdm.dylib")
     return ("win", "Windows", "10.0.19045.0", "win_x64", "widevinecdm.dll")
+
+
+def _cdm_arch(plat=None, machine=None):
+    """Omaha's (arch, nacl_arch, os.arch) for the CDM asked for: arm64 on an Apple Silicon Mac, x64
+    everywhere else (the Windows and Linux browsers are x64 builds)."""
+    if (plat or sys.platform) == "darwin" and _mac_arm(machine):
+        return ("arm64", "arm", "arm64")
+    return ("x64", "x86-64", "x86_64")
+
+
+def _user_agent(plat=None):
+    """The request UA for the OS the CDM is asked for. Read per request, not once at import."""
+    plat = plat or sys.platform
+    if plat == "linux":
+        return _UA_LINUX
+    if plat == "darwin":
+        return _UA_MAC
+    return _UA_WINDOWS
 
 
 def _cache_root():
@@ -91,16 +125,17 @@ def _cache_root():
 
 
 def _omaha_request_body():
-    # Minimal Omaha v3.1 update check for the Windows x64 Widevine CDM. version=0.0.0.0 forces the
+    # Minimal Omaha v3.1 update check for this OS's Widevine CDM. version=0.0.0.0 forces the
     # server to return the latest. (No requestid randomness — keep it deterministic + simple.)
     at_os, os_platform, os_version, _sub, _fn = _cdm_platform()
+    arch, nacl_arch, os_arch = _cdm_arch()
     return {
         "request": {
             "@os": at_os, "@updater": "clearcote",
             "acceptformat": "crx3", "protocol": "3.1",
-            "arch": "x64", "nacl_arch": "x86-64", "prodversion": "149.0.0.0",
+            "arch": arch, "nacl_arch": nacl_arch, "prodversion": "149.0.0.0",
             "updaterversion": "149.0.0.0", "dedup": "cr",
-            "os": {"arch": "x86_64", "platform": os_platform, "version": os_version},
+            "os": {"arch": os_arch, "platform": os_platform, "version": os_version},
             "app": [{
                 "appid": WIDEVINE_APP_ID, "version": "0.0.0.0",
                 "updatecheck": {}, "ping": {"r": -2},
@@ -112,7 +147,7 @@ def _omaha_request_body():
 def _post_json(url, body):
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/json", "User-Agent": _UA})
+                                 headers={"Content-Type": "application/json", "User-Agent": _user_agent()})
     with urllib.request.urlopen(req, timeout=60) as resp:
         raw = resp.read().decode("utf-8", "replace")
     # strip the XSSI guard prefix Google prepends
@@ -245,7 +280,7 @@ def _install(root, url, sha256, version, quiet):
         _sweep_leftovers(root)
         if not quiet:
             print("[widevine] fetching CDM %s" % (version or "(latest)"))
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": _UA}),
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": _user_agent()}),
                                     timeout=120) as r:
             blob = r.read()
         if hashlib.sha256(blob).hexdigest() != sha256.lower():
@@ -472,9 +507,9 @@ def apply_widevine_launch(user_data_dir, kwargs, quiet=False):
             kwargs["ignore_default_args"] = ["--disable-component-update"]
         # Force the pre-installed-component scan. A user-supplied --component-updater mode wins, but
         # if it isn't fast-update the CDM may not register — surface that instead of silently failing.
-        # Force the pre-installed-component scan on WINDOWS (the component-updater path). On Linux the
-        # CDM hint file we seeded IS the registration mechanism — read at startup regardless — so no
-        # fast-update scan is needed there (verified: hint file + un-suppressed updater is enough).
+        # Force the pre-installed-component scan on Windows and macOS (the component-updater path). On
+        # Linux the CDM hint file we seeded IS the registration mechanism — read at startup regardless —
+        # so no fast-update scan is needed there (verified: hint file + un-suppressed updater is enough).
         args = list(kwargs.get("args") or [])
         if sys.platform != "linux":
             existing = [a for a in args if "component-updater" in a]
