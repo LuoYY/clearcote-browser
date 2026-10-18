@@ -100,33 +100,50 @@ public static class Widevine
     // ── platform + Omaha ───────────────────────────────────────────────────────
 
     private static bool Linux => Native.OsTag == "linux";
+    private static bool Mac => Native.OsTag == "macos";
+    /// An Apple Silicon Mac (Native.Arch is the OS's CPU, so an x64 .NET under Rosetta still counts).
+    private static bool MacArm => Mac && Native.Arch == "arm64";
 
-    /// (@os, os.platform, os.version, platform subdir, CDM file) for this OS.
-    private static (string AtOs, string OsPlatform, string OsVersion, string Subdir, string FileName) CdmPlatform() =>
+    /// (@os, os.platform, os.version, platform subdir, CDM file) for this OS. Linux registers the CDM via the hint
+    /// file; Windows and macOS via the component-updater scan. macOS ships libwidevinecdm.dylib under mac_arm64 on
+    /// Apple Silicon (the native PRO build), mac_x64 on an Intel Mac. Asked as an arm64 Mac, Google's server answers
+    /// with <c>…_mac_arm64_….crx3</c>, whose library sits at _platform_specific/mac_arm64/libwidevinecdm.dylib
+    /// (checked 2026-10-17, CDM 4.10.3112.0). Before this every Mac was sent the Windows CDM, which no Mac can load.
+    internal static (string AtOs, string OsPlatform, string OsVersion, string Subdir, string FileName) CdmPlatform() =>
         Linux ? ("Linux", "Linux", "6.1.0", "linux_x64", "libwidevinecdm.so")
-              : ("win", "Windows", "10.0.19045.0", "win_x64", "widevinecdm.dll");
+        : Mac ? ("mac", "Mac OS X", "14.0.0", MacArm ? "mac_arm64" : "mac_x64", "libwidevinecdm.dylib")
+        : ("win", "Windows", "10.0.19045.0", "win_x64", "widevinecdm.dll");
 
-    // update.googleapis.com sits behind Google's edge; a bare client UA can 403. Match the OS asked for.
-    private static string UserAgent => Linux
+    /// Omaha's (arch, nacl_arch, os.arch) for the CDM asked for: arm64 on an Apple Silicon Mac, x64 elsewhere
+    /// (the Windows and Linux browsers are x64 builds).
+    internal static (string Arch, string NaclArch, string OsArch) CdmArch() =>
+        MacArm ? ("arm64", "arm", "arm64") : ("x64", "x86-64", "x86_64");
+
+    // update.googleapis.com sits behind Google's edge; a bare client UA can 403. Match the OS asked for
+    // (Chrome on Apple Silicon still says "Intel Mac OS X 10_15_7").
+    internal static string UserAgent => Linux
         ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-        : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+        : Mac
+            ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+            : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
     /// The CDM cache root: CLEARCOTE_WIDEVINE_DIR, else ~/.clearcote/WidevineCdm.
     public static string CacheRoot() =>
         Environment.GetEnvironmentVariable("CLEARCOTE_WIDEVINE_DIR") is { Length: > 0 } d ? d : Path.Combine(Native.ClearcoteDir, "WidevineCdm");
 
-    /// Minimal Omaha v3.1 update check for this OS's x64 CDM (version 0.0.0.0 -> the latest).
+    /// Minimal Omaha v3.1 update check for this OS's CDM (version 0.0.0.0 -> the latest).
     public static string OmahaRequestBody()
     {
         var (atOs, osPlatform, osVersion, _, _) = CdmPlatform();
+        var (arch, naclArch, osArch) = CdmArch();
         return new JsonObject
         {
             ["request"] = new JsonObject
             {
                 ["@os"] = atOs, ["@updater"] = "clearcote", ["acceptformat"] = "crx3", ["protocol"] = "3.1",
-                ["arch"] = "x64", ["nacl_arch"] = "x86-64", ["prodversion"] = "149.0.0.0", ["updaterversion"] = "149.0.0.0",
+                ["arch"] = arch, ["nacl_arch"] = naclArch, ["prodversion"] = "149.0.0.0", ["updaterversion"] = "149.0.0.0",
                 ["dedup"] = "cr",
-                ["os"] = new JsonObject { ["arch"] = "x86_64", ["platform"] = osPlatform, ["version"] = osVersion },
+                ["os"] = new JsonObject { ["arch"] = osArch, ["platform"] = osPlatform, ["version"] = osVersion },
                 ["app"] = new JsonArray(new JsonObject
                 {
                     ["appid"] = AppId, ["version"] = "0.0.0.0", ["updatecheck"] = new JsonObject(),
@@ -537,7 +554,7 @@ public static class Widevine
 
     /// <summary>What a requested Widevine launch on a persistent profile changes besides the switch: Playwright's
     /// <c>--disable-component-update</c> is no longer passed (the component updater registers the seeded CDM), and on
-    /// Windows <c>--component-updater=fast-update</c> forces the startup scan (on Linux the hint file registers it).
+    /// Windows and macOS <c>--component-updater=fast-update</c> forces the startup scan (on Linux the hint file registers it).
     /// A caller's own <c>--component-updater</c> mode is kept.</summary>
     internal static (List<string> IgnoreDefaultArgs, List<string> Args) ComponentUpdaterArgs(IReadOnlyList<string>? ignoreDefaultArgs,
         IReadOnlyList<string>? userArgs, bool quiet = true)

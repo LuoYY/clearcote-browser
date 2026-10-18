@@ -23,8 +23,11 @@ def test_constants_pin_the_widevine_component():
 
 def test_omaha_request_body_targets_current_os():
     body = _omaha_request_body()["request"]
-    assert body["arch"] == "x64" and body["acceptformat"] == "crx3"
-    assert body["@os"] in ("win", "Linux")  # platform-aware (Windows dev host / Linux CI)
+    assert body["acceptformat"] == "crx3"
+    # platform-aware (Windows dev host / Linux CI / a Mac; the darwin paths are in test_widevine_macos)
+    assert body["@os"] in ("win", "Linux", "mac")
+    if body["@os"] != "mac":
+        assert body["arch"] == "x64"
     app = body["app"][0]
     assert app["appid"] == WIDEVINE_APP_ID
     assert app["version"] == "0.0.0.0"  # forces the server to return the latest

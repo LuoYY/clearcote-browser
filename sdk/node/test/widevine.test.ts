@@ -29,11 +29,12 @@ describe("widevine constants", () => {
 });
 
 describe("omahaRequestBody", () => {
-  it("targets the current-OS x64 CDM + the latest version", () => {
+  it("targets the current-OS CDM + the latest version", () => {
     const req = (omahaRequestBody() as any).request;
-    // platform-aware: "win" on a Windows dev host, "Linux" on the Linux CI
-    expect(["win", "Linux"]).toContain(req["@os"]);
-    expect(req.arch).toBe("x64");
+    // platform-aware: "win" on a Windows dev host, "Linux" on the Linux CI, "mac" on a Mac
+    // (arm64 on Apple Silicon; the darwin paths are pinned in widevine-macos.test.ts)
+    expect(["win", "Linux", "mac"]).toContain(req["@os"]);
+    if (req["@os"] !== "mac") expect(req.arch).toBe("x64");
     expect(req.acceptformat).toBe("crx3");
     expect(req.app[0].appid).toBe(WIDEVINE_APP_ID);
     expect(req.app[0].version).toBe("0.0.0.0");

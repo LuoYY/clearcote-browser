@@ -36,6 +36,7 @@ import { performance } from "node:perf_hooks";
 import extract from "extract-zip";
 import { acquireInstallLock, renameDir } from "./download.js";
 import { engineSupportsSwitch } from "./launchopts.js";
+import { hostArch } from "./release.js";
 import { warnOnce } from "./warnings.js";
 
 /** 1/true/yes/on forces Widevine on, 0/false/no/off off; an explicit `widevine` option wins over it. */
@@ -69,27 +70,54 @@ export const WIDEVINE_APP_ID = "oimompecagnajdejgnnjijobebaeigek";
 export const OMAHA_URL = "https://update.googleapis.com/service/update2/json";
 export const HINT_FILE = "latest-component-updated-widevine-cdm";
 
-/** Per-OS CDM coordinates. Linux ships libwidevinecdm.so under linux_x64 and registers via the hint
- * file; Windows ships widevinecdm.dll under win_x64 and registers via the component-updater scan. */
-function cdmPlatform(): {
+/** One OS's CDM coordinates: what the Omaha request names, and where the library sits in the package. */
+export interface CdmPlatform {
   atOs: string;
   osPlatform: string;
   osVersion: string;
   subdir: string;
   filename: string;
-} {
-  if (process.platform === "linux") {
-    return { atOs: "Linux", osPlatform: "Linux", osVersion: "6.1.0", subdir: "linux_x64", filename: "libwidevinecdm.so" };
-  }
-  return { atOs: "win", osPlatform: "Windows", osVersion: "10.0.19045.0", subdir: "win_x64", filename: "widevinecdm.dll" };
+  /** Omaha's `arch`, `nacl_arch` and `os.arch` for the CPU asked for. */
+  arch: string;
+  naclArch: string;
+  osArch: string;
 }
 
-// update.googleapis.com sits behind Google's edge; a bare fetch UA can 403 — send a browser-ish one.
-// Match the request UA to the OS we ask the CDM for, so the Omaha call is coherent.
-const UA =
-  process.platform === "linux"
-    ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
-    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+/**
+ * Per-OS CDM coordinates. Linux ships libwidevinecdm.so under linux_x64 and registers via the hint
+ * file; Windows ships widevinecdm.dll under win_x64 and registers via the component-updater scan, and
+ * so does macOS: libwidevinecdm.dylib under mac_arm64 on Apple Silicon (the native PRO build), mac_x64
+ * on an Intel Mac. Asked as an arm64 Mac, Google's server answers with `…_mac_arm64_….crx3`, whose
+ * library sits at _platform_specific/mac_arm64/libwidevinecdm.dylib (checked 2026-10-17, CDM
+ * 4.10.3112.0). Before this every Mac was sent the Windows CDM, which no Mac can load.
+ */
+export function cdmPlatform(platform: string = process.platform, arch: string = hostArch.get()): CdmPlatform {
+  const x64 = { arch: "x64", naclArch: "x86-64", osArch: "x86_64" };
+  if (platform === "linux") {
+    return { atOs: "Linux", osPlatform: "Linux", osVersion: "6.1.0", subdir: "linux_x64", filename: "libwidevinecdm.so", ...x64 };
+  }
+  if (platform === "darwin") {
+    const arm = arch === "arm64";
+    return {
+      atOs: "mac", osPlatform: "Mac OS X", osVersion: "14.0.0",
+      subdir: arm ? "mac_arm64" : "mac_x64", filename: "libwidevinecdm.dylib",
+      ...(arm ? { arch: "arm64", naclArch: "arm", osArch: "arm64" } : x64),
+    };
+  }
+  return { atOs: "win", osPlatform: "Windows", osVersion: "10.0.19045.0", subdir: "win_x64", filename: "widevinecdm.dll", ...x64 };
+}
+
+/**
+ * update.googleapis.com sits behind Google's edge; a bare fetch UA can 403 — send a browser-ish one.
+ * Match the request UA to the OS we ask the CDM for, so the Omaha call is coherent. Read per request,
+ * not once at import, so it always follows the OS the request names. (Chrome on Apple Silicon still
+ * says "Intel Mac OS X 10_15_7".)
+ */
+export function omahaUserAgent(platform: string = process.platform): string {
+  if (platform === "linux") return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+  if (platform === "darwin") return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+  return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+}
 
 export interface WidevineOptions {
   /** Destination root (default CLEARCOTE_WIDEVINE_DIR, else ~/.clearcote/WidevineCdm). */
@@ -112,21 +140,21 @@ function cacheRoot(): string {
   return process.env.CLEARCOTE_WIDEVINE_DIR || path.join(os.homedir(), ".clearcote", "WidevineCdm");
 }
 
-/** Minimal Omaha v3.1 update check for the current-OS x64 Widevine CDM (version 0.0.0.0 -> latest). */
+/** Minimal Omaha v3.1 update check for the current OS's Widevine CDM (version 0.0.0.0 -> latest). */
 export function omahaRequestBody(): unknown {
-  const { atOs, osPlatform, osVersion } = cdmPlatform();
+  const { atOs, osPlatform, osVersion, arch, naclArch, osArch } = cdmPlatform();
   return {
     request: {
       "@os": atOs,
       "@updater": "clearcote",
       acceptformat: "crx3",
       protocol: "3.1",
-      arch: "x64",
-      nacl_arch: "x86-64",
+      arch,
+      nacl_arch: naclArch,
       prodversion: "149.0.0.0",
       updaterversion: "149.0.0.0",
       dedup: "cr",
-      os: { arch: "x86_64", platform: osPlatform, version: osVersion },
+      os: { arch: osArch, platform: osPlatform, version: osVersion },
       app: [{ appid: WIDEVINE_APP_ID, version: "0.0.0.0", updatecheck: {}, ping: { r: -2 } }],
     },
   };
@@ -149,7 +177,7 @@ function withTimeout(ms: number, signal?: AbortSignal): AbortSignal {
 async function postJson(url: string, body: unknown, signal?: AbortSignal): Promise<any> {
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": UA },
+    headers: { "Content-Type": "application/json", "User-Agent": omahaUserAgent() },
     body: JSON.stringify(body),
     redirect: "follow",
     signal: withTimeout(60_000, signal),
@@ -292,7 +320,7 @@ async function install(root: string, url: string, sha256: string, version: strin
     if (validCdm(verDir)) return verDir; // another process installed it while we waited
     sweepLeftovers(root);
     log(opts.quiet, `fetching CDM ${version || "(latest)"}`);
-    const res = await fetch(url, { headers: { "User-Agent": UA }, redirect: "follow", signal: withTimeout(120_000, opts.signal) });
+    const res = await fetch(url, { headers: { "User-Agent": omahaUserAgent() }, redirect: "follow", signal: withTimeout(120_000, opts.signal) });
     if (!res.ok) throw new Error(`Widevine CDM download HTTP ${res.status}`);
     const blob = Buffer.from(await res.arrayBuffer());
     if (createHash("sha256").update(blob).digest("hex") !== sha256.toLowerCase()) {
@@ -529,8 +557,8 @@ export async function seedWidevine(userDataDir: string, opts: WidevineOptions = 
  * `undefined`, or the boolean form Playwright accepts (`true` = ignore ALL defaults, so the updater
  * is already un-suppressed); only the list/undefined forms need `--disable-component-update` added.
  *
- * The `--component-updater=fast-update` startup scan is Windows-ONLY: on Linux the seeded CDM hint
- * file IS the registration mechanism (read at startup regardless), so no scan flag is added there.
+ * The `--component-updater=fast-update` startup scan is for Windows and macOS: on Linux the seeded CDM
+ * hint file IS the registration mechanism (read at startup regardless), so no scan flag is added there.
  * Verified: with these, requestMediaKeySystemAccess + createMediaKeys succeed.
  */
 export function widevineArgs(
@@ -545,7 +573,7 @@ export function widevineArgs(
   } else if (ignoreDefaultArgs === undefined) {
     ida = ["--disable-component-update"];
   }
-  // Force the pre-installed-component scan on WINDOWS only. On Linux the hint file registers the CDM.
+  // Force the pre-installed-component scan on Windows and macOS. On Linux the hint file registers the CDM.
   const args =
     process.platform === "linux" || userArgs.some((a) => a.includes("component-updater"))
       ? userArgs

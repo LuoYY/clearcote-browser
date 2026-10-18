@@ -29,8 +29,9 @@ public class WidevineTests : IDisposable
     private const string DownloadUrl = "https://example.invalid/cdm.crx3";
     private static readonly byte[] Engine1022 = Encoding.Latin1.GetBytes("\0widevine-cdm-path\0");
     private static readonly bool Linux = OperatingSystem.IsLinux();
-    private static readonly string Sub = Linux ? "linux_x64" : "win_x64";
-    private static readonly string CdmFile = Linux ? "libwidevinecdm.so" : "widevinecdm.dll";
+    // This host's own CDM layout (read before any test fakes the OS): linux_x64, win_x64, or mac_arm64 on a Mac.
+    private static readonly string Sub = Widevine.CdmPlatform().Subdir;
+    private static readonly string CdmFile = Widevine.CdmPlatform().FileName;
 
     private readonly Sandbox _sb = new();
     private readonly List<string> _dirs = new();
