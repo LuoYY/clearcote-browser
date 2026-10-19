@@ -212,14 +212,14 @@ await browser.CloseAsync();
 
 | Option (Python / Node) | What it does |
 |---|---|
-| `fingerprint` | The seed. One seed is one machine: hardware, screen, GPU, fonts, locale and per-site render noise all derive from it |
+| `fingerprint` | The seed. One seed is one machine: hardware, screen, GPU and per-site render noise derive from it. Fonts and language do not: every seed on one machine shows the same font list (limited to fonts common on the platform it presents), and the language comes from `accept_language` / `acceptLanguage`, `geoip` or the `en-US` default |
 | `platform` | The operating system the browser presents: `windows`, `linux`, `macos` or `android` |
 | `brand` | The browser brand in the user agent and client hints: `Chrome`, `Edge`, `Opera`, `Vivaldi` |
 | `proxy` | `{"server": "http://host:8080", "username": "u", "password": "p"}`. HTTP and SOCKS5 with a username and password both work |
 | `geoip` / `geoip` | `True` matches the timezone, languages and `Accept-Language` to the proxy's exit location (and the WebRTC IP, on the licensed build) |
 | `humanize` / `humanize` | Moves, clicks, drags, scrolls and types as native, trusted input with human-like paths |
 | `light_stealth` / `lightStealth` | Changes only hardware metadata (cores, memory, screen depth, pixel ratio, touch) and leaves rendering real |
-| `fingerprint_profile` / `fingerprintProfile` | Loads a real machine captured with the [collector](tools/fingerprint-collect) or from the [profile library](https://github.com/clearcotelabs/clearcote-profiles) |
+| `fingerprint_profile` / `fingerprintProfile` | Loads a real machine captured with the [collector](tools/fingerprint-collect) or from the [profile library](https://github.com/clearcotelabs/clearcote-profiles). Use it instead of `fingerprint`, not with it: a seed next to a profile adds canvas noise that strict checkers score as tampering |
 | `version` / `version` | Picks a Chromium major, for example `"150"`. Leave it out for the newest build your tier allows |
 
 Anything else is passed straight to Playwright (`headless`, `args`, `timeout`, …). Full lists:
